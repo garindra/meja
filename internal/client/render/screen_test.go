@@ -100,6 +100,26 @@ func TestLastActiveWindowTracking(t *testing.T) {
 	}
 }
 
+func TestLastActiveWindowTrackingIncludesWindowZeroToggle(t *testing.T) {
+	state := NewClientState()
+	state.ApplyWindowList(protocol.WindowList{
+		Windows: []protocol.WindowInfo{
+			{WindowID: 0, PaneID: 10, Index: 0, Title: "bash"},
+			{WindowID: 1, PaneID: 11, Index: 1, Title: "logs"},
+		},
+	})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 0, PaneID: 10})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 11})
+	if got, ok := state.LastActiveWindowID(); !ok || got != 0 {
+		t.Fatalf("LastActiveWindowID() after 0->1 = %d, %v; want 0, true", got, ok)
+	}
+
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 0, PaneID: 10})
+	if got, ok := state.LastActiveWindowID(); !ok || got != 1 {
+		t.Fatalf("LastActiveWindowID() after 1->0 = %d, %v; want 1, true", got, ok)
+	}
+}
+
 func TestWindowListDoesNotOverrideExplicitSelection(t *testing.T) {
 	state := NewClientState()
 	state.ApplyWindowList(protocol.WindowList{

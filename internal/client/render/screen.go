@@ -11,10 +11,12 @@ type Screen struct {
 type ClientState struct {
 	SessionID uint64
 
-	ActiveWindowID uint64
-	LastWindowID   uint64
-	FocusedPaneID  uint64
-	Windows        []protocol.WindowInfo
+	ActiveWindowID  uint64
+	LastWindowID    uint64
+	HasActiveWindow bool
+	HasLastWindow   bool
+	FocusedPaneID   uint64
+	Windows         []protocol.WindowInfo
 
 	Grid          Screen
 	Generation    uint64
@@ -59,10 +61,12 @@ func (s *ClientState) ApplyWindowList(msg protocol.WindowList) {
 }
 
 func (s *ClientState) ApplyWindowSelected(msg protocol.WindowSelected) {
-	if s.ActiveWindowID != 0 && s.ActiveWindowID != msg.WindowID {
+	if s.HasActiveWindow && s.ActiveWindowID != msg.WindowID {
 		s.LastWindowID = s.ActiveWindowID
+		s.HasLastWindow = true
 	}
 	s.ActiveWindowID = msg.WindowID
+	s.HasActiveWindow = true
 	s.FocusedPaneID = msg.PaneID
 	s.syncWindowSelection()
 }
@@ -75,8 +79,13 @@ func (s *ClientState) ApplyWindowClosed(windowID uint64) {
 		}
 	}
 	s.Windows = out
-	if s.LastWindowID == windowID {
+	if s.HasLastWindow && s.LastWindowID == windowID {
 		s.LastWindowID = 0
+		s.HasLastWindow = false
+	}
+	if s.HasActiveWindow && s.ActiveWindowID == windowID {
+		s.ActiveWindowID = 0
+		s.HasActiveWindow = false
 	}
 	s.syncWindowSelection()
 }
@@ -207,7 +216,7 @@ func (s *ClientState) WindowIDByIndex(index int) (uint64, bool) {
 }
 
 func (s *ClientState) LastActiveWindowID() (uint64, bool) {
-	if s.LastWindowID == 0 || s.LastWindowID == s.ActiveWindowID {
+	if !s.HasLastWindow || (s.HasActiveWindow && s.LastWindowID == s.ActiveWindowID) {
 		return 0, false
 	}
 	for _, w := range s.Windows {

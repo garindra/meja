@@ -96,6 +96,43 @@ func TestProcessInputBytePrefixActions(t *testing.T) {
 	}
 }
 
+func TestProcessInputByteLastWindowTogglesWithWindowZero(t *testing.T) {
+	ui := &runtimeState{ui: render.NewClientState()}
+	ui.with(func(state *render.ClientState) {
+		state.ApplyWindowList(protocol.WindowList{
+			Windows: []protocol.WindowInfo{
+				{WindowID: 0, PaneID: 10, Index: 0, Title: "bash"},
+				{WindowID: 1, PaneID: 11, Index: 1, Title: "logs"},
+			},
+		})
+		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 0, PaneID: 10})
+		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 11})
+	})
+
+	prefix := true
+	_, mgmt, detach := processInputByte(&prefix, 'l', ui, Config{})
+	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgSelectWindow {
+		t.Fatalf("first last-window selection failed: %#v detach=%v", mgmt, detach)
+	}
+	sel, err := protocol.DecodeSelectWindow(mgmt[0].Payload)
+	if err != nil || sel.WindowID != 0 {
+		t.Fatalf("first last SelectWindow = %#v err=%v", sel, err)
+	}
+
+	ui.with(func(state *render.ClientState) {
+		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 0, PaneID: 10})
+	})
+	prefix = true
+	_, mgmt, detach = processInputByte(&prefix, 'l', ui, Config{})
+	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgSelectWindow {
+		t.Fatalf("second last-window selection failed: %#v detach=%v", mgmt, detach)
+	}
+	sel, err = protocol.DecodeSelectWindow(mgmt[0].Payload)
+	if err != nil || sel.WindowID != 1 {
+		t.Fatalf("second last SelectWindow = %#v err=%v", sel, err)
+	}
+}
+
 func TestDrawableRowsExcludesStatusRow(t *testing.T) {
 	ui := render.NewClientState()
 	ui.SetTerminalSize(80, 24)
