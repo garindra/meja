@@ -61,6 +61,15 @@ type runtimeState struct {
 	inputBlocked bool
 }
 
+type prefixState uint8
+
+const (
+	prefixIdle prefixState = iota
+	prefixActive
+	prefixArrowESC
+	prefixArrowCSI
+)
+
 func ParseTarget(raw string) (Target, error) {
 	parsed, err := sshconfig.ParseTarget(raw)
 	if err != nil {
@@ -150,7 +159,7 @@ func Run(ctx context.Context, cfg Config) error {
 	ui := &runtimeState{ui: render.NewClientState(), stdout: cfg.Stdout}
 	outputReady := make(chan struct{}, 1)
 	sessionDone := make(chan error, 2)
-	go acceptOutputStream(ctx, conn, ui, mgmtFrames, outputReady, sessionDone)
+	go acceptOutputStreams(ctx, conn, ui, mgmtFrames, outputReady, sessionDone)
 
 	if err := enqueueEncoded(mgmtFrames, protocol.MsgAuthBegin, protocol.AuthBegin{
 		Username:  resolved.Username,
@@ -331,29 +340,42 @@ func loadTLSConfig(caFile, serverName string) (*tls.Config, error) {
 	}, nil
 }
 
-func acceptOutputStream(ctx context.Context, conn quic.Connection, ui *runtimeState, mgmtFrames chan<- protocol.Frame, outputReady chan<- struct{}, sessionDone chan<- error) {
-	stream, err := conn.AcceptStream(ctx)
-	if err != nil {
-		sessionDone <- fmt.Errorf("accept output stream: %w", err)
-		return
-	}
-	decoder := protocol.NewDecoder(stream, protocol.DefaultMaxFrameSize)
-	openFrame, err := decoder.ReadFrame()
-	if err != nil {
-		sessionDone <- fmt.Errorf("read output stream open: %w", err)
-		return
-	}
-	if openFrame.Type != protocol.MsgOpenPaneOutputStream {
-		sessionDone <- fmt.Errorf("unexpected output stream opener %d", openFrame.Type)
-		return
+func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeState, mgmtFrames chan<- protocol.Frame, outputReady chan<- struct{}, sessionDone chan<- error) {
+	for i := 0; i < int(protocol.MaxRenderSlots); i++ {
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			sessionDone <- fmt.Errorf("accept output stream: %w", err)
+			return
+		}
+		decoder := protocol.NewDecoder(stream, protocol.DefaultMaxFrameSize)
+		openFrame, err := decoder.ReadFrame()
+		if err != nil {
+			sessionDone <- fmt.Errorf("read output stream open: %w", err)
+			return
+		}
+		if openFrame.Type != protocol.MsgOpenPaneOutputStream {
+			sessionDone <- fmt.Errorf("unexpected output stream opener %d", openFrame.Type)
+			return
+		}
+		open, err := protocol.DecodeStreamOpen(openFrame.Payload)
+		if err != nil {
+			sessionDone <- err
+			return
+		}
+		if int(open.Slot) != i {
+			sessionDone <- fmt.Errorf("unexpected output stream slot %d, want %d", open.Slot, i)
+			return
+		}
+		go readOutputStream(open.Slot, decoder, ui, mgmtFrames, sessionDone)
 	}
 	outputReady <- struct{}{}
+}
 
+func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, mgmtFrames chan<- protocol.Frame, sessionDone chan<- error) {
 	for {
 		frame, err := decoder.ReadFrame()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				sessionDone <- nil
 				return
 			}
 			sessionDone <- fmt.Errorf("read output frame: %w", err)
@@ -367,15 +389,19 @@ func acceptOutputStream(ctx context.Context, conn quic.Connection, ui *runtimeSt
 			case protocol.MsgBindRenderStream:
 				msg, err := protocol.DecodeBindRenderStream(frame.Payload)
 				if err == nil {
+					if msg.Slot != slot {
+						return
+					}
 					state.ApplyBind(msg)
 					needsRedraw = true
+					snapshotPaneID = msg.PaneID
 				}
 			case protocol.MsgReplacePane:
 				msg, err := protocol.DecodeReplacePane(frame.Payload)
 				if err == nil {
-					if !state.ApplyReplace(msg) {
+					if !state.ApplyReplace(slot, msg) {
 						requestSnapshot = true
-						snapshotPaneID = state.FocusedPaneID
+						snapshotPaneID = msg.PaneID
 						return
 					}
 					needsRedraw = true
@@ -383,17 +409,17 @@ func acceptOutputStream(ctx context.Context, conn quic.Connection, ui *runtimeSt
 			case protocol.MsgDefineStyle:
 				msg, err := protocol.DecodeDefineStyle(frame.Payload)
 				if err == nil {
-					if !state.DefineStyle(msg) {
+					if !state.DefineStyle(slot, msg) {
 						requestSnapshot = true
-						snapshotPaneID = state.FocusedPaneID
+						snapshotPaneID = state.RenderSlots[slot]
 					}
 				}
 			case protocol.MsgSetRun:
 				msg, err := protocol.DecodeSetRun(frame.Payload)
 				if err == nil {
-					if !state.ApplySetRun(msg) {
+					if !state.ApplySetRun(slot, msg) {
 						requestSnapshot = true
-						snapshotPaneID = state.FocusedPaneID
+						snapshotPaneID = state.RenderSlots[slot]
 						return
 					}
 					needsRedraw = true
@@ -401,9 +427,9 @@ func acceptOutputStream(ctx context.Context, conn quic.Connection, ui *runtimeSt
 			case protocol.MsgSetCursor:
 				msg, err := protocol.DecodeSetCursor(frame.Payload)
 				if err == nil {
-					if !state.ApplySetCursor(msg) {
+					if !state.ApplySetCursor(slot, msg) {
 						requestSnapshot = true
-						snapshotPaneID = state.FocusedPaneID
+						snapshotPaneID = state.RenderSlots[slot]
 						return
 					}
 					needsRedraw = true
@@ -411,9 +437,9 @@ func acceptOutputStream(ctx context.Context, conn quic.Connection, ui *runtimeSt
 			case protocol.MsgSetCursorVisible:
 				msg, err := protocol.DecodeSetCursorVisible(frame.Payload)
 				if err == nil {
-					if !state.ApplySetCursorVisible(msg) {
+					if !state.ApplySetCursorVisible(slot, msg) {
 						requestSnapshot = true
-						snapshotPaneID = state.FocusedPaneID
+						snapshotPaneID = state.RenderSlots[slot]
 						return
 					}
 					needsRedraw = true
@@ -432,12 +458,10 @@ func acceptOutputStream(ctx context.Context, conn quic.Connection, ui *runtimeSt
 				sessionDone <- err
 				return
 			}
-			if exited.ExitCode == 0 {
-				sessionDone <- nil
+			if exited.ExitCode != 0 {
+				sessionDone <- fmt.Errorf("remote pane exited with code %d signal %s", exited.ExitCode, exited.Signal)
 				return
 			}
-			sessionDone <- fmt.Errorf("remote pane exited with code %d signal %s", exited.ExitCode, exited.Signal)
-			return
 		case protocol.MsgBindRenderStream, protocol.MsgReplacePane, protocol.MsgDefineStyle, protocol.MsgSetRun, protocol.MsgSetCursor, protocol.MsgSetCursorVisible:
 			if frame.Type == protocol.MsgBindRenderStream {
 				ui.setInputBlocked(false)
@@ -467,6 +491,17 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 			return
 		}
 		switch frame.Type {
+		case protocol.MsgWindowLayout:
+			msg, err := protocol.DecodeWindowLayout(frame.Payload)
+			if err != nil {
+				done <- err
+				return
+			}
+			ui.with(func(state *render.ClientState) { state.ApplyWindowLayout(msg) })
+			if err := ui.redraw(); err != nil {
+				done <- err
+				return
+			}
 		case protocol.MsgWindowList:
 			msg, err := protocol.DecodeWindowList(frame.Payload)
 			if err != nil {
@@ -540,7 +575,7 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 
 func forwardInput(ctx context.Context, stdin *os.File, inputFrames, mgmtFrames chan<- protocol.Frame, ui *runtimeState, cfg Config, errs chan<- error, done chan<- error) {
 	buf := make([]byte, 4096)
-	prefix := false
+	prefix := prefixIdle
 	for {
 		n, err := stdin.Read(buf)
 		if n > 0 {
@@ -581,15 +616,25 @@ func forwardInput(ctx context.Context, stdin *os.File, inputFrames, mgmtFrames c
 	}
 }
 
-func processInputByte(prefix *bool, b byte, ui *runtimeState, cfg Config) ([][]byte, []protocol.Frame, bool) {
-	if *prefix {
-		*prefix = false
+func processInputByte(prefix *prefixState, b byte, ui *runtimeState, cfg Config) ([][]byte, []protocol.Frame, bool) {
+	switch *prefix {
+	case prefixActive:
+		if b == 0x1b {
+			*prefix = prefixArrowESC
+			return nil, nil, false
+		}
+		*prefix = prefixIdle
 		switch b {
 		case prefixByte:
 			return [][]byte{{prefixByte}}, nil, false
 		case 'c':
 			payload, _ := protocol.EncodeCreateWindow(nil, protocol.CreateWindow{Cwd: cfg.Cwd, Argv: cfg.Argv})
 			frame := protocol.Frame{Type: protocol.MsgCreateWindow, Payload: payload}
+			ui.setInputBlocked(true)
+			return nil, []protocol.Frame{frame}, false
+		case '%':
+			payload, _ := protocol.EncodeCreateSplit(nil, protocol.CreateSplit{PaneID: ui.activePaneID()})
+			frame := protocol.Frame{Type: protocol.MsgCreateSplit, Payload: payload}
 			ui.setInputBlocked(true)
 			return nil, []protocol.Frame{frame}, false
 		case 'd':
@@ -619,8 +664,8 @@ func processInputByte(prefix *bool, b byte, ui *runtimeState, cfg Config) ([][]b
 			}
 			return nil, nil, false
 		case 'x':
-			payload, _ := protocol.EncodeCloseWindow(nil, protocol.CloseWindow{WindowID: ui.activeWindowID()})
-			frame := protocol.Frame{Type: protocol.MsgCloseWindow, Payload: payload}
+			payload, _ := protocol.EncodeClosePane(nil, protocol.ClosePane{PaneID: ui.activePaneID()})
+			frame := protocol.Frame{Type: protocol.MsgClosePane, Payload: payload}
 			ui.setInputBlocked(true)
 			return nil, []protocol.Frame{frame}, false
 		default:
@@ -634,9 +679,27 @@ func processInputByte(prefix *bool, b byte, ui *runtimeState, cfg Config) ([][]b
 			}
 			return nil, nil, false
 		}
+	case prefixArrowESC:
+		if b == '[' {
+			*prefix = prefixArrowCSI
+			return nil, nil, false
+		}
+		*prefix = prefixIdle
+		return nil, nil, false
+	case prefixArrowCSI:
+		*prefix = prefixIdle
+		switch b {
+		case 'C', 'D':
+			if paneID, ok := ui.nextFocusablePaneID(); ok {
+				payload, _ := protocol.EncodeFocusPane(nil, protocol.FocusPane{PaneID: paneID})
+				frame := protocol.Frame{Type: protocol.MsgFocusPane, Payload: payload}
+				return nil, []protocol.Frame{frame}, false
+			}
+		}
+		return nil, nil, false
 	}
 	if b == prefixByte {
-		*prefix = true
+		*prefix = prefixActive
 		return nil, nil, false
 	}
 	return [][]byte{{b}}, nil, false
@@ -785,6 +848,12 @@ func (r *runtimeState) lastWindowID() (uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.ui.LastActiveWindowID()
+}
+
+func (r *runtimeState) nextFocusablePaneID() (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ui.NextFocusablePaneID()
 }
 
 func (r *runtimeState) windowIDByIndex(index int) (uint64, bool) {

@@ -29,6 +29,10 @@ const (
 	MsgListWindows
 	MsgWindowList
 	MsgWindowTitleChanged
+	MsgWindowLayout
+	MsgCreateSplit
+	MsgFocusPane
+	MsgClosePane
 	MsgBindRenderStream
 	MsgReplacePane
 	MsgSetRun
@@ -47,6 +51,7 @@ const (
 
 type StreamOpen struct {
 	StreamType string
+	Slot       uint8
 	PaneID     uint64
 }
 
@@ -163,6 +168,36 @@ type WindowTitleChanged struct {
 	Title    string
 }
 
+type Rect struct {
+	X      int
+	Y      int
+	Width  int
+	Height int
+}
+
+type PanePlacement struct {
+	PaneID uint64
+	Rect   Rect
+}
+
+type WindowLayout struct {
+	WindowID       uint64
+	LayoutRevision uint64
+	Panes          []PanePlacement
+}
+
+type CreateSplit struct {
+	PaneID uint64
+}
+
+type FocusPane struct {
+	PaneID uint64
+}
+
+type ClosePane struct {
+	PaneID uint64
+}
+
 type Ping struct {
 	Seq           uint64
 	SentUnixMilli int64
@@ -208,6 +243,7 @@ type StyleDefinition struct {
 }
 
 type BindRenderStream struct {
+	Slot              uint8
 	SessionID         uint64
 	WindowID          uint64
 	PaneID            uint64
@@ -231,7 +267,6 @@ type ReplacePane struct {
 type SetRun struct {
 	SessionID         uint64
 	WindowID          uint64
-	PaneID            uint64
 	BindingGeneration uint64
 	BaseGeneration    uint64
 	Generation        uint64
@@ -243,7 +278,6 @@ type SetRun struct {
 type SetCursor struct {
 	SessionID         uint64
 	WindowID          uint64
-	PaneID            uint64
 	BindingGeneration uint64
 	BaseGeneration    uint64
 	Generation        uint64
@@ -253,7 +287,6 @@ type SetCursor struct {
 type SetCursorVisible struct {
 	SessionID         uint64
 	WindowID          uint64
-	PaneID            uint64
 	BindingGeneration uint64
 	BaseGeneration    uint64
 	Generation        uint64
@@ -261,7 +294,6 @@ type SetCursorVisible struct {
 }
 
 type DefineStyle struct {
-	PaneID            uint64
 	BindingGeneration uint64
 	ID                uint32
 	Style             Style

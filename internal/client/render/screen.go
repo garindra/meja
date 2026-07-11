@@ -1,11 +1,33 @@
 package render
 
-import "tali/internal/protocol"
+import (
+	"sort"
+
+	"tali/internal/protocol"
+)
 
 type Screen struct {
 	Cols  int
 	Rows  int
 	Cells []protocol.Cell
+}
+
+type LayoutDescription struct {
+	WindowID       uint64
+	LayoutRevision uint64
+	Panes          []protocol.PanePlacement
+}
+
+type PaneViewState struct {
+	PaneID            uint64
+	Rect              protocol.Rect
+	Grid              Screen
+	Generation        uint64
+	Cursor            protocol.Cursor
+	CursorVisible     bool
+	BindingGeneration uint64
+	Slot              uint8
+	Styles            map[uint32]protocol.Style
 }
 
 type ClientState struct {
@@ -18,28 +40,20 @@ type ClientState struct {
 	FocusedPaneID   uint64
 	Windows         []protocol.WindowInfo
 
-	Grid          Screen
-	Generation    uint64
-	Cursor        protocol.Cursor
-	CursorVisible bool
+	Layout      LayoutDescription
+	Panes       map[uint64]*PaneViewState
+	RenderSlots map[uint8]uint64
 
 	TerminalCols int
 	TerminalRows int
 
-	BindingGeneration uint64
-
 	LastRendered Screen
-	Styles       map[uint32]protocol.Style
 }
 
 func NewClientState() *ClientState {
 	return &ClientState{
-		Styles: map[uint32]protocol.Style{
-			0: {
-				FG: protocol.Color{Mode: "default"},
-				BG: protocol.Color{Mode: "default"},
-			},
-		},
+		Panes:       map[uint64]*PaneViewState{},
+		RenderSlots: map[uint8]uint64{},
 	}
 }
 
@@ -90,16 +104,168 @@ func (s *ClientState) ApplyWindowClosed(windowID uint64) {
 	s.syncWindowSelection()
 }
 
+func (s *ClientState) ApplyWindowLayout(msg protocol.WindowLayout) {
+	s.Layout = LayoutDescription{
+		WindowID:       msg.WindowID,
+		LayoutRevision: msg.LayoutRevision,
+		Panes:          append([]protocol.PanePlacement(nil), msg.Panes...),
+	}
+	visible := make(map[uint64]protocol.Rect, len(msg.Panes))
+	for _, pane := range msg.Panes {
+		visible[pane.PaneID] = pane.Rect
+		view := s.ensurePane(pane.PaneID)
+		view.Rect = pane.Rect
+	}
+	for paneID := range s.Panes {
+		if _, ok := visible[paneID]; !ok {
+			delete(s.Panes, paneID)
+		}
+	}
+	for slot, paneID := range s.RenderSlots {
+		if _, ok := visible[paneID]; !ok {
+			delete(s.RenderSlots, slot)
+		}
+	}
+}
+
 func (s *ClientState) ApplyBind(msg protocol.BindRenderStream) {
 	s.SessionID = msg.SessionID
-	s.FocusedPaneID = msg.PaneID
-	s.BindingGeneration = msg.BindingGeneration
-	s.Grid = Screen{}
-	s.Generation = 0
-	s.Cursor = protocol.Cursor{}
-	s.CursorVisible = true
-	s.LastRendered = Screen{}
-	s.Styles = map[uint32]protocol.Style{
+	if oldPaneID, ok := s.RenderSlots[msg.Slot]; ok && oldPaneID != msg.PaneID {
+		if !s.layoutContainsPane(oldPaneID) {
+			delete(s.Panes, oldPaneID)
+		}
+	}
+	s.RenderSlots[msg.Slot] = msg.PaneID
+	pane := s.ensurePane(msg.PaneID)
+	pane.PaneID = msg.PaneID
+	pane.BindingGeneration = msg.BindingGeneration
+	pane.Generation = 0
+	pane.Cursor = protocol.Cursor{}
+	pane.CursorVisible = true
+	pane.Grid = Screen{}
+	pane.Slot = msg.Slot
+	pane.Styles = defaultStyles()
+}
+
+func (s *ClientState) ApplyReplace(slot uint8, msg protocol.ReplacePane) bool {
+	paneID, ok := s.RenderSlots[slot]
+	if !ok || paneID != msg.PaneID {
+		return false
+	}
+	pane := s.ensurePane(paneID)
+	if msg.BindingGeneration != pane.BindingGeneration {
+		return false
+	}
+	s.SessionID = msg.SessionID
+	pane.Generation = msg.Generation
+	pane.Cursor = msg.Cursor
+	pane.CursorVisible = msg.CursorVisible
+	pane.Grid = Screen{Cols: msg.Cols, Rows: msg.Rows, Cells: append([]protocol.Cell(nil), msg.Cells...)}
+	pane.Styles = defaultStyles()
+	for _, def := range msg.Styles {
+		pane.Styles[def.ID] = def.Style
+	}
+	return true
+}
+
+func (s *ClientState) ApplySetRun(slot uint8, msg protocol.SetRun) bool {
+	paneID, ok := s.RenderSlots[slot]
+	if !ok {
+		return false
+	}
+	pane := s.Panes[paneID]
+	if pane == nil || msg.BindingGeneration != pane.BindingGeneration || pane.Generation != msg.BaseGeneration {
+		return false
+	}
+	if msg.Row < 0 || msg.Row >= pane.Grid.Rows || msg.Column < 0 || msg.Column >= pane.Grid.Cols {
+		return false
+	}
+	base := msg.Row*pane.Grid.Cols + msg.Column
+	for i, cell := range msg.Cells {
+		idx := base + i
+		if idx >= len(pane.Grid.Cells) || idx >= (msg.Row+1)*pane.Grid.Cols {
+			break
+		}
+		pane.Grid.Cells[idx] = cell
+	}
+	pane.Generation = msg.Generation
+	return true
+}
+
+func (s *ClientState) ApplySetCursor(slot uint8, msg protocol.SetCursor) bool {
+	paneID, ok := s.RenderSlots[slot]
+	if !ok {
+		return false
+	}
+	pane := s.Panes[paneID]
+	if pane == nil || msg.BindingGeneration != pane.BindingGeneration || pane.Generation != msg.BaseGeneration {
+		return false
+	}
+	pane.Cursor = msg.Cursor
+	pane.Generation = msg.Generation
+	return true
+}
+
+func (s *ClientState) ApplySetCursorVisible(slot uint8, msg protocol.SetCursorVisible) bool {
+	paneID, ok := s.RenderSlots[slot]
+	if !ok {
+		return false
+	}
+	pane := s.Panes[paneID]
+	if pane == nil || msg.BindingGeneration != pane.BindingGeneration || pane.Generation != msg.BaseGeneration {
+		return false
+	}
+	pane.CursorVisible = msg.Visible
+	pane.Generation = msg.Generation
+	return true
+}
+
+func (s *ClientState) DefineStyle(slot uint8, msg protocol.DefineStyle) bool {
+	paneID, ok := s.RenderSlots[slot]
+	if !ok {
+		return false
+	}
+	pane := s.Panes[paneID]
+	if pane == nil || msg.BindingGeneration != pane.BindingGeneration {
+		return false
+	}
+	if pane.Styles == nil {
+		pane.Styles = defaultStyles()
+	}
+	pane.Styles[msg.ID] = msg.Style
+	return true
+}
+
+func (s *ClientState) syncWindowSelection() {
+	for i := range s.Windows {
+		s.Windows[i].Active = s.Windows[i].WindowID == s.ActiveWindowID
+		if s.Windows[i].Active {
+			s.Windows[i].PaneID = s.FocusedPaneID
+		}
+	}
+}
+
+func (s *ClientState) ensurePane(paneID uint64) *PaneViewState {
+	if pane := s.Panes[paneID]; pane != nil {
+		return pane
+	}
+	pane := &PaneViewState{
+		PaneID:        paneID,
+		CursorVisible: true,
+		Styles:        defaultStyles(),
+	}
+	for _, placement := range s.Layout.Panes {
+		if placement.PaneID == paneID {
+			pane.Rect = placement.Rect
+			break
+		}
+	}
+	s.Panes[paneID] = pane
+	return pane
+}
+
+func defaultStyles() map[uint32]protocol.Style {
+	return map[uint32]protocol.Style{
 		0: {
 			FG: protocol.Color{Mode: "default"},
 			BG: protocol.Color{Mode: "default"},
@@ -107,79 +273,13 @@ func (s *ClientState) ApplyBind(msg protocol.BindRenderStream) {
 	}
 }
 
-func (s *ClientState) ApplyReplace(msg protocol.ReplacePane) bool {
-	if msg.BindingGeneration != s.BindingGeneration {
-		return false
-	}
-	s.SessionID = msg.SessionID
-	s.Generation = msg.Generation
-	s.Cursor = msg.Cursor
-	s.CursorVisible = msg.CursorVisible
-	s.Grid = Screen{Cols: msg.Cols, Rows: msg.Rows, Cells: append([]protocol.Cell(nil), msg.Cells...)}
-	if s.Styles == nil {
-		s.Styles = map[uint32]protocol.Style{}
-	}
-	for _, def := range msg.Styles {
-		s.Styles[def.ID] = def.Style
-	}
-	return true
-}
-
-func (s *ClientState) ApplySetRun(msg protocol.SetRun) bool {
-	if msg.BindingGeneration != s.BindingGeneration || s.Generation != msg.BaseGeneration {
-		return false
-	}
-	if msg.Row < 0 || msg.Row >= s.Grid.Rows || msg.Column < 0 || msg.Column >= s.Grid.Cols {
-		return false
-	}
-	base := msg.Row*s.Grid.Cols + msg.Column
-	for i, cell := range msg.Cells {
-		idx := base + i
-		if idx >= len(s.Grid.Cells) || idx >= (msg.Row+1)*s.Grid.Cols {
-			break
-		}
-		s.Grid.Cells[idx] = cell
-	}
-	s.Generation = msg.Generation
-	return true
-}
-
-func (s *ClientState) ApplySetCursor(msg protocol.SetCursor) bool {
-	if msg.BindingGeneration != s.BindingGeneration || s.Generation != msg.BaseGeneration {
-		return false
-	}
-	s.Cursor = msg.Cursor
-	s.Generation = msg.Generation
-	return true
-}
-
-func (s *ClientState) ApplySetCursorVisible(msg protocol.SetCursorVisible) bool {
-	if msg.BindingGeneration != s.BindingGeneration || s.Generation != msg.BaseGeneration {
-		return false
-	}
-	s.CursorVisible = msg.Visible
-	s.Generation = msg.Generation
-	return true
-}
-
-func (s *ClientState) DefineStyle(msg protocol.DefineStyle) bool {
-	if msg.BindingGeneration != s.BindingGeneration {
-		return false
-	}
-	if s.Styles == nil {
-		s.Styles = map[uint32]protocol.Style{}
-	}
-	s.Styles[msg.ID] = msg.Style
-	return true
-}
-
-func (s *ClientState) syncWindowSelection() {
-	for i := range s.Windows {
-		s.Windows[i].Active = s.Windows[i].WindowID == s.ActiveWindowID
-		if s.Windows[i].Active && s.FocusedPaneID != 0 && s.Windows[i].PaneID != s.FocusedPaneID {
-			s.Windows[i].PaneID = s.FocusedPaneID
+func (s *ClientState) layoutContainsPane(paneID uint64) bool {
+	for _, pane := range s.Layout.Panes {
+		if pane.PaneID == paneID {
+			return true
 		}
 	}
+	return false
 }
 
 func (s *ClientState) NextWindowID() (uint64, bool) {
@@ -225,4 +325,28 @@ func (s *ClientState) LastActiveWindowID() (uint64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func (s *ClientState) NextFocusablePaneID() (uint64, bool) {
+	ordered := s.orderedLayoutPanes()
+	if len(ordered) <= 1 {
+		return 0, false
+	}
+	for i, pane := range ordered {
+		if pane.PaneID == s.FocusedPaneID {
+			return ordered[(i+1)%len(ordered)].PaneID, true
+		}
+	}
+	return ordered[0].PaneID, true
+}
+
+func (s *ClientState) orderedLayoutPanes() []protocol.PanePlacement {
+	out := append([]protocol.PanePlacement(nil), s.Layout.Panes...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Rect.X == out[j].Rect.X {
+			return out[i].PaneID < out[j].PaneID
+		}
+		return out[i].Rect.X < out[j].Rect.X
+	})
+	return out
 }

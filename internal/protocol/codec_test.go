@@ -25,8 +25,8 @@ func TestGoldenPayloads(t *testing.T) {
 		},
 		{
 			name: "BindRenderStream",
-			got:  mustEncode(t, EncodeBindRenderStream, BindRenderStream{SessionID: 0, WindowID: 1, PaneID: 2, BindingGeneration: 3}),
-			want: []byte{0x00, 0x01, 0x02, 0x03},
+			got:  mustEncode(t, EncodeBindRenderStream, BindRenderStream{Slot: 0, SessionID: 0, WindowID: 1, PaneID: 2, BindingGeneration: 3}),
+			want: []byte{0x00, 0x00, 0x01, 0x02, 0x03},
 		},
 		{
 			name: "DefineStyle",
@@ -72,6 +72,22 @@ func TestGoldenPayloads(t *testing.T) {
 			},
 		},
 		{
+			name: "WindowLayout",
+			got: mustEncode(t, EncodeWindowLayout, WindowLayout{
+				WindowID:       2,
+				LayoutRevision: 3,
+				Panes: []PanePlacement{
+					{PaneID: 11, Rect: Rect{X: 0, Y: 0, Width: 59, Height: 39}},
+					{PaneID: 12, Rect: Rect{X: 60, Y: 0, Width: 60, Height: 39}},
+				},
+			}),
+			want: []byte{
+				0x02, 0x03, 0x02,
+				0x0b, 0x00, 0x00, 0x3b, 0x27,
+				0x0c, 0x3c, 0x00, 0x3c, 0x27,
+			},
+		},
+		{
 			name: "Ping",
 			got:  mustEncode(t, EncodePing, Ping{Seq: 7, SentUnixMilli: 0}),
 			want: []byte{0x07, 0x00},
@@ -86,8 +102,8 @@ func TestGoldenPayloads(t *testing.T) {
 
 func TestRoundTripMessages(t *testing.T) {
 	expiry := time.Unix(0, 123456789).UTC()
-	streamOpen := mustRoundTrip(t, EncodeStreamOpen, DecodeStreamOpen, StreamOpen{StreamType: StreamTypeManagement, PaneID: 3})
-	if streamOpen.StreamType != StreamTypeManagement || streamOpen.PaneID != 3 {
+	streamOpen := mustRoundTrip(t, EncodeStreamOpen, DecodeStreamOpen, StreamOpen{StreamType: StreamTypeManagement, Slot: 2, PaneID: 3})
+	if streamOpen.StreamType != StreamTypeManagement || streamOpen.Slot != 2 || streamOpen.PaneID != 3 {
 		t.Fatalf("StreamOpen round-trip = %#v", streamOpen)
 	}
 	authChallenge := mustRoundTrip(t, EncodeAuthChallenge, DecodeAuthChallenge, AuthChallenge{ChallengeID: "c1", Nonce: "n1", ExpiresAt: expiry})
@@ -97,6 +113,15 @@ func TestRoundTripMessages(t *testing.T) {
 	pong := mustRoundTrip(t, EncodePong, DecodePong, Pong{Seq: 4, SentUnixMilli: 12345})
 	if pong.Seq != 4 || pong.SentUnixMilli != 12345 {
 		t.Fatalf("Pong round-trip = %#v", pong)
+	}
+	setCursor := mustRoundTrip(t, EncodeSetCursor, DecodeSetCursor, SetCursor{
+		BindingGeneration: 3,
+		BaseGeneration:    4,
+		Generation:        5,
+		Cursor:            Cursor{X: 1, Y: 2},
+	})
+	if setCursor.Cursor.X != 1 || setCursor.Cursor.Y != 2 {
+		t.Fatalf("SetCursor round-trip = %#v", setCursor)
 	}
 	replace := mustRoundTrip(t, EncodeReplacePane, DecodeReplacePane, ReplacePane{
 		SessionID:         4,

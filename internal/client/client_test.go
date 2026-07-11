@@ -49,18 +49,25 @@ func TestProcessInputBytePrefixActions(t *testing.T) {
 			ActiveWindowID: 1,
 		})
 		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 1})
+		state.ApplyWindowLayout(protocol.WindowLayout{
+			WindowID: 1,
+			Panes: []protocol.PanePlacement{
+				{PaneID: 1, Rect: protocol.Rect{X: 0, Y: 0, Width: 4, Height: 2}},
+				{PaneID: 2, Rect: protocol.Rect{X: 5, Y: 0, Width: 4, Height: 2}},
+			},
+		})
 	})
 
-	prefix := false
-	if inputs, mgmt, detach := processInputByte(&prefix, prefixByte, ui, Config{}); len(inputs) != 0 || len(mgmt) != 0 || detach || !prefix {
+	prefix := prefixIdle
+	if inputs, mgmt, detach := processInputByte(&prefix, prefixByte, ui, Config{}); len(inputs) != 0 || len(mgmt) != 0 || detach || prefix != prefixActive {
 		t.Fatalf("prefix start failed")
 	}
 	inputs, mgmt, detach := processInputByte(&prefix, prefixByte, ui, Config{})
-	if prefix || detach || len(mgmt) != 0 || len(inputs) != 1 || inputs[0][0] != prefixByte {
+	if prefix != prefixIdle || detach || len(mgmt) != 0 || len(inputs) != 1 || inputs[0][0] != prefixByte {
 		t.Fatalf("literal prefix forwarding failed: %#v %#v detach=%v", inputs, mgmt, detach)
 	}
 
-	prefix = true
+	prefix = prefixActive
 	_, mgmt, detach = processInputByte(&prefix, '1', ui, Config{})
 	if detach {
 		t.Fatalf("numeric selection unexpectedly detached")
@@ -76,7 +83,7 @@ func TestProcessInputBytePrefixActions(t *testing.T) {
 	ui.with(func(state *render.ClientState) {
 		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 2})
 	})
-	prefix = true
+	prefix = prefixActive
 	_, mgmt, detach = processInputByte(&prefix, 'l', ui, Config{})
 	if detach {
 		t.Fatalf("last-window selection unexpectedly detached")
@@ -89,9 +96,35 @@ func TestProcessInputBytePrefixActions(t *testing.T) {
 		t.Fatalf("last SelectWindow = %#v err=%v", sel, err)
 	}
 
-	prefix = true
+	prefix = prefixActive
+	_, mgmt, detach = processInputByte(&prefix, '%', ui, Config{})
+	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgCreateSplit {
+		t.Fatalf("split action failed: %#v detach=%v", mgmt, detach)
+	}
+
+	prefix = prefixActive
+	_, mgmt, detach = processInputByte(&prefix, 0x1b, ui, Config{})
+	if detach || len(mgmt) != 0 || prefix != prefixArrowESC {
+		t.Fatalf("focus-pane arrow escape failed: mgmt=%#v detach=%v prefix=%v", mgmt, detach, prefix)
+	}
+	_, mgmt, detach = processInputByte(&prefix, '[', ui, Config{})
+	if detach || len(mgmt) != 0 || prefix != prefixArrowCSI {
+		t.Fatalf("focus-pane arrow csi failed: mgmt=%#v detach=%v prefix=%v", mgmt, detach, prefix)
+	}
+	_, mgmt, detach = processInputByte(&prefix, 'C', ui, Config{})
+	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgFocusPane {
+		t.Fatalf("focus-pane action failed: %#v detach=%v", mgmt, detach)
+	}
+
+	prefix = prefixActive
+	_, mgmt, detach = processInputByte(&prefix, 'x', ui, Config{})
+	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgClosePane {
+		t.Fatalf("close-pane action failed: %#v detach=%v", mgmt, detach)
+	}
+
+	prefix = prefixActive
 	inputs, mgmt, detach = processInputByte(&prefix, 'd', ui, Config{})
-	if !detach || prefix || len(inputs) != 0 || len(mgmt) != 0 {
+	if !detach || prefix != prefixIdle || len(inputs) != 0 || len(mgmt) != 0 {
 		t.Fatalf("detach action failed: inputs=%#v mgmt=%#v detach=%v prefix=%v", inputs, mgmt, detach, prefix)
 	}
 }
@@ -109,7 +142,7 @@ func TestProcessInputByteLastWindowTogglesWithWindowZero(t *testing.T) {
 		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 11})
 	})
 
-	prefix := true
+	prefix := prefixActive
 	_, mgmt, detach := processInputByte(&prefix, 'l', ui, Config{})
 	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgSelectWindow {
 		t.Fatalf("first last-window selection failed: %#v detach=%v", mgmt, detach)
@@ -122,7 +155,7 @@ func TestProcessInputByteLastWindowTogglesWithWindowZero(t *testing.T) {
 	ui.with(func(state *render.ClientState) {
 		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 0, PaneID: 10})
 	})
-	prefix = true
+	prefix = prefixActive
 	_, mgmt, detach = processInputByte(&prefix, 'l', ui, Config{})
 	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgSelectWindow {
 		t.Fatalf("second last-window selection failed: %#v detach=%v", mgmt, detach)
@@ -144,7 +177,7 @@ func TestDrawableRowsExcludesStatusRow(t *testing.T) {
 func TestCreateWindowPrefixBlocksInputUntilReleased(t *testing.T) {
 	ui := &runtimeState{ui: render.NewClientState()}
 
-	prefix := true
+	prefix := prefixActive
 	_, mgmt, detach := processInputByte(&prefix, 'c', ui, Config{})
 	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgCreateWindow {
 		t.Fatalf("processInputByte(create) = %#v detach=%v", mgmt, detach)

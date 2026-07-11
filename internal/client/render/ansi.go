@@ -14,17 +14,20 @@ var tabBarBG = protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}
 func RenderANSI(state *ClientState) []byte {
 	var buf bytes.Buffer
 	buf.WriteString("\x1b[?25l")
-	if state.LastRendered.Cols != state.Grid.Cols || state.LastRendered.Rows != state.Grid.Rows {
+	contentRows := state.DrawableRows()
+	if state.LastRendered.Cols != state.TerminalCols || state.LastRendered.Rows != contentRows {
 		buf.WriteString("\x1b[H\x1b[2J")
 	}
-	lastStyleID := ^uint32(0)
-	for row := 0; row < state.Grid.Rows; row++ {
+	composed := composeContent(state)
+	lastStyleKey := ""
+	for row := 0; row < contentRows; row++ {
 		buf.WriteString(fmt.Sprintf("\x1b[%d;1H", row+1))
-		for col := 0; col < state.Grid.Cols; col++ {
-			cell := state.Grid.Cells[row*state.Grid.Cols+col]
-			if cell.StyleID != lastStyleID {
-				buf.WriteString(sgrForStyle(state.Styles[cell.StyleID]))
-				lastStyleID = cell.StyleID
+		for col := 0; col < state.TerminalCols; col++ {
+			cell := composed[row*state.TerminalCols+col]
+			styleKey := styleCacheKey(cell.Style)
+			if styleKey != lastStyleKey {
+				buf.WriteString(sgrForStyle(cell.Style))
+				lastStyleKey = styleKey
 			}
 			r := cell.Rune
 			if r == 0 {
@@ -43,14 +46,88 @@ func RenderANSI(state *ClientState) []byte {
 		FG: protocol.Color{Mode: "default"},
 		BG: protocol.Color{Mode: "default"},
 	}))
-	buf.WriteString(fmt.Sprintf("\x1b[%d;%dH", state.Cursor.Y+1, state.Cursor.X+1))
-	if state.CursorVisible {
+	cursorX, cursorY, cursorVisible := physicalCursor(state)
+	buf.WriteString(fmt.Sprintf("\x1b[%d;%dH", cursorY+1, cursorX+1))
+	if cursorVisible {
 		buf.WriteString("\x1b[?25h")
 	} else {
 		buf.WriteString("\x1b[?25l")
 	}
-	state.LastRendered = state.Grid
+	state.LastRendered = Screen{Cols: state.TerminalCols, Rows: contentRows}
 	return buf.Bytes()
+}
+
+type composedCell struct {
+	Rune  rune
+	Style protocol.Style
+}
+
+func composeContent(state *ClientState) []composedCell {
+	contentRows := state.DrawableRows()
+	if state.TerminalCols <= 0 || contentRows <= 0 {
+		return nil
+	}
+	cells := make([]composedCell, state.TerminalCols*contentRows)
+	defaultStyle := protocol.Style{
+		FG: protocol.Color{Mode: "default"},
+		BG: protocol.Color{Mode: "default"},
+	}
+	for i := range cells {
+		cells[i] = composedCell{Rune: ' ', Style: defaultStyle}
+	}
+	for _, placement := range state.orderedLayoutPanes() {
+		pane := state.Panes[placement.PaneID]
+		if pane == nil || pane.Grid.Cols == 0 || pane.Grid.Rows == 0 {
+			continue
+		}
+		for row := 0; row < placement.Rect.Height && row < pane.Grid.Rows; row++ {
+			for col := 0; col < placement.Rect.Width && col < pane.Grid.Cols; col++ {
+				dstX := placement.Rect.X + col
+				dstY := placement.Rect.Y + row
+				if dstX < 0 || dstY < 0 || dstX >= state.TerminalCols || dstY >= contentRows {
+					continue
+				}
+				src := pane.Grid.Cells[row*pane.Grid.Cols+col]
+				style := defaultStyle
+				if pane.Styles != nil {
+					if found, ok := pane.Styles[src.StyleID]; ok {
+						style = found
+					}
+				}
+				r := src.Rune
+				if r == 0 {
+					r = ' '
+				}
+				cells[dstY*state.TerminalCols+dstX] = composedCell{Rune: r, Style: style}
+			}
+		}
+	}
+	if len(state.Layout.Panes) == 2 {
+		panes := state.orderedLayoutPanes()
+		borderX := panes[0].Rect.X + panes[0].Rect.Width
+		for y := 0; y < contentRows; y++ {
+			if borderX >= 0 && borderX < state.TerminalCols {
+				cells[y*state.TerminalCols+borderX] = composedCell{Rune: '│', Style: defaultStyle}
+			}
+		}
+	}
+	return cells
+}
+
+func physicalCursor(state *ClientState) (int, int, bool) {
+	pane := state.Panes[state.FocusedPaneID]
+	if pane == nil {
+		return 0, 0, false
+	}
+	x := pane.Rect.X + pane.Cursor.X
+	y := pane.Rect.Y + pane.Cursor.Y
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+	return x, y, pane.CursorVisible
 }
 
 func renderTabBar(state *ClientState) string {
@@ -107,6 +184,10 @@ func truncateToWidth(s string, width int) string {
 		return s
 	}
 	return s[:width]
+}
+
+func styleCacheKey(style protocol.Style) string {
+	return fmt.Sprintf("%#v", style)
 }
 
 func sgrForStyle(style protocol.Style) string {

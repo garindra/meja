@@ -18,6 +18,7 @@ const (
 
 func EncodeBindRenderStream(dst []byte, msg BindRenderStream) ([]byte, error) {
 	w := PayloadWriter{Buf: dst}
+	w.Uvarint(uint64(msg.Slot))
 	w.Uvarint(msg.SessionID)
 	w.Uvarint(msg.WindowID)
 	w.Uvarint(msg.PaneID)
@@ -27,6 +28,13 @@ func EncodeBindRenderStream(dst []byte, msg BindRenderStream) ([]byte, error) {
 
 func DecodeBindRenderStream(payload []byte) (BindRenderStream, error) {
 	r := PayloadReader{Data: payload}
+	slot, err := r.Uvarint()
+	if err != nil {
+		return BindRenderStream{}, fmt.Errorf("decode BindRenderStream: %w", err)
+	}
+	if slot >= MaxRenderSlots {
+		return BindRenderStream{}, fmt.Errorf("decode BindRenderStream: slot %d exceeds max %d", slot, MaxRenderSlots)
+	}
 	sessionID, err := r.Uvarint()
 	if err != nil {
 		return BindRenderStream{}, fmt.Errorf("decode BindRenderStream: %w", err)
@@ -47,6 +55,7 @@ func DecodeBindRenderStream(payload []byte) (BindRenderStream, error) {
 		return BindRenderStream{}, fmt.Errorf("decode BindRenderStream: %w", err)
 	}
 	return BindRenderStream{
+		Slot:              uint8(slot),
 		SessionID:         sessionID,
 		WindowID:          windowID,
 		PaneID:            paneID,

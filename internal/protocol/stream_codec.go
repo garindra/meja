@@ -8,6 +8,7 @@ func EncodeStreamOpen(dst []byte, msg StreamOpen) ([]byte, error) {
 	}
 	w := PayloadWriter{Buf: dst}
 	w.String(msg.StreamType)
+	w.Uvarint(uint64(msg.Slot))
 	w.Uvarint(msg.PaneID)
 	return w.Buf, nil
 }
@@ -18,6 +19,10 @@ func DecodeStreamOpen(payload []byte) (StreamOpen, error) {
 	if err != nil {
 		return StreamOpen{}, fmt.Errorf("decode StreamOpen: %w", err)
 	}
+	slot, err := r.Uvarint()
+	if err != nil {
+		return StreamOpen{}, fmt.Errorf("decode StreamOpen: %w", err)
+	}
 	paneID, err := r.Uvarint()
 	if err != nil {
 		return StreamOpen{}, fmt.Errorf("decode StreamOpen: %w", err)
@@ -25,7 +30,7 @@ func DecodeStreamOpen(payload []byte) (StreamOpen, error) {
 	if err := r.Done(); err != nil {
 		return StreamOpen{}, fmt.Errorf("decode StreamOpen: %w", err)
 	}
-	return StreamOpen{StreamType: streamType, PaneID: paneID}, nil
+	return StreamOpen{StreamType: streamType, Slot: uint8(slot), PaneID: paneID}, nil
 }
 
 func EncodeClientHello(dst []byte, msg ClientHello) ([]byte, error) {

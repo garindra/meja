@@ -47,7 +47,7 @@ type sessionState struct {
 	session  *Session
 
 	mu           sync.RWMutex
-	outputFrames chan protocol.Frame
+	outputFrames map[int]chan protocol.Frame
 }
 
 type controller struct {
@@ -56,7 +56,7 @@ type controller struct {
 	unixUser     *user.User
 	shell        string
 	mgmtFrames   chan protocol.Frame
-	outputFrames chan protocol.Frame
+	outputFrames map[int]chan protocol.Frame
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -79,8 +79,9 @@ func Run(ctx context.Context, cfg Config) error {
 	defer listener.Close()
 
 	shared := &sessionState{
-		verifier: auth.NewVerifier(),
-		session:  NewSession(sessionID0),
+		verifier:     auth.NewVerifier(),
+		session:      NewSession(sessionID0),
+		outputFrames: map[int]chan protocol.Frame{},
 	}
 
 	for {
@@ -169,17 +170,21 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 		return err
 	}
 
-	outputStream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		return fmt.Errorf("open output stream: %w", err)
-	}
-	outputFrames := make(chan protocol.Frame, 256)
-	go writeStream(outputStream, outputFrames, writerErrs)
-	defer close(outputFrames)
-	s.setOutputFrames(outputFrames)
-	defer s.clearOutputFrames(outputFrames)
-	if err := sendEncoded(outputFrames, protocol.MsgOpenPaneOutputStream, protocol.StreamOpen{StreamType: protocol.StreamTypePaneOutput}, protocol.EncodeStreamOpen); err != nil {
-		return err
+	outputFrames := make(map[int]chan protocol.Frame, int(protocol.MaxRenderSlots))
+	for slot := 0; slot < int(protocol.MaxRenderSlots); slot++ {
+		outputStream, err := conn.OpenStreamSync(ctx)
+		if err != nil {
+			return fmt.Errorf("open output stream %d: %w", slot, err)
+		}
+		frames := make(chan protocol.Frame, 256)
+		outputFrames[slot] = frames
+		go writeStream(outputStream, frames, writerErrs)
+		defer close(frames)
+		s.setOutputFrames(slot, frames)
+		defer s.clearOutputFrames(slot, frames)
+		if err := sendEncoded(frames, protocol.MsgOpenPaneOutputStream, protocol.StreamOpen{StreamType: protocol.StreamTypePaneOutput, Slot: uint8(slot)}, protocol.EncodeStreamOpen); err != nil {
+			return err
+		}
 	}
 
 	ctrl := &controller{
@@ -196,8 +201,9 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 	if err != nil {
 		return fmt.Errorf("read create pane: %w", err)
 	}
+	s.session.SetClientSize(clientID0, createPane.Cols, createPane.Rows)
 	if !s.session.HasWindows() {
-		initialPane, window, clientState, err := ctrl.createWindow(createPane.Cwd, createPane.Argv, createPane.Cols, createPane.Rows)
+		initialPane, window, _, err := ctrl.createWindow(createPane.Cwd, createPane.Argv, createPane.Cols, createPane.Rows)
 		if err != nil {
 			return err
 		}
@@ -210,13 +216,16 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 		if err := sendEncoded(mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: initialPane.ID}, protocol.EncodeWindowSelected); err != nil {
 			return err
 		}
-		if err := ctrl.bindAndSnapshot(clientState, window, initialPane); err != nil {
+		if err := ctrl.publishWindowLayout(); err != nil {
+			return err
+		}
+		if err := ctrl.publishBindingsAndSnapshots(); err != nil {
 			return err
 		}
 		ctrl.startPane(initialPane)
 	} else {
 		s.session.ResizeAll(createPane.Cols, createPane.Rows)
-		window, pane, clientState, err := s.session.ReattachClient(clientID0)
+		window, pane, _, err := s.session.ReattachClient(clientID0)
 		if err != nil {
 			return err
 		}
@@ -229,7 +238,10 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 		if err := sendEncoded(mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}, protocol.EncodeWindowSelected); err != nil {
 			return err
 		}
-		if err := ctrl.bindAndSnapshot(clientState, window, pane); err != nil {
+		if err := ctrl.publishWindowLayout(); err != nil {
+			return err
+		}
+		if err := ctrl.publishBindingsAndSnapshots(); err != nil {
 			return err
 		}
 	}
@@ -312,7 +324,11 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				done <- err
 				return
 			}
-			if err := c.bindAndSnapshot(clientState, window, pane); err != nil {
+			if err := c.publishWindowLayout(); err != nil {
+				done <- err
+				return
+			}
+			if err := c.publishBindingsAndSnapshots(); err != nil {
 				done <- err
 				return
 			}
@@ -323,16 +339,83 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				done <- err
 				return
 			}
-			window, pane, clientState, err := c.state.session.SelectWindow(clientID0, msg.WindowID)
+			window, _, err := c.state.session.SelectWindow(clientID0, msg.WindowID)
 			if err != nil {
 				done <- err
 				return
 			}
+			pane, _ := c.state.session.ActivePane(clientID0)
 			if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}, protocol.EncodeWindowSelected); err != nil {
 				done <- err
 				return
 			}
-			if err := c.bindAndSnapshot(clientState, window, pane); err != nil {
+			if err := c.publishWindowLayout(); err != nil {
+				done <- err
+				return
+			}
+			if err := c.publishBindingsAndSnapshots(); err != nil {
+				done <- err
+				return
+			}
+		case protocol.MsgCreateSplit:
+			msg, err := protocol.DecodeCreateSplit(frame.Payload)
+			if err != nil {
+				done <- err
+				return
+			}
+			activePane, clientState := c.state.session.ActivePane(clientID0)
+			if activePane == nil || clientState == nil {
+				continue
+			}
+			targetPaneID := clientState.FocusedPaneID
+			if msg.PaneID != 0 {
+				targetPaneID = msg.PaneID
+			}
+			if targetPaneID != clientState.FocusedPaneID {
+				continue
+			}
+			paneID := c.state.session.AddPaneID()
+			newPane, err := StartPane(c.unixUser, paneID, paneRequest{
+				Cols:  uint16(activePane.Terminal.Cols),
+				Rows:  uint16(activePane.Terminal.Rows),
+				Shell: c.shell,
+			})
+			if err != nil {
+				done <- fmt.Errorf("start split pane: %w", err)
+				return
+			}
+			window, clientState, err := c.state.session.SplitFocusedPane(clientID0, newPane)
+			if err != nil {
+				_ = terminatePane(newPane)
+				done <- err
+				return
+			}
+			c.state.session.ResizeAll(clientState.TerminalCols, clientState.TerminalRows)
+			if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: newPane.ID}, protocol.EncodeWindowSelected); err != nil {
+				done <- err
+				return
+			}
+			if err := c.publishWindowLayout(); err != nil {
+				done <- err
+				return
+			}
+			if err := c.publishBindingsAndSnapshots(); err != nil {
+				done <- err
+				return
+			}
+			c.startPane(newPane)
+		case protocol.MsgFocusPane:
+			msg, err := protocol.DecodeFocusPane(frame.Payload)
+			if err != nil {
+				done <- err
+				return
+			}
+			window, clientState, err := c.state.session.FocusPane(clientID0, msg.PaneID)
+			if err != nil {
+				done <- err
+				return
+			}
+			if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: clientState.FocusedPaneID}, protocol.EncodeWindowSelected); err != nil {
 				done <- err
 				return
 			}
@@ -383,7 +466,61 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 					done <- err
 					return
 				}
-				if err := c.bindAndSnapshot(clientState, replacement, pane); err != nil {
+				if err := c.publishWindowLayout(); err != nil {
+					done <- err
+					return
+				}
+				if err := c.publishBindingsAndSnapshots(); err != nil {
+					done <- err
+					return
+				}
+			}
+		case protocol.MsgClosePane:
+			_, err := protocol.DecodeClosePane(frame.Payload)
+			if err != nil {
+				done <- err
+				return
+			}
+			closedPane, window, clientState, windowClosed, closedWindowID, autoCreate, err := c.state.session.CloseFocusedPane(clientID0)
+			if err != nil {
+				done <- err
+				return
+			}
+			_ = terminatePane(closedPane)
+			if windowClosed {
+				if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowClosed, protocol.WindowClosed{WindowID: closedWindowID}, protocol.EncodeWindowClosed); err != nil {
+					done <- err
+					return
+				}
+				if autoCreate {
+					cols, rows := uint16(80), uint16(24)
+					if clientState != nil && clientState.TerminalCols > 0 && clientState.TerminalRows > 0 {
+						cols, rows = clientState.TerminalCols, clientState.TerminalRows
+					}
+					pane, replacement, nextClient, err := c.createWindow("", nil, cols, rows)
+					if err != nil {
+						done <- err
+						return
+					}
+					c.startPane(pane)
+					window = replacement
+					clientState = nextClient
+				}
+				if err := c.publishWindowList(); err != nil {
+					done <- err
+					return
+				}
+			}
+			if window != nil && clientState != nil {
+				if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: clientState.FocusedPaneID}, protocol.EncodeWindowSelected); err != nil {
+					done <- err
+					return
+				}
+				if err := c.publishWindowLayout(); err != nil {
+					done <- err
+					return
+				}
+				if err := c.publishBindingsAndSnapshots(); err != nil {
 					done <- err
 					return
 				}
@@ -399,15 +536,19 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				done <- err
 				return
 			}
-			pane, clientState := c.state.session.ActivePane(clientID0)
-			if pane == nil || clientState == nil || pane.ID != msg.PaneID {
+			pane := c.state.session.Panes[msg.PaneID]
+			if pane == nil {
 				continue
 			}
 			window := c.windowForPane(pane.ID)
 			if window == nil {
 				continue
 			}
-			if err := c.sendReplaceSnapshot(clientState, window, pane); err != nil {
+			binding, ok := c.state.session.BindingForPane(clientID0, pane.ID)
+			if !ok {
+				continue
+			}
+			if err := c.sendReplaceSnapshot(binding, window, pane); err != nil {
 				done <- err
 				return
 			}
@@ -467,9 +608,13 @@ func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
 			if pane == nil || clientState == nil {
 				continue
 			}
+			c.state.session.SetClientSize(clientID0, msg.Cols, msg.Rows)
 			c.state.session.ResizeAll(msg.Cols, msg.Rows)
-			window := c.windowForPane(pane.ID)
-			if err := c.sendReplaceSnapshot(clientState, window, pane); err != nil {
+			if err := c.publishWindowLayout(); err != nil {
+				done <- err
+				return
+			}
+			if err := c.publishVisibleSnapshots(); err != nil {
 				done <- err
 				return
 			}
@@ -497,11 +642,11 @@ func (c *controller) relayPTYToTerminal(pane *Pane) {
 }
 
 func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) error {
-	clientState := c.state.session.SnapshotClient(clientID0)
-	if clientState == nil || clientState.FocusedPaneID != pane.ID {
+	binding, ok := c.state.session.BindingForPane(clientID0, pane.ID)
+	if !ok {
 		return nil
 	}
-	outputFrames := c.state.currentOutputFrames()
+	outputFrames := c.state.currentOutputFrames(binding.Slot)
 	if outputFrames == nil {
 		return nil
 	}
@@ -510,7 +655,7 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		return nil
 	}
 	if update.FullRedraw {
-		return c.sendReplaceSnapshot(clientState, window, pane)
+		return c.sendReplaceSnapshot(binding, window, pane)
 	}
 
 	if len(update.DefinedStyles) > 0 {
@@ -522,8 +667,7 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		for _, rawID := range ids {
 			id := uint32(rawID)
 			if err := sendEncoded(outputFrames, protocol.MsgDefineStyle, protocol.DefineStyle{
-				PaneID:            pane.ID,
-				BindingGeneration: clientState.BindingGeneration,
+				BindingGeneration: binding.BindingGeneration,
 				ID:                id,
 				Style:             update.DefinedStyles[id],
 			}, protocol.EncodeDefineStyle); err != nil {
@@ -545,8 +689,7 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		if err := sendEncoded(outputFrames, protocol.MsgSetRun, protocol.SetRun{
 			SessionID:         c.state.session.ID,
 			WindowID:          window.ID,
-			PaneID:            pane.ID,
-			BindingGeneration: clientState.BindingGeneration,
+			BindingGeneration: binding.BindingGeneration,
 			BaseGeneration:    base,
 			Generation:        pane.Generation,
 			Row:               row,
@@ -562,8 +705,7 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		if err := sendEncoded(outputFrames, protocol.MsgSetCursor, protocol.SetCursor{
 			SessionID:         c.state.session.ID,
 			WindowID:          window.ID,
-			PaneID:            pane.ID,
-			BindingGeneration: clientState.BindingGeneration,
+			BindingGeneration: binding.BindingGeneration,
 			BaseGeneration:    base,
 			Generation:        pane.Generation,
 			Cursor:            protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY},
@@ -577,8 +719,7 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		if err := sendEncoded(outputFrames, protocol.MsgSetCursorVisible, protocol.SetCursorVisible{
 			SessionID:         c.state.session.ID,
 			WindowID:          window.ID,
-			PaneID:            pane.ID,
-			BindingGeneration: clientState.BindingGeneration,
+			BindingGeneration: binding.BindingGeneration,
 			BaseGeneration:    base,
 			Generation:        pane.Generation,
 			Visible:           pane.Terminal.CursorVisible,
@@ -589,30 +730,22 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 	return nil
 }
 
-func (c *controller) bindAndSnapshot(clientState *ClientState, window *Window, pane *Pane) error {
-	if err := sendEncoded(c.outputFrames, protocol.MsgBindRenderStream, protocol.BindRenderStream{
-		SessionID:         c.state.session.ID,
-		WindowID:          window.ID,
-		PaneID:            pane.ID,
-		BindingGeneration: clientState.BindingGeneration,
-	}, protocol.EncodeBindRenderStream); err != nil {
-		return err
+func (c *controller) sendReplaceSnapshot(binding RenderBinding, window *Window, pane *Pane) error {
+	outputFrames := c.outputFrames[binding.Slot]
+	if outputFrames == nil {
+		return fmt.Errorf("missing output stream for slot %d", binding.Slot)
 	}
-	return c.sendReplaceSnapshot(clientState, window, pane)
-}
-
-func (c *controller) sendReplaceSnapshot(clientState *ClientState, window *Window, pane *Pane) error {
 	pane.Generation++
 	styleDefs := pane.Terminal.SnapshotStyles()
 	styles := make([]protocol.StyleDefinition, 0, len(styleDefs))
 	for _, def := range styleDefs {
 		styles = append(styles, protocol.StyleDefinition{ID: def.ID, Style: def.Style})
 	}
-	return sendEncoded(c.outputFrames, protocol.MsgReplacePane, protocol.ReplacePane{
+	return sendEncoded(outputFrames, protocol.MsgReplacePane, protocol.ReplacePane{
 		SessionID:         c.state.session.ID,
 		WindowID:          window.ID,
 		PaneID:            pane.ID,
-		BindingGeneration: clientState.BindingGeneration,
+		BindingGeneration: binding.BindingGeneration,
 		Generation:        pane.Generation,
 		Cols:              pane.Terminal.Cols,
 		Rows:              pane.Terminal.Rows,
@@ -627,11 +760,65 @@ func (c *controller) publishWindowList() error {
 	return sendEncoded(c.mgmtFrames, protocol.MsgWindowList, c.state.session.WindowList(clientID0), protocol.EncodeWindowList)
 }
 
+func (c *controller) publishWindowLayout() error {
+	layout, err := c.state.session.WindowLayout(clientID0)
+	if err != nil {
+		return err
+	}
+	return sendEncoded(c.mgmtFrames, protocol.MsgWindowLayout, layout, protocol.EncodeWindowLayout)
+}
+
+func (c *controller) publishBindingsAndSnapshots() error {
+	bindings, _, _, err := c.state.session.RebuildRenderBindings(clientID0)
+	if err != nil {
+		return err
+	}
+	for _, binding := range bindings {
+		pane := c.state.session.Panes[binding.PaneID]
+		window := c.windowForPane(binding.PaneID)
+		if pane == nil || window == nil {
+			continue
+		}
+		outputFrames := c.outputFrames[binding.Slot]
+		if outputFrames == nil {
+			return fmt.Errorf("missing output stream for slot %d", binding.Slot)
+		}
+		if err := sendEncoded(outputFrames, protocol.MsgBindRenderStream, protocol.BindRenderStream{
+			Slot:              uint8(binding.Slot),
+			SessionID:         c.state.session.ID,
+			WindowID:          window.ID,
+			PaneID:            pane.ID,
+			BindingGeneration: binding.BindingGeneration,
+		}, protocol.EncodeBindRenderStream); err != nil {
+			return err
+		}
+		if err := c.sendReplaceSnapshot(binding, window, pane); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *controller) publishVisibleSnapshots() error {
+	bindings, _ := c.state.session.RenderBindings(clientID0)
+	for _, binding := range bindings {
+		pane := c.state.session.Panes[binding.PaneID]
+		window := c.windowForPane(binding.PaneID)
+		if pane == nil || window == nil {
+			continue
+		}
+		if err := c.sendReplaceSnapshot(binding, window, pane); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *controller) windowForPane(paneID uint64) *Window {
 	c.state.session.mu.RLock()
 	defer c.state.session.mu.RUnlock()
 	for _, window := range c.state.session.Windows {
-		if window.PaneID == paneID {
+		if windowHasPane(window, paneID) {
 			cp := *window
 			return &cp
 		}
@@ -658,7 +845,7 @@ func (c *controller) windowInfo(window *Window, active bool) protocol.WindowInfo
 			return w
 		}
 	}
-	return protocol.WindowInfo{WindowID: window.ID, PaneID: window.PaneID, Title: window.Name, Active: active}
+	return protocol.WindowInfo{WindowID: window.ID, PaneID: windowPrimaryPaneID(window), Title: window.Name, Active: active}
 }
 
 func expectStreamOpen(decoder *protocol.Decoder, opener uint64, streamType string) error {
@@ -712,22 +899,22 @@ func writeStream(stream io.Writer, frames <-chan protocol.Frame, errs chan<- err
 	}
 }
 
-func (s *sessionState) setOutputFrames(outputFrames chan protocol.Frame) {
+func (s *sessionState) setOutputFrames(slot int, outputFrames chan protocol.Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.outputFrames = outputFrames
+	s.outputFrames[slot] = outputFrames
 }
 
-func (s *sessionState) clearOutputFrames(outputFrames chan protocol.Frame) {
+func (s *sessionState) clearOutputFrames(slot int, outputFrames chan protocol.Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.outputFrames == outputFrames {
-		s.outputFrames = nil
+	if s.outputFrames[slot] == outputFrames {
+		delete(s.outputFrames, slot)
 	}
 }
 
-func (s *sessionState) currentOutputFrames() chan protocol.Frame {
+func (s *sessionState) currentOutputFrames(slot int) chan protocol.Frame {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.outputFrames
+	return s.outputFrames[slot]
 }
