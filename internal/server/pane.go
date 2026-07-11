@@ -11,13 +11,17 @@ import (
 	"syscall"
 
 	"github.com/creack/pty"
+
+	"tali/internal/server/terminal"
 )
 
 type Pane struct {
-	ID   string
-	PTY  *os.File
-	Cmd  *exec.Cmd
-	User *user.User
+	ID         uint64
+	PTY        *os.File
+	Process    *exec.Cmd
+	User       *user.User
+	Terminal   *terminal.TerminalState
+	Generation uint64
 }
 
 func StartPane(unixUser *user.User, request paneRequest) (*Pane, error) {
@@ -75,10 +79,11 @@ func StartPane(unixUser *user.User, request paneRequest) (*Pane, error) {
 	}
 
 	return &Pane{
-		ID:   "pane-1",
-		PTY:  ptmx,
-		Cmd:  cmd,
-		User: unixUser,
+		ID:       0,
+		PTY:      ptmx,
+		Process:  cmd,
+		User:     unixUser,
+		Terminal: terminal.New(int(request.Cols), int(request.Rows)),
 	}, nil
 }
 

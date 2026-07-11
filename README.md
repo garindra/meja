@@ -27,7 +27,7 @@ Authentication is application-level and uses the local `ssh-agent`:
 5. the client signs a deterministic transcript via `ssh-agent`
 6. the server verifies the signature and rejects expired or reused challenges
 
-After authentication, the server allocates a PTY, starts the login shell or requested command as the authenticated Unix account, and relays raw PTY bytes.
+After authentication, the server allocates a PTY, starts the login shell or requested command as the authenticated Unix account, parses PTY output into a bounded terminal grid, and sends pane snapshots / row updates to the client for ANSI rendering.
 
 ## Build
 
@@ -104,9 +104,9 @@ Identity selection prefers exact configured identities, uses matching keys from 
 ## Current Limitations
 
 - only one remote pane is implemented
-- no terminal emulation or local screen model
+- only a minimal primary-screen terminal model is implemented
 - no pane layouts or multiplexer commands
-- no history, snapshots, or deltas
+- no alternate screen or scrollback
 - no client certificate authentication
 - only `ssh-ed25519` keys are accepted
 - `authorized_keys` entries with options are rejected
