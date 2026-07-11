@@ -8,8 +8,6 @@ import (
 	"io"
 )
 
-const DefaultMaxFrameSize = 4 << 20
-
 var ErrFrameTooLarge = errors.New("frame too large")
 
 type Frame struct {
@@ -20,6 +18,7 @@ type Frame struct {
 type Decoder struct {
 	r            *bufio.Reader
 	maxFrameSize uint64
+	buf          []byte
 }
 
 func NewDecoder(r io.Reader, maxFrameSize uint64) *Decoder {
@@ -46,12 +45,16 @@ func (d *Decoder) ReadFrame() (Frame, error) {
 		return Frame{}, fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, payloadLen, d.maxFrameSize)
 	}
 
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(d.r, payload); err != nil {
+	if uint64(cap(d.buf)) < payloadLen {
+		d.buf = make([]byte, payloadLen)
+	} else {
+		d.buf = d.buf[:payloadLen]
+	}
+	if _, err := io.ReadFull(d.r, d.buf); err != nil {
 		return Frame{}, err
 	}
 
-	return Frame{Type: msgType, Payload: payload}, nil
+	return Frame{Type: msgType, Payload: d.buf}, nil
 }
 
 type Encoder struct {

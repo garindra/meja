@@ -58,6 +58,7 @@ func TestWindowNavigation(t *testing.T) {
 		},
 		ActiveWindowID: 10,
 	})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 10, PaneID: 10})
 	if got, _ := state.NextWindowID(); got != 20 {
 		t.Fatalf("NextWindowID() = %d, want 20", got)
 	}
@@ -66,5 +67,72 @@ func TestWindowNavigation(t *testing.T) {
 	}
 	if got, _ := state.WindowIDByIndex(2); got != 30 {
 		t.Fatalf("WindowIDByIndex() = %d, want 30", got)
+	}
+}
+
+func TestWindowListDoesNotOverrideExplicitSelection(t *testing.T) {
+	state := NewClientState()
+	state.ApplyWindowList(protocol.WindowList{
+		Windows: []protocol.WindowInfo{
+			{WindowID: 0, PaneID: 10, Index: 0, Title: "bash", Active: true},
+			{WindowID: 1, PaneID: 11, Index: 1, Title: "logs"},
+		},
+		ActiveWindowID: 0,
+	})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 11})
+	state.ApplyWindowList(protocol.WindowList{
+		Windows: []protocol.WindowInfo{
+			{WindowID: 0, PaneID: 10, Index: 0, Title: "bash", Active: true},
+			{WindowID: 1, PaneID: 11, Index: 1, Title: "logs"},
+		},
+		ActiveWindowID: 0,
+	})
+
+	if state.ActiveWindowID != 1 || state.FocusedPaneID != 11 {
+		t.Fatalf("window list overwrote explicit selection: window=%d pane=%d", state.ActiveWindowID, state.FocusedPaneID)
+	}
+	if !state.Windows[1].Active || state.Windows[0].Active {
+		t.Fatalf("window actives not normalized after explicit selection: %#v", state.Windows)
+	}
+}
+
+func TestRenderBindingDoesNotOwnTabSelection(t *testing.T) {
+	state := NewClientState()
+	state.ApplyWindowList(protocol.WindowList{
+		Windows: []protocol.WindowInfo{
+			{WindowID: 0, PaneID: 10, Index: 0, Title: "bash", Active: true},
+			{WindowID: 1, PaneID: 11, Index: 1, Title: "logs"},
+		},
+		ActiveWindowID: 0,
+	})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 0, PaneID: 10})
+	state.ApplyBind(protocol.BindRenderStream{
+		SessionID:         7,
+		WindowID:          1,
+		PaneID:            11,
+		BindingGeneration: 2,
+	})
+
+	ok := state.ApplyReplace(protocol.ReplacePane{
+		SessionID:         7,
+		WindowID:          1,
+		PaneID:            11,
+		BindingGeneration: 2,
+		Generation:        1,
+		Cols:              1,
+		Rows:              1,
+		Cells:             []protocol.Cell{{Rune: 'x', Width: 1}},
+		Styles: []protocol.StyleDefinition{
+			{ID: 0, Style: protocol.Style{FG: protocol.Color{Mode: "default"}, BG: protocol.Color{Mode: "default"}}},
+		},
+	})
+	if !ok {
+		t.Fatal("ApplyReplace() rejected matching binding")
+	}
+	if state.ActiveWindowID != 0 {
+		t.Fatalf("render snapshot changed active tab selection: window=%d", state.ActiveWindowID)
+	}
+	if state.FocusedPaneID != 11 {
+		t.Fatalf("render binding did not update focused pane: pane=%d", state.FocusedPaneID)
 	}
 }

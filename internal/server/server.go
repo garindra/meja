@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/quic-go/quic-go"
 
@@ -19,8 +20,10 @@ import (
 )
 
 const (
-	sessionID0 = 0
-	clientID0  = 0
+	sessionID0          = 0
+	clientID0           = 0
+	quicMaxIdleTimeout  = 60 * time.Second
+	quicKeepAlivePeriod = 10 * time.Second
 )
 
 type Config struct {
@@ -66,7 +69,10 @@ func Run(ctx context.Context, cfg Config) error {
 		NextProtos:   []string{protocol.ALPN},
 		MinVersion:   tls.VersionTLS13,
 	}
-	listener, err := quic.ListenAddr(cfg.ListenAddr, tlsConfig, nil)
+	listener, err := quic.ListenAddr(cfg.ListenAddr, tlsConfig, &quic.Config{
+		MaxIdleTimeout:  quicMaxIdleTimeout,
+		KeepAlivePeriod: quicKeepAlivePeriod,
+	})
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
 	}
@@ -114,8 +120,8 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 		return err
 	}
 
-	var hello protocol.ClientHello
-	if err := expectMessage(mgmtDecoder, protocol.MsgClientHello, &hello); err != nil {
+	hello, err := expectDecoded(mgmtDecoder, protocol.MsgClientHello, protocol.DecodeClientHello)
+	if err != nil {
 		return fmt.Errorf("read client hello: %w", err)
 	}
 	if hello.Version != 1 {
@@ -127,39 +133,39 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 	go writeStream(mgmtStream, mgmtFrames, writerErrs)
 	defer close(mgmtFrames)
 
-	var authBegin protocol.AuthBegin
-	if err := expectMessage(mgmtDecoder, protocol.MsgAuthBegin, &authBegin); err != nil {
+	authBegin, err := expectDecoded(mgmtDecoder, protocol.MsgAuthBegin, protocol.DecodeAuthBegin)
+	if err != nil {
 		return fmt.Errorf("read auth begin: %w", err)
 	}
 	beginResult, err := s.verifier.Begin(authBegin.Username, authBegin.PublicKey)
 	if err != nil {
-		_ = sendFrame(mgmtFrames, protocol.MsgAuthFailed, protocol.AuthFailed{Reason: err.Error()})
+		_ = sendEncoded(mgmtFrames, protocol.MsgAuthFailed, protocol.AuthFailed{Reason: err.Error()}, protocol.EncodeAuthFailed)
 		return fmt.Errorf("begin auth: %w", err)
 	}
 	unixUser := beginResult.User
 	fingerprint := beginResult.Fingerprint
-	if err := sendFrame(mgmtFrames, protocol.MsgAuthChallenge, protocol.AuthChallenge{
+	if err := sendEncoded(mgmtFrames, protocol.MsgAuthChallenge, protocol.AuthChallenge{
 		ChallengeID: beginResult.Challenge.ID,
 		Nonce:       beginResult.Challenge.Nonce,
 		ExpiresAt:   beginResult.Challenge.ExpiresAt,
-	}); err != nil {
+	}, protocol.EncodeAuthChallenge); err != nil {
 		return err
 	}
-	var authResponse protocol.AuthResponse
-	if err := expectMessage(mgmtDecoder, protocol.MsgAuthResponse, &authResponse); err != nil {
+	authResponse, err := expectDecoded(mgmtDecoder, protocol.MsgAuthResponse, protocol.DecodeAuthResponse)
+	if err != nil {
 		return fmt.Errorf("read auth response: %w", err)
 	}
 	if err := s.verifier.Verify(authBegin.Username, fingerprint, authResponse.ChallengeID, authResponse.Signature); err != nil {
-		_ = sendFrame(mgmtFrames, protocol.MsgAuthFailed, protocol.AuthFailed{Reason: err.Error()})
+		_ = sendEncoded(mgmtFrames, protocol.MsgAuthFailed, protocol.AuthFailed{Reason: err.Error()}, protocol.EncodeAuthFailed)
 		return fmt.Errorf("verify auth response: %w", err)
 	}
 
 	shell := loginShellForUser(unixUser)
-	if err := sendFrame(mgmtFrames, protocol.MsgAuthOK, protocol.AuthOK{
+	if err := sendEncoded(mgmtFrames, protocol.MsgAuthOK, protocol.AuthOK{
 		Username: unixUser.Username,
 		HomeDir:  unixUser.HomeDir,
 		Shell:    shell,
-	}); err != nil {
+	}, protocol.EncodeAuthOK); err != nil {
 		return err
 	}
 
@@ -172,7 +178,7 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 	defer close(outputFrames)
 	s.setOutputFrames(outputFrames)
 	defer s.clearOutputFrames(outputFrames)
-	if err := sendFrame(outputFrames, protocol.MsgOpenPaneOutputStream, protocol.StreamOpen{StreamType: protocol.StreamTypePaneOutput}); err != nil {
+	if err := sendEncoded(outputFrames, protocol.MsgOpenPaneOutputStream, protocol.StreamOpen{StreamType: protocol.StreamTypePaneOutput}, protocol.EncodeStreamOpen); err != nil {
 		return err
 	}
 
@@ -186,8 +192,8 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 	}
 	s.session.EnsureClient(clientID0)
 
-	var createPane protocol.CreatePane
-	if err := expectMessage(mgmtDecoder, protocol.MsgCreatePane, &createPane); err != nil {
+	createPane, err := expectDecoded(mgmtDecoder, protocol.MsgCreatePane, protocol.DecodeCreatePane)
+	if err != nil {
 		return fmt.Errorf("read create pane: %w", err)
 	}
 	if !s.session.HasWindows() {
@@ -195,13 +201,13 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 		if err != nil {
 			return err
 		}
-		if err := sendFrame(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: initialPane.ID}); err != nil {
+		if err := sendEncoded(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: initialPane.ID}, protocol.EncodePaneCreated); err != nil {
 			return err
 		}
 		if err := ctrl.publishWindowList(); err != nil {
 			return err
 		}
-		if err := sendFrame(mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: initialPane.ID}); err != nil {
+		if err := sendEncoded(mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: initialPane.ID}, protocol.EncodeWindowSelected); err != nil {
 			return err
 		}
 		if err := ctrl.bindAndSnapshot(clientState, window, initialPane); err != nil {
@@ -214,13 +220,13 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 		if err != nil {
 			return err
 		}
-		if err := sendFrame(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: pane.ID}); err != nil {
+		if err := sendEncoded(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: pane.ID}, protocol.EncodePaneCreated); err != nil {
 			return err
 		}
 		if err := ctrl.publishWindowList(); err != nil {
 			return err
 		}
-		if err := sendFrame(mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}); err != nil {
+		if err := sendEncoded(mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}, protocol.EncodeWindowSelected); err != nil {
 			return err
 		}
 		if err := ctrl.bindAndSnapshot(clientState, window, pane); err != nil {
@@ -282,8 +288,8 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 		}
 		switch frame.Type {
 		case protocol.MsgCreateWindow:
-			var msg protocol.CreateWindow
-			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+			msg, err := protocol.DecodeCreateWindow(frame.Payload)
+			if err != nil {
 				done <- err
 				return
 			}
@@ -294,7 +300,7 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				done <- err
 				return
 			}
-			if err := sendFrame(c.mgmtFrames, protocol.MsgWindowCreated, protocol.WindowCreated{Window: c.windowInfo(window, clientState.ActiveWindowID == window.ID)}); err != nil {
+			if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowCreated, protocol.WindowCreated{Window: c.windowInfo(window, clientState.ActiveWindowID == window.ID)}, protocol.EncodeWindowCreated); err != nil {
 				done <- err
 				return
 			}
@@ -302,7 +308,7 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				done <- err
 				return
 			}
-			if err := sendFrame(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}); err != nil {
+			if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}, protocol.EncodeWindowSelected); err != nil {
 				done <- err
 				return
 			}
@@ -312,8 +318,8 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 			}
 			c.startPane(pane)
 		case protocol.MsgSelectWindow:
-			var msg protocol.SelectWindow
-			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+			msg, err := protocol.DecodeSelectWindow(frame.Payload)
+			if err != nil {
 				done <- err
 				return
 			}
@@ -322,7 +328,7 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				done <- err
 				return
 			}
-			if err := sendFrame(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}); err != nil {
+			if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}, protocol.EncodeWindowSelected); err != nil {
 				done <- err
 				return
 			}
@@ -331,8 +337,8 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				return
 			}
 		case protocol.MsgCloseWindow:
-			var msg protocol.CloseWindow
-			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+			msg, err := protocol.DecodeCloseWindow(frame.Payload)
+			if err != nil {
 				done <- err
 				return
 			}
@@ -364,7 +370,7 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				}
 				c.startPane(pane)
 			}
-			if err := sendFrame(c.mgmtFrames, protocol.MsgWindowClosed, protocol.WindowClosed{WindowID: closed}); err != nil {
+			if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowClosed, protocol.WindowClosed{WindowID: closed}, protocol.EncodeWindowClosed); err != nil {
 				done <- err
 				return
 			}
@@ -373,7 +379,7 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				return
 			}
 			if replacement != nil && pane != nil && clientState != nil {
-				if err := sendFrame(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: replacement.ID, PaneID: pane.ID}); err != nil {
+				if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: replacement.ID, PaneID: pane.ID}, protocol.EncodeWindowSelected); err != nil {
 					done <- err
 					return
 				}
@@ -388,8 +394,8 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				return
 			}
 		case protocol.MsgRequestPaneSnapshot:
-			var msg protocol.RequestPaneSnapshot
-			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+			msg, err := protocol.DecodeRequestPaneSnapshot(frame.Payload)
+			if err != nil {
 				done <- err
 				return
 			}
@@ -402,6 +408,19 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				continue
 			}
 			if err := c.sendReplaceSnapshot(clientState, window, pane); err != nil {
+				done <- err
+				return
+			}
+		case protocol.MsgPing:
+			msg, err := protocol.DecodePing(frame.Payload)
+			if err != nil {
+				done <- err
+				return
+			}
+			if err := sendEncoded(c.mgmtFrames, protocol.MsgPong, protocol.Pong{
+				Seq:           msg.Seq,
+				SentUnixMilli: msg.SentUnixMilli,
+			}, protocol.EncodePong); err != nil {
 				done <- err
 				return
 			}
@@ -425,16 +444,12 @@ func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
 		}
 		switch frame.Type {
 		case protocol.MsgInputBytes:
-			var msg protocol.InputBytes
-			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+			msg, err := protocol.DecodeInputBytes(frame.Payload)
+			if err != nil {
 				done <- err
 				return
 			}
-			if !c.state.session.IsFocusedPane(clientID0, msg.PaneID) {
-				done <- fmt.Errorf("rejected input for nonfocused pane %d", msg.PaneID)
-				return
-			}
-			pane, _ := c.state.session.ActivePane(clientID0)
+			pane, _, _ := c.state.session.ResolveInputTarget(clientID0, msg.PaneID)
 			if pane == nil {
 				continue
 			}
@@ -443,17 +458,16 @@ func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
 				return
 			}
 		case protocol.MsgResizePane:
-			var msg protocol.ResizePane
-			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+			msg, err := protocol.DecodeResizePane(frame.Payload)
+			if err != nil {
 				done <- err
 				return
 			}
-			if !c.state.session.IsFocusedPane(clientID0, msg.PaneID) {
-				done <- fmt.Errorf("rejected resize for nonfocused pane %d", msg.PaneID)
-				return
+			pane, clientState, _ := c.state.session.ResolveInputTarget(clientID0, msg.PaneID)
+			if pane == nil || clientState == nil {
+				continue
 			}
 			c.state.session.ResizeAll(msg.Cols, msg.Rows)
-			pane, clientState := c.state.session.ActivePane(clientID0)
 			window := c.windowForPane(pane.ID)
 			if err := c.sendReplaceSnapshot(clientState, window, pane); err != nil {
 				done <- err
@@ -507,12 +521,12 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		sort.Ints(ids)
 		for _, rawID := range ids {
 			id := uint32(rawID)
-			if err := sendFrame(outputFrames, protocol.MsgDefineStyle, protocol.DefineStyle{
+			if err := sendEncoded(outputFrames, protocol.MsgDefineStyle, protocol.DefineStyle{
 				PaneID:            pane.ID,
 				BindingGeneration: clientState.BindingGeneration,
 				ID:                id,
 				Style:             update.DefinedStyles[id],
-			}); err != nil {
+			}, protocol.EncodeDefineStyle); err != nil {
 				return err
 			}
 		}
@@ -528,7 +542,7 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		pane.Generation++
 		start := row * pane.Terminal.Cols
 		end := start + pane.Terminal.Cols
-		if err := sendFrame(outputFrames, protocol.MsgSetRun, protocol.SetRun{
+		if err := sendEncoded(outputFrames, protocol.MsgSetRun, protocol.SetRun{
 			SessionID:         c.state.session.ID,
 			WindowID:          window.ID,
 			PaneID:            pane.ID,
@@ -538,14 +552,14 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 			Row:               row,
 			Column:            0,
 			Cells:             append([]protocol.Cell(nil), pane.Terminal.Cells[start:end]...),
-		}); err != nil {
+		}, protocol.EncodeSetRun); err != nil {
 			return err
 		}
 	}
 	if update.CursorChanged {
 		base := pane.Generation
 		pane.Generation++
-		if err := sendFrame(outputFrames, protocol.MsgSetCursor, protocol.SetCursor{
+		if err := sendEncoded(outputFrames, protocol.MsgSetCursor, protocol.SetCursor{
 			SessionID:         c.state.session.ID,
 			WindowID:          window.ID,
 			PaneID:            pane.ID,
@@ -553,14 +567,14 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 			BaseGeneration:    base,
 			Generation:        pane.Generation,
 			Cursor:            protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY},
-		}); err != nil {
+		}, protocol.EncodeSetCursor); err != nil {
 			return err
 		}
 	}
 	if update.VisibleChange {
 		base := pane.Generation
 		pane.Generation++
-		if err := sendFrame(outputFrames, protocol.MsgSetCursorVisible, protocol.SetCursorVisible{
+		if err := sendEncoded(outputFrames, protocol.MsgSetCursorVisible, protocol.SetCursorVisible{
 			SessionID:         c.state.session.ID,
 			WindowID:          window.ID,
 			PaneID:            pane.ID,
@@ -568,7 +582,7 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 			BaseGeneration:    base,
 			Generation:        pane.Generation,
 			Visible:           pane.Terminal.CursorVisible,
-		}); err != nil {
+		}, protocol.EncodeSetCursorVisible); err != nil {
 			return err
 		}
 	}
@@ -576,12 +590,12 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 }
 
 func (c *controller) bindAndSnapshot(clientState *ClientState, window *Window, pane *Pane) error {
-	if err := sendFrame(c.outputFrames, protocol.MsgBindRenderStream, protocol.BindRenderStream{
+	if err := sendEncoded(c.outputFrames, protocol.MsgBindRenderStream, protocol.BindRenderStream{
 		SessionID:         c.state.session.ID,
 		WindowID:          window.ID,
 		PaneID:            pane.ID,
 		BindingGeneration: clientState.BindingGeneration,
-	}); err != nil {
+	}, protocol.EncodeBindRenderStream); err != nil {
 		return err
 	}
 	return c.sendReplaceSnapshot(clientState, window, pane)
@@ -594,7 +608,7 @@ func (c *controller) sendReplaceSnapshot(clientState *ClientState, window *Windo
 	for _, def := range styleDefs {
 		styles = append(styles, protocol.StyleDefinition{ID: def.ID, Style: def.Style})
 	}
-	return sendFrame(c.outputFrames, protocol.MsgReplacePane, protocol.ReplacePane{
+	return sendEncoded(c.outputFrames, protocol.MsgReplacePane, protocol.ReplacePane{
 		SessionID:         c.state.session.ID,
 		WindowID:          window.ID,
 		PaneID:            pane.ID,
@@ -606,11 +620,11 @@ func (c *controller) sendReplaceSnapshot(clientState *ClientState, window *Windo
 		Styles:            styles,
 		Cursor:            protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY},
 		CursorVisible:     pane.Terminal.CursorVisible,
-	})
+	}, protocol.EncodeReplacePane)
 }
 
 func (c *controller) publishWindowList() error {
-	return sendFrame(c.mgmtFrames, protocol.MsgWindowList, c.state.session.WindowList(clientID0))
+	return sendEncoded(c.mgmtFrames, protocol.MsgWindowList, c.state.session.WindowList(clientID0), protocol.EncodeWindowList)
 }
 
 func (c *controller) windowForPane(paneID uint64) *Window {
@@ -655,8 +669,8 @@ func expectStreamOpen(decoder *protocol.Decoder, opener uint64, streamType strin
 	if frame.Type != opener {
 		return fmt.Errorf("unexpected stream opener %d", frame.Type)
 	}
-	var open protocol.StreamOpen
-	if err := protocol.DecodeMessage(frame, &open); err != nil {
+	open, err := protocol.DecodeStreamOpen(frame.Payload)
+	if err != nil {
 		return err
 	}
 	if open.StreamType != streamType {
@@ -665,24 +679,26 @@ func expectStreamOpen(decoder *protocol.Decoder, opener uint64, streamType strin
 	return nil
 }
 
-func expectMessage(decoder *protocol.Decoder, msgType uint64, v any) error {
+func expectDecoded[T any](decoder *protocol.Decoder, msgType uint64, decode func([]byte) (T, error)) (T, error) {
 	frame, err := decoder.ReadFrame()
 	if err != nil {
-		return err
+		var zero T
+		return zero, err
 	}
 	if frame.Type != msgType {
-		return fmt.Errorf("unexpected message type %d", frame.Type)
+		var zero T
+		return zero, fmt.Errorf("unexpected message type %d", frame.Type)
 	}
-	return protocol.DecodeMessage(frame, v)
+	return decode(frame.Payload)
 }
 
-func sendFrame(ch chan<- protocol.Frame, msgType uint64, v any) error {
-	frame, err := protocol.EncodeMessage(msgType, v)
+func sendEncoded[T any](ch chan<- protocol.Frame, msgType uint64, msg T, encode func([]byte, T) ([]byte, error)) error {
+	payload, err := encode(nil, msg)
 	if err != nil {
 		return err
 	}
 	defer func() { recover() }()
-	ch <- frame
+	ch <- protocol.Frame{Type: msgType, Payload: payload}
 	return nil
 }
 

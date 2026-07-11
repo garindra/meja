@@ -69,11 +69,11 @@ func renderTabBar(state *ClientState) string {
 
 	entries := make([]string, 0, len(state.Windows))
 	for _, w := range state.Windows {
-		suffix := ""
+		marker := ' '
 		if w.WindowID == state.ActiveWindowID {
-			suffix = "*"
+			marker = '*'
 		}
-		entries = append(entries, fmt.Sprintf(" %d:%s%s ", w.Index, w.Title, suffix))
+		entries = append(entries, fmt.Sprintf("%d:%s%c ", w.Index, w.Title, marker))
 	}
 
 	used := 0

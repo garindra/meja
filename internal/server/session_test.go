@@ -85,3 +85,41 @@ func TestEnsureClientAndReattachReuseExistingSessionState(t *testing.T) {
 		t.Fatalf("second window ID changed unexpectedly: %#v", w1)
 	}
 }
+
+func TestResolveInputTargetUsesServerFocusedPane(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+
+	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash"}
+	w0, _ := s.CreateWindow(pane0, 0)
+	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs"}
+	w1, _ := s.CreateWindow(pane1, 0)
+
+	if _, _, _, err := s.SelectWindow(0, w1.ID); err != nil {
+		t.Fatalf("SelectWindow() error = %v", err)
+	}
+
+	pane, client, exact := s.ResolveInputTarget(0, pane0.ID)
+	if pane == nil || client == nil {
+		t.Fatalf("ResolveInputTarget() = %#v %#v", pane, client)
+	}
+	if pane.ID != pane1.ID || client.ActiveWindowID != w1.ID || client.FocusedPaneID != pane1.ID {
+		t.Fatalf("ResolveInputTarget() routed to wrong target: pane=%#v client=%#v", pane, client)
+	}
+	if exact {
+		t.Fatalf("ResolveInputTarget() reported stale pane id %d as exact match", pane0.ID)
+	}
+
+	pane, client, exact = s.ResolveInputTarget(0, pane1.ID)
+	if pane == nil || client == nil || pane.ID != pane1.ID || !exact {
+		t.Fatalf("ResolveInputTarget() exact active target failed: pane=%#v client=%#v exact=%v", pane, client, exact)
+	}
+
+	if _, _, _, err := s.SelectWindow(0, w0.ID); err != nil {
+		t.Fatalf("SelectWindow() error = %v", err)
+	}
+	pane, client, exact = s.ResolveInputTarget(0, pane1.ID)
+	if pane == nil || client == nil || pane.ID != pane0.ID || client.ActiveWindowID != w0.ID || client.FocusedPaneID != pane0.ID || exact {
+		t.Fatalf("ResolveInputTarget() after reselection failed: pane=%#v client=%#v exact=%v", pane, client, exact)
+	}
+}

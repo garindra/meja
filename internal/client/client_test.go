@@ -1,7 +1,9 @@
 package client
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"tali/internal/client/render"
 	"tali/internal/protocol"
@@ -66,8 +68,8 @@ func TestProcessInputBytePrefixActions(t *testing.T) {
 	if len(mgmt) != 1 || mgmt[0].Type != protocol.MsgSelectWindow {
 		t.Fatalf("numeric selection failed: %#v", mgmt)
 	}
-	var sel protocol.SelectWindow
-	if err := protocol.DecodeMessage(mgmt[0], &sel); err != nil || sel.WindowID != 2 {
+	sel, err := protocol.DecodeSelectWindow(mgmt[0].Payload)
+	if err != nil || sel.WindowID != 2 {
 		t.Fatalf("SelectWindow = %#v err=%v", sel, err)
 	}
 
@@ -83,5 +85,26 @@ func TestDrawableRowsExcludesStatusRow(t *testing.T) {
 	ui.SetTerminalSize(80, 24)
 	if got := ui.DrawableRows(); got != 23 {
 		t.Fatalf("DrawableRows() = %d, want 23", got)
+	}
+}
+
+func TestCreateWindowPrefixBlocksInputUntilReleased(t *testing.T) {
+	ui := &runtimeState{ui: render.NewClientState()}
+
+	prefix := true
+	_, mgmt, detach := processInputByte(&prefix, 'c', ui, Config{})
+	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgCreateWindow {
+		t.Fatalf("processInputByte(create) = %#v detach=%v", mgmt, detach)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := ui.waitForInputReady(ctx); err == nil {
+		t.Fatal("waitForInputReady() unexpectedly returned while input was blocked")
+	}
+
+	ui.setInputBlocked(false)
+	if err := ui.waitForInputReady(context.Background()); err != nil {
+		t.Fatalf("waitForInputReady() after release = %v", err)
 	}
 }

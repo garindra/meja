@@ -54,28 +54,13 @@ func (s *ClientState) DrawableRows() int {
 
 func (s *ClientState) ApplyWindowList(msg protocol.WindowList) {
 	s.Windows = append([]protocol.WindowInfo(nil), msg.Windows...)
-	s.ActiveWindowID = msg.ActiveWindowID
-	for _, w := range s.Windows {
-		if w.Active {
-			s.FocusedPaneID = w.PaneID
-			s.ActiveWindowID = w.WindowID
-			return
-		}
-	}
-	for _, w := range s.Windows {
-		if w.WindowID == s.ActiveWindowID {
-			s.FocusedPaneID = w.PaneID
-			return
-		}
-	}
+	s.syncWindowSelection()
 }
 
 func (s *ClientState) ApplyWindowSelected(msg protocol.WindowSelected) {
 	s.ActiveWindowID = msg.WindowID
 	s.FocusedPaneID = msg.PaneID
-	for i := range s.Windows {
-		s.Windows[i].Active = s.Windows[i].WindowID == msg.WindowID
-	}
+	s.syncWindowSelection()
 }
 
 func (s *ClientState) ApplyWindowClosed(windowID uint64) {
@@ -86,11 +71,11 @@ func (s *ClientState) ApplyWindowClosed(windowID uint64) {
 		}
 	}
 	s.Windows = out
+	s.syncWindowSelection()
 }
 
 func (s *ClientState) ApplyBind(msg protocol.BindRenderStream) {
 	s.SessionID = msg.SessionID
-	s.ActiveWindowID = msg.WindowID
 	s.FocusedPaneID = msg.PaneID
 	s.BindingGeneration = msg.BindingGeneration
 	s.Grid = Screen{}
@@ -111,8 +96,6 @@ func (s *ClientState) ApplyReplace(msg protocol.ReplacePane) bool {
 		return false
 	}
 	s.SessionID = msg.SessionID
-	s.ActiveWindowID = msg.WindowID
-	s.FocusedPaneID = msg.PaneID
 	s.Generation = msg.Generation
 	s.Cursor = msg.Cursor
 	s.CursorVisible = msg.CursorVisible
@@ -172,6 +155,15 @@ func (s *ClientState) DefineStyle(msg protocol.DefineStyle) bool {
 	}
 	s.Styles[msg.ID] = msg.Style
 	return true
+}
+
+func (s *ClientState) syncWindowSelection() {
+	for i := range s.Windows {
+		s.Windows[i].Active = s.Windows[i].WindowID == s.ActiveWindowID
+		if s.Windows[i].Active && s.FocusedPaneID != 0 && s.Windows[i].PaneID != s.FocusedPaneID {
+			s.Windows[i].PaneID = s.FocusedPaneID
+		}
+	}
 }
 
 func (s *ClientState) NextWindowID() (uint64, bool) {

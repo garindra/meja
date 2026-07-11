@@ -149,6 +149,20 @@ func (s *Session) ActivePane(clientID uint64) (*Pane, *ClientState) {
 	return s.Panes[client.FocusedPaneID], cloneClientState(client)
 }
 
+func (s *Session) ResolveInputTarget(clientID, requestedPaneID uint64) (*Pane, *ClientState, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	client := s.Clients[clientID]
+	if client == nil {
+		return nil, nil, false
+	}
+	pane := s.Panes[client.FocusedPaneID]
+	if pane == nil {
+		return nil, cloneClientState(client), false
+	}
+	return pane, cloneClientState(client), client.FocusedPaneID == requestedPaneID
+}
+
 func (s *Session) SelectWindow(clientID, windowID uint64) (*Window, *Pane, *ClientState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
