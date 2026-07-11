@@ -1,0 +1,14 @@
+# Build outputs
+/bin/
+
+# Local TLS / dev certificate material
+/dev/*.crt
+/dev/*.csr
+/dev/*.key
+/dev/*.srl
+/dev/*.cnf
+
+# macOS / editor noise
+.DS_Store
+*.swp
+*.swo
