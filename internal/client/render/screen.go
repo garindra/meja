@@ -75,13 +75,17 @@ func (s *ClientState) ApplyWindowList(msg protocol.WindowList) {
 }
 
 func (s *ClientState) ApplyWindowSelected(msg protocol.WindowSelected) {
-	if s.HasActiveWindow && s.ActiveWindowID != msg.WindowID {
+	windowChanged := s.HasActiveWindow && s.ActiveWindowID != msg.WindowID
+	if windowChanged {
 		s.LastWindowID = s.ActiveWindowID
 		s.HasLastWindow = true
 	}
 	s.ActiveWindowID = msg.WindowID
 	s.HasActiveWindow = true
 	s.FocusedPaneID = msg.PaneID
+	if windowChanged {
+		s.resetActiveLayout()
+	}
 	s.syncWindowSelection()
 }
 
@@ -349,4 +353,27 @@ func (s *ClientState) orderedLayoutPanes() []protocol.PanePlacement {
 		return out[i].Rect.X < out[j].Rect.X
 	})
 	return out
+}
+
+func (s *ClientState) resetActiveLayout() {
+	rect := protocol.Rect{
+		X:      0,
+		Y:      0,
+		Width:  s.TerminalCols,
+		Height: s.DrawableRows(),
+	}
+	if rect.Width < 0 {
+		rect.Width = 0
+	}
+	if rect.Height < 0 {
+		rect.Height = 0
+	}
+	s.Layout = LayoutDescription{
+		WindowID: s.ActiveWindowID,
+		Panes: []protocol.PanePlacement{
+			{PaneID: s.FocusedPaneID, Rect: rect},
+		},
+	}
+	view := s.ensurePane(s.FocusedPaneID)
+	view.Rect = rect
 }

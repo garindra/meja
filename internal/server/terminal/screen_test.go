@@ -1,6 +1,8 @@
 package terminal
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -38,6 +40,14 @@ func TestLFScrollAtBottom(t *testing.T) {
 	row1 := string([]rune{term.Cells[3].Rune, term.Cells[4].Rune, term.Cells[5].Rune})
 	if row0 != "bbb" || row1 != "ccc" {
 		t.Fatalf("rows = %q / %q", row0, row1)
+	}
+}
+
+func TestLFWithoutScrollDoesNotForceFullRedraw(t *testing.T) {
+	term := New(3, 2)
+	update := term.Apply([]byte("a\n"))
+	if update.FullRedraw {
+		t.Fatal("newline without scroll forced full redraw")
 	}
 }
 
@@ -112,13 +122,166 @@ func TestResizePreservesVisibleContent(t *testing.T) {
 	}
 }
 
-func TestResizeShrinksByKeepingTopLeftContent(t *testing.T) {
+func TestResizeShrinksByReflowingRows(t *testing.T) {
 	term := New(5, 2)
 	term.Apply([]byte("abcde\nvwxyz"))
 
-	term.Resize(3, 1)
+	term.Resize(3, 4)
 	if got := rowString(term, 0, 3); got != "abc" {
 		t.Fatalf("row 0 after shrink resize = %q", got)
+	}
+	if got := rowString(term, 1, 3); got != "de " {
+		t.Fatalf("row 1 after shrink resize = %q", got)
+	}
+	if got := rowString(term, 2, 3); got != "vwx" {
+		t.Fatalf("row 2 after shrink resize = %q", got)
+	}
+	if got := rowString(term, 3, 3); got != "yz " {
+		t.Fatalf("row 3 after shrink resize = %q", got)
+	}
+}
+
+func TestResizeShrinkKeepsBottomContentVisible(t *testing.T) {
+	term := New(5, 2)
+	term.Apply([]byte("hello\nworld"))
+
+	term.Resize(3, 2)
+	if got := rowString(term, 0, 3); got != "wor" {
+		t.Fatalf("row 0 after bottom-preserving shrink resize = %q", got)
+	}
+	if got := rowString(term, 1, 3); got != "ld " {
+		t.Fatalf("row 1 after bottom-preserving shrink resize = %q", got)
+	}
+}
+
+func TestAutoWrapMarksWrapsNext(t *testing.T) {
+	term := New(5, 2)
+	term.Apply([]byte("abcdef"))
+	if !term.GridRows[0].WrapsNext {
+		t.Fatal("row 0 should wrap into row 1")
+	}
+	if term.GridRows[1].WrapsNext {
+		t.Fatal("row 1 should not wrap onward")
+	}
+}
+
+func TestLFCreatesHardBoundary(t *testing.T) {
+	term := New(5, 2)
+	term.Apply([]byte("abc\n"))
+	if term.GridRows[0].WrapsNext {
+		t.Fatal("newline should not leave soft-wrap metadata behind")
+	}
+}
+
+func TestCRDoesNotCreateFalseWrapChain(t *testing.T) {
+	term := New(5, 2)
+	term.Apply([]byte("abcdef"))
+	if !term.GridRows[0].WrapsNext {
+		t.Fatal("expected initial soft wrap")
+	}
+	term.Apply([]byte("\rZ"))
+	if term.GridRows[0].WrapsNext {
+		t.Fatal("carriage-return overwrite should conservatively break the wrap chain")
+	}
+}
+
+func TestResizeShrinkAndGrowRestoresSoftWrappedChain(t *testing.T) {
+	term := New(8, 2)
+	term.Apply([]byte("abcdefghijkl"))
+	term.Resize(4, 4)
+	if got := rowString(term, 0, 4); got != "abcd" {
+		t.Fatalf("row 0 after shrink = %q", got)
+	}
+	if got := rowString(term, 2, 4); got != "ijkl" {
+		t.Fatalf("row 2 after shrink = %q", got)
+	}
+
+	term.Resize(8, 2)
+	if got := rowString(term, 0, 8); got != "abcdefgh" {
+		t.Fatalf("row 0 after grow = %q", got)
+	}
+	if got := rowString(term, 1, 8); got != "ijkl    " {
+		t.Fatalf("row 1 after grow = %q", got)
+	}
+}
+
+func TestUnsupportedCSIIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	SetDebugLogger(&buf)
+	defer SetDebugLogger(nil)
+
+	term := New(5, 1)
+	term.Apply([]byte("\x1b[1L"))
+
+	if got := buf.String(); !strings.Contains(got, "unsupported CSI 1L") {
+		t.Fatalf("debug log = %q", got)
+	}
+}
+
+func TestSaveRestoreCursorAndStyle(t *testing.T) {
+	term := New(5, 2)
+	term.CursorX = 2
+	term.CursorY = 1
+	term.CurrentStyle = Style{Bold: true}
+	term.Apply([]byte("\x1b7"))
+	term.CursorX = 0
+	term.CursorY = 0
+	term.CurrentStyle = DefaultStyle
+	term.Apply([]byte("\x1b8"))
+	if term.CursorX != 2 || term.CursorY != 1 || !term.CurrentStyle.Bold {
+		t.Fatalf("restored cursor/style = (%d,%d) %#v", term.CursorX, term.CursorY, term.CurrentStyle)
+	}
+}
+
+func TestDeleteChars(t *testing.T) {
+	term := New(5, 1)
+	term.Apply([]byte("abcde"))
+	term.CursorX = 1
+	term.Apply([]byte("\x1b[1P"))
+	if got := rowString(term, 0, 5); got != "acde " {
+		t.Fatalf("row after DCH = %q", got)
+	}
+}
+
+func TestScrollRegionLineFeedScrollsWithinMargins(t *testing.T) {
+	term := New(4, 4)
+	term.Apply([]byte("1111\n2222\n3333\n4444"))
+	term.Apply([]byte("\x1b[2;3r"))
+	term.CursorY = 2
+	term.CursorX = 0
+	term.Apply([]byte("\n"))
+	if got := rowString(term, 0, 4); got != "1111" {
+		t.Fatalf("row 0 changed outside margins: %q", got)
+	}
+	if got := rowString(term, 1, 4); got != "3333" {
+		t.Fatalf("row 1 after margin scroll = %q", got)
+	}
+	if got := rowString(term, 2, 4); got != "    " {
+		t.Fatalf("row 2 after margin scroll = %q", got)
+	}
+}
+
+func TestReverseIndexAtTopMarginScrollsDown(t *testing.T) {
+	term := New(4, 4)
+	term.Apply([]byte("1111\n2222\n3333\n4444"))
+	term.Apply([]byte("\x1b[2;3r"))
+	term.CursorY = 1
+	term.Apply([]byte("\x1bM"))
+	if got := rowString(term, 1, 4); got != "    " {
+		t.Fatalf("top margin row after RI = %q", got)
+	}
+	if got := rowString(term, 2, 4); got != "2222" {
+		t.Fatalf("shifted row after RI = %q", got)
+	}
+}
+
+func TestDSRReply(t *testing.T) {
+	term := New(5, 2)
+	term.CursorX = 2
+	term.CursorY = 1
+	update := term.Apply([]byte("\x1b[6n"))
+	if len(update.Replies) != 1 || string(update.Replies[0]) != "\x1b[2;3R" {
+		t.Fatalf("DSR replies = %#v", update.Replies)
 	}
 }
 

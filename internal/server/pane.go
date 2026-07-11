@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/creack/pty"
@@ -23,6 +24,8 @@ type Pane struct {
 	Terminal   *terminal.TerminalState
 	Generation uint64
 	Title      string
+
+	writeMu sync.Mutex
 }
 
 func StartPane(unixUser *user.User, paneID uint64, request paneRequest) (*Pane, error) {
@@ -91,6 +94,12 @@ func StartPane(unixUser *user.User, paneID uint64, request paneRequest) (*Pane, 
 
 func (p *Pane) Resize(cols, rows uint16) error {
 	return pty.Setsize(p.PTY, &pty.Winsize{Cols: cols, Rows: rows})
+}
+
+func (p *Pane) WriteInput(data []byte) (int, error) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	return p.PTY.Write(data)
 }
 
 func resolveCommand(shell string, argv []string) (string, []string) {

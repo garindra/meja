@@ -15,9 +15,11 @@ import (
 func main() {
 	port := intFlagValue{value: 4433}
 	var (
-		ca       = flag.String("ca", "", "path to CA certificate file")
-		cwd      = flag.String("cwd", "", "remote working directory")
-		identity = flag.String("i", "", "path to SSH identity file")
+		ca             = flag.String("ca", "", "path to CA certificate file")
+		cwd            = flag.String("cwd", "", "remote working directory")
+		identity       = flag.String("i", "", "path to SSH identity file")
+		debugRender    = flag.Bool("debug-render", false, "enable client redraw logging")
+		debugRenderLog = flag.String("debug-render-log", "", "write client redraw logs to this file")
 	)
 	flag.Var(&port, "port", "remote port")
 
@@ -46,16 +48,18 @@ func main() {
 	defer stop()
 
 	cfg := client.Config{
-		Target:       target,
-		Port:         port.value,
-		PortSet:      port.set,
-		CAFile:       *ca,
-		IdentityFile: *identity,
-		Cwd:          *cwd,
-		Argv:         cmdArgs,
-		Stdin:        os.Stdin,
-		Stdout:       os.Stdout,
-		Stderr:       os.Stderr,
+		Target:             target,
+		Port:               port.value,
+		PortSet:            port.set,
+		CAFile:             *ca,
+		IdentityFile:       *identity,
+		DebugRender:        *debugRender,
+		DebugRenderLogPath: *debugRenderLog,
+		Cwd:                *cwd,
+		Argv:               cmdArgs,
+		Stdin:              os.Stdin,
+		Stdout:             os.Stdout,
+		Stderr:             os.Stderr,
 	}
 
 	if err := client.Run(ctx, cfg); err != nil {

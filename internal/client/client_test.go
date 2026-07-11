@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -82,6 +83,13 @@ func TestProcessInputBytePrefixActions(t *testing.T) {
 
 	ui.with(func(state *render.ClientState) {
 		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 2})
+		state.ApplyWindowLayout(protocol.WindowLayout{
+			WindowID: 2,
+			Panes: []protocol.PanePlacement{
+				{PaneID: 2, Rect: protocol.Rect{X: 0, Y: 0, Width: 4, Height: 2}},
+				{PaneID: 3, Rect: protocol.Rect{X: 5, Y: 0, Width: 4, Height: 2}},
+			},
+		})
 	})
 	prefix = prefixActive
 	_, mgmt, detach = processInputByte(&prefix, 'l', ui, Config{})
@@ -192,5 +200,72 @@ func TestCreateWindowPrefixBlocksInputUntilReleased(t *testing.T) {
 	ui.setInputBlocked(false)
 	if err := ui.waitForInputReady(context.Background()); err != nil {
 		t.Fatalf("waitForInputReady() after release = %v", err)
+	}
+}
+
+func TestForwardInputBatchesContiguousBytes(t *testing.T) {
+	ui := &runtimeState{ui: render.NewClientState()}
+	ui.with(func(state *render.ClientState) {
+		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 7})
+	})
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() = %v", err)
+	}
+	defer stdinR.Close()
+
+	inputFrames := make(chan protocol.Frame, 8)
+	mgmtFrames := make(chan protocol.Frame, 8)
+	errs := make(chan error, 1)
+	done := make(chan error, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go forwardInput(ctx, stdinR, inputFrames, mgmtFrames, ui, Config{}, errs, done)
+
+	if _, err := stdinW.Write([]byte("abc")); err != nil {
+		t.Fatalf("stdin write = %v", err)
+	}
+	_ = stdinW.Close()
+
+	select {
+	case err := <-errs:
+		t.Fatalf("forwardInput() error = %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("forwardInput() unexpected done = %v", err)
+	default:
+	}
+
+	select {
+	case frame := <-inputFrames:
+		if frame.Type != protocol.MsgInputBytes {
+			t.Fatalf("input frame type = %d", frame.Type)
+		}
+		msg, err := protocol.DecodeInputBytes(frame.Payload)
+		if err != nil {
+			t.Fatalf("DecodeInputBytes() = %v", err)
+		}
+		if msg.PaneID != 7 || string(msg.Data) != "abc" {
+			t.Fatalf("batched input = pane %d data %q", msg.PaneID, string(msg.Data))
+		}
+	default:
+		t.Fatal("expected one input frame")
+	}
+
+	select {
+	case frame := <-inputFrames:
+		t.Fatalf("unexpected extra input frame: %#v", frame)
+	default:
+	}
+
+	select {
+	case frame := <-mgmtFrames:
+		t.Fatalf("unexpected management frame: %#v", frame)
+	default:
 	}
 }

@@ -1,6 +1,10 @@
 package server
 
-import "testing"
+import (
+	"testing"
+
+	"tali/internal/server/terminal"
+)
 
 func TestPaneAndSplitLayoutsComputeExpectedRects(t *testing.T) {
 	single := (&PaneLayout{PaneID: 1}).Compute(Rect{X: 0, Y: 0, Width: 120, Height: 39})
@@ -119,5 +123,28 @@ func TestCloseFocusedPaneCollapsesSplit(t *testing.T) {
 	}
 	if _, ok := window.Layout.(*PaneLayout); !ok {
 		t.Fatalf("collapsed layout = %#v, want single pane", window.Layout)
+	}
+}
+
+func TestCreateWindowSizePrefersClientDimensionsOverSplitPane(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols = 120
+	client.TerminalRows = 39
+
+	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash", Terminal: terminal.New(120, 39)}
+	s.CreateWindow(pane0, 0)
+	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs", Terminal: terminal.New(59, 39)}
+	if _, _, err := s.SplitFocusedPane(0, pane1); err != nil {
+		t.Fatalf("SplitFocusedPane() error = %v", err)
+	}
+
+	ctrl := &controller{state: &sessionState{session: s}}
+	cols, rows, err := ctrl.createWindowSize()
+	if err != nil {
+		t.Fatalf("createWindowSize() error = %v", err)
+	}
+	if cols != 120 || rows != 39 {
+		t.Fatalf("createWindowSize() = %dx%d, want 120x39", cols, rows)
 	}
 }

@@ -1,0 +1,1 @@
+tail -f /tmp/tali-terminal.log

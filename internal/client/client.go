@@ -33,6 +33,7 @@ const (
 	quicMaxIdleTimeout  = 60 * time.Second
 	quicKeepAlivePeriod = 10 * time.Second
 	clientPingPeriod    = 15 * time.Second
+	redrawCoalesceDelay = 2 * time.Millisecond
 )
 
 type Target struct {
@@ -42,23 +43,30 @@ type Target struct {
 }
 
 type Config struct {
-	Target       Target
-	Port         int
-	PortSet      bool
-	CAFile       string
-	IdentityFile string
-	Cwd          string
-	Argv         []string
-	Stdin        *os.File
-	Stdout       io.Writer
-	Stderr       io.Writer
+	Target             Target
+	Port               int
+	PortSet            bool
+	CAFile             string
+	IdentityFile       string
+	DebugRender        bool
+	DebugRenderLogPath string
+	Cwd                string
+	Argv               []string
+	Stdin              *os.File
+	Stdout             io.Writer
+	Stderr             io.Writer
 }
 
 type runtimeState struct {
-	mu           sync.Mutex
-	ui           *render.ClientState
-	stdout       io.Writer
-	inputBlocked bool
+	mu             sync.Mutex
+	ui             *render.ClientState
+	stdout         io.Writer
+	stderr         io.Writer
+	inputBlocked   bool
+	redrawCh       chan struct{}
+	debugRender    bool
+	redrawRequests uint64
+	redrawWrites   uint64
 }
 
 type prefixState uint8
@@ -88,6 +96,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if cfg.Stdout == nil {
 		return errors.New("stdout is required")
+	}
+	renderLog := cfg.Stderr
+	if cfg.DebugRenderLogPath != "" {
+		f, err := os.Create(cfg.DebugRenderLogPath)
+		if err != nil {
+			return fmt.Errorf("open render log: %w", err)
+		}
+		defer f.Close()
+		renderLog = f
 	}
 
 	localUser, err := currentUsername()
@@ -156,7 +173,14 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	mgmtDecoder := protocol.NewDecoder(mgmtStream, protocol.DefaultMaxFrameSize)
-	ui := &runtimeState{ui: render.NewClientState(), stdout: cfg.Stdout}
+	ui := &runtimeState{
+		ui:          render.NewClientState(),
+		stdout:      cfg.Stdout,
+		stderr:      renderLog,
+		redrawCh:    make(chan struct{}, 1),
+		debugRender: cfg.DebugRender,
+	}
+	go ui.redrawLoop(ctx, streamErrs)
 	outputReady := make(chan struct{}, 1)
 	sessionDone := make(chan error, 2)
 	go acceptOutputStreams(ctx, conn, ui, mgmtFrames, outputReady, sessionDone)
@@ -467,7 +491,7 @@ func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, m
 				ui.setInputBlocked(false)
 			}
 			if needsRedraw {
-				if err := ui.redraw(); err != nil {
+				if err := ui.requestRedraw(fmt.Sprintf("output-stream slot=%d msg=%d", slot, frame.Type)); err != nil {
 					sessionDone <- err
 					return
 				}
@@ -498,7 +522,7 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 				return
 			}
 			ui.with(func(state *render.ClientState) { state.ApplyWindowLayout(msg) })
-			if err := ui.redraw(); err != nil {
+			if err := ui.requestRedraw("window-layout"); err != nil {
 				done <- err
 				return
 			}
@@ -509,7 +533,7 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 				return
 			}
 			ui.with(func(state *render.ClientState) { state.ApplyWindowList(msg) })
-			if err := ui.redraw(); err != nil {
+			if err := ui.requestRedraw("window-list"); err != nil {
 				done <- err
 				return
 			}
@@ -534,7 +558,7 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 				return
 			}
 			ui.with(func(state *render.ClientState) { state.ApplyWindowSelected(msg) })
-			if err := ui.redraw(); err != nil {
+			if err := ui.requestRedraw("window-selected"); err != nil {
 				done <- err
 				return
 			}
@@ -545,7 +569,7 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 				return
 			}
 			ui.with(func(state *render.ClientState) { state.ApplyWindowClosed(msg.WindowID) })
-			if err := ui.redraw(); err != nil {
+			if err := ui.requestRedraw("window-closed"); err != nil {
 				done <- err
 				return
 			}
@@ -575,26 +599,46 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 
 func forwardInput(ctx context.Context, stdin *os.File, inputFrames, mgmtFrames chan<- protocol.Frame, ui *runtimeState, cfg Config, errs chan<- error, done chan<- error) {
 	buf := make([]byte, 4096)
+	pending := make([]byte, 0, len(buf))
 	prefix := prefixIdle
+	flushPending := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		if waitErr := ui.waitForInputReady(ctx); waitErr != nil {
+			return waitErr
+		}
+		if sendErr := sendInputBytes(inputFrames, ui.activePaneID(), append([]byte(nil), pending...)); sendErr != nil {
+			return sendErr
+		}
+		pending = pending[:0]
+		return nil
+	}
 	for {
 		n, err := stdin.Read(buf)
 		if n > 0 {
 			for _, b := range buf[:n] {
 				inputs, mgmts, detach := processInputByte(&prefix, b, ui, cfg)
 				if detach {
+					if flushErr := flushPending(); flushErr != nil {
+						if ctx.Err() != nil {
+							return
+						}
+						errs <- flushErr
+						return
+					}
 					done <- errDetachRequested
 					return
 				}
 				for _, payload := range inputs {
-					if waitErr := ui.waitForInputReady(ctx); waitErr != nil {
+					pending = append(pending, payload...)
+				}
+				if len(mgmts) > 0 {
+					if flushErr := flushPending(); flushErr != nil {
 						if ctx.Err() != nil {
 							return
 						}
-						errs <- waitErr
-						return
-					}
-					if sendErr := sendInputBytes(inputFrames, ui.activePaneID(), payload); sendErr != nil {
-						errs <- sendErr
+						errs <- flushErr
 						return
 					}
 				}
@@ -604,6 +648,13 @@ func forwardInput(ctx context.Context, stdin *os.File, inputFrames, mgmtFrames c
 						return
 					}
 				}
+			}
+			if flushErr := flushPending(); flushErr != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				errs <- flushErr
+				return
 			}
 		}
 		if err != nil {
@@ -728,7 +779,7 @@ func forwardResize(ctx context.Context, tty *os.File, inputFrames chan<- protoco
 				errs <- sendErr
 				return
 			}
-			if err := ui.redraw(); err != nil {
+			if err := ui.requestRedraw("resize"); err != nil {
 				errs <- err
 				return
 			}
@@ -813,11 +864,80 @@ func (r *runtimeState) with(fn func(*render.ClientState)) {
 	fn(r.ui)
 }
 
+func (r *runtimeState) redrawLoop(ctx context.Context, errs chan<- error) {
+	if r.redrawCh == nil {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.redrawCh:
+		}
+
+		timer := time.NewTimer(redrawCoalesceDelay)
+	coalesce:
+		for {
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			case <-r.redrawCh:
+			case <-timer.C:
+				break coalesce
+			}
+		}
+
+		r.logRenderf("redraw flush")
+		if err := r.redraw(); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			errs <- err
+			return
+		}
+	}
+}
+
+func (r *runtimeState) requestRedraw(reason string) error {
+	r.mu.Lock()
+	r.redrawRequests++
+	req := r.redrawRequests
+	r.mu.Unlock()
+	r.logRenderf("redraw request #%d: %s", req, reason)
+	if r.redrawCh == nil {
+		return r.redraw()
+	}
+	select {
+	case r.redrawCh <- struct{}{}:
+		r.logRenderf("redraw queued #%d", req)
+	default:
+		r.logRenderf("redraw coalesced #%d", req)
+	}
+	return nil
+}
+
 func (r *runtimeState) redraw() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	_, err := r.stdout.Write(render.RenderANSI(r.ui))
+	buf := render.RenderANSI(r.ui)
+	r.redrawWrites++
+	writeNo := r.redrawWrites
+	r.mu.Unlock()
+	r.logRenderf("redraw write #%d bytes=%d", writeNo, len(buf))
+	_, err := r.stdout.Write(buf)
 	return err
+}
+
+func (r *runtimeState) logRenderf(format string, args ...any) {
+	if !r.debugRender || r.stderr == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(r.stderr, "tali render: "+format+"\n", args...)
 }
 
 func (r *runtimeState) activePaneID() uint64 {

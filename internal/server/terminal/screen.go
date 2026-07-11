@@ -1,8 +1,6 @@
 package terminal
 
-import (
-	"unicode/utf8"
-)
+import "unicode/utf8"
 
 type Update struct {
 	DirtyRows     map[int]struct{}
@@ -10,22 +8,54 @@ type Update struct {
 	DefinedStyles map[uint32]Style
 	CursorChanged bool
 	VisibleChange bool
+	Replies       [][]byte
+}
+
+type Row struct {
+	Cells     []Cell
+	WrapsNext bool
 }
 
 type TerminalState struct {
 	Cols          int
 	Rows          int
 	Cells         []Cell
+	GridRows      []Row
 	CursorX       int
 	CursorY       int
 	CurrentStyle  Style
 	CursorVisible bool
 	Parser        Parser
 	wrapPending   bool
+	SavedCursor   SavedCursor
+	ScrollTop     int
+	ScrollBottom  int
 
 	styleByID   map[uint32]Style
 	styleToID   map[Style]uint32
 	nextStyleID uint32
+}
+
+type SavedCursor struct {
+	X           int
+	Y           int
+	Style       Style
+	WrapPending bool
+	Valid       bool
+}
+
+type logicalLine struct {
+	cells        []Cell
+	reflowable   bool
+	cursorHere   bool
+	cursorOffset int
+}
+
+type reflowRow struct {
+	cells      []Cell
+	continued  bool
+	cursorHere bool
+	cursorCol  int
 }
 
 func New(cols, rows int) *TerminalState {
@@ -37,11 +67,13 @@ func New(cols, rows int) *TerminalState {
 		styleByID:     map[uint32]Style{0: DefaultStyle},
 		styleToID:     map[Style]uint32{DefaultStyle: 0},
 		nextStyleID:   1,
+		ScrollBottom:  rows - 1,
 	}
-	t.Cells = make([]Cell, cols*rows)
-	for i := range t.Cells {
-		t.Cells[i] = blankCell(0)
+	t.GridRows = make([]Row, rows)
+	for row := range t.GridRows {
+		t.GridRows[row] = blankRow(cols, 0)
 	}
+	t.syncCellsFromRows()
 	return t
 }
 
@@ -54,24 +86,52 @@ func (t *TerminalState) Resize(cols, rows int) {
 	next.CursorVisible = t.CursorVisible
 	next.Parser = t.Parser
 	next.wrapPending = t.wrapPending
-	next.styleByID = make(map[uint32]Style, len(t.styleByID))
-	for id, style := range t.styleByID {
-		next.styleByID[id] = style
-	}
-	next.styleToID = make(map[Style]uint32, len(t.styleToID))
-	for style, id := range t.styleToID {
-		next.styleToID[style] = id
-	}
+	next.styleByID = cloneStyleMap(t.styleByID)
+	next.styleToID = cloneStyleIDMap(t.styleToID)
 	next.nextStyleID = t.nextStyleID
 
-	copyCols := min(t.Cols, cols)
-	copyRows := min(t.Rows, rows)
-	for row := 0; row < copyRows; row++ {
-		copy(next.Cells[row*cols:row*cols+copyCols], t.Cells[row*t.Cols:row*t.Cols+copyCols])
+	lines := t.collectLogicalLines()
+	projected := make([]reflowRow, 0, max(rows, len(lines)))
+	cursorProjectedRow, cursorProjectedCol := 0, 0
+	cursorPlaced := false
+	for _, line := range lines {
+		rowsForLine := t.projectLogicalLine(line, cols)
+		start := len(projected)
+		projected = append(projected, rowsForLine...)
+		if line.cursorHere {
+			cursorProjectedRow, cursorProjectedCol = mapCursorOffset(start, rowsForLine, line.cursorOffset, cols)
+			cursorPlaced = true
+		}
 	}
-	next.CursorX = t.CursorX
-	next.CursorY = t.CursorY
+
+	start := 0
+	if len(projected) > rows {
+		start = len(projected) - rows
+	}
+	visible := projected[start:]
+	if len(visible) > rows {
+		visible = visible[:rows]
+	}
+	for row := range next.GridRows {
+		next.GridRows[row] = blankRow(cols, 0)
+	}
+	for row, src := range visible {
+		copy(next.GridRows[row].Cells, src.cells)
+		next.GridRows[row].WrapsNext = src.continued
+		if src.cursorHere {
+			next.CursorY = row
+			next.CursorX = src.cursorCol
+		}
+	}
+	if cursorPlaced {
+		cursorProjectedRow -= start
+		if cursorProjectedRow >= 0 && cursorProjectedRow < len(visible) {
+			next.CursorY = cursorProjectedRow
+			next.CursorX = cursorProjectedCol
+		}
+	}
 	next.clampCursor()
+	next.syncCellsFromRows()
 	*t = *next
 }
 
@@ -108,6 +168,7 @@ func (t *TerminalState) Apply(data []byte) Update {
 			case 0x1b:
 				t.Parser.state = parserESC
 			case '\r':
+				t.breakWrapChainAt(t.CursorY)
 				t.CursorX = 0
 				t.wrapPending = false
 				update.CursorChanged = true
@@ -115,9 +176,10 @@ func (t *TerminalState) Apply(data []byte) Update {
 				if t.wrapPending {
 					t.CursorX = 0
 				}
-				t.lineFeed()
+				if t.lineFeed() {
+					update.FullRedraw = true
+				}
 				t.wrapPending = false
-				update.FullRedraw = true
 				update.CursorChanged = true
 			case '\b':
 				if t.CursorX > 0 {
@@ -150,9 +212,19 @@ func (t *TerminalState) Apply(data []byte) Update {
 			case ']':
 				t.Parser.state = parserOSC
 				t.Parser.oscBuf.Reset()
+			case '7':
+				t.saveCursor()
+				t.Parser.state = parserText
+			case '8':
+				t.restoreCursor()
+				t.Parser.state = parserText
+			case 'M':
+				t.reverseIndex(&update)
+				t.Parser.state = parserText
 			case '(', ')', '*', '+', '-', '.', '/':
 				t.Parser.state = parserESCCharset
 			default:
+				logUnsupportedf("unsupported ESC %q", data[0])
 				t.Parser.state = parserText
 			}
 			data = data[1:]
@@ -218,6 +290,7 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 		return
 	}
 	if t.wrapPending {
+		t.setRowWrapped(t.CursorY, true)
 		t.wrapPending = false
 		t.CursorX = 0
 		if t.CursorY == t.Rows-1 {
@@ -231,13 +304,14 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 	if added {
 		update.DefinedStyles[styleID] = t.CurrentStyle
 	}
-	idx := t.CursorY*t.Cols + t.CursorX
-	t.Cells[idx] = Cell{Rune: r, StyleID: styleID, Width: 1}
+	t.GridRows[t.CursorY].Cells[t.CursorX] = Cell{Rune: r, StyleID: styleID, Width: 1}
+	t.syncRowToCells(t.CursorY)
 	update.DirtyRows[t.CursorY] = struct{}{}
 	if t.CursorX == t.Cols-1 {
 		t.wrapPending = true
 	} else {
 		t.CursorX++
+		t.setRowWrapped(t.CursorY, false)
 	}
 	update.CursorChanged = true
 }
@@ -246,62 +320,89 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 	if seq == "" {
 		return
 	}
-	private := false
-	if seq[0] == '?' {
-		private = true
-		seq = seq[1:]
-	}
-	if seq == "" {
-		return
-	}
-	final := seq[len(seq)-1]
-	params := parseCSIParams(seq[:len(seq)-1])
-	if private {
-		switch final {
+	parsed := parseCSISequence(seq)
+	switch parsed.PrivatePrefix {
+	case '?':
+		switch parsed.Final {
 		case 'h':
-			if len(params) == 1 && params[0] == 25 {
+			if len(parsed.Params) == 1 && parsed.Params[0] == 25 {
 				t.CursorVisible = true
 				update.VisibleChange = true
+				return
 			}
+			logUnsupportedf("unsupported private CSI ?%s", seq)
 		case 'l':
-			if len(params) == 1 && params[0] == 25 {
+			if len(parsed.Params) == 1 && parsed.Params[0] == 25 {
 				t.CursorVisible = false
 				update.VisibleChange = true
+				return
 			}
+			logUnsupportedf("unsupported private CSI ?%s", seq)
+		default:
+			logUnsupportedf("unsupported private CSI ?%s", seq)
 		}
+		return
+	case 0:
+	default:
+		logUnsupportedf("unsupported prefixed CSI %s", seq)
 		return
 	}
 
-	switch final {
+	switch parsed.Final {
 	case 'A':
-		t.CursorY -= max1(params, 1)
+		t.breakWrapChainAt(t.CursorY)
+		t.CursorY -= max1(parsed.Params, 1)
 	case 'B':
-		t.CursorY += max1(params, 1)
+		t.breakWrapChainAt(t.CursorY)
+		t.CursorY += max1(parsed.Params, 1)
 	case 'C':
-		t.CursorX += max1(params, 1)
+		t.CursorX += max1(parsed.Params, 1)
 	case 'D':
-		t.CursorX -= max1(params, 1)
+		t.CursorX -= max1(parsed.Params, 1)
 	case 'H', 'f':
-		row := paramOr(params, 0, 1) - 1
-		col := paramOr(params, 1, 1) - 1
+		t.breakWrapChainAt(t.CursorY)
+		row := paramOr(parsed.Params, 0, 1) - 1
+		col := paramOr(parsed.Params, 1, 1) - 1
 		t.CursorY, t.CursorX = row, col
 	case 'G':
-		t.CursorX = paramOr(params, 0, 1) - 1
+		t.CursorX = paramOr(parsed.Params, 0, 1) - 1
 	case 'd':
-		t.CursorY = paramOr(params, 0, 1) - 1
+		t.breakWrapChainAt(t.CursorY)
+		t.CursorY = paramOr(parsed.Params, 0, 1) - 1
 	case 'J':
-		t.eraseDisplay(paramOr(params, 0, 0))
+		t.breakAllWrapChains()
+		t.eraseDisplay(paramOr(parsed.Params, 0, 0))
 		update.FullRedraw = true
 	case 'K':
-		t.eraseLine(paramOr(params, 0, 0))
+		t.breakWrapChainAt(t.CursorY)
+		t.eraseLine(paramOr(parsed.Params, 0, 0))
 		update.FullRedraw = true
 	case 'X':
-		t.eraseChars(max1(params, 1))
+		t.breakWrapChainAt(t.CursorY)
+		t.eraseChars(max1(parsed.Params, 1))
 		update.FullRedraw = true
+	case 'P':
+		t.breakWrapChainAt(t.CursorY)
+		t.deleteChars(max1(parsed.Params, 1))
+		update.DirtyRows[t.CursorY] = struct{}{}
+	case 'r':
+		t.setScrollRegion(parsed.Params)
+		t.CursorX, t.CursorY = 0, 0
+	case 'n':
+		if len(parsed.Params) == 1 && parsed.Params[0] == 6 {
+			update.Replies = append(update.Replies, []byte(formatDSR(t.CursorY+1, t.CursorX+1)))
+			return
+		}
+		logUnsupportedf("unsupported CSI %s", seq)
+		return
+	case 'c':
+		update.Replies = append(update.Replies, []byte("\x1b[?1;0c"))
+		return
 	case 'm':
-		t.applySGR(params, update)
+		t.applySGR(parsed.Params, update)
 	case 'h', 'l':
 	default:
+		logUnsupportedf("unsupported CSI %s", seq)
 		return
 	}
 	t.clampCursor()
@@ -396,8 +497,9 @@ func (t *TerminalState) eraseDisplay(mode int) {
 			t.fillRow(row, start, end, styleID)
 		}
 	case 2:
-		for i := range t.Cells {
-			t.Cells[i] = blankCell(styleID)
+		for row := range t.GridRows {
+			t.GridRows[row] = blankRow(t.Cols, styleID)
+			t.syncRowToCells(row)
 		}
 	default:
 		for row := t.CursorY; row < t.Rows; row++ {
@@ -441,25 +543,146 @@ func (t *TerminalState) fillRow(row, start, end int, styleID uint32) {
 	if end > t.Cols {
 		end = t.Cols
 	}
+	t.setRowWrapped(row, false)
 	for col := start; col < end; col++ {
-		t.Cells[row*t.Cols+col] = blankCell(styleID)
+		t.GridRows[row].Cells[col] = blankCell(styleID)
 	}
+	t.syncRowToCells(row)
 }
 
 func (t *TerminalState) scrollUp() {
-	copy(t.Cells, t.Cells[t.Cols:])
-	lastRow := (t.Rows - 1) * t.Cols
-	for i := 0; i < t.Cols; i++ {
-		t.Cells[lastRow+i] = blankCell(0)
+	t.scrollUpRegion(t.ScrollTop, t.ScrollBottom)
+}
+
+func (t *TerminalState) scrollUpRegion(top, bottom int) {
+	if top < 0 || bottom >= len(t.GridRows) || top >= bottom {
+		return
+	}
+	copy(t.GridRows[top:bottom], t.GridRows[top+1:bottom+1])
+	t.GridRows[bottom] = blankRow(t.Cols, 0)
+	t.breakWrapChainAt(top)
+	t.breakWrapChainAt(bottom)
+	t.syncCellsFromRows()
+}
+
+func (t *TerminalState) scrollDownRegion(top, bottom int) {
+	if top < 0 || bottom >= len(t.GridRows) || top >= bottom {
+		return
+	}
+	copy(t.GridRows[top+1:bottom+1], t.GridRows[top:bottom])
+	t.GridRows[top] = blankRow(t.Cols, 0)
+	t.breakWrapChainAt(top)
+	t.breakWrapChainAt(bottom)
+	t.syncCellsFromRows()
+}
+
+func (t *TerminalState) reverseIndex(update *Update) {
+	if t.CursorY > t.ScrollTop {
+		t.CursorY--
+		update.CursorChanged = true
+		return
+	}
+	t.scrollDownRegion(t.ScrollTop, t.ScrollBottom)
+	update.FullRedraw = true
+	update.CursorChanged = true
+}
+
+func (t *TerminalState) saveCursor() {
+	t.SavedCursor = SavedCursor{
+		X:           t.CursorX,
+		Y:           t.CursorY,
+		Style:       t.CurrentStyle,
+		WrapPending: t.wrapPending,
+		Valid:       true,
 	}
 }
 
-func (t *TerminalState) lineFeed() {
-	if t.CursorY == t.Rows-1 {
-		t.scrollUp()
-	} else {
-		t.CursorY++
+func (t *TerminalState) restoreCursor() {
+	if !t.SavedCursor.Valid {
+		return
 	}
+	t.CursorX = t.SavedCursor.X
+	t.CursorY = t.SavedCursor.Y
+	t.CurrentStyle = t.SavedCursor.Style
+	t.wrapPending = t.SavedCursor.WrapPending
+	t.clampCursor()
+}
+
+func (t *TerminalState) setScrollRegion(params []int) {
+	top, bottom := 0, t.Rows-1
+	if len(params) > 0 {
+		top = paramOr(params, 0, 1) - 1
+	}
+	if len(params) > 1 {
+		bottom = paramOr(params, 1, t.Rows) - 1
+	}
+	if top < 0 || bottom >= t.Rows || top >= bottom {
+		top, bottom = 0, t.Rows-1
+	}
+	t.ScrollTop = top
+	t.ScrollBottom = bottom
+	t.wrapPending = false
+}
+
+func (t *TerminalState) deleteChars(n int) {
+	if t.CursorY < 0 || t.CursorY >= t.Rows || n <= 0 {
+		return
+	}
+	row := t.GridRows[t.CursorY].Cells
+	if t.CursorX < 0 || t.CursorX >= len(row) {
+		return
+	}
+	if n > len(row)-t.CursorX {
+		n = len(row) - t.CursorX
+	}
+	copy(row[t.CursorX:], row[t.CursorX+n:])
+	for i := len(row) - n; i < len(row); i++ {
+		row[i] = blankCell(0)
+	}
+	t.normalizeRow(t.CursorY)
+	t.syncRowToCells(t.CursorY)
+}
+
+func (t *TerminalState) normalizeRow(row int) {
+	if row < 0 || row >= t.Rows {
+		return
+	}
+	cells := t.GridRows[row].Cells
+	for i := 0; i < len(cells); i++ {
+		if cells[i].Width == 0 {
+			if i == 0 || cells[i-1].Width <= 1 {
+				cells[i] = blankCell(0)
+			}
+		}
+	}
+}
+
+func formatDSR(row, col int) string {
+	return "\x1b[" + itoa(row) + ";" + itoa(col) + "R"
+}
+
+func itoa(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(buf[i:])
+}
+
+func (t *TerminalState) lineFeed() bool {
+	t.breakWrapChainAt(t.CursorY)
+	if t.CursorY == t.ScrollBottom {
+		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom)
+		return true
+	}
+	t.CursorY++
+	return false
 }
 
 func (t *TerminalState) styleID(style Style) (uint32, bool) {
@@ -488,6 +711,156 @@ func (t *TerminalState) clampCursor() {
 	}
 }
 
+func (t *TerminalState) collectLogicalLines() []logicalLine {
+	lines := make([]logicalLine, 0, t.Rows)
+	current := logicalLine{reflowable: true}
+	for row := 0; row < t.Rows; row++ {
+		segment := append([]Cell(nil), t.GridRows[row].Cells...)
+		if !t.GridRows[row].WrapsNext {
+			segment = trimTrailingBlankCells(segment)
+		}
+		if row == t.CursorY {
+			current.cursorHere = true
+			current.cursorOffset = len(current.cells) + min(t.CursorX, len(segment))
+		}
+		current.cells = append(current.cells, segment...)
+		if !t.GridRows[row].WrapsNext {
+			lines = append(lines, current)
+			current = logicalLine{reflowable: true}
+		}
+	}
+	if len(current.cells) > 0 || current.cursorHere {
+		lines = append(lines, current)
+	}
+	for len(lines) > 0 {
+		last := lines[len(lines)-1]
+		if last.cursorHere || len(last.cells) > 0 {
+			break
+		}
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return []logicalLine{{reflowable: true}}
+	}
+	return lines
+}
+
+func (t *TerminalState) projectLogicalLine(line logicalLine, cols int) []reflowRow {
+	if cols <= 0 {
+		return nil
+	}
+	if len(line.cells) == 0 {
+		return []reflowRow{{cursorHere: line.cursorHere, cursorCol: line.cursorOffset}}
+	}
+	if !line.reflowable {
+		row := reflowRow{
+			cells:      make([]Cell, cols),
+			continued:  false,
+			cursorHere: line.cursorHere,
+			cursorCol:  min(line.cursorOffset, cols-1),
+		}
+		for i := range row.cells {
+			row.cells[i] = blankCell(0)
+		}
+		copy(row.cells, line.cells[:min(len(line.cells), cols)])
+		return []reflowRow{row}
+	}
+	out := make([]reflowRow, 0, (len(line.cells)+cols-1)/cols)
+	for start := 0; start < len(line.cells); start += cols {
+		end := start + cols
+		if end > len(line.cells) {
+			end = len(line.cells)
+		}
+		row := reflowRow{
+			cells:     make([]Cell, cols),
+			continued: end < len(line.cells),
+		}
+		for i := range row.cells {
+			row.cells[i] = blankCell(0)
+		}
+		copy(row.cells, line.cells[start:end])
+		if line.cursorHere && line.cursorOffset >= start && line.cursorOffset <= end {
+			row.cursorHere = true
+			row.cursorCol = line.cursorOffset - start
+			if row.cursorCol >= cols {
+				row.cursorCol = cols - 1
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+func mapCursorOffset(start int, rows []reflowRow, offset, cols int) (int, int) {
+	if cols <= 0 || len(rows) == 0 {
+		return start, 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return start + (offset / cols), offset % cols
+}
+
+func (t *TerminalState) setRowWrapped(row int, wrapped bool) {
+	if row >= 0 && row < len(t.GridRows) {
+		t.GridRows[row].WrapsNext = wrapped
+	}
+}
+
+func (t *TerminalState) breakWrapChainAt(row int) {
+	if row >= 0 && row < len(t.GridRows) {
+		t.GridRows[row].WrapsNext = false
+	}
+	if row > 0 && row-1 < len(t.GridRows) {
+		t.GridRows[row-1].WrapsNext = false
+	}
+}
+
+func (t *TerminalState) breakAllWrapChains() {
+	for row := range t.GridRows {
+		t.GridRows[row].WrapsNext = false
+	}
+}
+
+func (t *TerminalState) syncCellsFromRows() {
+	t.Cells = make([]Cell, t.Cols*t.Rows)
+	for row := 0; row < t.Rows; row++ {
+		copy(t.Cells[row*t.Cols:(row+1)*t.Cols], t.GridRows[row].Cells)
+	}
+}
+
+func (t *TerminalState) syncRowToCells(row int) {
+	if row < 0 || row >= t.Rows || len(t.Cells) != t.Cols*t.Rows {
+		t.syncCellsFromRows()
+		return
+	}
+	copy(t.Cells[row*t.Cols:(row+1)*t.Cols], t.GridRows[row].Cells)
+}
+
+func blankRow(cols int, styleID uint32) Row {
+	row := Row{Cells: make([]Cell, cols)}
+	for i := range row.Cells {
+		row.Cells[i] = blankCell(styleID)
+	}
+	return row
+}
+
+func cloneStyleMap(in map[uint32]Style) map[uint32]Style {
+	out := make(map[uint32]Style, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneStyleIDMap(in map[Style]uint32) map[Style]uint32 {
+	out := make(map[Style]uint32, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 func paramOr(params []int, idx, def int) int {
 	if idx >= len(params) || params[idx] == 0 {
 		return def
@@ -508,4 +881,23 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func trimTrailingBlankCells(cells []Cell) []Cell {
+	end := len(cells)
+	for end > 0 {
+		cell := cells[end-1]
+		if cell.Rune != 0 && cell.Rune != ' ' {
+			break
+		}
+		end--
+	}
+	return cells[:end]
 }

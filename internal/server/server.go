@@ -27,11 +27,12 @@ const (
 )
 
 type Config struct {
-	ListenAddr string
-	CertFile   string
-	KeyFile    string
-	Stdout     io.Writer
-	Stderr     io.Writer
+	ListenAddr       string
+	CertFile         string
+	KeyFile          string
+	Stdout           io.Writer
+	Stderr           io.Writer
+	TerminalDebugLog io.Writer
 }
 
 type paneRequest struct {
@@ -60,6 +61,7 @@ type controller struct {
 }
 
 func Run(ctx context.Context, cfg Config) error {
+	terminal.SetDebugLogger(cfg.TerminalDebugLog)
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
 		return fmt.Errorf("load TLS key pair: %w", err)
@@ -287,6 +289,26 @@ func (c *controller) createWindow(cwd string, argv []string, cols, rows uint16) 
 	return pane, window, clientState, nil
 }
 
+func (c *controller) createWindowSize() (uint16, uint16, error) {
+	if clientState := c.state.session.SnapshotClient(clientID0); clientState != nil {
+		if clientState.TerminalCols > 0 && clientState.TerminalRows > 0 {
+			return clientState.TerminalCols, clientState.TerminalRows, nil
+		}
+	}
+	activePane, _ := c.state.session.ActivePane(clientID0)
+	if activePane == nil {
+		return 0, 0, fmt.Errorf("create window: no active pane")
+	}
+	return uint16(activePane.Terminal.Cols), uint16(activePane.Terminal.Rows), nil
+}
+
+func (c *controller) resizeSessionToClient(clientState *ClientState) {
+	if clientState == nil || clientState.TerminalCols == 0 || clientState.TerminalRows == 0 {
+		return
+	}
+	c.state.session.ResizeAll(clientState.TerminalCols, clientState.TerminalRows)
+}
+
 func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- error) {
 	for {
 		frame, err := decoder.ReadFrame()
@@ -305,8 +327,11 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				done <- err
 				return
 			}
-			activePane, _ := c.state.session.ActivePane(clientID0)
-			cols, rows := uint16(activePane.Terminal.Cols), uint16(activePane.Terminal.Rows)
+			cols, rows, err := c.createWindowSize()
+			if err != nil {
+				done <- err
+				return
+			}
 			pane, window, clientState, err := c.createWindow(msg.Cwd, msg.Argv, cols, rows)
 			if err != nil {
 				done <- err
@@ -462,6 +487,7 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				return
 			}
 			if replacement != nil && pane != nil && clientState != nil {
+				c.resizeSessionToClient(clientState)
 				if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: replacement.ID, PaneID: pane.ID}, protocol.EncodeWindowSelected); err != nil {
 					done <- err
 					return
@@ -512,6 +538,7 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				}
 			}
 			if window != nil && clientState != nil {
+				c.resizeSessionToClient(clientState)
 				if err := sendEncoded(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: clientState.FocusedPaneID}, protocol.EncodeWindowSelected); err != nil {
 					done <- err
 					return
@@ -594,7 +621,7 @@ func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
 			if pane == nil {
 				continue
 			}
-			if _, err := pane.PTY.Write(msg.Data); err != nil {
+			if _, err := pane.WriteInput(msg.Data); err != nil {
 				done <- fmt.Errorf("write pty: %w", err)
 				return
 			}
@@ -631,6 +658,11 @@ func (c *controller) relayPTYToTerminal(pane *Pane) {
 		n, err := pane.PTY.Read(buf)
 		if n > 0 {
 			update := pane.Terminal.Apply(buf[:n])
+			for _, reply := range update.Replies {
+				if _, err := pane.WriteInput(reply); err != nil {
+					return
+				}
+			}
 			if sendErr := c.emitTerminalUpdate(pane, update); sendErr != nil {
 				return
 			}

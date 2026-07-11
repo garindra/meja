@@ -126,6 +126,7 @@ func TestWindowListDoesNotOverrideExplicitSelection(t *testing.T) {
 
 func TestWindowLayoutStoresMultiplePaneRectsAndFocusOrder(t *testing.T) {
 	state := NewClientState()
+	state.SetTerminalSize(12, 4)
 	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID:       1,
@@ -140,6 +141,28 @@ func TestWindowLayoutStoresMultiplePaneRectsAndFocusOrder(t *testing.T) {
 	}
 	if got, ok := state.NextFocusablePaneID(); !ok || got != 11 {
 		t.Fatalf("NextFocusablePaneID() = %d, %v; want 11, true", got, ok)
+	}
+}
+
+func TestWindowSelectionResetsStaleSplitLayout(t *testing.T) {
+	state := NewClientState()
+	state.SetTerminalSize(12, 4)
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
+	state.ApplyWindowLayout(protocol.WindowLayout{
+		WindowID: 1,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 10, Rect: protocol.Rect{X: 0, Y: 0, Width: 5, Height: 3}},
+			{PaneID: 11, Rect: protocol.Rect{X: 6, Y: 0, Width: 6, Height: 3}},
+		},
+	})
+
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 20})
+
+	if state.Layout.WindowID != 2 || len(state.Layout.Panes) != 1 {
+		t.Fatalf("reset layout = %#v", state.Layout)
+	}
+	if got := state.Layout.Panes[0].Rect; got.Width != 12 || got.Height != 3 || got.X != 0 || got.Y != 0 {
+		t.Fatalf("provisional pane rect = %#v", got)
 	}
 }
 
