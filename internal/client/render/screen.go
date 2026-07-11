@@ -9,15 +9,24 @@ type Screen struct {
 }
 
 type ClientState struct {
-	SessionID     uint64
-	WindowID      uint64
-	PaneID        uint64
+	SessionID uint64
+
+	ActiveWindowID uint64
+	FocusedPaneID  uint64
+	Windows        []protocol.WindowInfo
+
 	Grid          Screen
 	Generation    uint64
 	Cursor        protocol.Cursor
 	CursorVisible bool
-	LastRendered  Screen
-	Styles        map[uint32]protocol.Style
+
+	TerminalCols int
+	TerminalRows int
+
+	BindingGeneration uint64
+
+	LastRendered Screen
+	Styles       map[uint32]protocol.Style
 }
 
 func NewClientState() *ClientState {
@@ -31,10 +40,79 @@ func NewClientState() *ClientState {
 	}
 }
 
-func (s *ClientState) ApplyReplace(msg protocol.ReplacePane) {
+func (s *ClientState) SetTerminalSize(cols, rows int) {
+	s.TerminalCols = cols
+	s.TerminalRows = rows
+}
+
+func (s *ClientState) DrawableRows() int {
+	if s.TerminalRows <= 1 {
+		return 1
+	}
+	return s.TerminalRows - 1
+}
+
+func (s *ClientState) ApplyWindowList(msg protocol.WindowList) {
+	s.Windows = append([]protocol.WindowInfo(nil), msg.Windows...)
+	s.ActiveWindowID = msg.ActiveWindowID
+	for _, w := range s.Windows {
+		if w.Active {
+			s.FocusedPaneID = w.PaneID
+			s.ActiveWindowID = w.WindowID
+			return
+		}
+	}
+	for _, w := range s.Windows {
+		if w.WindowID == s.ActiveWindowID {
+			s.FocusedPaneID = w.PaneID
+			return
+		}
+	}
+}
+
+func (s *ClientState) ApplyWindowSelected(msg protocol.WindowSelected) {
+	s.ActiveWindowID = msg.WindowID
+	s.FocusedPaneID = msg.PaneID
+	for i := range s.Windows {
+		s.Windows[i].Active = s.Windows[i].WindowID == msg.WindowID
+	}
+}
+
+func (s *ClientState) ApplyWindowClosed(windowID uint64) {
+	out := s.Windows[:0]
+	for _, w := range s.Windows {
+		if w.WindowID != windowID {
+			out = append(out, w)
+		}
+	}
+	s.Windows = out
+}
+
+func (s *ClientState) ApplyBind(msg protocol.BindRenderStream) {
 	s.SessionID = msg.SessionID
-	s.WindowID = msg.WindowID
-	s.PaneID = msg.PaneID
+	s.ActiveWindowID = msg.WindowID
+	s.FocusedPaneID = msg.PaneID
+	s.BindingGeneration = msg.BindingGeneration
+	s.Grid = Screen{}
+	s.Generation = 0
+	s.Cursor = protocol.Cursor{}
+	s.CursorVisible = true
+	s.LastRendered = Screen{}
+	s.Styles = map[uint32]protocol.Style{
+		0: {
+			FG: protocol.Color{Mode: "default"},
+			BG: protocol.Color{Mode: "default"},
+		},
+	}
+}
+
+func (s *ClientState) ApplyReplace(msg protocol.ReplacePane) bool {
+	if msg.BindingGeneration != s.BindingGeneration {
+		return false
+	}
+	s.SessionID = msg.SessionID
+	s.ActiveWindowID = msg.WindowID
+	s.FocusedPaneID = msg.PaneID
 	s.Generation = msg.Generation
 	s.Cursor = msg.Cursor
 	s.CursorVisible = msg.CursorVisible
@@ -45,10 +123,11 @@ func (s *ClientState) ApplyReplace(msg protocol.ReplacePane) {
 	for _, def := range msg.Styles {
 		s.Styles[def.ID] = def.Style
 	}
+	return true
 }
 
 func (s *ClientState) ApplySetRun(msg protocol.SetRun) bool {
-	if s.Generation != msg.BaseGeneration {
+	if msg.BindingGeneration != s.BindingGeneration || s.Generation != msg.BaseGeneration {
 		return false
 	}
 	if msg.Row < 0 || msg.Row >= s.Grid.Rows || msg.Column < 0 || msg.Column >= s.Grid.Cols {
@@ -67,7 +146,7 @@ func (s *ClientState) ApplySetRun(msg protocol.SetRun) bool {
 }
 
 func (s *ClientState) ApplySetCursor(msg protocol.SetCursor) bool {
-	if s.Generation != msg.BaseGeneration {
+	if msg.BindingGeneration != s.BindingGeneration || s.Generation != msg.BaseGeneration {
 		return false
 	}
 	s.Cursor = msg.Cursor
@@ -76,7 +155,7 @@ func (s *ClientState) ApplySetCursor(msg protocol.SetCursor) bool {
 }
 
 func (s *ClientState) ApplySetCursorVisible(msg protocol.SetCursorVisible) bool {
-	if s.Generation != msg.BaseGeneration {
+	if msg.BindingGeneration != s.BindingGeneration || s.Generation != msg.BaseGeneration {
 		return false
 	}
 	s.CursorVisible = msg.Visible
@@ -84,9 +163,46 @@ func (s *ClientState) ApplySetCursorVisible(msg protocol.SetCursorVisible) bool 
 	return true
 }
 
-func (s *ClientState) DefineStyle(msg protocol.DefineStyle) {
+func (s *ClientState) DefineStyle(msg protocol.DefineStyle) bool {
+	if msg.BindingGeneration != s.BindingGeneration {
+		return false
+	}
 	if s.Styles == nil {
 		s.Styles = map[uint32]protocol.Style{}
 	}
 	s.Styles[msg.ID] = msg.Style
+	return true
+}
+
+func (s *ClientState) NextWindowID() (uint64, bool) {
+	if len(s.Windows) == 0 {
+		return 0, false
+	}
+	for i, w := range s.Windows {
+		if w.WindowID == s.ActiveWindowID {
+			return s.Windows[(i+1)%len(s.Windows)].WindowID, true
+		}
+	}
+	return s.Windows[0].WindowID, true
+}
+
+func (s *ClientState) PreviousWindowID() (uint64, bool) {
+	if len(s.Windows) == 0 {
+		return 0, false
+	}
+	for i, w := range s.Windows {
+		if w.WindowID == s.ActiveWindowID {
+			return s.Windows[(i-1+len(s.Windows))%len(s.Windows)].WindowID, true
+		}
+	}
+	return s.Windows[0].WindowID, true
+}
+
+func (s *ClientState) WindowIDByIndex(index int) (uint64, bool) {
+	for _, w := range s.Windows {
+		if w.Index == index {
+			return w.WindowID, true
+		}
+	}
+	return 0, false
 }

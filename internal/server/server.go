@@ -6,10 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
 	"os/user"
 	"sort"
+	"sync"
 	"syscall"
 
 	"github.com/quic-go/quic-go"
@@ -21,8 +20,7 @@ import (
 
 const (
 	sessionID0 = 0
-	windowID0  = 0
-	paneID0    = 0
+	clientID0  = 0
 )
 
 type Config struct {
@@ -41,14 +39,21 @@ type paneRequest struct {
 	Shell   string
 }
 
-type session struct {
-	conn        quic.Connection
-	verifier    *auth.Verifier
-	mgmtStream  quic.Stream
-	inputStream quic.Stream
-	unixUser    *user.User
-	fingerprint string
-	pane        *Pane
+type sessionState struct {
+	verifier *auth.Verifier
+	session  *Session
+
+	mu           sync.RWMutex
+	outputFrames chan protocol.Frame
+}
+
+type controller struct {
+	ctx          context.Context
+	state        *sessionState
+	unixUser     *user.User
+	shell        string
+	mgmtFrames   chan protocol.Frame
+	outputFrames chan protocol.Frame
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -56,18 +61,21 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("load TLS key pair: %w", err)
 	}
-
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{protocol.ALPN},
 		MinVersion:   tls.VersionTLS13,
 	}
-
 	listener, err := quic.ListenAddr(cfg.ListenAddr, tlsConfig, nil)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
 	}
 	defer listener.Close()
+
+	shared := &sessionState{
+		verifier: auth.NewVerifier(),
+		session:  NewSession(sessionID0),
+	}
 
 	for {
 		conn, err := listener.Accept(ctx)
@@ -77,31 +85,28 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			return fmt.Errorf("accept connection: %w", err)
 		}
-
 		go func(conn quic.Connection) {
-			if err := handleSession(ctx, conn); err != nil && cfg.Stderr != nil {
+			if err := handleSession(ctx, shared, conn); err != nil && cfg.Stderr != nil {
 				fmt.Fprintf(cfg.Stderr, "session error: %v\n", err)
 			}
 		}(conn)
 	}
 }
 
-func handleSession(ctx context.Context, conn quic.Connection) error {
-	s := &session{conn: conn, verifier: auth.NewVerifier()}
+func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) error {
 	defer conn.CloseWithError(0, "")
 
 	var err error
-	s.mgmtStream, err = conn.AcceptStream(ctx)
+	mgmtStream, err := conn.AcceptStream(ctx)
 	if err != nil {
 		return fmt.Errorf("accept management stream: %w", err)
 	}
-	s.inputStream, err = conn.AcceptStream(ctx)
+	inputStream, err := conn.AcceptStream(ctx)
 	if err != nil {
 		return fmt.Errorf("accept input stream: %w", err)
 	}
-
-	mgmtDecoder := protocol.NewDecoder(s.mgmtStream, protocol.DefaultMaxFrameSize)
-	inputDecoder := protocol.NewDecoder(s.inputStream, protocol.DefaultMaxFrameSize)
+	mgmtDecoder := protocol.NewDecoder(mgmtStream, protocol.DefaultMaxFrameSize)
+	inputDecoder := protocol.NewDecoder(inputStream, protocol.DefaultMaxFrameSize)
 	if err := expectStreamOpen(mgmtDecoder, protocol.MsgOpenManagementStream, protocol.StreamTypeManagement); err != nil {
 		return err
 	}
@@ -117,24 +122,22 @@ func handleSession(ctx context.Context, conn quic.Connection) error {
 		return errors.New("unsupported client protocol version")
 	}
 
-	mgmtFrames := make(chan protocol.Frame, 32)
+	mgmtFrames := make(chan protocol.Frame, 64)
 	writerErrs := make(chan error, 4)
-	go writeStream(s.mgmtStream, mgmtFrames, writerErrs)
+	go writeStream(mgmtStream, mgmtFrames, writerErrs)
 	defer close(mgmtFrames)
 
 	var authBegin protocol.AuthBegin
 	if err := expectMessage(mgmtDecoder, protocol.MsgAuthBegin, &authBegin); err != nil {
 		return fmt.Errorf("read auth begin: %w", err)
 	}
-
 	beginResult, err := s.verifier.Begin(authBegin.Username, authBegin.PublicKey)
 	if err != nil {
 		_ = sendFrame(mgmtFrames, protocol.MsgAuthFailed, protocol.AuthFailed{Reason: err.Error()})
 		return fmt.Errorf("begin auth: %w", err)
 	}
-	s.unixUser = beginResult.User
-	s.fingerprint = beginResult.Fingerprint
-
+	unixUser := beginResult.User
+	fingerprint := beginResult.Fingerprint
 	if err := sendFrame(mgmtFrames, protocol.MsgAuthChallenge, protocol.AuthChallenge{
 		ChallengeID: beginResult.Challenge.ID,
 		Nonce:       beginResult.Challenge.Nonce,
@@ -142,90 +145,506 @@ func handleSession(ctx context.Context, conn quic.Connection) error {
 	}); err != nil {
 		return err
 	}
-
 	var authResponse protocol.AuthResponse
 	if err := expectMessage(mgmtDecoder, protocol.MsgAuthResponse, &authResponse); err != nil {
 		return fmt.Errorf("read auth response: %w", err)
 	}
-	if err := s.verifier.Verify(authBegin.Username, s.fingerprint, authResponse.ChallengeID, authResponse.Signature); err != nil {
+	if err := s.verifier.Verify(authBegin.Username, fingerprint, authResponse.ChallengeID, authResponse.Signature); err != nil {
 		_ = sendFrame(mgmtFrames, protocol.MsgAuthFailed, protocol.AuthFailed{Reason: err.Error()})
 		return fmt.Errorf("verify auth response: %w", err)
 	}
 
-	shell := loginShellForUser(s.unixUser)
+	shell := loginShellForUser(unixUser)
 	if err := sendFrame(mgmtFrames, protocol.MsgAuthOK, protocol.AuthOK{
-		Username: s.unixUser.Username,
-		HomeDir:  s.unixUser.HomeDir,
+		Username: unixUser.Username,
+		HomeDir:  unixUser.HomeDir,
 		Shell:    shell,
 	}); err != nil {
 		return err
 	}
 
+	outputStream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return fmt.Errorf("open output stream: %w", err)
+	}
+	outputFrames := make(chan protocol.Frame, 256)
+	go writeStream(outputStream, outputFrames, writerErrs)
+	defer close(outputFrames)
+	s.setOutputFrames(outputFrames)
+	defer s.clearOutputFrames(outputFrames)
+	if err := sendFrame(outputFrames, protocol.MsgOpenPaneOutputStream, protocol.StreamOpen{StreamType: protocol.StreamTypePaneOutput}); err != nil {
+		return err
+	}
+
+	ctrl := &controller{
+		ctx:          ctx,
+		state:        s,
+		unixUser:     unixUser,
+		shell:        shell,
+		mgmtFrames:   mgmtFrames,
+		outputFrames: outputFrames,
+	}
+	s.session.EnsureClient(clientID0)
+
 	var createPane protocol.CreatePane
 	if err := expectMessage(mgmtDecoder, protocol.MsgCreatePane, &createPane); err != nil {
 		return fmt.Errorf("read create pane: %w", err)
 	}
-
-	s.pane, err = StartPane(s.unixUser, paneRequest{
-		Cwd:     createPane.Cwd,
-		Command: createPane.Argv,
-		Cols:    createPane.Cols,
-		Rows:    createPane.Rows,
-		Shell:   shell,
-	})
-	if err != nil {
-		return fmt.Errorf("start pane: %w", err)
+	if !s.session.HasWindows() {
+		initialPane, window, clientState, err := ctrl.createWindow(createPane.Cwd, createPane.Argv, createPane.Cols, createPane.Rows)
+		if err != nil {
+			return err
+		}
+		if err := sendFrame(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: initialPane.ID}); err != nil {
+			return err
+		}
+		if err := ctrl.publishWindowList(); err != nil {
+			return err
+		}
+		if err := sendFrame(mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: initialPane.ID}); err != nil {
+			return err
+		}
+		if err := ctrl.bindAndSnapshot(clientState, window, initialPane); err != nil {
+			return err
+		}
+		ctrl.startPane(initialPane)
+	} else {
+		s.session.ResizeAll(createPane.Cols, createPane.Rows)
+		window, pane, clientState, err := s.session.ReattachClient(clientID0)
+		if err != nil {
+			return err
+		}
+		if err := sendFrame(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: pane.ID}); err != nil {
+			return err
+		}
+		if err := ctrl.publishWindowList(); err != nil {
+			return err
+		}
+		if err := sendFrame(mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}); err != nil {
+			return err
+		}
+		if err := ctrl.bindAndSnapshot(clientState, window, pane); err != nil {
+			return err
+		}
 	}
-	defer s.pane.PTY.Close()
-
-	outputStream, err := s.conn.OpenStreamSync(ctx)
-	if err != nil {
-		return fmt.Errorf("open output stream: %w", err)
-	}
-	outputFrames := make(chan protocol.Frame, 128)
-	go writeStream(outputStream, outputFrames, writerErrs)
-	defer close(outputFrames)
-
-	if err := sendFrame(outputFrames, protocol.MsgOpenPaneOutputStream, protocol.StreamOpen{
-		StreamType: protocol.StreamTypePaneOutput,
-		PaneID:     s.pane.ID,
-	}); err != nil {
-		return err
-	}
-	if err := sendReplaceSnapshot(outputFrames, s.pane); err != nil {
-		return err
-	}
-	if err := sendFrame(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: s.pane.ID}); err != nil {
-		return err
-	}
-
-	paneIOErrs := make(chan error, 2)
-	go relayPTYToTerminal(s.pane, outputFrames, paneIOErrs)
-	go handleInput(s.pane, inputDecoder, outputFrames, paneIOErrs)
 
 	mgmtErrs := make(chan error, 1)
-	go handleManagementRequests(mgmtDecoder, s.pane, outputFrames, mgmtErrs)
-
-	waitDone := make(chan error, 1)
-	go func() {
-		waitDone <- paneExitMessage(s.pane, mgmtFrames, outputFrames)
-	}()
+	inputErrs := make(chan error, 1)
+	go ctrl.handleManagement(mgmtDecoder, mgmtErrs)
+	go ctrl.handleInput(inputDecoder, inputErrs)
 
 	select {
-	case err := <-paneIOErrs:
-		return err
 	case err := <-writerErrs:
-		return err
-	case err := <-waitDone:
 		return err
 	case err := <-mgmtErrs:
 		return err
+	case err := <-inputErrs:
+		return err
 	case <-ctx.Done():
-		if s.pane != nil && s.pane.Process.Process != nil {
-			_ = s.pane.Process.Process.Signal(syscall.SIGHUP)
-		}
 		return ctx.Err()
 	}
+}
+
+func (c *controller) startPane(pane *Pane) {
+	go c.relayPTYToTerminal(pane)
+	go func() {
+		_ = pane.Process.Wait()
+		_ = pane.PTY.Close()
+	}()
+}
+
+func (c *controller) createWindow(cwd string, argv []string, cols, rows uint16) (*Pane, *Window, *ClientState, error) {
+	paneID := c.state.session.AddPaneID()
+	pane, err := StartPane(c.unixUser, paneID, paneRequest{
+		Cwd:     cwd,
+		Command: argv,
+		Cols:    cols,
+		Rows:    rows,
+		Shell:   c.shell,
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("start pane: %w", err)
+	}
+	window, clientState := c.state.session.CreateWindow(pane, clientID0)
+	return pane, window, clientState, nil
+}
+
+func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- error) {
+	for {
+		frame, err := decoder.ReadFrame()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				done <- nil
+				return
+			}
+			done <- fmt.Errorf("read management frame: %w", err)
+			return
+		}
+		switch frame.Type {
+		case protocol.MsgCreateWindow:
+			var msg protocol.CreateWindow
+			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+				done <- err
+				return
+			}
+			activePane, _ := c.state.session.ActivePane(clientID0)
+			cols, rows := uint16(activePane.Terminal.Cols), uint16(activePane.Terminal.Rows)
+			pane, window, clientState, err := c.createWindow(msg.Cwd, msg.Argv, cols, rows)
+			if err != nil {
+				done <- err
+				return
+			}
+			if err := sendFrame(c.mgmtFrames, protocol.MsgWindowCreated, protocol.WindowCreated{Window: c.windowInfo(window, clientState.ActiveWindowID == window.ID)}); err != nil {
+				done <- err
+				return
+			}
+			if err := c.publishWindowList(); err != nil {
+				done <- err
+				return
+			}
+			if err := sendFrame(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}); err != nil {
+				done <- err
+				return
+			}
+			if err := c.bindAndSnapshot(clientState, window, pane); err != nil {
+				done <- err
+				return
+			}
+			c.startPane(pane)
+		case protocol.MsgSelectWindow:
+			var msg protocol.SelectWindow
+			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+				done <- err
+				return
+			}
+			window, pane, clientState, err := c.state.session.SelectWindow(clientID0, msg.WindowID)
+			if err != nil {
+				done <- err
+				return
+			}
+			if err := sendFrame(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: window.ID, PaneID: pane.ID}); err != nil {
+				done <- err
+				return
+			}
+			if err := c.bindAndSnapshot(clientState, window, pane); err != nil {
+				done <- err
+				return
+			}
+		case protocol.MsgCloseWindow:
+			var msg protocol.CloseWindow
+			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+				done <- err
+				return
+			}
+			targetWindowID := msg.WindowID
+			if targetWindowID == 0 {
+				clientState := c.state.session.SnapshotClient(clientID0)
+				if clientState != nil {
+					targetWindowID = clientState.ActiveWindowID
+				}
+			}
+			closed, closedPane, replacement, pane, clientState, autoCreate, err := c.state.session.CloseWindow(clientID0, targetWindowID)
+			if err != nil {
+				done <- err
+				return
+			}
+			_ = terminatePane(closedPane)
+			if autoCreate {
+				cols, rows := uint16(80), uint16(24)
+				if clientState != nil && clientState.FocusedPaneID != 0 {
+					if activePane, _ := c.state.session.ActivePane(clientID0); activePane != nil {
+						cols, rows = uint16(activePane.Terminal.Cols), uint16(activePane.Terminal.Rows)
+					}
+				}
+				var err error
+				pane, replacement, clientState, err = c.createWindow("", nil, cols, rows)
+				if err != nil {
+					done <- err
+					return
+				}
+				c.startPane(pane)
+			}
+			if err := sendFrame(c.mgmtFrames, protocol.MsgWindowClosed, protocol.WindowClosed{WindowID: closed}); err != nil {
+				done <- err
+				return
+			}
+			if err := c.publishWindowList(); err != nil {
+				done <- err
+				return
+			}
+			if replacement != nil && pane != nil && clientState != nil {
+				if err := sendFrame(c.mgmtFrames, protocol.MsgWindowSelected, protocol.WindowSelected{WindowID: replacement.ID, PaneID: pane.ID}); err != nil {
+					done <- err
+					return
+				}
+				if err := c.bindAndSnapshot(clientState, replacement, pane); err != nil {
+					done <- err
+					return
+				}
+			}
+		case protocol.MsgListWindows:
+			if err := c.publishWindowList(); err != nil {
+				done <- err
+				return
+			}
+		case protocol.MsgRequestPaneSnapshot:
+			var msg protocol.RequestPaneSnapshot
+			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+				done <- err
+				return
+			}
+			pane, clientState := c.state.session.ActivePane(clientID0)
+			if pane == nil || clientState == nil || pane.ID != msg.PaneID {
+				continue
+			}
+			window := c.windowForPane(pane.ID)
+			if window == nil {
+				continue
+			}
+			if err := c.sendReplaceSnapshot(clientState, window, pane); err != nil {
+				done <- err
+				return
+			}
+		case protocol.MsgPaneExited:
+			done <- nil
+			return
+		}
+	}
+}
+
+func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
+	for {
+		frame, err := decoder.ReadFrame()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				done <- nil
+				return
+			}
+			done <- fmt.Errorf("read input frame: %w", err)
+			return
+		}
+		switch frame.Type {
+		case protocol.MsgInputBytes:
+			var msg protocol.InputBytes
+			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+				done <- err
+				return
+			}
+			if !c.state.session.IsFocusedPane(clientID0, msg.PaneID) {
+				done <- fmt.Errorf("rejected input for nonfocused pane %d", msg.PaneID)
+				return
+			}
+			pane, _ := c.state.session.ActivePane(clientID0)
+			if pane == nil {
+				continue
+			}
+			if _, err := pane.PTY.Write(msg.Data); err != nil {
+				done <- fmt.Errorf("write pty: %w", err)
+				return
+			}
+		case protocol.MsgResizePane:
+			var msg protocol.ResizePane
+			if err := protocol.DecodeMessage(frame, &msg); err != nil {
+				done <- err
+				return
+			}
+			if !c.state.session.IsFocusedPane(clientID0, msg.PaneID) {
+				done <- fmt.Errorf("rejected resize for nonfocused pane %d", msg.PaneID)
+				return
+			}
+			c.state.session.ResizeAll(msg.Cols, msg.Rows)
+			pane, clientState := c.state.session.ActivePane(clientID0)
+			window := c.windowForPane(pane.ID)
+			if err := c.sendReplaceSnapshot(clientState, window, pane); err != nil {
+				done <- err
+				return
+			}
+		default:
+			done <- fmt.Errorf("unexpected input frame %d", frame.Type)
+			return
+		}
+	}
+}
+
+func (c *controller) relayPTYToTerminal(pane *Pane) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := pane.PTY.Read(buf)
+		if n > 0 {
+			update := pane.Terminal.Apply(buf[:n])
+			if sendErr := c.emitTerminalUpdate(pane, update); sendErr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) error {
+	clientState := c.state.session.SnapshotClient(clientID0)
+	if clientState == nil || clientState.FocusedPaneID != pane.ID {
+		return nil
+	}
+	outputFrames := c.state.currentOutputFrames()
+	if outputFrames == nil {
+		return nil
+	}
+	window := c.windowForPane(pane.ID)
+	if window == nil {
+		return nil
+	}
+	if update.FullRedraw {
+		return c.sendReplaceSnapshot(clientState, window, pane)
+	}
+
+	if len(update.DefinedStyles) > 0 {
+		ids := make([]int, 0, len(update.DefinedStyles))
+		for id := range update.DefinedStyles {
+			ids = append(ids, int(id))
+		}
+		sort.Ints(ids)
+		for _, rawID := range ids {
+			id := uint32(rawID)
+			if err := sendFrame(outputFrames, protocol.MsgDefineStyle, protocol.DefineStyle{
+				PaneID:            pane.ID,
+				BindingGeneration: clientState.BindingGeneration,
+				ID:                id,
+				Style:             update.DefinedStyles[id],
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	rows := make([]int, 0, len(update.DirtyRows))
+	for row := range update.DirtyRows {
+		rows = append(rows, row)
+	}
+	sort.Ints(rows)
+	for _, row := range rows {
+		base := pane.Generation
+		pane.Generation++
+		start := row * pane.Terminal.Cols
+		end := start + pane.Terminal.Cols
+		if err := sendFrame(outputFrames, protocol.MsgSetRun, protocol.SetRun{
+			SessionID:         c.state.session.ID,
+			WindowID:          window.ID,
+			PaneID:            pane.ID,
+			BindingGeneration: clientState.BindingGeneration,
+			BaseGeneration:    base,
+			Generation:        pane.Generation,
+			Row:               row,
+			Column:            0,
+			Cells:             append([]protocol.Cell(nil), pane.Terminal.Cells[start:end]...),
+		}); err != nil {
+			return err
+		}
+	}
+	if update.CursorChanged {
+		base := pane.Generation
+		pane.Generation++
+		if err := sendFrame(outputFrames, protocol.MsgSetCursor, protocol.SetCursor{
+			SessionID:         c.state.session.ID,
+			WindowID:          window.ID,
+			PaneID:            pane.ID,
+			BindingGeneration: clientState.BindingGeneration,
+			BaseGeneration:    base,
+			Generation:        pane.Generation,
+			Cursor:            protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY},
+		}); err != nil {
+			return err
+		}
+	}
+	if update.VisibleChange {
+		base := pane.Generation
+		pane.Generation++
+		if err := sendFrame(outputFrames, protocol.MsgSetCursorVisible, protocol.SetCursorVisible{
+			SessionID:         c.state.session.ID,
+			WindowID:          window.ID,
+			PaneID:            pane.ID,
+			BindingGeneration: clientState.BindingGeneration,
+			BaseGeneration:    base,
+			Generation:        pane.Generation,
+			Visible:           pane.Terminal.CursorVisible,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *controller) bindAndSnapshot(clientState *ClientState, window *Window, pane *Pane) error {
+	if err := sendFrame(c.outputFrames, protocol.MsgBindRenderStream, protocol.BindRenderStream{
+		SessionID:         c.state.session.ID,
+		WindowID:          window.ID,
+		PaneID:            pane.ID,
+		BindingGeneration: clientState.BindingGeneration,
+	}); err != nil {
+		return err
+	}
+	return c.sendReplaceSnapshot(clientState, window, pane)
+}
+
+func (c *controller) sendReplaceSnapshot(clientState *ClientState, window *Window, pane *Pane) error {
+	pane.Generation++
+	styleDefs := pane.Terminal.SnapshotStyles()
+	styles := make([]protocol.StyleDefinition, 0, len(styleDefs))
+	for _, def := range styleDefs {
+		styles = append(styles, protocol.StyleDefinition{ID: def.ID, Style: def.Style})
+	}
+	return sendFrame(c.outputFrames, protocol.MsgReplacePane, protocol.ReplacePane{
+		SessionID:         c.state.session.ID,
+		WindowID:          window.ID,
+		PaneID:            pane.ID,
+		BindingGeneration: clientState.BindingGeneration,
+		Generation:        pane.Generation,
+		Cols:              pane.Terminal.Cols,
+		Rows:              pane.Terminal.Rows,
+		Cells:             append([]protocol.Cell(nil), pane.Terminal.Cells...),
+		Styles:            styles,
+		Cursor:            protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY},
+		CursorVisible:     pane.Terminal.CursorVisible,
+	})
+}
+
+func (c *controller) publishWindowList() error {
+	return sendFrame(c.mgmtFrames, protocol.MsgWindowList, c.state.session.WindowList(clientID0))
+}
+
+func (c *controller) windowForPane(paneID uint64) *Window {
+	c.state.session.mu.RLock()
+	defer c.state.session.mu.RUnlock()
+	for _, window := range c.state.session.Windows {
+		if window.PaneID == paneID {
+			cp := *window
+			return &cp
+		}
+	}
+	return nil
+}
+
+func terminatePane(pane *Pane) error {
+	if pane == nil {
+		return nil
+	}
+	if pane.Process.Process != nil {
+		_ = pane.Process.Process.Signal(syscall.SIGHUP)
+	}
+	_ = pane.PTY.Close()
+	return nil
+}
+
+func (c *controller) windowInfo(window *Window, active bool) protocol.WindowInfo {
+	list := c.state.session.WindowList(clientID0)
+	for _, w := range list.Windows {
+		if w.WindowID == window.ID {
+			w.Active = active
+			return w
+		}
+	}
+	return protocol.WindowInfo{WindowID: window.ID, PaneID: window.PaneID, Title: window.Name, Active: active}
 }
 
 func expectStreamOpen(decoder *protocol.Decoder, opener uint64, streamType string) error {
@@ -236,7 +655,6 @@ func expectStreamOpen(decoder *protocol.Decoder, opener uint64, streamType strin
 	if frame.Type != opener {
 		return fmt.Errorf("unexpected stream opener %d", frame.Type)
 	}
-
 	var open protocol.StreamOpen
 	if err := protocol.DecodeMessage(frame, &open); err != nil {
 		return err
@@ -258,249 +676,6 @@ func expectMessage(decoder *protocol.Decoder, msgType uint64, v any) error {
 	return protocol.DecodeMessage(frame, v)
 }
 
-func relayPTYToTerminal(pane *Pane, outputFrames chan<- protocol.Frame, done chan<- error) {
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := pane.PTY.Read(buf)
-		if n > 0 {
-			update := pane.Terminal.Apply(buf[:n])
-			if sendErr := emitTerminalUpdate(pane, outputFrames, update); sendErr != nil {
-				done <- sendErr
-				return
-			}
-		}
-		if err != nil {
-			if errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF) {
-				return
-			}
-			done <- fmt.Errorf("read pty: %w", err)
-			return
-		}
-	}
-}
-
-func emitTerminalUpdate(pane *Pane, outputFrames chan<- protocol.Frame, update terminal.Update) error {
-	if update.FullRedraw {
-		return sendReplaceSnapshot(outputFrames, pane)
-	}
-
-	if len(update.DefinedStyles) > 0 {
-		ids := make([]int, 0, len(update.DefinedStyles))
-		for id := range update.DefinedStyles {
-			ids = append(ids, int(id))
-		}
-		sort.Ints(ids)
-		for _, rawID := range ids {
-			id := uint32(rawID)
-			if err := sendFrame(outputFrames, protocol.MsgDefineStyle, protocol.DefineStyle{
-				PaneID: pane.ID,
-				ID:     id,
-				Style:  update.DefinedStyles[id],
-			}); err != nil {
-				return err
-			}
-		}
-	}
-
-	rows := make([]int, 0, len(update.DirtyRows))
-	for row := range update.DirtyRows {
-		rows = append(rows, row)
-	}
-	sort.Ints(rows)
-	for _, row := range rows {
-		base := pane.Generation
-		pane.Generation++
-		start := row * pane.Terminal.Cols
-		end := start + pane.Terminal.Cols
-		if err := sendFrame(outputFrames, protocol.MsgSetRun, protocol.SetRun{
-			SessionID:      sessionID0,
-			WindowID:       windowID0,
-			PaneID:         pane.ID,
-			BaseGeneration: base,
-			Generation:     pane.Generation,
-			Row:            row,
-			Column:         0,
-			Cells:          append([]protocol.Cell(nil), pane.Terminal.Cells[start:end]...),
-		}); err != nil {
-			return err
-		}
-	}
-	if update.CursorChanged {
-		base := pane.Generation
-		pane.Generation++
-		if err := sendFrame(outputFrames, protocol.MsgSetCursor, protocol.SetCursor{
-			SessionID:      sessionID0,
-			WindowID:       windowID0,
-			PaneID:         pane.ID,
-			BaseGeneration: base,
-			Generation:     pane.Generation,
-			Cursor: protocol.Cursor{
-				X: pane.Terminal.CursorX,
-				Y: pane.Terminal.CursorY,
-			},
-		}); err != nil {
-			return err
-		}
-	}
-	if update.VisibleChange {
-		base := pane.Generation
-		pane.Generation++
-		if err := sendFrame(outputFrames, protocol.MsgSetCursorVisible, protocol.SetCursorVisible{
-			SessionID:      sessionID0,
-			WindowID:       windowID0,
-			PaneID:         pane.ID,
-			BaseGeneration: base,
-			Generation:     pane.Generation,
-			Visible:        pane.Terminal.CursorVisible,
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func sendReplaceSnapshot(outputFrames chan<- protocol.Frame, pane *Pane) error {
-	pane.Generation++
-	styleDefs := pane.Terminal.SnapshotStyles()
-	styles := make([]protocol.StyleDefinition, 0, len(styleDefs))
-	for _, def := range styleDefs {
-		styles = append(styles, protocol.StyleDefinition{ID: def.ID, Style: def.Style})
-	}
-	return sendFrame(outputFrames, protocol.MsgReplacePane, protocol.ReplacePane{
-		SessionID:     sessionID0,
-		WindowID:      windowID0,
-		PaneID:        pane.ID,
-		Generation:    pane.Generation,
-		Cols:          pane.Terminal.Cols,
-		Rows:          pane.Terminal.Rows,
-		Cells:         append([]protocol.Cell(nil), pane.Terminal.Cells...),
-		Styles:        styles,
-		Cursor:        protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY},
-		CursorVisible: pane.Terminal.CursorVisible,
-	})
-}
-
-func handleInput(pane *Pane, inputDecoder *protocol.Decoder, outputFrames chan<- protocol.Frame, done chan<- error) {
-	for {
-		frame, err := inputDecoder.ReadFrame()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				if pane.Process.Process != nil {
-					_ = pane.Process.Process.Signal(syscall.SIGHUP)
-				}
-				return
-			}
-			done <- fmt.Errorf("read input frame: %w", err)
-			return
-		}
-
-		switch frame.Type {
-		case protocol.MsgInputBytes:
-			var msg protocol.InputBytes
-			if err := protocol.DecodeMessage(frame, &msg); err != nil {
-				done <- err
-				return
-			}
-			if msg.PaneID != pane.ID {
-				done <- fmt.Errorf("unknown pane id %d", msg.PaneID)
-				return
-			}
-			if _, err := pane.PTY.Write(msg.Data); err != nil {
-				done <- fmt.Errorf("write pty: %w", err)
-				return
-			}
-		case protocol.MsgResizePane:
-			var msg protocol.ResizePane
-			if err := protocol.DecodeMessage(frame, &msg); err != nil {
-				done <- err
-				return
-			}
-			if msg.PaneID != pane.ID {
-				done <- fmt.Errorf("unknown pane id %d", msg.PaneID)
-				return
-			}
-			if err := pane.Resize(msg.Cols, msg.Rows); err != nil {
-				done <- fmt.Errorf("resize pty: %w", err)
-				return
-			}
-			pane.Terminal.Resize(int(msg.Cols), int(msg.Rows))
-			if err := sendReplaceSnapshot(outputFrames, pane); err != nil {
-				done <- err
-				return
-			}
-		default:
-			done <- fmt.Errorf("unexpected input frame %d", frame.Type)
-			return
-		}
-	}
-}
-
-func handleManagementRequests(decoder *protocol.Decoder, pane *Pane, outputFrames chan<- protocol.Frame, done chan<- error) {
-	for {
-		frame, err := decoder.ReadFrame()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return
-			}
-			done <- fmt.Errorf("read management frame: %w", err)
-			return
-		}
-		switch frame.Type {
-		case protocol.MsgRequestPaneSnapshot:
-			var req protocol.RequestPaneSnapshot
-			if err := protocol.DecodeMessage(frame, &req); err != nil {
-				done <- err
-				return
-			}
-			if req.PaneID != pane.ID {
-				done <- fmt.Errorf("unknown pane id %d in snapshot request", req.PaneID)
-				return
-			}
-			if err := sendReplaceSnapshot(outputFrames, pane); err != nil {
-				done <- err
-				return
-			}
-		case protocol.MsgPaneExited:
-			return
-		default:
-			// Ignore messages already handled during setup.
-		}
-	}
-}
-
-func paneExitMessage(pane *Pane, mgmtFrames, outputFrames chan<- protocol.Frame) error {
-	err := pane.Process.Wait()
-	exitCode := 0
-	signalName := ""
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode = exitErr.ExitCode()
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-				signalName = status.Signal().String()
-			}
-		} else {
-			return fmt.Errorf("wait for pane: %w", err)
-		}
-	}
-
-	msg := protocol.PaneExited{
-		PaneID:   pane.ID,
-		ExitCode: exitCode,
-		Signal:   signalName,
-	}
-	if sendErr := sendFrame(mgmtFrames, protocol.MsgPaneExited, msg); sendErr != nil {
-		return sendErr
-	}
-	if sendErr := sendFrame(outputFrames, protocol.MsgPaneExited, msg); sendErr != nil {
-		return sendErr
-	}
-	if exitCode != 0 {
-		return fmt.Errorf("remote pane exited with code %d signal %s", exitCode, signalName)
-	}
-	return nil
-}
-
 func sendFrame(ch chan<- protocol.Frame, msgType uint64, v any) error {
 	frame, err := protocol.EncodeMessage(msgType, v)
 	if err != nil {
@@ -519,4 +694,24 @@ func writeStream(stream io.Writer, frames <-chan protocol.Frame, errs chan<- err
 			return
 		}
 	}
+}
+
+func (s *sessionState) setOutputFrames(outputFrames chan protocol.Frame) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.outputFrames = outputFrames
+}
+
+func (s *sessionState) clearOutputFrames(outputFrames chan protocol.Frame) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.outputFrames == outputFrames {
+		s.outputFrames = nil
+	}
+}
+
+func (s *sessionState) currentOutputFrames() chan protocol.Frame {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.outputFrames
 }

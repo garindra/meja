@@ -46,7 +46,33 @@ func New(cols, rows int) *TerminalState {
 }
 
 func (t *TerminalState) Resize(cols, rows int) {
-	*t = *New(cols, rows)
+	if cols == t.Cols && rows == t.Rows {
+		return
+	}
+	next := New(cols, rows)
+	next.CurrentStyle = t.CurrentStyle
+	next.CursorVisible = t.CursorVisible
+	next.Parser = t.Parser
+	next.wrapPending = t.wrapPending
+	next.styleByID = make(map[uint32]Style, len(t.styleByID))
+	for id, style := range t.styleByID {
+		next.styleByID[id] = style
+	}
+	next.styleToID = make(map[Style]uint32, len(t.styleToID))
+	for style, id := range t.styleToID {
+		next.styleToID[style] = id
+	}
+	next.nextStyleID = t.nextStyleID
+
+	copyCols := min(t.Cols, cols)
+	copyRows := min(t.Rows, rows)
+	for row := 0; row < copyRows; row++ {
+		copy(next.Cells[row*cols:row*cols+copyCols], t.Cells[row*t.Cols:row*t.Cols+copyCols])
+	}
+	next.CursorX = t.CursorX
+	next.CursorY = t.CursorY
+	next.clampCursor()
+	*t = *next
 }
 
 func (t *TerminalState) SnapshotStyles() []protocolStyleDef {
@@ -470,4 +496,11 @@ func max1(params []int, def int) int {
 		return def
 	}
 	return v
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

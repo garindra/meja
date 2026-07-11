@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"strconv"
+	"strings"
+
 	"tali/internal/protocol"
 )
+
+var tabBarBG = protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}
 
 func RenderANSI(state *ClientState) []byte {
 	var buf bytes.Buffer
@@ -31,6 +35,12 @@ func RenderANSI(state *ClientState) []byte {
 		FG: protocol.Color{Mode: "default"},
 		BG: protocol.Color{Mode: "default"},
 	}))
+	buf.WriteString(fmt.Sprintf("\x1b[%d;1H", state.TerminalRows))
+	buf.WriteString(renderTabBar(state))
+	buf.WriteString(sgrForStyle(protocol.Style{
+		FG: protocol.Color{Mode: "default"},
+		BG: protocol.Color{Mode: "default"},
+	}))
 	buf.WriteString(fmt.Sprintf("\x1b[%d;%dH", state.Cursor.Y+1, state.Cursor.X+1))
 	if state.CursorVisible {
 		buf.WriteString("\x1b[?25h")
@@ -39,6 +49,62 @@ func RenderANSI(state *ClientState) []byte {
 	}
 	state.LastRendered = state.Grid
 	return buf.Bytes()
+}
+
+func renderTabBar(state *ClientState) string {
+	width := state.TerminalCols
+	if width <= 0 {
+		return ""
+	}
+	var buf strings.Builder
+	defaultStyle := protocol.Style{
+		FG: protocol.Color{Mode: "default"},
+		BG: tabBarBG,
+	}
+
+	prefix := fmt.Sprintf("[%d] ", state.SessionID)
+	if len(prefix) > width {
+		prefix = truncateToWidth(prefix, width)
+	}
+
+	entries := make([]string, 0, len(state.Windows))
+	for _, w := range state.Windows {
+		suffix := ""
+		if w.WindowID == state.ActiveWindowID {
+			suffix = "*"
+		}
+		entries = append(entries, fmt.Sprintf(" %d:%s%s ", w.Index, w.Title, suffix))
+	}
+
+	used := 0
+	buf.WriteString(sgrForStyle(defaultStyle))
+	buf.WriteString(prefix)
+	used += len(prefix)
+	for _, entry := range entries {
+		remaining := width - used
+		if remaining <= 0 {
+			break
+		}
+		if len(entry) > remaining {
+			entry = truncateToWidth(entry, remaining)
+		}
+		buf.WriteString(entry)
+		used += len(entry)
+	}
+	if used < width {
+		buf.WriteString(strings.Repeat(" ", width-used))
+	}
+	return buf.String()
+}
+
+func truncateToWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if len(s) <= width {
+		return s
+	}
+	return s[:width]
 }
 
 func sgrForStyle(style protocol.Style) string {
@@ -57,7 +123,7 @@ func sgrForStyle(style protocol.Style) string {
 	}
 	codes = append(codes, colorCodes(style.FG, true)...)
 	codes = append(codes, colorCodes(style.BG, false)...)
-	return "\x1b[" + join(codes, ";") + "m"
+	return "\x1b[" + strings.Join(codes, ";") + "m"
 }
 
 func colorCodes(c protocol.Color, fg bool) []string {
@@ -92,15 +158,4 @@ func colorCodes(c protocol.Color, fg bool) []string {
 		}
 		return []string{"49"}
 	}
-}
-
-func join(parts []string, sep string) string {
-	if len(parts) == 0 {
-		return ""
-	}
-	out := parts[0]
-	for _, part := range parts[1:] {
-		out += sep + part
-	}
-	return out
 }

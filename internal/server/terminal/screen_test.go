@@ -82,6 +82,37 @@ func TestOSCSTTerminatorIsConsumed(t *testing.T) {
 	}
 }
 
+func TestResizePreservesVisibleContent(t *testing.T) {
+	term := New(5, 2)
+	term.Apply([]byte("hello\nworld"))
+
+	term.Resize(5, 2)
+	if got := rowString(term, 0, 5); got != "hello" {
+		t.Fatalf("row 0 after same-size resize = %q", got)
+	}
+	if got := rowString(term, 1, 5); got != "world" {
+		t.Fatalf("row 1 after same-size resize = %q", got)
+	}
+
+	term.Resize(7, 3)
+	if got := rowString(term, 0, 5); got != "hello" {
+		t.Fatalf("row 0 after grow resize = %q", got)
+	}
+	if got := rowString(term, 1, 5); got != "world" {
+		t.Fatalf("row 1 after grow resize = %q", got)
+	}
+}
+
+func TestResizeShrinksByKeepingTopLeftContent(t *testing.T) {
+	term := New(5, 2)
+	term.Apply([]byte("abcde\nvwxyz"))
+
+	term.Resize(3, 1)
+	if got := rowString(term, 0, 3); got != "abc" {
+		t.Fatalf("row 0 after shrink resize = %q", got)
+	}
+}
+
 func rowString(term *TerminalState, row, count int) string {
 	runes := make([]rune, 0, count)
 	for i := 0; i < count; i++ {

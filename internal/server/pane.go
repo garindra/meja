@@ -22,9 +22,10 @@ type Pane struct {
 	User       *user.User
 	Terminal   *terminal.TerminalState
 	Generation uint64
+	Title      string
 }
 
-func StartPane(unixUser *user.User, request paneRequest) (*Pane, error) {
+func StartPane(unixUser *user.User, paneID uint64, request paneRequest) (*Pane, error) {
 	shell := request.Shell
 	if shell == "" {
 		shell = loginShellForUser(unixUser)
@@ -79,11 +80,12 @@ func StartPane(unixUser *user.User, request paneRequest) (*Pane, error) {
 	}
 
 	return &Pane{
-		ID:       0,
+		ID:       paneID,
 		PTY:      ptmx,
 		Process:  cmd,
 		User:     unixUser,
 		Terminal: terminal.New(int(request.Cols), int(request.Rows)),
+		Title:    paneTitle(shell, request.Command),
 	}, nil
 }
 
@@ -132,4 +134,14 @@ func loginShellForUser(unixUser *user.User) string {
 	}
 
 	return "/bin/sh"
+}
+
+func paneTitle(shell string, argv []string) string {
+	if len(argv) > 0 && argv[0] != "" {
+		return filepath.Base(argv[0])
+	}
+	if shell != "" {
+		return filepath.Base(shell)
+	}
+	return "shell"
 }

@@ -24,6 +24,16 @@ const (
 	MsgInputBytes
 	MsgResizePane
 	MsgRequestPaneSnapshot
+	MsgCreateWindow
+	MsgWindowCreated
+	MsgCloseWindow
+	MsgWindowClosed
+	MsgSelectWindow
+	MsgWindowSelected
+	MsgListWindows
+	MsgWindowList
+	MsgWindowTitleChanged
+	MsgBindRenderStream
 	MsgReplacePane
 	MsgSetRun
 	MsgSetCursor
@@ -104,6 +114,52 @@ type RequestPaneSnapshot struct {
 	PaneID uint64 `json:"pane_id"`
 }
 
+type CreateWindow struct {
+	Cwd  string   `json:"cwd"`
+	Argv []string `json:"argv,omitempty"`
+}
+
+type WindowInfo struct {
+	WindowID uint64 `json:"window_id"`
+	PaneID   uint64 `json:"pane_id"`
+	Index    int    `json:"index"`
+	Title    string `json:"title"`
+	Active   bool   `json:"active"`
+}
+
+type WindowCreated struct {
+	Window WindowInfo `json:"window"`
+}
+
+type CloseWindow struct {
+	WindowID uint64 `json:"window_id"`
+}
+
+type WindowClosed struct {
+	WindowID uint64 `json:"window_id"`
+}
+
+type SelectWindow struct {
+	WindowID uint64 `json:"window_id"`
+}
+
+type WindowSelected struct {
+	WindowID uint64 `json:"window_id"`
+	PaneID   uint64 `json:"pane_id"`
+}
+
+type ListWindows struct{}
+
+type WindowList struct {
+	Windows        []WindowInfo `json:"windows"`
+	ActiveWindowID uint64       `json:"active_window_id"`
+}
+
+type WindowTitleChanged struct {
+	WindowID uint64 `json:"window_id"`
+	Title    string `json:"title"`
+}
+
 type Color struct {
 	Mode  string `json:"mode"`
 	Index uint8  `json:"index,omitempty"`
@@ -137,52 +193,64 @@ type StyleDefinition struct {
 	Style Style  `json:"style"`
 }
 
+type BindRenderStream struct {
+	SessionID         uint64 `json:"session_id"`
+	WindowID          uint64 `json:"window_id"`
+	PaneID            uint64 `json:"pane_id"`
+	BindingGeneration uint64 `json:"binding_generation"`
+}
+
 type ReplacePane struct {
-	SessionID     uint64            `json:"session_id"`
-	WindowID      uint64            `json:"window_id"`
-	PaneID        uint64            `json:"pane_id"`
-	Generation    uint64            `json:"generation"`
-	Cols          int               `json:"cols"`
-	Rows          int               `json:"rows"`
-	Cells         []Cell            `json:"cells"`
-	Styles        []StyleDefinition `json:"styles"`
-	Cursor        Cursor            `json:"cursor"`
-	CursorVisible bool              `json:"cursor_visible"`
+	SessionID         uint64            `json:"session_id"`
+	WindowID          uint64            `json:"window_id"`
+	PaneID            uint64            `json:"pane_id"`
+	BindingGeneration uint64            `json:"binding_generation"`
+	Generation        uint64            `json:"generation"`
+	Cols              int               `json:"cols"`
+	Rows              int               `json:"rows"`
+	Cells             []Cell            `json:"cells"`
+	Styles            []StyleDefinition `json:"styles"`
+	Cursor            Cursor            `json:"cursor"`
+	CursorVisible     bool              `json:"cursor_visible"`
 }
 
 type SetRun struct {
-	SessionID      uint64 `json:"session_id"`
-	WindowID       uint64 `json:"window_id"`
-	PaneID         uint64 `json:"pane_id"`
-	BaseGeneration uint64 `json:"base_generation"`
-	Generation     uint64 `json:"generation"`
-	Row            int    `json:"row"`
-	Column         int    `json:"column"`
-	Cells          []Cell `json:"cells"`
+	SessionID         uint64 `json:"session_id"`
+	WindowID          uint64 `json:"window_id"`
+	PaneID            uint64 `json:"pane_id"`
+	BindingGeneration uint64 `json:"binding_generation"`
+	BaseGeneration    uint64 `json:"base_generation"`
+	Generation        uint64 `json:"generation"`
+	Row               int    `json:"row"`
+	Column            int    `json:"column"`
+	Cells             []Cell `json:"cells"`
 }
 
 type SetCursor struct {
-	SessionID      uint64 `json:"session_id"`
-	WindowID       uint64 `json:"window_id"`
-	PaneID         uint64 `json:"pane_id"`
-	BaseGeneration uint64 `json:"base_generation"`
-	Generation     uint64 `json:"generation"`
-	Cursor         Cursor `json:"cursor"`
+	SessionID         uint64 `json:"session_id"`
+	WindowID          uint64 `json:"window_id"`
+	PaneID            uint64 `json:"pane_id"`
+	BindingGeneration uint64 `json:"binding_generation"`
+	BaseGeneration    uint64 `json:"base_generation"`
+	Generation        uint64 `json:"generation"`
+	Cursor            Cursor `json:"cursor"`
 }
 
 type SetCursorVisible struct {
-	SessionID      uint64 `json:"session_id"`
-	WindowID       uint64 `json:"window_id"`
-	PaneID         uint64 `json:"pane_id"`
-	BaseGeneration uint64 `json:"base_generation"`
-	Generation     uint64 `json:"generation"`
-	Visible        bool   `json:"visible"`
+	SessionID         uint64 `json:"session_id"`
+	WindowID          uint64 `json:"window_id"`
+	PaneID            uint64 `json:"pane_id"`
+	BindingGeneration uint64 `json:"binding_generation"`
+	BaseGeneration    uint64 `json:"base_generation"`
+	Generation        uint64 `json:"generation"`
+	Visible           bool   `json:"visible"`
 }
 
 type DefineStyle struct {
-	PaneID uint64 `json:"pane_id"`
-	ID     uint32 `json:"id"`
-	Style  Style  `json:"style"`
+	PaneID            uint64 `json:"pane_id"`
+	BindingGeneration uint64 `json:"binding_generation"`
+	ID                uint32 `json:"id"`
+	Style             Style  `json:"style"`
 }
 
 func EncodeMessage(msgType uint64, v any) (Frame, error) {
