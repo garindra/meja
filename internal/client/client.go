@@ -610,6 +610,14 @@ func processInputByte(prefix *bool, b byte, ui *runtimeState, cfg Config) ([][]b
 				return nil, []protocol.Frame{frame}, false
 			}
 			return nil, nil, false
+		case 'l':
+			if windowID, ok := ui.lastWindowID(); ok {
+				payload, _ := protocol.EncodeSelectWindow(nil, protocol.SelectWindow{WindowID: windowID})
+				frame := protocol.Frame{Type: protocol.MsgSelectWindow, Payload: payload}
+				ui.setInputBlocked(true)
+				return nil, []protocol.Frame{frame}, false
+			}
+			return nil, nil, false
 		case 'x':
 			payload, _ := protocol.EncodeCloseWindow(nil, protocol.CloseWindow{WindowID: ui.activeWindowID()})
 			frame := protocol.Frame{Type: protocol.MsgCloseWindow, Payload: payload}
@@ -771,6 +779,12 @@ func (r *runtimeState) previousWindowID() (uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.ui.PreviousWindowID()
+}
+
+func (r *runtimeState) lastWindowID() (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ui.LastActiveWindowID()
 }
 
 func (r *runtimeState) windowIDByIndex(index int) (uint64, bool) {

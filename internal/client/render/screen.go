@@ -12,6 +12,7 @@ type ClientState struct {
 	SessionID uint64
 
 	ActiveWindowID uint64
+	LastWindowID   uint64
 	FocusedPaneID  uint64
 	Windows        []protocol.WindowInfo
 
@@ -58,6 +59,9 @@ func (s *ClientState) ApplyWindowList(msg protocol.WindowList) {
 }
 
 func (s *ClientState) ApplyWindowSelected(msg protocol.WindowSelected) {
+	if s.ActiveWindowID != 0 && s.ActiveWindowID != msg.WindowID {
+		s.LastWindowID = s.ActiveWindowID
+	}
 	s.ActiveWindowID = msg.WindowID
 	s.FocusedPaneID = msg.PaneID
 	s.syncWindowSelection()
@@ -71,6 +75,9 @@ func (s *ClientState) ApplyWindowClosed(windowID uint64) {
 		}
 	}
 	s.Windows = out
+	if s.LastWindowID == windowID {
+		s.LastWindowID = 0
+	}
 	s.syncWindowSelection()
 }
 
@@ -193,6 +200,18 @@ func (s *ClientState) PreviousWindowID() (uint64, bool) {
 func (s *ClientState) WindowIDByIndex(index int) (uint64, bool) {
 	for _, w := range s.Windows {
 		if w.Index == index {
+			return w.WindowID, true
+		}
+	}
+	return 0, false
+}
+
+func (s *ClientState) LastActiveWindowID() (uint64, bool) {
+	if s.LastWindowID == 0 || s.LastWindowID == s.ActiveWindowID {
+		return 0, false
+	}
+	for _, w := range s.Windows {
+		if w.WindowID == s.LastWindowID {
 			return w.WindowID, true
 		}
 	}

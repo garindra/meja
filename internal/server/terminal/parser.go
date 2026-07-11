@@ -10,6 +10,7 @@ type parserState int
 const (
 	parserText parserState = iota
 	parserESC
+	parserESCCharset
 	parserCSI
 	parserOSC
 	parserOSCESC

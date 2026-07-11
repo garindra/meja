@@ -70,6 +70,36 @@ func TestWindowNavigation(t *testing.T) {
 	}
 }
 
+func TestLastActiveWindowTracking(t *testing.T) {
+	state := NewClientState()
+	state.ApplyWindowList(protocol.WindowList{
+		Windows: []protocol.WindowInfo{
+			{WindowID: 10, PaneID: 10, Index: 0, Title: "bash"},
+			{WindowID: 20, PaneID: 20, Index: 1, Title: "logs"},
+			{WindowID: 30, PaneID: 30, Index: 2, Title: "vim"},
+		},
+	})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 10, PaneID: 10})
+	if _, ok := state.LastActiveWindowID(); ok {
+		t.Fatal("LastActiveWindowID() unexpectedly reported a previous window after initial selection")
+	}
+
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 20, PaneID: 20})
+	if got, ok := state.LastActiveWindowID(); !ok || got != 10 {
+		t.Fatalf("LastActiveWindowID() after switch = %d, %v; want 10, true", got, ok)
+	}
+
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 30, PaneID: 30})
+	if got, ok := state.LastActiveWindowID(); !ok || got != 20 {
+		t.Fatalf("LastActiveWindowID() after second switch = %d, %v; want 20, true", got, ok)
+	}
+
+	state.ApplyWindowClosed(20)
+	if _, ok := state.LastActiveWindowID(); ok {
+		t.Fatal("LastActiveWindowID() unexpectedly kept a closed window")
+	}
+}
+
 func TestWindowListDoesNotOverrideExplicitSelection(t *testing.T) {
 	state := NewClientState()
 	state.ApplyWindowList(protocol.WindowList{

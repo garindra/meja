@@ -73,6 +73,22 @@ func TestProcessInputBytePrefixActions(t *testing.T) {
 		t.Fatalf("SelectWindow = %#v err=%v", sel, err)
 	}
 
+	ui.with(func(state *render.ClientState) {
+		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 2})
+	})
+	prefix = true
+	_, mgmt, detach = processInputByte(&prefix, 'l', ui, Config{})
+	if detach {
+		t.Fatalf("last-window selection unexpectedly detached")
+	}
+	if len(mgmt) != 1 || mgmt[0].Type != protocol.MsgSelectWindow {
+		t.Fatalf("last-window selection failed: %#v", mgmt)
+	}
+	sel, err = protocol.DecodeSelectWindow(mgmt[0].Payload)
+	if err != nil || sel.WindowID != 1 {
+		t.Fatalf("last SelectWindow = %#v err=%v", sel, err)
+	}
+
 	prefix = true
 	inputs, mgmt, detach = processInputByte(&prefix, 'd', ui, Config{})
 	if !detach || prefix || len(inputs) != 0 || len(mgmt) != 0 {

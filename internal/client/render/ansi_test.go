@@ -97,3 +97,38 @@ func TestTabBarTruncatesWithoutWrapping(t *testing.T) {
 		t.Fatalf("tab bar missing active session prefix: %q", bar)
 	}
 }
+
+func TestRenderANSIDoesNotClearScreenOnSteadyStateRedraw(t *testing.T) {
+	state := NewClientState()
+	state.SetTerminalSize(4, 3)
+	state.SessionID = 7
+	state.ApplyWindowList(protocol.WindowList{
+		Windows: []protocol.WindowInfo{{WindowID: 1, PaneID: 1, Index: 0, Title: "sh"}},
+	})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 1})
+	state.Grid = Screen{
+		Cols: 4,
+		Rows: 2,
+		Cells: []protocol.Cell{
+			{Rune: 'a', Width: 1},
+			{Rune: 'b', Width: 1},
+			{Rune: 'c', Width: 1},
+			{Rune: 'd', Width: 1},
+			{Rune: 'e', Width: 1},
+			{Rune: 'f', Width: 1},
+			{Rune: 'g', Width: 1},
+			{Rune: 'h', Width: 1},
+		},
+	}
+	state.CursorVisible = true
+
+	first := string(RenderANSI(state))
+	if !strings.Contains(first, "\x1b[H\x1b[2J") {
+		t.Fatalf("first render missing clear: %q", first)
+	}
+
+	second := string(RenderANSI(state))
+	if strings.Contains(second, "\x1b[H\x1b[2J") {
+		t.Fatalf("steady-state redraw unexpectedly clears screen: %q", second)
+	}
+}

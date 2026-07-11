@@ -82,6 +82,15 @@ func TestOSCSTTerminatorIsConsumed(t *testing.T) {
 	}
 }
 
+func TestCharsetDesignationIsConsumedAndNotPrinted(t *testing.T) {
+	term := New(8, 1)
+	term.Apply([]byte("\x1b(Bprompt"))
+	got := rowString(term, 0, 6)
+	if got != "prompt" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestResizePreservesVisibleContent(t *testing.T) {
 	term := New(5, 2)
 	term.Apply([]byte("hello\nworld"))

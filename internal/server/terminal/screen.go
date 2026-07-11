@@ -150,9 +150,14 @@ func (t *TerminalState) Apply(data []byte) Update {
 			case ']':
 				t.Parser.state = parserOSC
 				t.Parser.oscBuf.Reset()
+			case '(', ')', '*', '+', '-', '.', '/':
+				t.Parser.state = parserESCCharset
 			default:
 				t.Parser.state = parserText
 			}
+			data = data[1:]
+		case parserESCCharset:
+			t.Parser.state = parserText
 			data = data[1:]
 		case parserCSI:
 			b := data[0]

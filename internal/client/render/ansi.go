@@ -14,7 +14,9 @@ var tabBarBG = protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}
 func RenderANSI(state *ClientState) []byte {
 	var buf bytes.Buffer
 	buf.WriteString("\x1b[?25l")
-	buf.WriteString("\x1b[H\x1b[2J")
+	if state.LastRendered.Cols != state.Grid.Cols || state.LastRendered.Rows != state.Grid.Rows {
+		buf.WriteString("\x1b[H\x1b[2J")
+	}
 	lastStyleID := ^uint32(0)
 	for row := 0; row < state.Grid.Rows; row++ {
 		buf.WriteString(fmt.Sprintf("\x1b[%d;1H", row+1))
