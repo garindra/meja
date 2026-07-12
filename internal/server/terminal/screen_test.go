@@ -43,6 +43,33 @@ func TestLFScrollAtBottom(t *testing.T) {
 	}
 }
 
+func TestFullPrimaryScrollCapturesBoundedHistory(t *testing.T) {
+	term := New(3, 2)
+	term.HistoryLimit = 2
+	term.Apply([]byte("aaa\nbbb\nccc\nddd"))
+	if len(term.History) != 2 {
+		t.Fatalf("history rows = %d, want 2", len(term.History))
+	}
+	if got := cellsString(term.History[0].Cells); got != "aaa" {
+		t.Fatalf("oldest retained history row = %q, want aaa", got)
+	}
+	if got := cellsString(term.History[1].Cells); got != "bbb" {
+		t.Fatalf("newest retained history row = %q, want bbb", got)
+	}
+}
+
+func TestPartialScrollRegionDoesNotAppendHistory(t *testing.T) {
+	term := New(4, 4)
+	term.Apply([]byte("1111\n2222\n3333\n4444"))
+	before := len(term.History)
+	term.Apply([]byte("\x1b[2;3r"))
+	term.CursorY = 2
+	term.Apply([]byte("\n"))
+	if len(term.History) != before {
+		t.Fatalf("partial-region scroll appended history: before=%d after=%d", before, len(term.History))
+	}
+}
+
 func TestLFWithoutScrollDoesNotForceFullRedraw(t *testing.T) {
 	term := New(3, 2)
 	update := term.Apply([]byte("a\n"))
@@ -339,6 +366,17 @@ func rowString(term *TerminalState, row, count int) string {
 			r = ' '
 		}
 		runes = append(runes, r)
+	}
+	return string(runes)
+}
+
+func cellsString(cells []Cell) string {
+	runes := make([]rune, len(cells))
+	for i, cell := range cells {
+		runes[i] = cell.Rune
+		if runes[i] == 0 {
+			runes[i] = ' '
+		}
 	}
 	return string(runes)
 }

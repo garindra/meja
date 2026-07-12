@@ -49,6 +49,7 @@ type sessionState struct {
 
 	mu           sync.RWMutex
 	outputFrames map[int]chan protocol.Frame
+	renderMu     sync.Mutex
 }
 
 type controller struct {
@@ -300,7 +301,8 @@ func (c *controller) createWindowSize() (uint16, uint16, error) {
 	if activePane == nil {
 		return 0, 0, fmt.Errorf("create window: no active pane")
 	}
-	return uint16(activePane.Terminal.Cols), uint16(activePane.Terminal.Rows), nil
+	cols, rows := activePane.TerminalSize()
+	return uint16(cols), uint16(rows), nil
 }
 
 func (c *controller) resizeSessionToClient(clientState *ClientState) {
@@ -408,9 +410,10 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				continue
 			}
 			paneID := c.state.session.AddPaneID()
+			activeCols, activeRows := activePane.TerminalSize()
 			newPane, err := StartPane(c.unixUser, paneID, paneRequest{
-				Cols:  uint16(activePane.Terminal.Cols),
-				Rows:  uint16(activePane.Terminal.Rows),
+				Cols:  uint16(activeCols),
+				Rows:  uint16(activeRows),
 				Shell: c.shell,
 			})
 			if err != nil {
@@ -441,6 +444,27 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				return
 			}
 			c.startPane(newPane)
+		case protocol.MsgEnterHistory:
+			msg, err := protocol.DecodeEnterHistory(frame.Payload)
+			if err != nil {
+				done <- err
+				return
+			}
+			pane, clientState := c.state.session.ActivePane(clientID0)
+			if pane == nil || clientState == nil || msg.PaneID != clientState.FocusedPaneID {
+				continue
+			}
+			if !c.state.session.IsHistoryPane(clientID0, pane.ID) {
+				snapshot := captureHistorySnapshot(pane)
+				if err := c.state.session.InstallHistoryView(clientID0, pane.ID, snapshot); err != nil {
+					done <- err
+					return
+				}
+			}
+			if err := c.publishBindingsAndSnapshots(); err != nil {
+				done <- err
+				return
+			}
 		case protocol.MsgFocusPane:
 			msg, err := protocol.DecodeFocusPane(frame.Payload)
 			if err != nil {
@@ -481,7 +505,8 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				cols, rows := uint16(80), uint16(24)
 				if clientState != nil && clientState.FocusedPaneID != 0 {
 					if activePane, _ := c.state.session.ActivePane(clientID0); activePane != nil {
-						cols, rows = uint16(activePane.Terminal.Cols), uint16(activePane.Terminal.Rows)
+						activeCols, activeRows := activePane.TerminalSize()
+						cols, rows = uint16(activeCols), uint16(activeRows)
 					}
 				}
 				var err error
@@ -589,7 +614,7 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 			if !ok {
 				continue
 			}
-			if err := c.sendReplaceSnapshot(binding, window, pane); err != nil {
+			if err := c.sendCurrentViewSnapshot(binding, window, pane); err != nil {
 				done <- err
 				return
 			}
@@ -635,6 +660,13 @@ func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
 			if pane == nil {
 				continue
 			}
+			if c.state.session.IsHistoryPane(clientID0, pane.ID) {
+				if err := c.handleHistoryInput(pane, msg.Data); err != nil {
+					done <- err
+					return
+				}
+				continue
+			}
 			if _, err := pane.WriteInput(msg.Data); err != nil {
 				done <- fmt.Errorf("write pty: %w", err)
 				return
@@ -649,13 +681,7 @@ func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
 			if pane == nil || clientState == nil {
 				continue
 			}
-			c.state.session.SetClientSize(clientID0, msg.Cols, msg.Rows)
-			c.state.session.ResizeAll(msg.Cols, msg.Rows)
-			if err := c.publishWindowLayout(); err != nil {
-				done <- err
-				return
-			}
-			if err := c.publishVisibleSnapshots(); err != nil {
+			if err := c.resizeClient(msg.Cols, msg.Rows); err != nil {
 				done <- err
 				return
 			}
@@ -666,12 +692,175 @@ func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
 	}
 }
 
+func (c *controller) resizeClient(cols, rows uint16) error {
+	c.state.renderMu.Lock()
+	defer c.state.renderMu.Unlock()
+	c.state.session.ClearHistoryViews()
+	c.state.session.SetClientSize(clientID0, cols, rows)
+	c.state.session.ResizeAll(cols, rows)
+	if err := c.publishWindowLayout(); err != nil {
+		return err
+	}
+	return c.publishVisibleSnapshotsLocked()
+}
+
+func (c *controller) handleHistoryInput(pane *Pane, data []byte) error {
+	for len(data) > 0 {
+		direction, count, exit, consumed := decodeHistoryInput(data)
+		if consumed <= 0 {
+			consumed = 1
+		}
+		data = data[min(consumed, len(data)):]
+		if exit {
+			c.state.renderMu.Lock()
+			defer c.state.renderMu.Unlock()
+			if bindings, ok := c.state.session.exitHistoryAndRebuild(clientID0, pane.ID); ok {
+				return c.publishBindingSnapshotsLocked(bindings)
+			}
+			return nil
+		}
+		if count < 0 {
+			if c.state.session.jumpHistory(clientID0, pane.ID, count == -1) {
+				binding, ok := c.state.session.BindingForPane(clientID0, pane.ID)
+				window := c.windowForPane(pane.ID)
+				view := c.state.session.HistoryView(clientID0, pane.ID)
+				if ok && window != nil && view != nil {
+					if err := c.sendHistorySnapshotSerialized(binding, window, pane, view); err != nil {
+						return err
+					}
+				}
+			}
+			continue
+		}
+		for i := 0; i < count; i++ {
+			move, ok := c.state.session.moveHistory(clientID0, pane.ID, direction)
+			if !ok {
+				return nil
+			}
+			if !move.Changed {
+				break
+			}
+			if err := c.emitHistoryMove(pane, move); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func decodeHistoryInput(data []byte) (direction, count int, exit bool, consumed int) {
+	if len(data) == 0 {
+		return 0, 0, false, 0
+	}
+	switch data[0] {
+	case 'q', 0x03, 0x1b:
+		if len(data) >= 3 && data[0] == 0x1b && data[1] == '[' {
+			switch data[2] {
+			case 'A':
+				return -1, 1, false, 3
+			case 'B':
+				return 1, 1, false, 3
+			case '5', '6':
+				if len(data) >= 4 && data[3] == '~' {
+					direction = -1
+					if data[2] == '6' {
+						direction = 1
+					}
+					return direction, 12, false, 4
+				}
+			}
+		}
+		return 0, 0, true, 1
+	case 0x15:
+		return -1, 6, false, 1
+	case 0x04:
+		return 1, 6, false, 1
+	case 'g':
+		return 0, -1, false, 1
+	case 'G':
+		return 0, -2, false, 1
+	default:
+		return 0, 0, false, 1
+	}
+}
+
+func (c *controller) emitHistoryMove(pane *Pane, move historyMove) error {
+	c.state.renderMu.Lock()
+	defer c.state.renderMu.Unlock()
+	view := c.state.session.HistoryView(clientID0, pane.ID)
+	if view == nil {
+		return nil
+	}
+	binding, ok := c.state.session.BindingForPane(clientID0, pane.ID)
+	if !ok {
+		return nil
+	}
+	outputFrames := c.state.currentOutputFrames(binding.Slot)
+	if outputFrames == nil {
+		return nil
+	}
+	pane.terminalMu.Lock()
+	defer pane.terminalMu.Unlock()
+	if move.Delta != 0 {
+		if err := sendEncoded(outputFrames, protocol.MsgScrollPane, protocol.ScrollPane{Delta: move.Delta}, protocol.EncodeScrollPane); err != nil {
+			return err
+		}
+	}
+	runs := historyMoveRuns(view, move)
+	base := pane.Generation
+	pane.Generation++
+	return sendEncoded(outputFrames, protocol.MsgPaneUpdate, protocol.PaneUpdate{
+		BindingGeneration: binding.BindingGeneration,
+		BaseGeneration:    base,
+		Generation:        pane.Generation,
+		Runs:              runs,
+		CursorChanged:     true,
+		Cursor:            move.Cursor,
+	}, protocol.EncodePaneUpdate)
+}
+
+func historyMoveRuns(view *HistoryView, move historyMove) []protocol.CellRun {
+	if move.Delta == 0 {
+		return nil
+	}
+	snapshot := view.Snapshot
+	runs := make([]protocol.CellRun, 0, 2)
+	if move.Delta > 0 {
+		cells := append([]protocol.Cell(nil), snapshot.Rows[view.ViewTop].Cells...)
+		overlayHistoryCounter(cells, snapshot.Cols, move.NewCounter, snapshot.CounterStyle)
+		runs = append(runs, protocol.CellRun{Row: 0, Cells: cells})
+		if snapshot.ViewportRows > 1 {
+			runs = append(runs, historyCounterRun(view, 1, move.OldCounter, ""))
+		}
+		return runs
+	}
+	bottom := snapshot.ViewportRows - 1
+	rowIndex := view.ViewTop + bottom
+	runs = append(runs, protocol.CellRun{Row: bottom, Cells: append([]protocol.Cell(nil), snapshot.Rows[rowIndex].Cells...)})
+	runs = append(runs, historyCounterRun(view, 0, move.OldCounter, move.NewCounter))
+	return runs
+}
+
+func historyCounterRun(view *HistoryView, viewportRow int, oldLabel, newLabel string) protocol.CellRun {
+	snapshot := view.Snapshot
+	width := max(len(oldLabel), len(newLabel))
+	start := max(0, snapshot.Cols-width)
+	rowIndex := view.ViewTop + viewportRow
+	cells := append([]protocol.Cell(nil), snapshot.Rows[rowIndex].Cells[start:]...)
+	if newLabel != "" {
+		overlayHistoryCounter(cells, len(cells), newLabel, snapshot.CounterStyle)
+	}
+	return protocol.CellRun{Row: viewportRow, Column: start, Cells: cells}
+}
+
 func (c *controller) relayPTYToTerminal(pane *Pane) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := pane.PTY.Read(buf)
 		if n > 0 {
+			pane.terminalMu.Lock()
 			update := pane.Terminal.Apply(buf[:n])
+			pane.terminalMu.Unlock()
 			for _, reply := range update.Replies {
 				if _, err := pane.WriteInput(reply); err != nil {
 					return
@@ -688,6 +877,11 @@ func (c *controller) relayPTYToTerminal(pane *Pane) {
 }
 
 func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) error {
+	c.state.renderMu.Lock()
+	defer c.state.renderMu.Unlock()
+	if c.state.session.IsHistoryPane(clientID0, pane.ID) {
+		return nil
+	}
 	binding, ok := c.state.session.BindingForPane(clientID0, pane.ID)
 	if !ok {
 		return nil
@@ -703,6 +897,8 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 	if update.FullRedraw {
 		return c.sendReplaceSnapshot(binding, window, pane)
 	}
+	pane.terminalMu.Lock()
+	defer pane.terminalMu.Unlock()
 
 	styleIDs := make([]int, 0, len(update.DefinedStyles))
 	for id := range update.DefinedStyles {
@@ -754,6 +950,8 @@ func (c *controller) sendReplaceSnapshot(binding RenderBinding, window *Window, 
 	if outputFrames == nil {
 		return fmt.Errorf("missing output stream for slot %d", binding.Slot)
 	}
+	pane.terminalMu.Lock()
+	defer pane.terminalMu.Unlock()
 	pane.Generation++
 	styleDefs := pane.Terminal.SnapshotStyles()
 	styles := make([]protocol.StyleDefinition, 0, len(styleDefs))
@@ -775,6 +973,46 @@ func (c *controller) sendReplaceSnapshot(binding RenderBinding, window *Window, 
 	}, protocol.EncodeReplacePane)
 }
 
+func (c *controller) sendCurrentViewSnapshot(binding RenderBinding, window *Window, pane *Pane) error {
+	if view := c.state.session.HistoryView(clientID0, pane.ID); view != nil {
+		return c.sendHistorySnapshot(binding, window, pane, view)
+	}
+	return c.sendReplaceSnapshot(binding, window, pane)
+}
+
+func (c *controller) sendHistorySnapshot(binding RenderBinding, window *Window, pane *Pane, view *HistoryView) error {
+	outputFrames := c.outputFrames[binding.Slot]
+	if outputFrames == nil {
+		return fmt.Errorf("missing output stream for slot %d", binding.Slot)
+	}
+	pane.terminalMu.Lock()
+	defer pane.terminalMu.Unlock()
+	pane.Generation++
+	snapshot := view.Snapshot
+	return sendEncoded(outputFrames, protocol.MsgReplacePane, protocol.ReplacePane{
+		SessionID:         c.state.session.ID,
+		WindowID:          window.ID,
+		PaneID:            pane.ID,
+		BindingGeneration: binding.BindingGeneration,
+		Generation:        pane.Generation,
+		Cols:              snapshot.Cols,
+		Rows:              snapshot.ViewportRows,
+		Cells:             historyViewport(view),
+		Styles:            append([]protocol.StyleDefinition(nil), snapshot.Styles...),
+		Cursor: protocol.Cursor{
+			X: min(view.CursorCol, snapshot.Cols-1),
+			Y: view.CursorRow - view.ViewTop,
+		},
+		CursorVisible: true,
+	}, protocol.EncodeReplacePane)
+}
+
+func (c *controller) sendHistorySnapshotSerialized(binding RenderBinding, window *Window, pane *Pane, view *HistoryView) error {
+	c.state.renderMu.Lock()
+	defer c.state.renderMu.Unlock()
+	return c.sendHistorySnapshot(binding, window, pane, view)
+}
+
 func (c *controller) publishWindowList() error {
 	return sendEncoded(c.mgmtFrames, protocol.MsgWindowList, c.state.session.WindowList(clientID0), protocol.EncodeWindowList)
 }
@@ -788,10 +1026,22 @@ func (c *controller) publishWindowLayout() error {
 }
 
 func (c *controller) publishBindingsAndSnapshots() error {
+	c.state.renderMu.Lock()
+	defer c.state.renderMu.Unlock()
 	bindings, _, _, err := c.state.session.RebuildRenderBindings(clientID0)
 	if err != nil {
 		return err
 	}
+	return c.publishBindingSnapshotsLocked(bindings)
+}
+
+func (c *controller) publishBindingSnapshots(bindings []RenderBinding) error {
+	c.state.renderMu.Lock()
+	defer c.state.renderMu.Unlock()
+	return c.publishBindingSnapshotsLocked(bindings)
+}
+
+func (c *controller) publishBindingSnapshotsLocked(bindings []RenderBinding) error {
 	for _, binding := range bindings {
 		pane := c.state.session.Panes[binding.PaneID]
 		window := c.windowForPane(binding.PaneID)
@@ -802,7 +1052,7 @@ func (c *controller) publishBindingsAndSnapshots() error {
 		if outputFrames == nil {
 			return fmt.Errorf("missing output stream for slot %d", binding.Slot)
 		}
-		if err := c.sendReplaceSnapshot(binding, window, pane); err != nil {
+		if err := c.sendCurrentViewSnapshot(binding, window, pane); err != nil {
 			return err
 		}
 	}
@@ -810,6 +1060,12 @@ func (c *controller) publishBindingsAndSnapshots() error {
 }
 
 func (c *controller) publishVisibleSnapshots() error {
+	c.state.renderMu.Lock()
+	defer c.state.renderMu.Unlock()
+	return c.publishVisibleSnapshotsLocked()
+}
+
+func (c *controller) publishVisibleSnapshotsLocked() error {
 	bindings, _ := c.state.session.RenderBindings(clientID0)
 	for _, binding := range bindings {
 		pane := c.state.session.Panes[binding.PaneID]
@@ -817,7 +1073,7 @@ func (c *controller) publishVisibleSnapshots() error {
 		if pane == nil || window == nil {
 			continue
 		}
-		if err := c.sendReplaceSnapshot(binding, window, pane); err != nil {
+		if err := c.sendCurrentViewSnapshot(binding, window, pane); err != nil {
 			return err
 		}
 	}

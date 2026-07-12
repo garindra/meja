@@ -255,6 +255,37 @@ func (s *ClientState) ApplyPaneUpdate(slot uint8, msg protocol.PaneUpdate) bool 
 	return accepted
 }
 
+func (s *ClientState) ApplyScrollPane(slot uint8, delta int) bool {
+	paneID, ok := s.RenderSlots[slot]
+	if !ok || delta == 0 {
+		return ok
+	}
+	pane := s.Panes[paneID]
+	if pane == nil || pane.Grid.Cols <= 0 || pane.Grid.Rows <= 0 {
+		return false
+	}
+	rows := pane.Grid.Rows
+	if delta >= rows || delta <= -rows {
+		for i := range pane.Grid.Cells {
+			pane.Grid.Cells[i] = protocol.Cell{Rune: ' ', Width: 1}
+		}
+	} else if delta > 0 {
+		shift := delta * pane.Grid.Cols
+		copy(pane.Grid.Cells[shift:], pane.Grid.Cells[:len(pane.Grid.Cells)-shift])
+		for i := 0; i < shift; i++ {
+			pane.Grid.Cells[i] = protocol.Cell{Rune: ' ', Width: 1}
+		}
+	} else {
+		shift := -delta * pane.Grid.Cols
+		copy(pane.Grid.Cells, pane.Grid.Cells[shift:])
+		for i := len(pane.Grid.Cells) - shift; i < len(pane.Grid.Cells); i++ {
+			pane.Grid.Cells[i] = protocol.Cell{Rune: ' ', Width: 1}
+		}
+	}
+	s.markDamageRect(pane.Rect)
+	return true
+}
+
 func (s *ClientState) ApplyPaneUpdateResult(slot uint8, msg protocol.PaneUpdate) (bool, bool) {
 	paneID, ok := s.RenderSlots[slot]
 	if !ok {

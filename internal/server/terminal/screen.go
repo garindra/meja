@@ -36,6 +36,8 @@ type TerminalState struct {
 	SavedCursor   SavedCursor
 	ScrollTop     int
 	ScrollBottom  int
+	History       []Row
+	HistoryLimit  int
 
 	styleByID   map[uint32]Style
 	styleToID   map[Style]uint32
@@ -74,6 +76,7 @@ func New(cols, rows int) *TerminalState {
 		styleToID:     map[Style]uint32{DefaultStyle: 0},
 		nextStyleID:   1,
 		ScrollBottom:  rows - 1,
+		HistoryLimit:  2000,
 	}
 	t.GridRows = make([]Row, rows)
 	for row := range t.GridRows {
@@ -95,6 +98,8 @@ func (t *TerminalState) Resize(cols, rows int) {
 	next.styleByID = cloneStyleMap(t.styleByID)
 	next.styleToID = cloneStyleIDMap(t.styleToID)
 	next.nextStyleID = t.nextStyleID
+	next.History = cloneRows(t.History)
+	next.HistoryLimit = t.HistoryLimit
 
 	lines := t.collectLogicalLines()
 	projected := make([]reflowRow, 0, max(rows, len(lines)))
@@ -604,11 +609,40 @@ func (t *TerminalState) scrollUpRegion(top, bottom int) {
 	if top < 0 || bottom >= len(t.GridRows) || top >= bottom {
 		return
 	}
+	if top == 0 && bottom == len(t.GridRows)-1 {
+		t.appendHistoryRow(t.GridRows[0])
+	}
 	copy(t.GridRows[top:bottom], t.GridRows[top+1:bottom+1])
 	t.GridRows[bottom] = blankRow(t.Cols, 0)
 	t.breakWrapChainAt(top)
 	t.breakWrapChainAt(bottom)
 	t.syncCellsFromRows()
+}
+
+func (t *TerminalState) appendHistoryRow(row Row) {
+	if t.HistoryLimit <= 0 {
+		return
+	}
+	copyRow := Row{Cells: append([]Cell(nil), row.Cells...), WrapsNext: row.WrapsNext}
+	if len(t.History) >= t.HistoryLimit {
+		copy(t.History, t.History[len(t.History)-t.HistoryLimit+1:])
+		t.History = t.History[:t.HistoryLimit-1]
+	}
+	t.History = append(t.History, copyRow)
+}
+
+func (t *TerminalState) SnapshotRows() (history, primary []Row) {
+	history = cloneRows(t.History)
+	primary = cloneRows(t.GridRows)
+	return history, primary
+}
+
+func cloneRows(rows []Row) []Row {
+	out := make([]Row, len(rows))
+	for i, row := range rows {
+		out[i] = Row{Cells: append([]Cell(nil), row.Cells...), WrapsNext: row.WrapsNext}
+	}
+	return out
 }
 
 func (t *TerminalState) scrollDownRegion(top, bottom int) {

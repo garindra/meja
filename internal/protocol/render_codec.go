@@ -2,6 +2,27 @@ package protocol
 
 import "fmt"
 
+func EncodeScrollPane(dst []byte, msg ScrollPane) ([]byte, error) {
+	w := PayloadWriter{Buf: dst}
+	w.Varint(int64(msg.Delta))
+	return w.Buf, nil
+}
+
+func DecodeScrollPane(payload []byte) (ScrollPane, error) {
+	r := PayloadReader{Data: payload}
+	delta, err := r.Varint()
+	if err != nil {
+		return ScrollPane{}, fmt.Errorf("decode ScrollPane: %w", err)
+	}
+	if delta < -int64(MaxGridRows) || delta > int64(MaxGridRows) {
+		return ScrollPane{}, fmt.Errorf("decode ScrollPane: delta %d exceeds max rows %d", delta, MaxGridRows)
+	}
+	if err := r.Done(); err != nil {
+		return ScrollPane{}, fmt.Errorf("decode ScrollPane: %w", err)
+	}
+	return ScrollPane{Delta: int(delta)}, nil
+}
+
 const (
 	colorKindDefault byte = iota
 	colorKindIndexed

@@ -25,7 +25,14 @@ type Pane struct {
 	Generation uint64
 	Title      string
 
-	writeMu sync.Mutex
+	writeMu    sync.Mutex
+	terminalMu sync.Mutex
+}
+
+func (p *Pane) TerminalSize() (int, int) {
+	p.terminalMu.Lock()
+	defer p.terminalMu.Unlock()
+	return p.Terminal.Cols, p.Terminal.Rows
 }
 
 func StartPane(unixUser *user.User, paneID uint64, request paneRequest) (*Pane, error) {

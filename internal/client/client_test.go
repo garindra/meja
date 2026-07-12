@@ -182,6 +182,12 @@ func TestProcessInputBytePrefixActions(t *testing.T) {
 	if !detach || prefix != prefixIdle || len(inputs) != 0 || len(mgmt) != 0 {
 		t.Fatalf("detach action failed: inputs=%#v mgmt=%#v detach=%v prefix=%v", inputs, mgmt, detach, prefix)
 	}
+
+	prefix = prefixActive
+	_, mgmt, detach = processInputByte(&prefix, '[', ui, Config{})
+	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgEnterHistory {
+		t.Fatalf("history entry failed: mgmt=%#v detach=%v", mgmt, detach)
+	}
 }
 
 func TestProcessInputByteLastWindowToggles(t *testing.T) {

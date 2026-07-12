@@ -100,6 +100,20 @@ func TestGoldenPayloads(t *testing.T) {
 	}
 }
 
+func TestScrollPaneCodecContainsOnlySignedDelta(t *testing.T) {
+	encoded, err := EncodeScrollPane(nil, ScrollPane{Delta: -1})
+	if err != nil {
+		t.Fatalf("EncodeScrollPane() error = %v", err)
+	}
+	if len(encoded) != 1 {
+		t.Fatalf("encoded ScrollPane length = %d, want 1", len(encoded))
+	}
+	decoded, err := DecodeScrollPane(encoded)
+	if err != nil || decoded.Delta != -1 {
+		t.Fatalf("DecodeScrollPane() = %#v, %v", decoded, err)
+	}
+}
+
 func TestRoundTripMessages(t *testing.T) {
 	expiry := time.Unix(0, 123456789).UTC()
 	streamOpen := mustRoundTrip(t, EncodeStreamOpen, DecodeStreamOpen, StreamOpen{StreamType: StreamTypeManagement, Slot: 2, PaneID: 3})

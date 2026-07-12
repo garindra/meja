@@ -207,6 +207,35 @@ func TestReplaceAcceptsNewPaneAfterShiftedPaneArrivesOnAnotherSlot(t *testing.T)
 	}
 }
 
+func TestApplyScrollPaneShiftsOnlyBoundPaneGrid(t *testing.T) {
+	state := NewClientState()
+	state.ApplyWindowLayout(protocol.WindowLayout{WindowID: 1, Panes: []protocol.PanePlacement{{PaneID: 4, Rect: protocol.Rect{Width: 2, Height: 3}}}})
+	state.ApplyReplace(0, protocol.ReplacePane{
+		WindowID: 1, PaneID: 4, BindingGeneration: 1, Generation: 1,
+		Cols: 2, Rows: 3, Cells: repeatedCells("AABBCC"),
+	})
+	if !state.ApplyScrollPane(0, 1) {
+		t.Fatal("ApplyScrollPane(+1) rejected")
+	}
+	if got := paneCellString(state.Panes[4].Grid.Cells); got != "  AABB" {
+		t.Fatalf("cells after +1 = %q", got)
+	}
+	if !state.ApplyScrollPane(0, -1) {
+		t.Fatal("ApplyScrollPane(-1) rejected")
+	}
+	if got := paneCellString(state.Panes[4].Grid.Cells); got != "AABB  " {
+		t.Fatalf("cells after -1 = %q", got)
+	}
+}
+
+func paneCellString(cells []protocol.Cell) string {
+	runes := make([]rune, len(cells))
+	for i, cell := range cells {
+		runes[i] = cell.Rune
+	}
+	return string(runes)
+}
+
 func TestWindowSelectionKeepsPresentedLayoutUntilReplacement(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(12, 4)

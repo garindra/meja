@@ -348,6 +348,24 @@ func DecodeCreateSplit(payload []byte) (CreateSplit, error) {
 	return CreateSplit{PaneID: paneID, Direction: SplitDirection(direction)}, nil
 }
 
+func EncodeEnterHistory(dst []byte, msg EnterHistory) ([]byte, error) {
+	w := PayloadWriter{Buf: dst}
+	w.Uvarint(msg.PaneID)
+	return w.Buf, nil
+}
+
+func DecodeEnterHistory(payload []byte) (EnterHistory, error) {
+	r := PayloadReader{Data: payload}
+	paneID, err := r.Uvarint()
+	if err != nil {
+		return EnterHistory{}, fmt.Errorf("decode EnterHistory: %w", err)
+	}
+	if err := r.Done(); err != nil {
+		return EnterHistory{}, fmt.Errorf("decode EnterHistory: %w", err)
+	}
+	return EnterHistory{PaneID: paneID}, nil
+}
+
 func EncodeFocusPane(dst []byte, msg FocusPane) ([]byte, error) {
 	w := PayloadWriter{Buf: dst}
 	w.Uvarint(msg.PaneID)

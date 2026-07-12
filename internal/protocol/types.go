@@ -42,6 +42,8 @@ const (
 	MsgPing
 	MsgPong
 	MsgPaneUpdate
+	MsgEnterHistory
+	MsgScrollPane
 )
 
 const (
@@ -205,6 +207,14 @@ type FocusPane struct {
 
 type ClosePane struct {
 	PaneID uint64
+}
+
+type EnterHistory struct {
+	PaneID uint64
+}
+
+type ScrollPane struct {
+	Delta int
 }
 
 type Ping struct {

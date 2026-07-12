@@ -272,10 +272,14 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("set terminal raw mode: %w", err)
 	}
+	if _, err := io.WriteString(cfg.Stdout, "\x1b[?1049h\x1b[H\x1b[2J"); err != nil {
+		_ = term.Restore(int(cfg.Stdin.Fd()), rawState)
+		return fmt.Errorf("enter alternate screen: %w", err)
+	}
 	var restoreOnce sync.Once
 	restoreTerminal := func() {
 		restoreOnce.Do(func() {
-			_, _ = io.WriteString(cfg.Stdout, "\x1b[?25h\x1b[0m")
+			_, _ = io.WriteString(cfg.Stdout, "\x1b[?25h\x1b[0m\x1b[?1049l")
 			_ = term.Restore(int(cfg.Stdin.Fd()), rawState)
 		})
 	}
@@ -456,6 +460,15 @@ func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, m
 					}
 					needsRedraw = presented
 				}
+			case protocol.MsgScrollPane:
+				msg, err := protocol.DecodeScrollPane(frame.Payload)
+				if err == nil {
+					if !state.ApplyScrollPane(slot, msg.Delta) {
+						requestSnapshot = true
+						snapshotPaneID = state.RenderSlots[slot]
+						return
+					}
+				}
 			case protocol.MsgDefineStyle:
 				msg, err := protocol.DecodeDefineStyle(frame.Payload)
 				if err == nil {
@@ -512,7 +525,7 @@ func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, m
 				sessionDone <- fmt.Errorf("remote pane exited with code %d signal %s", exited.ExitCode, exited.Signal)
 				return
 			}
-		case protocol.MsgBindRenderStream, protocol.MsgReplacePane, protocol.MsgPaneUpdate, protocol.MsgDefineStyle, protocol.MsgSetRun, protocol.MsgSetCursor, protocol.MsgSetCursorVisible:
+		case protocol.MsgBindRenderStream, protocol.MsgReplacePane, protocol.MsgPaneUpdate, protocol.MsgScrollPane, protocol.MsgDefineStyle, protocol.MsgSetRun, protocol.MsgSetCursor, protocol.MsgSetCursorVisible:
 			if frame.Type == protocol.MsgReplacePane && needsRedraw {
 				ui.setInputBlocked(false)
 			}
@@ -752,6 +765,11 @@ func processInputByte(prefix *prefixState, b byte, ui *runtimeState, cfg Config)
 		case 'x':
 			payload, _ := protocol.EncodeClosePane(nil, protocol.ClosePane{PaneID: ui.activePaneID()})
 			frame := protocol.Frame{Type: protocol.MsgClosePane, Payload: payload}
+			ui.setInputBlocked(true)
+			return nil, []protocol.Frame{frame}, false
+		case '[':
+			payload, _ := protocol.EncodeEnterHistory(nil, protocol.EnterHistory{PaneID: ui.activePaneID()})
+			frame := protocol.Frame{Type: protocol.MsgEnterHistory, Payload: payload}
 			ui.setInputBlocked(true)
 			return nil, []protocol.Frame{frame}, false
 		default:
@@ -1071,6 +1089,8 @@ func incomingRenderMessageName(msgType uint64) string {
 		return "ReplacePane"
 	case protocol.MsgPaneUpdate:
 		return "PaneUpdate"
+	case protocol.MsgScrollPane:
+		return "ScrollPane"
 	case protocol.MsgDefineStyle:
 		return "DefineStyle"
 	case protocol.MsgSetRun:

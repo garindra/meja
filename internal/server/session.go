@@ -43,6 +43,7 @@ type ClientState struct {
 
 	NextBindingGeneration uint64
 	RenderBindings        []RenderBinding
+	HistoryViews          map[uint64]*HistoryView
 }
 
 func NewSession(id uint64) *Session {
@@ -58,7 +59,7 @@ func NewSession(id uint64) *Session {
 func (s *Session) NewClient(id uint64) *ClientState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	client := &ClientState{ID: id, SessionID: s.ID}
+	client := &ClientState{ID: id, SessionID: s.ID, HistoryViews: map[uint64]*HistoryView{}}
 	s.Clients[id] = client
 	return client
 }
@@ -72,10 +73,13 @@ func (s *Session) EnsureClient(id uint64) *ClientState {
 
 func (s *Session) ensureClientLocked(id uint64) *ClientState {
 	if client := s.Clients[id]; client != nil {
+		if client.HistoryViews == nil {
+			client.HistoryViews = map[uint64]*HistoryView{}
+		}
 		s.ensureClientFocusLocked(client)
 		return client
 	}
-	client := &ClientState{ID: id, SessionID: s.ID}
+	client := &ClientState{ID: id, SessionID: s.ID, HistoryViews: map[uint64]*HistoryView{}}
 	s.ensureClientFocusLocked(client)
 	s.Clients[id] = client
 	return client
@@ -298,6 +302,9 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 		return nil, nil, nil, false, 0, false, fmt.Errorf("unknown window %d", c.ActiveWindowID)
 	}
 	paneIDs := window.Layout.PaneIDs()
+	for _, client := range s.Clients {
+		delete(client.HistoryViews, c.FocusedPaneID)
+	}
 	if len(paneIDs) <= 1 {
 		closedPane = s.Panes[c.FocusedPaneID]
 		delete(s.Panes, c.FocusedPaneID)
@@ -344,6 +351,9 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	}
 	closedPanes = make([]*Pane, 0, len(paneIDs))
 	for _, paneID := range paneIDs {
+		for _, client := range s.Clients {
+			delete(client.HistoryViews, paneID)
+		}
 		if p := s.Panes[paneID]; p != nil {
 			closedPanes = append(closedPanes, p)
 		}
@@ -525,7 +535,11 @@ func (s *Session) SnapshotClient(clientID uint64) *ClientState {
 
 func (s *Session) ResizeAll(cols, rows uint16) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	type resizeTarget struct {
+		pane *Pane
+		rect Rect
+	}
+	var targets []resizeTarget
 	for _, client := range s.Clients {
 		client.TerminalCols = cols
 		client.TerminalRows = rows
@@ -538,9 +552,15 @@ func (s *Session) ResizeAll(cols, rows uint16) {
 			if pane == nil {
 				continue
 			}
-			_ = pane.Resize(uint16(placement.Rect.Width), uint16(placement.Rect.Height))
-			pane.Terminal.Resize(placement.Rect.Width, placement.Rect.Height)
+			targets = append(targets, resizeTarget{pane: pane, rect: placement.Rect})
 		}
+	}
+	s.mu.Unlock()
+	for _, target := range targets {
+		_ = target.pane.Resize(uint16(target.rect.Width), uint16(target.rect.Height))
+		target.pane.terminalMu.Lock()
+		target.pane.Terminal.Resize(target.rect.Width, target.rect.Height)
+		target.pane.terminalMu.Unlock()
 	}
 }
 
