@@ -14,8 +14,9 @@ type Session struct {
 	Panes   map[uint64]*Pane
 	Clients map[uint64]*ClientState
 
-	NextWindowID uint64
-	NextPaneID   uint64
+	NextWindowID       uint64
+	NextPaneID         uint64
+	NextLayoutRevision uint64
 
 	mu sync.RWMutex
 }
@@ -28,9 +29,8 @@ type Window struct {
 }
 
 type RenderBinding struct {
-	Slot              int
-	PaneID            uint64
-	BindingGeneration uint64
+	Slot   int
+	PaneID uint64
 }
 
 type ClientState struct {
@@ -41,12 +41,11 @@ type ClientState struct {
 	TerminalCols   uint16
 	TerminalRows   uint16
 
-	NextBindingGeneration uint64
-	RenderBindings        []RenderBinding
-	HistoryViews          map[uint64]*HistoryView
-	InputState            serverInputState
-	LastWindowID          uint64
-	HasLastWindow         bool
+	RenderBindings []RenderBinding
+	HistoryViews   map[uint64]*HistoryView
+	InputState     serverInputState
+	LastWindowID   uint64
+	HasLastWindow  bool
 }
 
 func NewSession(id uint64) *Session {
@@ -57,6 +56,11 @@ func NewSession(id uint64) *Session {
 		Clients:      map[uint64]*ClientState{},
 		NextWindowID: 1,
 	}
+}
+
+func (s *Session) nextLayoutRevisionLocked() uint64 {
+	s.NextLayoutRevision++
+	return s.NextLayoutRevision
 }
 
 func (s *Session) NewClient(id uint64) *ClientState {
@@ -107,8 +111,13 @@ func (s *Session) SetClientSize(clientID uint64, cols, rows uint16) *ClientState
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	client := s.ensureClientLocked(clientID)
-	client.TerminalCols = cols
-	client.TerminalRows = rows
+	if client.TerminalCols != cols || client.TerminalRows != rows {
+		for _, window := range s.Windows {
+			window.LayoutRevision = s.nextLayoutRevisionLocked()
+		}
+		client.TerminalCols = cols
+		client.TerminalRows = rows
+	}
 	return cloneClientState(client)
 }
 
@@ -124,7 +133,7 @@ func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *Client
 		ID:             windowID,
 		Name:           pane.Title,
 		Layout:         &PaneLayout{PaneID: pane.ID},
-		LayoutRevision: 1,
+		LayoutRevision: s.nextLayoutRevisionLocked(),
 	}
 	s.Windows[windowID] = window
 	s.Panes[pane.ID] = pane
@@ -275,7 +284,7 @@ func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitD
 	}
 	s.Panes[pane.ID] = pane
 	window.Layout = updated
-	window.LayoutRevision++
+	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	client.FocusedPaneID = pane.ID
 	s.rebuildBindingsLocked(client, window)
 	return cloneWindow(window), cloneClientState(client), nil
@@ -339,10 +348,62 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 	}
 	delete(s.Panes, c.FocusedPaneID)
 	window.Layout = updated
-	window.LayoutRevision++
+	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	c.FocusedPaneID = nextFocusedPaneID
 	s.rebuildBindingsLocked(c, window)
 	return closedPane, cloneWindow(window), cloneClientState(c), false, 0, false, nil
+}
+
+// RemovePane applies process exit to authoritative session state. It is a no-op
+// when an explicit close already removed the pane before Process.Wait returned.
+func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *ClientState, finalPane, removed bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.Clients[clientID]
+	if c == nil {
+		return nil, nil, false, false, fmt.Errorf("unknown client %d", clientID)
+	}
+	var owner *Window
+	for _, candidate := range s.Windows {
+		if windowHasPane(candidate, paneID) {
+			owner = candidate
+			break
+		}
+	}
+	if owner == nil || s.Panes[paneID] == nil {
+		return nil, cloneClientState(c), false, false, nil
+	}
+	for _, state := range s.Clients {
+		delete(state.HistoryViews, paneID)
+	}
+	delete(s.Panes, paneID)
+	if len(owner.Layout.PaneIDs()) > 1 {
+		updated, nextFocusedPaneID, ok := removePaneFromLayout(owner.Layout, paneID)
+		if !ok || updated == nil {
+			return nil, nil, false, false, fmt.Errorf("pane %d not found in window %d layout", paneID, owner.ID)
+		}
+		owner.Layout = updated
+		owner.LayoutRevision = s.nextLayoutRevisionLocked()
+		if c.ActiveWindowID == owner.ID && c.FocusedPaneID == paneID {
+			c.FocusedPaneID = nextFocusedPaneID
+		}
+	} else {
+		delete(s.Windows, owner.ID)
+		if len(s.Windows) == 0 {
+			return nil, cloneClientState(c), true, true, nil
+		}
+		if c.ActiveWindowID == owner.ID {
+			ids := s.windowIDsLocked()
+			c.ActiveWindowID = ids[0]
+			c.FocusedPaneID = windowPrimaryPaneID(s.Windows[ids[0]])
+		}
+	}
+	active := s.Windows[c.ActiveWindowID]
+	if active == nil {
+		return nil, nil, false, false, fmt.Errorf("client %d has no active window after removing pane %d", clientID, paneID)
+	}
+	s.rebuildBindingsLocked(c, active)
+	return cloneWindow(active), cloneClientState(c), false, true, nil
 }
 
 func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedPanes []*Pane, replacement *Window, pane *Pane, client *ClientState, autoCreated bool, err error) {
@@ -429,8 +490,16 @@ func (s *Session) WindowLayout(clientID uint64) (protocol.WindowLayout, error) {
 	placements := window.Layout.Compute(rect)
 	out := make([]protocol.PanePlacement, 0, len(placements))
 	for _, placement := range placements {
+		slot := uint8(0)
+		for _, binding := range client.RenderBindings {
+			if binding.PaneID == placement.PaneID {
+				slot = uint8(binding.Slot)
+				break
+			}
+		}
 		out = append(out, protocol.PanePlacement{
 			PaneID: placement.PaneID,
+			Slot:   slot,
 			Rect: protocol.Rect{
 				X:      placement.Rect.X,
 				Y:      placement.Rect.Y,
@@ -516,11 +585,9 @@ func (s *Session) rebuildBindingsLocked(client *ClientState, window *Window) {
 	})
 	bindings := make([]RenderBinding, 0, len(placements))
 	for slot, placement := range placements {
-		client.NextBindingGeneration++
 		bindings = append(bindings, RenderBinding{
-			Slot:              slot,
-			PaneID:            placement.PaneID,
-			BindingGeneration: client.NextBindingGeneration,
+			Slot:   slot,
+			PaneID: placement.PaneID,
 		})
 	}
 	client.RenderBindings = bindings
@@ -563,7 +630,7 @@ func (s *Session) ResizeAll(cols, rows uint16) {
 		client.TerminalRows = rows
 	}
 	for _, window := range s.Windows {
-		window.LayoutRevision++
+		window.LayoutRevision = s.nextLayoutRevisionLocked()
 		placements := window.Layout.Compute(Rect{Width: int(cols), Height: int(rows)})
 		for _, placement := range placements {
 			pane := s.Panes[placement.PaneID]

@@ -38,10 +38,24 @@ type TerminalState struct {
 	ScrollBottom  int
 	History       []Row
 	HistoryLimit  int
+	Alternate     bool
+	Primary       *screenBuffer
 
 	styleByID   map[uint32]Style
 	styleToID   map[Style]uint32
 	nextStyleID uint32
+}
+
+type screenBuffer struct {
+	Rows          []Row
+	CursorX       int
+	CursorY       int
+	CurrentStyle  Style
+	CursorVisible bool
+	WrapPending   bool
+	SavedCursor   SavedCursor
+	ScrollTop     int
+	ScrollBottom  int
 }
 
 type SavedCursor struct {
@@ -88,6 +102,10 @@ func New(cols, rows int) *TerminalState {
 
 func (t *TerminalState) Resize(cols, rows int) {
 	if cols == t.Cols && rows == t.Rows {
+		return
+	}
+	if t.Alternate && t.Primary != nil {
+		t.resizeWhileAlternate(cols, rows)
 		return
 	}
 	next := New(cols, rows)
@@ -144,6 +162,43 @@ func (t *TerminalState) Resize(cols, rows int) {
 	next.clampCursor()
 	next.syncCellsFromRows()
 	*t = *next
+}
+
+func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
+	p := t.Primary
+	primary := New(t.Cols, t.Rows)
+	primary.GridRows = cloneRows(p.Rows)
+	primary.syncCellsFromRows()
+	primary.CursorX = p.CursorX
+	primary.CursorY = p.CursorY
+	primary.CurrentStyle = p.CurrentStyle
+	primary.CursorVisible = p.CursorVisible
+	primary.wrapPending = p.WrapPending
+	primary.SavedCursor = p.SavedCursor
+	primary.ScrollTop = p.ScrollTop
+	primary.ScrollBottom = p.ScrollBottom
+	primary.History = cloneRows(t.History)
+	primary.HistoryLimit = t.HistoryLimit
+	primary.styleByID = cloneStyleMap(t.styleByID)
+	primary.styleToID = cloneStyleIDMap(t.styleToID)
+	primary.nextStyleID = t.nextStyleID
+	primary.Resize(cols, rows)
+	active := make([]Row, rows)
+	for row := range active {
+		active[row] = blankRow(cols, 0)
+	}
+	for row := 0; row < min(rows, len(t.GridRows)); row++ {
+		copy(active[row].Cells, t.GridRows[row].Cells[:min(cols, len(t.GridRows[row].Cells))])
+		active[row].WrapsNext = t.GridRows[row].WrapsNext
+	}
+	t.Cols, t.Rows = cols, rows
+	t.GridRows = active
+	t.ScrollTop = 0
+	t.ScrollBottom = rows - 1
+	t.clampCursor()
+	t.syncCellsFromRows()
+	t.History = primary.History
+	t.Primary = &screenBuffer{Rows: cloneRows(primary.GridRows), CursorX: primary.CursorX, CursorY: primary.CursorY, CurrentStyle: primary.CurrentStyle, CursorVisible: primary.CursorVisible, WrapPending: primary.wrapPending, SavedCursor: primary.SavedCursor, ScrollTop: primary.ScrollTop, ScrollBottom: primary.ScrollBottom}
 }
 
 func (t *TerminalState) SnapshotStyles() []protocolStyleDef {
@@ -338,6 +393,13 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 	case '?':
 		switch parsed.Final {
 		case 'h':
+			if hasScreenMode(parsed.Params) {
+				t.enterAlternateScreen()
+				update.FullRedraw = true
+				update.CursorChanged = true
+				update.VisibleChange = true
+				return
+			}
 			if len(parsed.Params) == 1 && parsed.Params[0] == 25 {
 				t.CursorVisible = true
 				update.VisibleChange = true
@@ -345,6 +407,13 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 			}
 			logUnsupportedf("unsupported private CSI ?%s", seq)
 		case 'l':
+			if hasScreenMode(parsed.Params) {
+				t.exitAlternateScreen()
+				update.FullRedraw = true
+				update.CursorChanged = true
+				update.VisibleChange = true
+				return
+			}
 			if len(parsed.Params) == 1 && parsed.Params[0] == 25 {
 				t.CursorVisible = false
 				update.VisibleChange = true
@@ -609,13 +678,62 @@ func (t *TerminalState) scrollUpRegion(top, bottom int) {
 	if top < 0 || bottom >= len(t.GridRows) || top >= bottom {
 		return
 	}
-	if top == 0 && bottom == len(t.GridRows)-1 {
+	if !t.Alternate && top == 0 && bottom == len(t.GridRows)-1 {
 		t.appendHistoryRow(t.GridRows[0])
 	}
 	copy(t.GridRows[top:bottom], t.GridRows[top+1:bottom+1])
 	t.GridRows[bottom] = blankRow(t.Cols, 0)
 	t.breakWrapChainAt(top)
 	t.breakWrapChainAt(bottom)
+	t.syncCellsFromRows()
+}
+
+func hasScreenMode(params []int) bool {
+	for _, mode := range params {
+		if mode == 47 || mode == 1047 || mode == 1049 {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *TerminalState) enterAlternateScreen() {
+	if t.Alternate {
+		return
+	}
+	t.Primary = &screenBuffer{Rows: cloneRows(t.GridRows), CursorX: t.CursorX, CursorY: t.CursorY, CurrentStyle: t.CurrentStyle, CursorVisible: t.CursorVisible, WrapPending: t.wrapPending, SavedCursor: t.SavedCursor, ScrollTop: t.ScrollTop, ScrollBottom: t.ScrollBottom}
+	t.GridRows = make([]Row, t.Rows)
+	for row := range t.GridRows {
+		t.GridRows[row] = blankRow(t.Cols, 0)
+	}
+	t.CursorX, t.CursorY = 0, 0
+	t.CurrentStyle = DefaultStyle
+	t.CursorVisible = true
+	t.wrapPending = false
+	t.SavedCursor = SavedCursor{}
+	t.ScrollTop = 0
+	t.ScrollBottom = t.Rows - 1
+	t.Alternate = true
+	t.syncCellsFromRows()
+}
+
+func (t *TerminalState) exitAlternateScreen() {
+	if !t.Alternate || t.Primary == nil {
+		return
+	}
+	p := t.Primary
+	t.GridRows = cloneRows(p.Rows)
+	t.CursorX = p.CursorX
+	t.CursorY = p.CursorY
+	t.CurrentStyle = p.CurrentStyle
+	t.CursorVisible = p.CursorVisible
+	t.wrapPending = p.WrapPending
+	t.SavedCursor = p.SavedCursor
+	t.ScrollTop = p.ScrollTop
+	t.ScrollBottom = p.ScrollBottom
+	t.Alternate = false
+	t.Primary = nil
+	t.clampCursor()
 	t.syncCellsFromRows()
 }
 

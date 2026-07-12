@@ -17,13 +17,12 @@ import (
 )
 
 type Pane struct {
-	ID         uint64
-	PTY        *os.File
-	Process    *exec.Cmd
-	User       *user.User
-	Terminal   *terminal.TerminalState
-	Generation uint64
-	Title      string
+	ID       uint64
+	PTY      *os.File
+	Process  *exec.Cmd
+	User     *user.User
+	Terminal *terminal.TerminalState
+	Title    string
 
 	writeMu    sync.Mutex
 	terminalMu sync.Mutex

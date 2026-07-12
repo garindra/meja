@@ -196,6 +196,75 @@ func TestCloseFocusedPaneCollapsesSplit(t *testing.T) {
 	}
 }
 
+func TestRemovePaneCollapsesSplitAndMovesFocus(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash"}
+	s.CreateWindow(pane0, 0)
+	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs"}
+	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
+		t.Fatalf("SplitFocusedPane() error = %v", err)
+	}
+
+	window, client, finalPane, removed, err := s.RemovePane(pane1.ID, 0)
+	if err != nil || !removed || finalPane {
+		t.Fatalf("RemovePane() removed=%v final=%v err=%v", removed, finalPane, err)
+	}
+	if client.FocusedPaneID != pane0.ID {
+		t.Fatalf("focused pane = %d, want %d", client.FocusedPaneID, pane0.ID)
+	}
+	if _, ok := window.Layout.(*PaneLayout); !ok {
+		t.Fatalf("collapsed layout = %#v, want single pane", window.Layout)
+	}
+}
+
+func TestRemoveFinalPaneRequestsReplacement(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	pane := &Pane{ID: s.AddPaneID(), Title: "bash"}
+	s.CreateWindow(pane, 0)
+
+	window, client, finalPane, removed, err := s.RemovePane(pane.ID, 0)
+	if err != nil || !removed || !finalPane || window != nil || client == nil {
+		t.Fatalf("RemovePane() window=%#v client=%#v removed=%v final=%v err=%v", window, client, removed, finalPane, err)
+	}
+	if s.HasWindows() {
+		t.Fatal("session retained a window after its final pane exited")
+	}
+}
+
+func TestLayoutRevisionsAreUniqueAcrossWindows(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	first := &Pane{ID: s.AddPaneID(), Title: "one"}
+	w1, _ := s.CreateWindow(first, 0)
+	second := &Pane{ID: s.AddPaneID(), Title: "two"}
+	w2, _ := s.CreateWindow(second, 0)
+	if w1.LayoutRevision == 0 || w2.LayoutRevision <= w1.LayoutRevision {
+		t.Fatalf("layout revisions first=%d second=%d", w1.LayoutRevision, w2.LayoutRevision)
+	}
+}
+
+func TestWindowLayoutCarriesRenderSlots(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols = 80
+	client.TerminalRows = 23
+	left := &Pane{ID: s.AddPaneID()}
+	s.CreateWindow(left, 0)
+	right := &Pane{ID: s.AddPaneID()}
+	if _, _, err := s.SplitFocusedPane(0, right, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := s.WindowLayout(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layout.Panes) != 2 || layout.Panes[0].Slot == layout.Panes[1].Slot {
+		t.Fatalf("layout slots=%#v", layout.Panes)
+	}
+}
+
 func TestCreateWindowSizePrefersClientDimensionsOverSplitPane(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)

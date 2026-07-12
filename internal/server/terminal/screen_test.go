@@ -114,6 +114,51 @@ func TestEraseLine(t *testing.T) {
 	}
 }
 
+func TestClearErasesEntireCanonicalGrid(t *testing.T) {
+	term := New(8, 3)
+	term.Apply([]byte("first\nsecond\nthird"))
+	update := term.Apply([]byte("\x1b[H\x1b[2J\x1b[3J"))
+	if !update.FullRedraw {
+		t.Fatal("clear did not request full redraw")
+	}
+	for i, cell := range term.Cells {
+		if cell.Rune != ' ' {
+			t.Fatalf("cell %d survived clear: %#v", i, cell)
+		}
+	}
+}
+
+func TestAlternateScreenRestoresPrimaryGrid(t *testing.T) {
+	term := New(8, 3)
+	term.Apply([]byte("prompt"))
+	term.Apply([]byte("\x1b[?1049hTUI data"))
+	if !term.Alternate {
+		t.Fatal("alternate screen not entered")
+	}
+	term.Apply([]byte("\nmore\nrows\nscroll"))
+	if len(term.History) != 0 {
+		t.Fatalf("alternate output entered primary history: %d", len(term.History))
+	}
+	update := term.Apply([]byte("\x1b[?1049l"))
+	if !update.FullRedraw || term.Alternate {
+		t.Fatal("alternate screen not exited")
+	}
+	if got := cellsString(term.GridRows[0].Cells[:6]); got != "prompt" {
+		t.Fatalf("restored primary row=%q", got)
+	}
+}
+
+func TestAlternateResizePreservesPrimary(t *testing.T) {
+	term := New(8, 3)
+	term.Apply([]byte("primary"))
+	term.Apply([]byte("\x1b[?1049hTUI"))
+	term.Resize(12, 4)
+	term.Apply([]byte("\x1b[?1049l"))
+	if got := cellsString(term.GridRows[0].Cells[:7]); got != "primary" {
+		t.Fatalf("primary after alternate resize=%q", got)
+	}
+}
+
 func TestEraseCharsMarksOnlyCurrentRowDirty(t *testing.T) {
 	term := New(5, 2)
 	term.Apply([]byte("hello"))

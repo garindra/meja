@@ -3,14 +3,28 @@ package client
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"tali/internal/client/render"
 	"tali/internal/protocol"
 )
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(p)
+}
+func (b *lockedBuffer) Len() int { b.mu.Lock(); defer b.mu.Unlock(); return b.Buffer.Len() }
 
 func TestParseTarget(t *testing.T) {
 	target, err := ParseTarget("alice@example.com")
@@ -45,11 +59,11 @@ func TestIncomingRenderBurstLog(t *testing.T) {
 	var log bytes.Buffer
 	ui := &runtimeState{debugRender: true, stderr: &log}
 	ui.recordIncomingRenderFrame(protocol.Frame{
-		Type:    protocol.MsgPaneUpdate,
+		Type:    protocol.MsgWriteText,
 		Payload: make([]byte, 7),
 	})
 	ui.recordIncomingRenderFrame(protocol.Frame{
-		Type:    protocol.MsgReplacePane,
+		Type:    protocol.MsgPresent,
 		Payload: make([]byte, 3),
 	})
 	ui.flushIncomingRender()
@@ -61,7 +75,7 @@ func TestIncomingRenderBurstLog(t *testing.T) {
 		"wire_bytes=14",
 		"payload_bytes=10",
 		"commands=2",
-		"types=ReplacePane:1,PaneUpdate:1",
+		"types=WriteText:1,Present:1",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("incoming burst log missing %q: %q", want, got)
@@ -71,6 +85,50 @@ func TestIncomingRenderBurstLog(t *testing.T) {
 	ui.closeIncomingRenderLog()
 	if strings.Count(log.String(), "incoming burst") != 1 {
 		t.Fatalf("closeIncomingRenderLog() duplicated burst log: %q", log.String())
+	}
+}
+
+func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout lockedBuffer
+	ui := &runtimeState{stdout: &stdout, events: make(chan renderEvent, 16)}
+	errs := make(chan error, 2)
+	go ui.renderLoop(ctx, errs)
+	ui.emit(sizeEvent{cols: 8, rows: 4})
+	ui.emit(layoutEvent{layout: protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 8, Height: 3}}}}})
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	done := make(chan error, 1)
+	go readOutputStream(0, protocol.NewDecoder(reader, protocol.DefaultMaxFrameSize), ui, done)
+	enc := protocol.NewEncoder(writer)
+	write := func(kind uint64, payload []byte) {
+		t.Helper()
+		if err := enc.WriteFrame(protocol.Frame{Type: kind, Payload: payload}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, _ := protocol.EncodeRelayoutBarrier(nil, protocol.RelayoutBarrier{LayoutRevision: 1})
+	write(protocol.MsgRelayoutBarrier, b)
+	b, _ = protocol.EncodeSetWritePosition(nil, protocol.SetWritePosition{})
+	write(protocol.MsgSetWritePosition, b)
+	b, _ = protocol.EncodeSetWriteStyle(nil, protocol.SetWriteStyle{})
+	write(protocol.MsgSetWriteStyle, b)
+	b, _ = protocol.EncodeWriteText(nil, protocol.WriteText{CellWidth: 1, Text: []byte("x")})
+	write(protocol.MsgWriteText, b)
+	time.Sleep(10 * time.Millisecond)
+	if stdout.Len() != 0 {
+		t.Fatalf("rendered %d bytes before PRESENT", stdout.Len())
+	}
+	b, _ = protocol.EncodePresent(nil, protocol.Present{})
+	write(protocol.MsgPresent, b)
+	deadline := time.Now().Add(time.Second)
+	for stdout.Len() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if stdout.Len() == 0 {
+		t.Fatal("PRESENT did not render")
 	}
 }
 

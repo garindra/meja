@@ -31,7 +31,6 @@ const (
 	quicMaxIdleTimeout  = 60 * time.Second
 	quicKeepAlivePeriod = 10 * time.Second
 	clientPingPeriod    = 15 * time.Second
-	redrawCoalesceDelay = 2 * time.Millisecond
 	incomingBurstWindow = 50 * time.Millisecond
 )
 
@@ -57,11 +56,9 @@ type Config struct {
 }
 
 type runtimeState struct {
-	mu             sync.Mutex
-	ui             *render.ClientState
 	stdout         io.Writer
 	stderr         io.Writer
-	redrawCh       chan struct{}
+	events         chan renderEvent
 	debugRender    bool
 	redrawRequests uint64
 	redrawWrites   uint64
@@ -75,6 +72,21 @@ type runtimeState struct {
 	incomingCommandCount    uint64
 	incomingMessageTypeHits map[uint64]uint64
 }
+
+type renderEvent interface{ renderEvent() }
+type paneBatchEvent struct {
+	slot           uint8
+	layoutRevision uint64
+	commands       []protocol.Frame
+}
+type layoutEvent struct{ layout protocol.WindowLayout }
+type statusEvent struct{ status protocol.StatusBar }
+type sizeEvent struct{ cols, rows int }
+
+func (paneBatchEvent) renderEvent() {}
+func (layoutEvent) renderEvent()    {}
+func (statusEvent) renderEvent()    {}
+func (sizeEvent) renderEvent()      {}
 
 func ParseTarget(raw string) (Target, error) {
 	parsed, err := sshconfig.ParseTarget(raw)
@@ -173,17 +185,16 @@ func Run(ctx context.Context, cfg Config) error {
 
 	mgmtDecoder := protocol.NewDecoder(mgmtStream, protocol.DefaultMaxFrameSize)
 	ui := &runtimeState{
-		ui:          render.NewClientState(),
 		stdout:      cfg.Stdout,
 		stderr:      renderLog,
-		redrawCh:    make(chan struct{}, 1),
+		events:      make(chan renderEvent, 256),
 		debugRender: cfg.DebugRender,
 	}
 	defer ui.closeIncomingRenderLog()
-	go ui.redrawLoop(ctx, streamErrs)
+	go ui.renderLoop(ctx, streamErrs)
 	outputReady := make(chan struct{}, 1)
 	sessionDone := make(chan error, 2)
-	go acceptOutputStreams(ctx, conn, ui, mgmtFrames, outputReady, sessionDone)
+	go acceptOutputStreams(ctx, conn, ui, outputReady, sessionDone)
 
 	if err := enqueueEncoded(mgmtFrames, protocol.MsgAuthBegin, protocol.AuthBegin{
 		Username:  resolved.Username,
@@ -250,9 +261,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	ui.with(func(state *render.ClientState) {
-		state.SetTerminalSize(int(cols), int(rows))
-	})
+	ui.emit(sizeEvent{cols: int(cols), rows: int(rows)})
 
 	rawState, err := term.MakeRaw(int(cfg.Stdin.Fd()))
 	if err != nil {
@@ -286,7 +295,7 @@ func Run(ctx context.Context, cfg Config) error {
 		Cwd:  cfg.Cwd,
 		Argv: cfg.Argv,
 		Cols: cols,
-		Rows: uint16(ui.drawableRows()),
+		Rows: drawableRows(int(rows)),
 	}, protocol.EncodeCreatePane); err != nil {
 		return err
 	}
@@ -302,9 +311,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("decode pane created: %w", err)
 	}
-	ui.with(func(state *render.ClientState) {
-		state.FocusedPaneID = created.PaneID
-	})
+	_ = created
 
 	select {
 	case <-outputReady:
@@ -364,7 +371,7 @@ func loadTLSConfig(caFile, serverName string) (*tls.Config, error) {
 	}, nil
 }
 
-func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeState, mgmtFrames chan<- protocol.Frame, outputReady chan<- struct{}, sessionDone chan<- error) {
+func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeState, outputReady chan<- struct{}, sessionDone chan<- error) {
 	for i := 0; i < int(protocol.MaxRenderSlots); i++ {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
@@ -390,12 +397,14 @@ func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeS
 			sessionDone <- fmt.Errorf("unexpected output stream slot %d, want %d", open.Slot, i)
 			return
 		}
-		go readOutputStream(open.Slot, decoder, ui, mgmtFrames, sessionDone)
+		go readOutputStream(open.Slot, decoder, ui, sessionDone)
 	}
 	outputReady <- struct{}{}
 }
 
-func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, mgmtFrames chan<- protocol.Frame, sessionDone chan<- error) {
+func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, sessionDone chan<- error) {
+	var layoutRevision uint64
+	var pending []protocol.Frame
 	for {
 		frame, err := decoder.ReadFrame()
 		if err != nil {
@@ -406,119 +415,89 @@ func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, m
 			return
 		}
 		ui.recordIncomingRenderFrame(frame)
-		needsRedraw := false
-		requestSnapshot := false
-		var snapshotPaneID uint64
-		ui.with(func(state *render.ClientState) {
-			switch frame.Type {
-			case protocol.MsgBindRenderStream:
-				msg, err := protocol.DecodeBindRenderStream(frame.Payload)
-				if err == nil {
-					if msg.Slot != slot {
-						return
-					}
-					state.ApplyBind(msg)
-					snapshotPaneID = msg.PaneID
-				}
-			case protocol.MsgReplacePane:
-				msg, err := protocol.DecodeReplacePane(frame.Payload)
-				if err == nil {
-					accepted, presented := state.ApplyReplaceResult(slot, msg)
-					if !accepted {
-						requestSnapshot = true
-						snapshotPaneID = msg.PaneID
-						return
-					}
-					needsRedraw = presented
-				}
-			case protocol.MsgPaneUpdate:
-				msg, err := protocol.DecodePaneUpdate(frame.Payload)
-				if err == nil {
-					accepted, presented := state.ApplyPaneUpdateResult(slot, msg)
-					if !accepted {
-						requestSnapshot = true
-						snapshotPaneID = state.RenderSlots[slot]
-						return
-					}
-					needsRedraw = presented
-				}
-			case protocol.MsgScrollPane:
-				msg, err := protocol.DecodeScrollPane(frame.Payload)
-				if err == nil {
-					if !state.ApplyScrollPane(slot, msg.Delta) {
-						requestSnapshot = true
-						snapshotPaneID = state.RenderSlots[slot]
-						return
-					}
-				}
-			case protocol.MsgDefineStyle:
-				msg, err := protocol.DecodeDefineStyle(frame.Payload)
-				if err == nil {
-					if !state.DefineStyle(slot, msg) {
-						requestSnapshot = true
-						snapshotPaneID = state.RenderSlots[slot]
-					}
-				}
-			case protocol.MsgSetRun:
-				msg, err := protocol.DecodeSetRun(frame.Payload)
-				if err == nil {
-					if !state.ApplySetRun(slot, msg) {
-						requestSnapshot = true
-						snapshotPaneID = state.RenderSlots[slot]
-						return
-					}
-					needsRedraw = true
-				}
-			case protocol.MsgSetCursor:
-				msg, err := protocol.DecodeSetCursor(frame.Payload)
-				if err == nil {
-					if !state.ApplySetCursor(slot, msg) {
-						requestSnapshot = true
-						snapshotPaneID = state.RenderSlots[slot]
-						return
-					}
-					needsRedraw = true
-				}
-			case protocol.MsgSetCursorVisible:
-				msg, err := protocol.DecodeSetCursorVisible(frame.Payload)
-				if err == nil {
-					if !state.ApplySetCursorVisible(slot, msg) {
-						requestSnapshot = true
-						snapshotPaneID = state.RenderSlots[slot]
-						return
-					}
-					needsRedraw = true
-				}
+		if frame.Type == protocol.MsgRelayoutBarrier {
+			msg, err := protocol.DecodeRelayoutBarrier(frame.Payload)
+			if err != nil {
+				sessionDone <- fmt.Errorf("decode RELAYOUT_BARRIER on slot %d: %w", slot, err)
+				return
 			}
-		})
-
-		if requestSnapshot {
-			_ = enqueueEncoded(mgmtFrames, protocol.MsgRequestPaneSnapshot, protocol.RequestPaneSnapshot{PaneID: snapshotPaneID}, protocol.EncodeRequestPaneSnapshot)
+			pending = pending[:0]
+			layoutRevision = msg.LayoutRevision
 			continue
 		}
-		switch frame.Type {
-		case protocol.MsgPaneExited:
-			exited, err := protocol.DecodePaneExited(frame.Payload)
-			if err != nil {
-				sessionDone <- err
-				return
-			}
-			if exited.ExitCode != 0 {
-				sessionDone <- fmt.Errorf("remote pane exited with code %d signal %s", exited.ExitCode, exited.Signal)
-				return
-			}
-		case protocol.MsgBindRenderStream, protocol.MsgReplacePane, protocol.MsgPaneUpdate, protocol.MsgScrollPane, protocol.MsgDefineStyle, protocol.MsgSetRun, protocol.MsgSetCursor, protocol.MsgSetCursorVisible:
-			if needsRedraw {
-				if err := ui.requestRedraw(fmt.Sprintf("output-stream slot=%d msg=%d", slot, frame.Type)); err != nil {
-					sessionDone <- err
-					return
-				}
-			}
-		default:
-			sessionDone <- fmt.Errorf("unexpected output message %d", frame.Type)
+		if frame.Type != protocol.MsgPresent {
+			pending = append(pending, protocol.Frame{
+				Type:    frame.Type,
+				Payload: append([]byte(nil), frame.Payload...),
+			})
+			continue
+		}
+		if _, err := protocol.DecodePresent(frame.Payload); err != nil {
+			sessionDone <- fmt.Errorf("decode PRESENT on slot %d: %w", slot, err)
 			return
 		}
+		if layoutRevision == 0 {
+			sessionDone <- fmt.Errorf("PRESENT on slot %d before RELAYOUT_BARRIER", slot)
+			return
+		}
+		batch := paneBatchEvent{slot: slot, layoutRevision: layoutRevision, commands: append([]protocol.Frame(nil), pending...)}
+		pending = pending[:0]
+		ui.emit(batch)
 	}
+}
+
+func applyDisplayCommand(s *render.ClientState, slot uint8, frame protocol.Frame) error {
+	valid := false
+	switch frame.Type {
+	case protocol.MsgStyleInstall:
+		m, e := protocol.DecodeStyleInstall(frame.Payload)
+		if e != nil {
+			return fmt.Errorf("decode STYLE_INSTALL: %w", e)
+		}
+		valid = s.InstallStyle(slot, m)
+	case protocol.MsgSetWritePosition:
+		m, e := protocol.DecodeSetWritePosition(frame.Payload)
+		if e != nil {
+			return fmt.Errorf("decode SET_WRITE_POSITION: %w", e)
+		}
+		valid = s.SetWritePosition(slot, m)
+	case protocol.MsgSetWriteStyle:
+		m, e := protocol.DecodeSetWriteStyle(frame.Payload)
+		if e != nil {
+			return fmt.Errorf("decode SET_WRITE_STYLE: %w", e)
+		}
+		valid = s.SetWriteStyle(slot, m)
+	case protocol.MsgWriteText:
+		m, e := protocol.DecodeWriteText(frame.Payload)
+		if e != nil {
+			return fmt.Errorf("decode WRITE_TEXT: %w", e)
+		}
+		valid = s.WriteText(slot, m)
+	case protocol.MsgFill:
+		m, e := protocol.DecodeFill(frame.Payload)
+		if e != nil {
+			return fmt.Errorf("decode FILL: %w", e)
+		}
+		valid = s.Fill(slot, m)
+	case protocol.MsgCursorUpdate:
+		m, e := protocol.DecodeCursorUpdate(frame.Payload)
+		if e != nil {
+			return fmt.Errorf("decode CURSOR_UPDATE: %w", e)
+		}
+		valid = s.UpdateCursor(slot, m)
+	case protocol.MsgScroll:
+		m, e := protocol.DecodeScroll(frame.Payload)
+		if e != nil {
+			return fmt.Errorf("decode SCROLL: %w", e)
+		}
+		valid = s.ApplyScroll(slot, m.Delta)
+	default:
+		return fmt.Errorf("unexpected display command %d", frame.Type)
+	}
+	if !valid {
+		return fmt.Errorf("invalid display command %d on slot %d", frame.Type, slot)
+	}
+	return nil
 }
 
 func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- error) {
@@ -536,45 +515,22 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 		case protocol.MsgWindowLayout:
 			msg, err := protocol.DecodeWindowLayout(frame.Payload)
 			if err != nil {
-				done <- err
+				done <- fmt.Errorf("decode WINDOW_LAYOUT: %w", err)
 				return
 			}
-			needsRedraw := false
-			ui.with(func(state *render.ClientState) { needsRedraw = state.ApplyWindowLayout(msg) })
-			if needsRedraw {
-				if err := ui.requestRedraw("window-layout"); err != nil {
-					done <- err
-					return
-				}
-			}
+			ui.emit(layoutEvent{layout: msg})
 		case protocol.MsgStatusBar:
 			msg, err := protocol.DecodeStatusBar(frame.Payload)
 			if err != nil {
-				done <- err
+				done <- fmt.Errorf("decode STATUS_BAR: %w", err)
 				return
 			}
-			ui.with(func(state *render.ClientState) { state.ApplyStatusBar(msg) })
-			if err := ui.requestRedraw("status-bar"); err != nil {
-				done <- err
-				return
-			}
+			ui.emit(statusEvent{status: msg})
 		case protocol.MsgPong:
 			if _, err := protocol.DecodePong(frame.Payload); err != nil {
 				done <- err
 				return
 			}
-		case protocol.MsgPaneExited:
-			exited, err := protocol.DecodePaneExited(frame.Payload)
-			if err != nil {
-				done <- err
-				return
-			}
-			if exited.ExitCode != 0 {
-				done <- fmt.Errorf("remote pane exited with code %d signal %s", exited.ExitCode, exited.Signal)
-				return
-			}
-			done <- nil
-			return
 		default:
 		}
 	}
@@ -617,16 +573,12 @@ func forwardResize(ctx context.Context, tty *os.File, inputFrames chan<- protoco
 				errs <- err
 				return
 			}
-			ui.with(func(state *render.ClientState) { state.SetTerminalSize(int(cols), int(rows)) })
+			ui.emit(sizeEvent{cols: int(cols), rows: int(rows)})
 			if sendErr := enqueueEncoded(inputFrames, protocol.MsgResizePane, protocol.ResizePane{
 				Cols: cols,
-				Rows: uint16(ui.drawableRows()),
+				Rows: drawableRows(int(rows)),
 			}, protocol.EncodeResizePane); sendErr != nil {
 				errs <- sendErr
-				return
-			}
-			if err := ui.requestRedraw("resize"); err != nil {
-				errs <- err
 				return
 			}
 		}
@@ -704,94 +656,81 @@ func currentUsername() (string, error) {
 	return strings.TrimSpace(current.Username), nil
 }
 
-func (r *runtimeState) with(fn func(*render.ClientState)) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	fn(r.ui)
-}
-
-func (r *runtimeState) redrawLoop(ctx context.Context, errs chan<- error) {
-	if r.redrawCh == nil {
-		return
+func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
+	state := render.NewClientState()
+	pending := make(map[uint64][]paneBatchEvent)
+	slotRevision := make(map[uint8]uint64)
+	present := func(reason string) error {
+		r.redrawRequests++
+		r.logRenderf("redraw request #%d: %s", r.redrawRequests, reason)
+		buf := render.RenderANSI(state)
+		r.redrawWrites++
+		r.logRenderf("redraw write #%d bytes=%d", r.redrawWrites, len(buf))
+		_, err := r.stdout.Write(buf)
+		return err
+	}
+	applyBatch := func(batch paneBatchEvent) error {
+		if slotRevision[batch.slot] != batch.layoutRevision {
+			if !state.ResetStream(batch.slot) {
+				return fmt.Errorf("barrier for unbound output slot %d", batch.slot)
+			}
+			slotRevision[batch.slot] = batch.layoutRevision
+		}
+		for _, command := range batch.commands {
+			if err := applyDisplayCommand(state, batch.slot, command); err != nil {
+				return err
+			}
+		}
+		return present(fmt.Sprintf("present slot=%d", batch.slot))
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-r.redrawCh:
-		}
-
-		r.logRenderf("redraw flush")
-		if err := r.redraw(); err != nil {
-			if ctx.Err() != nil {
-				return
+		case event := <-r.events:
+			var err error
+			switch e := event.(type) {
+			case sizeEvent:
+				state.SetTerminalSize(e.cols, e.rows)
+			case statusEvent:
+				state.ApplyStatusBar(e.status)
+				err = present("status-bar")
+			case layoutEvent:
+				if state.ApplyWindowLayout(e.layout) {
+					err = present("window-layout")
+				}
+				for revision := range pending {
+					if revision < e.layout.LayoutRevision {
+						delete(pending, revision)
+					}
+				}
+				if err == nil {
+					for _, batch := range pending[e.layout.LayoutRevision] {
+						if err = applyBatch(batch); err != nil {
+							break
+						}
+					}
+					delete(pending, e.layout.LayoutRevision)
+				}
+			case paneBatchEvent:
+				current := state.Layout.LayoutRevision
+				if e.layoutRevision > current {
+					pending[e.layoutRevision] = append(pending[e.layoutRevision], e)
+				} else if e.layoutRevision == current {
+					err = applyBatch(e)
+				}
 			}
-			errs <- err
-			return
-		}
-
-		timer := time.NewTimer(redrawCoalesceDelay)
-		pending := false
-		for {
-			select {
-			case <-ctx.Done():
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				return
-			case <-r.redrawCh:
-				pending = true
-			case <-timer.C:
-				if !pending {
-					goto nextRedraw
-				}
-				pending = false
-				r.logRenderf("redraw trailing flush")
-				if err := r.redraw(); err != nil {
-					if ctx.Err() != nil {
-						return
-					}
+			if err != nil {
+				if ctx.Err() == nil {
 					errs <- err
-					return
 				}
-				timer.Reset(redrawCoalesceDelay)
+				return
 			}
 		}
-	nextRedraw:
 	}
 }
 
-func (r *runtimeState) requestRedraw(reason string) error {
-	r.mu.Lock()
-	r.redrawRequests++
-	req := r.redrawRequests
-	r.mu.Unlock()
-	r.logRenderf("redraw request #%d: %s", req, reason)
-	if r.redrawCh == nil {
-		return r.redraw()
-	}
-	select {
-	case r.redrawCh <- struct{}{}:
-		r.logRenderf("redraw queued #%d", req)
-	default:
-		r.logRenderf("redraw coalesced #%d", req)
-	}
-	return nil
-}
-
-func (r *runtimeState) redraw() error {
-	r.mu.Lock()
-	buf := render.RenderANSI(r.ui)
-	r.redrawWrites++
-	writeNo := r.redrawWrites
-	r.mu.Unlock()
-	r.logRenderf("redraw write #%d bytes=%d", writeNo, len(buf))
-	_, err := r.stdout.Write(buf)
-	return err
-}
+func (r *runtimeState) emit(event renderEvent) { r.events <- event }
 
 func (r *runtimeState) logRenderf(format string, args ...any) {
 	if !r.debugRender || r.stderr == nil {
@@ -876,24 +815,24 @@ func formatIncomingRenderTypes(types map[uint64]uint64) string {
 
 func incomingRenderMessageName(msgType uint64) string {
 	switch msgType {
-	case protocol.MsgBindRenderStream:
-		return "BindRenderStream"
-	case protocol.MsgReplacePane:
-		return "ReplacePane"
-	case protocol.MsgPaneUpdate:
-		return "PaneUpdate"
-	case protocol.MsgScrollPane:
-		return "ScrollPane"
-	case protocol.MsgDefineStyle:
-		return "DefineStyle"
-	case protocol.MsgSetRun:
-		return "SetRun"
-	case protocol.MsgSetCursor:
-		return "SetCursor"
-	case protocol.MsgSetCursorVisible:
-		return "SetCursorVisible"
-	case protocol.MsgPaneExited:
-		return "PaneExited"
+	case protocol.MsgRelayoutBarrier:
+		return "RelayoutBarrier"
+	case protocol.MsgStyleInstall:
+		return "StyleInstall"
+	case protocol.MsgSetWritePosition:
+		return "SetWritePosition"
+	case protocol.MsgSetWriteStyle:
+		return "SetWriteStyle"
+	case protocol.MsgWriteText:
+		return "WriteText"
+	case protocol.MsgFill:
+		return "Fill"
+	case protocol.MsgCursorUpdate:
+		return "CursorUpdate"
+	case protocol.MsgScroll:
+		return "Scroll"
+	case protocol.MsgPresent:
+		return "Present"
 	default:
 		return fmt.Sprintf("Message%d", msgType)
 	}
@@ -906,8 +845,9 @@ func encodedFrameSize(frame protocol.Frame) int {
 	return typeBytes + payloadBytes + len(frame.Payload)
 }
 
-func (r *runtimeState) drawableRows() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ui.DrawableRows()
+func drawableRows(rows int) uint16 {
+	if rows <= 1 {
+		return 1
+	}
+	return uint16(rows - 1)
 }

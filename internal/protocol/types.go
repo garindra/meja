@@ -2,7 +2,7 @@ package protocol
 
 import "time"
 
-const ALPN = "tali/3"
+const ALPN = "tali/5"
 
 const (
 	MsgOpenManagementStream uint64 = iota + 1
@@ -16,22 +16,21 @@ const (
 	MsgAuthFailed
 	MsgCreatePane
 	MsgPaneCreated
-	MsgPaneExited
 	MsgInputBytes
 	MsgResizePane
-	MsgRequestPaneSnapshot
 	MsgWindowLayout
-	MsgBindRenderStream
-	MsgReplacePane
-	MsgSetRun
-	MsgSetCursor
-	MsgSetCursorVisible
-	MsgDefineStyle
 	MsgPing
 	MsgPong
-	MsgPaneUpdate
-	MsgScrollPane
 	MsgStatusBar
+	MsgRelayoutBarrier
+	MsgStyleInstall
+	MsgSetWritePosition
+	MsgSetWriteStyle
+	MsgWriteText
+	MsgFill
+	MsgCursorUpdate
+	MsgScroll
+	MsgPresent
 )
 
 const (
@@ -87,12 +86,6 @@ type PaneCreated struct {
 	PaneID uint64
 }
 
-type PaneExited struct {
-	PaneID   uint64
-	ExitCode int
-	Signal   string
-}
-
 type InputBytes struct {
 	Data []byte
 }
@@ -106,10 +99,6 @@ type ResizePane struct {
 	Rows uint16
 }
 
-type RequestPaneSnapshot struct {
-	PaneID uint64
-}
-
 type Rect struct {
 	X      int
 	Y      int
@@ -119,6 +108,7 @@ type Rect struct {
 
 type PanePlacement struct {
 	PaneID uint64
+	Slot   uint8
 	Rect   Rect
 }
 
@@ -135,9 +125,45 @@ type StatusBar struct {
 	Styles []StyleDefinition
 }
 
-type ScrollPane struct {
+type RelayoutBarrier struct {
+	LayoutRevision uint64
+}
+
+type StyleInstall struct {
+	ID    uint32
+	Style Style
+}
+
+type SetWritePosition struct {
+	Row    int
+	Column int
+}
+
+type SetWriteStyle struct {
+	StyleID uint32
+}
+
+type WriteText struct {
+	CellWidth uint8
+	Text      []byte
+}
+
+type Fill struct {
+	Columns int
+	Rune    rune
+	Width   uint8
+}
+
+type CursorUpdate struct {
+	Cursor  Cursor
+	Visible bool
+}
+
+type Scroll struct {
 	Delta int
 }
+
+type Present struct{}
 
 type Ping struct {
 	Seq           uint64
@@ -181,79 +207,4 @@ type Cursor struct {
 type StyleDefinition struct {
 	ID    uint32
 	Style Style
-}
-
-type BindRenderStream struct {
-	Slot              uint8
-	SessionID         uint64
-	WindowID          uint64
-	PaneID            uint64
-	BindingGeneration uint64
-}
-
-type ReplacePane struct {
-	SessionID         uint64
-	WindowID          uint64
-	PaneID            uint64
-	BindingGeneration uint64
-	Generation        uint64
-	Cols              int
-	Rows              int
-	Cells             []Cell
-	Styles            []StyleDefinition
-	Cursor            Cursor
-	CursorVisible     bool
-}
-
-type SetRun struct {
-	SessionID         uint64
-	WindowID          uint64
-	BindingGeneration uint64
-	BaseGeneration    uint64
-	Generation        uint64
-	Row               int
-	Column            int
-	Cells             []Cell
-}
-
-type CellRun struct {
-	Row    int
-	Column int
-	Cells  []Cell
-}
-
-type PaneUpdate struct {
-	BindingGeneration    uint64
-	BaseGeneration       uint64
-	Generation           uint64
-	Styles               []StyleDefinition
-	Runs                 []CellRun
-	CursorChanged        bool
-	Cursor               Cursor
-	CursorVisibleChanged bool
-	CursorVisible        bool
-}
-
-type SetCursor struct {
-	SessionID         uint64
-	WindowID          uint64
-	BindingGeneration uint64
-	BaseGeneration    uint64
-	Generation        uint64
-	Cursor            Cursor
-}
-
-type SetCursorVisible struct {
-	SessionID         uint64
-	WindowID          uint64
-	BindingGeneration uint64
-	BaseGeneration    uint64
-	Generation        uint64
-	Visible           bool
-}
-
-type DefineStyle struct {
-	BindingGeneration uint64
-	ID                uint32
-	Style             Style
 }

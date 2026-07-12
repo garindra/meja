@@ -2,30 +2,17 @@ package protocol
 
 import "testing"
 
-func FuzzDecodeInputBytes(f *testing.F) {
-	f.Add([]byte{0x01, 'l', 's'})
-	f.Fuzz(func(t *testing.T, payload []byte) {
-		_, _ = DecodeInputBytes(payload)
-	})
-}
-
-func FuzzDecodeSetRun(f *testing.F) {
-	f.Add([]byte{0x01, 0x02, 0x03, 0x00, 0x00, 0x01, 0x41, 0x00, 0x01})
-	f.Fuzz(func(t *testing.T, payload []byte) {
-		_, _ = DecodeSetRun(payload)
-	})
-}
-
-func FuzzDecodeReplacePane(f *testing.F) {
-	f.Add([]byte{0x01, 0x02, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x41, 0x00, 0x01})
-	f.Fuzz(func(t *testing.T, payload []byte) {
-		_, _ = DecodeReplacePane(payload)
-	})
-}
-
-func FuzzDecodeDefineStyle(f *testing.F) {
-	f.Add([]byte{0x01, 0x01, 0x00, 0x00})
-	f.Fuzz(func(t *testing.T, payload []byte) {
-		_, _ = DecodeDefineStyle(payload)
+func FuzzDisplayCommandDecoders(f *testing.F) {
+	f.Add([]byte{1, 2, 3})
+	f.Fuzz(func(t *testing.T, b []byte) {
+		_, _ = DecodeRelayoutBarrier(b)
+		_, _ = DecodeStyleInstall(b)
+		_, _ = DecodeSetWritePosition(b)
+		_, _ = DecodeSetWriteStyle(b)
+		_, _ = DecodeWriteText(b)
+		_, _ = DecodeFill(b)
+		_, _ = DecodeCursorUpdate(b)
+		_, _ = DecodeScroll(b)
+		_, _ = DecodePresent(b)
 	})
 }

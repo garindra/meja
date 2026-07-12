@@ -60,34 +60,6 @@ func DecodePaneCreated(payload []byte) (PaneCreated, error) {
 	return PaneCreated{PaneID: paneID}, nil
 }
 
-func EncodePaneExited(dst []byte, msg PaneExited) ([]byte, error) {
-	w := PayloadWriter{Buf: dst}
-	w.Uvarint(msg.PaneID)
-	w.Varint(int64(msg.ExitCode))
-	w.String(msg.Signal)
-	return w.Buf, nil
-}
-
-func DecodePaneExited(payload []byte) (PaneExited, error) {
-	r := PayloadReader{Data: payload}
-	paneID, err := r.Uvarint()
-	if err != nil {
-		return PaneExited{}, fmt.Errorf("decode PaneExited: %w", err)
-	}
-	exitCode, err := r.Varint()
-	if err != nil {
-		return PaneExited{}, fmt.Errorf("decode PaneExited: %w", err)
-	}
-	signal, err := r.String(MaxStringLen)
-	if err != nil {
-		return PaneExited{}, fmt.Errorf("decode PaneExited: %w", err)
-	}
-	if err := r.Done(); err != nil {
-		return PaneExited{}, fmt.Errorf("decode PaneExited: %w", err)
-	}
-	return PaneExited{PaneID: paneID, ExitCode: int(exitCode), Signal: signal}, nil
-}
-
 func EncodeInputBytes(dst []byte, msg InputBytes) ([]byte, error) {
 	w := PayloadWriter{Buf: dst}
 	w.Raw(msg.Data)
@@ -123,22 +95,4 @@ func DecodeResizePane(payload []byte) (ResizePane, error) {
 		return ResizePane{}, fmt.Errorf("decode ResizePane: %w", err)
 	}
 	return ResizePane{Cols: uint16(cols), Rows: uint16(rows)}, nil
-}
-
-func EncodeRequestPaneSnapshot(dst []byte, msg RequestPaneSnapshot) ([]byte, error) {
-	w := PayloadWriter{Buf: dst}
-	w.Uvarint(msg.PaneID)
-	return w.Buf, nil
-}
-
-func DecodeRequestPaneSnapshot(payload []byte) (RequestPaneSnapshot, error) {
-	r := PayloadReader{Data: payload}
-	paneID, err := r.Uvarint()
-	if err != nil {
-		return RequestPaneSnapshot{}, fmt.Errorf("decode RequestPaneSnapshot: %w", err)
-	}
-	if err := r.Done(); err != nil {
-		return RequestPaneSnapshot{}, fmt.Errorf("decode RequestPaneSnapshot: %w", err)
-	}
-	return RequestPaneSnapshot{PaneID: paneID}, nil
 }

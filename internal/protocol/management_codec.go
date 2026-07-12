@@ -44,6 +44,7 @@ func EncodeWindowLayout(dst []byte, msg WindowLayout) ([]byte, error) {
 	w.Uvarint(uint64(len(msg.Panes)))
 	for _, pane := range msg.Panes {
 		w.Uvarint(pane.PaneID)
+		w.Uvarint(uint64(pane.Slot))
 		if err := encodeRect(&w, pane.Rect); err != nil {
 			return nil, fmt.Errorf("encode WindowLayout: %w", err)
 		}
@@ -75,11 +76,15 @@ func DecodeWindowLayout(payload []byte) (WindowLayout, error) {
 		if err != nil {
 			return WindowLayout{}, fmt.Errorf("decode WindowLayout: %w", err)
 		}
+		slot, err := r.Uvarint()
+		if err != nil || slot >= MaxRenderSlots {
+			return WindowLayout{}, fmt.Errorf("decode WindowLayout: invalid slot %d", slot)
+		}
 		rect, err := decodeRect(&r)
 		if err != nil {
 			return WindowLayout{}, fmt.Errorf("decode WindowLayout: %w", err)
 		}
-		panes = append(panes, PanePlacement{PaneID: paneID, Rect: rect})
+		panes = append(panes, PanePlacement{PaneID: paneID, Slot: uint8(slot), Rect: rect})
 	}
 	if err := r.Done(); err != nil {
 		return WindowLayout{}, fmt.Errorf("decode WindowLayout: %w", err)
