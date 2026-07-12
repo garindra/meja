@@ -144,6 +144,18 @@ func TestProcessInputBytePrefixActions(t *testing.T) {
 	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgCreateSplit {
 		t.Fatalf("split action failed: %#v detach=%v", mgmt, detach)
 	}
+	if split, err := protocol.DecodeCreateSplit(mgmt[0].Payload); err != nil || split.Direction != protocol.SplitVertical {
+		t.Fatalf("vertical split = %#v err=%v", split, err)
+	}
+
+	prefix = prefixActive
+	_, mgmt, detach = processInputByte(&prefix, '"', ui, Config{})
+	if detach || len(mgmt) != 1 || mgmt[0].Type != protocol.MsgCreateSplit {
+		t.Fatalf("horizontal split action failed: %#v detach=%v", mgmt, detach)
+	}
+	if split, err := protocol.DecodeCreateSplit(mgmt[0].Payload); err != nil || split.Direction != protocol.SplitHorizontal {
+		t.Fatalf("horizontal split = %#v err=%v", split, err)
+	}
 
 	prefix = prefixActive
 	_, mgmt, detach = processInputByte(&prefix, 0x1b, ui, Config{})

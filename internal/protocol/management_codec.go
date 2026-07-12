@@ -320,8 +320,12 @@ func DecodeWindowLayout(payload []byte) (WindowLayout, error) {
 }
 
 func EncodeCreateSplit(dst []byte, msg CreateSplit) ([]byte, error) {
+	if msg.Direction > SplitHorizontal {
+		return nil, fmt.Errorf("encode CreateSplit: invalid direction %d", msg.Direction)
+	}
 	w := PayloadWriter{Buf: dst}
 	w.Uvarint(msg.PaneID)
+	w.Byte(byte(msg.Direction))
 	return w.Buf, nil
 }
 
@@ -331,10 +335,17 @@ func DecodeCreateSplit(payload []byte) (CreateSplit, error) {
 	if err != nil {
 		return CreateSplit{}, fmt.Errorf("decode CreateSplit: %w", err)
 	}
+	direction, err := r.Byte()
+	if err != nil {
+		return CreateSplit{}, fmt.Errorf("decode CreateSplit: %w", err)
+	}
+	if SplitDirection(direction) > SplitHorizontal {
+		return CreateSplit{}, fmt.Errorf("decode CreateSplit: invalid direction %d", direction)
+	}
 	if err := r.Done(); err != nil {
 		return CreateSplit{}, fmt.Errorf("decode CreateSplit: %w", err)
 	}
-	return CreateSplit{PaneID: paneID}, nil
+	return CreateSplit{PaneID: paneID, Direction: SplitDirection(direction)}, nil
 }
 
 func EncodeFocusPane(dst []byte, msg FocusPane) ([]byte, error) {

@@ -72,8 +72,9 @@ func Run(ctx context.Context, cfg Config) error {
 		MinVersion:   tls.VersionTLS13,
 	}
 	listener, err := quic.ListenAddr(cfg.ListenAddr, tlsConfig, &quic.Config{
-		MaxIdleTimeout:  quicMaxIdleTimeout,
-		KeepAlivePeriod: quicKeepAlivePeriod,
+		MaxIdleTimeout:     quicMaxIdleTimeout,
+		KeepAlivePeriod:    quicKeepAlivePeriod,
+		MaxIncomingStreams: int64(protocol.MaxRenderSlots),
 	})
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
@@ -399,6 +400,13 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 			if targetPaneID != clientState.FocusedPaneID {
 				continue
 			}
+			if err := c.state.session.CanSplitFocusedPane(clientID0); err != nil {
+				if err := c.publishVisibleSnapshots(); err != nil {
+					done <- err
+					return
+				}
+				continue
+			}
 			paneID := c.state.session.AddPaneID()
 			newPane, err := StartPane(c.unixUser, paneID, paneRequest{
 				Cols:  uint16(activePane.Terminal.Cols),
@@ -409,7 +417,11 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 				done <- fmt.Errorf("start split pane: %w", err)
 				return
 			}
-			window, clientState, err := c.state.session.SplitFocusedPane(clientID0, newPane)
+			direction := SplitVertical
+			if msg.Direction == protocol.SplitHorizontal {
+				direction = SplitHorizontal
+			}
+			window, clientState, err := c.state.session.SplitFocusedPane(clientID0, newPane, direction)
 			if err != nil {
 				_ = terminatePane(newPane)
 				done <- err
@@ -457,12 +469,14 @@ func (c *controller) handleManagement(decoder *protocol.Decoder, done chan<- err
 					targetWindowID = clientState.ActiveWindowID
 				}
 			}
-			closed, closedPane, replacement, pane, clientState, autoCreate, err := c.state.session.CloseWindow(clientID0, targetWindowID)
+			closed, closedPanes, replacement, pane, clientState, autoCreate, err := c.state.session.CloseWindow(clientID0, targetWindowID)
 			if err != nil {
 				done <- err
 				return
 			}
-			_ = terminatePane(closedPane)
+			for _, closedPane := range closedPanes {
+				_ = terminatePane(closedPane)
+			}
 			if autoCreate {
 				cols, rows := uint16(80), uint16(24)
 				if clientState != nil && clientState.FocusedPaneID != 0 {

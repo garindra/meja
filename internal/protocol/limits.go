@@ -8,8 +8,8 @@ const (
 	MaxBytesLen           uint64 = 4 << 20
 	MaxArgvCount          uint64 = 256
 	MaxWindows            uint64 = 1024
-	MaxVisiblePanes       uint64 = 4
-	MaxRenderSlots        uint64 = 4
+	MaxVisiblePanes       uint64 = 8
+	MaxRenderSlots        uint64 = 8
 	MaxStyles             uint64 = 4096
 	MaxGridCols           uint64 = 1024
 	MaxGridRows           uint64 = 1024

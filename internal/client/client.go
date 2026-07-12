@@ -149,8 +149,9 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	addr := net.JoinHostPort(resolved.Hostname, fmt.Sprintf("%d", resolved.Port))
 	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quic.Config{
-		MaxIdleTimeout:  quicMaxIdleTimeout,
-		KeepAlivePeriod: quicKeepAlivePeriod,
+		MaxIdleTimeout:     quicMaxIdleTimeout,
+		KeepAlivePeriod:    quicKeepAlivePeriod,
+		MaxIncomingStreams: int64(protocol.MaxRenderSlots),
 	})
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
@@ -713,7 +714,12 @@ func processInputByte(prefix *prefixState, b byte, ui *runtimeState, cfg Config)
 			ui.setInputBlocked(true)
 			return nil, []protocol.Frame{frame}, false
 		case '%':
-			payload, _ := protocol.EncodeCreateSplit(nil, protocol.CreateSplit{PaneID: ui.activePaneID()})
+			payload, _ := protocol.EncodeCreateSplit(nil, protocol.CreateSplit{PaneID: ui.activePaneID(), Direction: protocol.SplitVertical})
+			frame := protocol.Frame{Type: protocol.MsgCreateSplit, Payload: payload}
+			ui.setInputBlocked(true)
+			return nil, []protocol.Frame{frame}, false
+		case '"':
+			payload, _ := protocol.EncodeCreateSplit(nil, protocol.CreateSplit{PaneID: ui.activePaneID(), Direction: protocol.SplitHorizontal})
 			frame := protocol.Frame{Type: protocol.MsgCreateSplit, Payload: payload}
 			ui.setInputBlocked(true)
 			return nil, []protocol.Frame{frame}, false
@@ -769,8 +775,8 @@ func processInputByte(prefix *prefixState, b byte, ui *runtimeState, cfg Config)
 	case prefixArrowCSI:
 		*prefix = prefixIdle
 		switch b {
-		case 'C', 'D':
-			if paneID, ok := ui.nextFocusablePaneID(); ok {
+		case 'A', 'B', 'C', 'D':
+			if paneID, ok := ui.focusablePaneID(b); ok {
 				payload, _ := protocol.EncodeFocusPane(nil, protocol.FocusPane{PaneID: paneID})
 				frame := protocol.Frame{Type: protocol.MsgFocusPane, Payload: payload}
 				return nil, []protocol.Frame{frame}, false
@@ -1121,6 +1127,12 @@ func (r *runtimeState) nextFocusablePaneID() (uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.ui.NextFocusablePaneID()
+}
+
+func (r *runtimeState) focusablePaneID(direction byte) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ui.FocusablePaneID(direction)
 }
 
 func (r *runtimeState) windowIDByIndex(index int) (uint64, bool) {

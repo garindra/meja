@@ -3,6 +3,7 @@ package server
 import (
 	"testing"
 
+	"tali/internal/protocol"
 	"tali/internal/server/terminal"
 )
 
@@ -21,6 +22,16 @@ func TestPaneAndSplitLayoutsComputeExpectedRects(t *testing.T) {
 	if len(split) != 2 || split[0].Rect.Width != 59 || split[1].Rect.X != 60 || split[1].Rect.Width != 60 {
 		t.Fatalf("vertical split layout = %#v", split)
 	}
+
+	split = (&SplitLayout{
+		Direction: SplitHorizontal,
+		Ratio:     500,
+		First:     &PaneLayout{PaneID: 1},
+		Second:    &PaneLayout{PaneID: 2},
+	}).Compute(Rect{X: 0, Y: 0, Width: 120, Height: 39})
+	if len(split) != 2 || split[0].Rect.Height != 19 || split[1].Rect.Y != 20 || split[1].Rect.Height != 19 {
+		t.Fatalf("horizontal split layout = %#v", split)
+	}
 }
 
 func TestSessionSplitCreatesNewPaneAndBindings(t *testing.T) {
@@ -36,7 +47,7 @@ func TestSessionSplitCreatesNewPaneAndBindings(t *testing.T) {
 	}
 
 	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs"}
-	window, clientState, err := s.SplitFocusedPane(0, pane1)
+	window, clientState, err := s.SplitFocusedPane(0, pane1, SplitVertical)
 	if err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
@@ -51,6 +62,65 @@ func TestSessionSplitCreatesNewPaneAndBindings(t *testing.T) {
 	}
 }
 
+func TestRecursiveMixedSplitsAndCloseCollapseOnlyParent(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols = 120
+	client.TerminalRows = 39
+
+	pane0 := &Pane{ID: s.AddPaneID(), Title: "root"}
+	s.CreateWindow(pane0, 0)
+	pane1 := &Pane{ID: s.AddPaneID(), Title: "right"}
+	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
+		t.Fatalf("vertical SplitFocusedPane() error = %v", err)
+	}
+	pane2 := &Pane{ID: s.AddPaneID(), Title: "bottom-right"}
+	window, clientState, err := s.SplitFocusedPane(0, pane2, SplitHorizontal)
+	if err != nil {
+		t.Fatalf("nested horizontal SplitFocusedPane() error = %v", err)
+	}
+	placements := window.Layout.Compute(Rect{Width: 120, Height: 39})
+	if len(placements) != 3 || len(clientState.RenderBindings) != 3 {
+		t.Fatalf("nested layout = %#v bindings=%#v", placements, clientState.RenderBindings)
+	}
+	if placements[0].PaneID != pane0.ID || placements[0].Rect.Width != 59 ||
+		placements[1].PaneID != pane1.ID || placements[1].Rect.Height != 19 ||
+		placements[2].PaneID != pane2.ID || placements[2].Rect.Y != 20 {
+		t.Fatalf("nested placements = %#v", placements)
+	}
+
+	closed, window, clientState, windowClosed, _, _, err := s.CloseFocusedPane(0)
+	if err != nil || windowClosed || closed != pane2 {
+		t.Fatalf("CloseFocusedPane() closed=%#v windowClosed=%v err=%v", closed, windowClosed, err)
+	}
+	placements = window.Layout.Compute(Rect{Width: 120, Height: 39})
+	if len(placements) != 2 || placements[0].PaneID != pane0.ID || placements[1].PaneID != pane1.ID || clientState.FocusedPaneID != pane1.ID {
+		t.Fatalf("collapsed nested layout = %#v client=%#v", placements, clientState)
+	}
+}
+
+func TestWindowRejectsNinthPane(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols = 240
+	client.TerminalRows = 80
+	pane := &Pane{ID: s.AddPaneID()}
+	s.CreateWindow(pane, 0)
+	for count := 2; count <= int(protocol.MaxVisiblePanes); count++ {
+		pane = &Pane{ID: s.AddPaneID()}
+		if _, _, err := s.SplitFocusedPane(0, pane, SplitDirection(count%2)); err != nil {
+			t.Fatalf("split %d error = %v", count, err)
+		}
+	}
+	if err := s.CanSplitFocusedPane(0); err == nil {
+		t.Fatal("CanSplitFocusedPane() allowed ninth pane")
+	}
+	extra := &Pane{ID: s.AddPaneID()}
+	if _, _, err := s.SplitFocusedPane(0, extra, SplitVertical); err == nil {
+		t.Fatal("SplitFocusedPane() allowed ninth pane")
+	}
+}
+
 func TestWindowLayoutAndFocusReuseVisiblePanes(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
@@ -60,7 +130,7 @@ func TestWindowLayoutAndFocusReuseVisiblePanes(t *testing.T) {
 	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash"}
 	s.CreateWindow(pane0, 0)
 	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs"}
-	if _, _, err := s.SplitFocusedPane(0, pane1); err != nil {
+	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
 
@@ -88,7 +158,7 @@ func TestResolveInputTargetUsesFocusedPaneWithinSplit(t *testing.T) {
 	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash"}
 	s.CreateWindow(pane0, 0)
 	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs"}
-	if _, _, err := s.SplitFocusedPane(0, pane1); err != nil {
+	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
 	if _, _, err := s.FocusPane(0, pane0.ID); err != nil {
@@ -110,7 +180,7 @@ func TestCloseFocusedPaneCollapsesSplit(t *testing.T) {
 	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash"}
 	s.CreateWindow(pane0, 0)
 	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs"}
-	if _, _, err := s.SplitFocusedPane(0, pane1); err != nil {
+	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
 
@@ -135,7 +205,7 @@ func TestCreateWindowSizePrefersClientDimensionsOverSplitPane(t *testing.T) {
 	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash", Terminal: terminal.New(120, 39)}
 	s.CreateWindow(pane0, 0)
 	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs", Terminal: terminal.New(59, 39)}
-	if _, _, err := s.SplitFocusedPane(0, pane1); err != nil {
+	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
 

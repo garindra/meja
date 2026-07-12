@@ -27,6 +27,7 @@ type SplitDirection uint8
 
 const (
 	SplitVertical SplitDirection = iota
+	SplitHorizontal
 )
 
 type SplitLayout struct {
@@ -48,30 +49,46 @@ func (s *SplitLayout) Compute(rect Rect) []PanePlacement {
 	if s == nil || rect.Width <= 0 || rect.Height <= 0 {
 		return nil
 	}
-	if s.Direction != SplitVertical {
+	if s.Direction != SplitVertical && s.Direction != SplitHorizontal {
 		return nil
 	}
-	if rect.Width <= 1 {
+	axisSize := rect.Width
+	if s.Direction == SplitHorizontal {
+		axisSize = rect.Height
+	}
+	if axisSize <= 1 {
 		return append(s.First.Compute(rect), s.Second.Compute(rect)...)
 	}
 	ratio := int(s.Ratio)
 	if ratio <= 0 || ratio >= 1000 {
 		ratio = 500
 	}
-	available := rect.Width - 1
-	firstWidth := (available * ratio) / 1000
-	if firstWidth < 1 {
-		firstWidth = 1
+	available := axisSize - 1
+	firstSize := (available * ratio) / 1000
+	if firstSize < 1 {
+		firstSize = 1
 	}
-	secondWidth := available - firstWidth
-	if secondWidth < 1 {
-		secondWidth = 1
-		firstWidth = available - secondWidth
+	secondSize := available - firstSize
+	if secondSize < 1 {
+		secondSize = 1
+		firstSize = available - secondSize
 	}
-	firstRect := Rect{X: rect.X, Y: rect.Y, Width: firstWidth, Height: rect.Height}
-	secondRect := Rect{X: rect.X + firstWidth + 1, Y: rect.Y, Width: secondWidth, Height: rect.Height}
+	firstRect := rect
+	secondRect := rect
+	if s.Direction == SplitVertical {
+		firstRect.Width = firstSize
+		secondRect.X += firstSize + 1
+		secondRect.Width = secondSize
+	} else {
+		firstRect.Height = firstSize
+		secondRect.Y += firstSize + 1
+		secondRect.Height = secondSize
+	}
 	out := append(s.First.Compute(firstRect), s.Second.Compute(secondRect)...)
 	sort.Slice(out, func(i, j int) bool {
+		if out[i].Rect.Y != out[j].Rect.Y {
+			return out[i].Rect.Y < out[j].Rect.Y
+		}
 		if out[i].Rect.X == out[j].Rect.X {
 			return out[i].PaneID < out[j].PaneID
 		}

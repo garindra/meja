@@ -144,6 +144,69 @@ func TestWindowLayoutStoresMultiplePaneRectsAndFocusOrder(t *testing.T) {
 	}
 }
 
+func TestDirectionalFocusCanSelectPaneZero(t *testing.T) {
+	state := NewClientState()
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 1})
+	state.ApplyWindowLayout(protocol.WindowLayout{
+		WindowID: 1,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 0, Rect: protocol.Rect{X: 0, Y: 0, Width: 80, Height: 11}},
+			{PaneID: 1, Rect: protocol.Rect{X: 0, Y: 12, Width: 80, Height: 11}},
+		},
+	})
+	if got, ok := state.FocusablePaneID('A'); !ok || got != 0 {
+		t.Fatalf("FocusablePaneID(up) = %d, %v; want 0, true", got, ok)
+	}
+
+	state.FocusedPaneID = 2
+	state.ApplyWindowLayout(protocol.WindowLayout{
+		WindowID: 1,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 0, Rect: protocol.Rect{X: 0, Y: 0, Width: 39, Height: 23}},
+			{PaneID: 2, Rect: protocol.Rect{X: 40, Y: 0, Width: 40, Height: 23}},
+		},
+	})
+	if got, ok := state.FocusablePaneID('D'); !ok || got != 0 {
+		t.Fatalf("FocusablePaneID(left) = %d, %v; want 0, true", got, ok)
+	}
+}
+
+func TestReplaceAcceptsNewPaneAfterShiftedPaneArrivesOnAnotherSlot(t *testing.T) {
+	state := NewClientState()
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 1})
+	state.ApplyWindowLayout(protocol.WindowLayout{
+		WindowID: 1,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 0, Rect: protocol.Rect{X: 0, Y: 0, Width: 80, Height: 19}},
+			{PaneID: 1, Rect: protocol.Rect{X: 0, Y: 20, Width: 80, Height: 19}},
+		},
+	})
+	if !state.ApplyReplace(0, protocol.ReplacePane{WindowID: 1, PaneID: 0, BindingGeneration: 3, Cols: 80, Rows: 19}) ||
+		!state.ApplyReplace(1, protocol.ReplacePane{WindowID: 1, PaneID: 1, BindingGeneration: 4, Cols: 80, Rows: 19}) {
+		t.Fatal("initial pane bindings rejected")
+	}
+
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 2})
+	state.ApplyWindowLayout(protocol.WindowLayout{
+		WindowID: 1,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 0, Rect: protocol.Rect{X: 0, Y: 0, Width: 80, Height: 9}},
+			{PaneID: 2, Rect: protocol.Rect{X: 0, Y: 10, Width: 80, Height: 9}},
+			{PaneID: 1, Rect: protocol.Rect{X: 0, Y: 20, Width: 80, Height: 19}},
+		},
+	})
+	// Independent QUIC streams may deliver the shifted old pane before the new pane.
+	if !state.ApplyReplace(2, protocol.ReplacePane{WindowID: 1, PaneID: 1, BindingGeneration: 10, Cols: 80, Rows: 19}) {
+		t.Fatal("shifted pane replacement rejected")
+	}
+	if !state.ApplyReplace(1, protocol.ReplacePane{WindowID: 1, PaneID: 2, BindingGeneration: 9, Cols: 80, Rows: 9}) {
+		t.Fatal("new pane replacement rejected after shifted pane arrived")
+	}
+	if got := state.RenderSlots[1]; got != 2 {
+		t.Fatalf("render slot 1 = pane %d, want pane 2", got)
+	}
+}
+
 func TestWindowSelectionKeepsPresentedLayoutUntilReplacement(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(12, 4)

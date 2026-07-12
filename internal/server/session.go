@@ -234,7 +234,7 @@ func (s *Session) FocusPane(clientID, paneID uint64) (*Window, *ClientState, err
 	return cloneWindow(window), cloneClientState(client), nil
 }
 
-func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane) (*Window, *ClientState, error) {
+func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitDirection) (*Window, *ClientState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	client := s.Clients[clientID]
@@ -245,23 +245,45 @@ func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane) (*Window, *Clien
 	if window == nil {
 		return nil, nil, fmt.Errorf("unknown window %d", client.ActiveWindowID)
 	}
-	if _, ok := window.Layout.(*SplitLayout); ok {
-		return nil, nil, fmt.Errorf("window %d already split", window.ID)
+	if len(window.Layout.PaneIDs()) >= int(protocol.MaxVisiblePanes) {
+		return nil, nil, fmt.Errorf("window %d has reached the %d-pane limit", window.ID, protocol.MaxVisiblePanes)
 	}
 	if !windowHasPane(window, client.FocusedPaneID) {
 		return nil, nil, fmt.Errorf("focused pane %d not in window %d", client.FocusedPaneID, window.ID)
 	}
-	s.Panes[pane.ID] = pane
-	window.Layout = &SplitLayout{
-		Direction: SplitVertical,
-		Ratio:     500,
-		First:     window.Layout,
-		Second:    &PaneLayout{PaneID: pane.ID},
+	if direction != SplitVertical && direction != SplitHorizontal {
+		return nil, nil, fmt.Errorf("invalid split direction %d", direction)
 	}
+	updated, replaced := replacePaneWithSplit(window.Layout, client.FocusedPaneID, pane.ID, direction)
+	if !replaced {
+		return nil, nil, fmt.Errorf("focused pane %d not found in layout", client.FocusedPaneID)
+	}
+	s.Panes[pane.ID] = pane
+	window.Layout = updated
 	window.LayoutRevision++
 	client.FocusedPaneID = pane.ID
 	s.rebuildBindingsLocked(client, window)
 	return cloneWindow(window), cloneClientState(client), nil
+}
+
+func (s *Session) CanSplitFocusedPane(clientID uint64) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	client := s.Clients[clientID]
+	if client == nil {
+		return fmt.Errorf("unknown client %d", clientID)
+	}
+	window := s.Windows[client.ActiveWindowID]
+	if window == nil {
+		return fmt.Errorf("unknown window %d", client.ActiveWindowID)
+	}
+	if !windowHasPane(window, client.FocusedPaneID) {
+		return fmt.Errorf("focused pane %d not in window %d", client.FocusedPaneID, window.ID)
+	}
+	if len(window.Layout.PaneIDs()) >= int(protocol.MaxVisiblePanes) {
+		return fmt.Errorf("window %d has reached the %d-pane limit", window.ID, protocol.MaxVisiblePanes)
+	}
+	return nil
 }
 
 func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *Window, client *ClientState, windowClosed bool, closedWindowID uint64, autoCreate bool, err error) {
@@ -292,24 +314,20 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 		s.rebuildBindingsLocked(c, nextWindow)
 		return closedPane, cloneWindow(nextWindow), cloneClientState(c), true, closedWindowID, false, nil
 	}
-	split, ok := window.Layout.(*SplitLayout)
-	if !ok {
-		return nil, nil, nil, false, 0, false, fmt.Errorf("unsupported layout for close")
-	}
 	closedPane = s.Panes[c.FocusedPaneID]
-	delete(s.Panes, c.FocusedPaneID)
-	if left := paneIDsFromLayout(split.First); containsPane(left, c.FocusedPaneID) {
-		window.Layout = split.Second
-	} else {
-		window.Layout = split.First
+	updated, nextFocusedPaneID, removed := removePaneFromLayout(window.Layout, c.FocusedPaneID)
+	if !removed || updated == nil {
+		return nil, nil, nil, false, 0, false, fmt.Errorf("focused pane %d not found in layout", c.FocusedPaneID)
 	}
+	delete(s.Panes, c.FocusedPaneID)
+	window.Layout = updated
 	window.LayoutRevision++
-	c.FocusedPaneID = windowPrimaryPaneID(window)
+	c.FocusedPaneID = nextFocusedPaneID
 	s.rebuildBindingsLocked(c, window)
 	return closedPane, cloneWindow(window), cloneClientState(c), false, 0, false, nil
 }
 
-func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedPane *Pane, replacement *Window, pane *Pane, client *ClientState, autoCreated bool, err error) {
+func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedPanes []*Pane, replacement *Window, pane *Pane, client *ClientState, autoCreated bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := s.Clients[clientID]
@@ -324,10 +342,10 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	if len(paneIDs) == 0 {
 		return 0, nil, nil, nil, nil, false, fmt.Errorf("window %d has no panes", windowID)
 	}
-	closedPane = s.Panes[paneIDs[0]]
+	closedPanes = make([]*Pane, 0, len(paneIDs))
 	for _, paneID := range paneIDs {
-		if p := s.Panes[paneID]; p != nil && closedPane == nil {
-			closedPane = p
+		if p := s.Panes[paneID]; p != nil {
+			closedPanes = append(closedPanes, p)
 		}
 		delete(s.Panes, paneID)
 	}
@@ -335,7 +353,7 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	closed = windowID
 
 	if len(s.Windows) == 0 {
-		return closed, closedPane, nil, nil, cloneClientState(c), true, nil
+		return closed, closedPanes, nil, nil, cloneClientState(c), true, nil
 	}
 	ids := s.windowIDsLocked()
 	nextWindow := s.Windows[ids[0]]
@@ -343,7 +361,7 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	c.FocusedPaneID = windowPrimaryPaneID(nextWindow)
 	s.rebuildBindingsLocked(c, nextWindow)
 	pane = s.Panes[c.FocusedPaneID]
-	return closed, closedPane, cloneWindow(nextWindow), pane, cloneClientState(c), false, nil
+	return closed, closedPanes, cloneWindow(nextWindow), pane, cloneClientState(c), false, nil
 }
 
 func (s *Session) WindowList(clientID uint64) protocol.WindowList {
@@ -460,6 +478,9 @@ func (s *Session) RebuildRenderBindings(clientID uint64) ([]RenderBinding, *Wind
 func (s *Session) rebuildBindingsLocked(client *ClientState, window *Window) {
 	placements := window.Layout.Compute(Rect{Width: int(client.TerminalCols), Height: int(client.TerminalRows)})
 	sort.Slice(placements, func(i, j int) bool {
+		if placements[i].Rect.Y != placements[j].Rect.Y {
+			return placements[i].Rect.Y < placements[j].Rect.Y
+		}
 		if placements[i].Rect.X == placements[j].Rect.X {
 			return placements[i].PaneID < placements[j].PaneID
 		}
@@ -537,6 +558,67 @@ func paneIDsFromLayout(layout LayoutNode) []uint64 {
 		return nil
 	}
 	return layout.PaneIDs()
+}
+
+func replacePaneWithSplit(layout LayoutNode, targetPaneID, newPaneID uint64, direction SplitDirection) (LayoutNode, bool) {
+	switch node := layout.(type) {
+	case *PaneLayout:
+		if node.PaneID != targetPaneID {
+			return layout, false
+		}
+		return &SplitLayout{
+			Direction: direction,
+			Ratio:     500,
+			First:     node,
+			Second:    &PaneLayout{PaneID: newPaneID},
+		}, true
+	case *SplitLayout:
+		if updated, ok := replacePaneWithSplit(node.First, targetPaneID, newPaneID, direction); ok {
+			node.First = updated
+			return node, true
+		}
+		if updated, ok := replacePaneWithSplit(node.Second, targetPaneID, newPaneID, direction); ok {
+			node.Second = updated
+			return node, true
+		}
+	}
+	return layout, false
+}
+
+func removePaneFromLayout(layout LayoutNode, targetPaneID uint64) (LayoutNode, uint64, bool) {
+	switch node := layout.(type) {
+	case *PaneLayout:
+		if node.PaneID == targetPaneID {
+			return nil, 0, true
+		}
+	case *SplitLayout:
+		if updated, focusedPaneID, removed := removePaneFromLayout(node.First, targetPaneID); removed {
+			if updated == nil {
+				return node.Second, firstPaneID(node.Second), true
+			}
+			node.First = updated
+			return node, focusedPaneID, true
+		}
+		if updated, focusedPaneID, removed := removePaneFromLayout(node.Second, targetPaneID); removed {
+			if updated == nil {
+				return node.First, firstPaneID(node.First), true
+			}
+			node.Second = updated
+			return node, focusedPaneID, true
+		}
+	}
+	return layout, 0, false
+}
+
+func firstPaneID(layout LayoutNode) uint64 {
+	if layout == nil {
+		return 0
+	}
+	ids := layout.PaneIDs()
+	if len(ids) == 0 {
+		return 0
+	}
+	return ids[0]
 }
 
 func containsPane(ids []uint64, paneID uint64) bool {

@@ -188,8 +188,16 @@ type WindowLayout struct {
 }
 
 type CreateSplit struct {
-	PaneID uint64
+	PaneID    uint64
+	Direction SplitDirection
 }
+
+type SplitDirection uint8
+
+const (
+	SplitVertical SplitDirection = iota
+	SplitHorizontal
+)
 
 type FocusPane struct {
 	PaneID uint64

@@ -170,18 +170,16 @@ func composeContent(state *ClientState) []composedCell {
 
 func composeRowSpan(dst []composedCell, state *ClientState, placements []protocol.PanePlacement, row, startColumn int) {
 	defaultCell := composedCell{Rune: ' ', Style: defaultStyle()}
-	borderX := -1
-	if len(placements) == 2 {
-		borderX = placements[0].Rect.X + placements[0].Rect.Width
-	}
 	for i := range dst {
 		column := startColumn + i
 		cell := defaultCell
+		insidePane := false
 		for _, placement := range placements {
 			if column < placement.Rect.X || column >= placement.Rect.X+placement.Rect.Width ||
 				row < placement.Rect.Y || row >= placement.Rect.Y+placement.Rect.Height {
 				continue
 			}
+			insidePane = true
 			pane := state.Panes[placement.PaneID]
 			if pane == nil {
 				break
@@ -202,10 +200,39 @@ func composeRowSpan(dst []composedCell, state *ClientState, placements []protoco
 			}
 			break
 		}
-		if column == borderX {
-			cell = composedCell{Rune: '│', Style: defaultCell.Style}
+		if !insidePane {
+			if border := paneBorderRune(placements, column, row); border != 0 {
+				cell = composedCell{Rune: border, Style: defaultCell.Style}
+			}
 		}
 		dst[i] = cell
+	}
+}
+
+func paneBorderRune(placements []protocol.PanePlacement, column, row int) rune {
+	var left, right, above, below bool
+	for _, placement := range placements {
+		rect := placement.Rect
+		if row >= rect.Y && row < rect.Y+rect.Height {
+			left = left || rect.X+rect.Width == column
+			right = right || rect.X == column+1
+		}
+		if column >= rect.X && column < rect.X+rect.Width {
+			above = above || rect.Y+rect.Height == row
+			below = below || rect.Y == row+1
+		}
+	}
+	vertical := left && right
+	horizontal := above && below
+	switch {
+	case vertical && horizontal:
+		return '┼'
+	case vertical:
+		return '│'
+	case horizontal:
+		return '─'
+	default:
+		return 0
 	}
 }
 

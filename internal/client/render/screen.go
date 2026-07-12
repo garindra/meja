@@ -221,21 +221,16 @@ func (s *ClientState) ApplyReplaceResult(slot uint8, msg protocol.ReplacePane) (
 
 func (s *ClientState) applyReplace(slot uint8, msg protocol.ReplacePane) bool {
 	oldPaneID, bound := s.RenderSlots[slot]
-	if bound {
-		oldPane := s.Panes[oldPaneID]
-		if oldPane != nil && msg.BindingGeneration < oldPane.BindingGeneration {
-			return false
-		}
-		if oldPaneID != msg.PaneID && !s.layoutContainsPane(oldPaneID) {
-			delete(s.Panes, oldPaneID)
-		}
+	pane := s.Panes[msg.PaneID]
+	if pane != nil && pane.BindingGeneration > msg.BindingGeneration {
+		return false
+	}
+	if bound && oldPaneID != msg.PaneID && !s.layoutContainsPane(oldPaneID) {
+		delete(s.Panes, oldPaneID)
 	}
 	s.RenderSlots[slot] = msg.PaneID
 	delete(s.transitioningSlots, slot)
-	pane := s.ensurePane(msg.PaneID)
-	if pane.BindingGeneration > msg.BindingGeneration {
-		return false
-	}
+	pane = s.ensurePane(msg.PaneID)
 	if s.SessionID != msg.SessionID {
 		s.tabBarDirty = true
 	}
@@ -505,9 +500,79 @@ func (s *ClientState) NextFocusablePaneID() (uint64, bool) {
 	return ordered[0].PaneID, true
 }
 
+func (s *ClientState) FocusablePaneID(direction byte) (uint64, bool) {
+	var current protocol.PanePlacement
+	foundCurrent := false
+	for _, pane := range s.Layout.Panes {
+		if pane.PaneID == s.FocusedPaneID {
+			current = pane
+			foundCurrent = true
+			break
+		}
+	}
+	if !foundCurrent {
+		return s.NextFocusablePaneID()
+	}
+	currentX := current.Rect.X*2 + current.Rect.Width
+	currentY := current.Rect.Y*2 + current.Rect.Height
+	bestScore := int(^uint(0) >> 1)
+	bestPaneID := uint64(0)
+	foundCandidate := false
+	for _, candidate := range s.Layout.Panes {
+		if candidate.PaneID == current.PaneID {
+			continue
+		}
+		x := candidate.Rect.X*2 + candidate.Rect.Width
+		y := candidate.Rect.Y*2 + candidate.Rect.Height
+		dx, dy := x-currentX, y-currentY
+		primary, secondary := 0, 0
+		switch direction {
+		case 'A':
+			if dy >= 0 {
+				continue
+			}
+			primary, secondary = -dy, absInt(dx)
+		case 'B':
+			if dy <= 0 {
+				continue
+			}
+			primary, secondary = dy, absInt(dx)
+		case 'C':
+			if dx <= 0 {
+				continue
+			}
+			primary, secondary = dx, absInt(dy)
+		case 'D':
+			if dx >= 0 {
+				continue
+			}
+			primary, secondary = -dx, absInt(dy)
+		default:
+			return 0, false
+		}
+		score := primary*10000 + secondary
+		if score < bestScore {
+			bestScore = score
+			bestPaneID = candidate.PaneID
+			foundCandidate = true
+		}
+	}
+	return bestPaneID, foundCandidate
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
 func (s *ClientState) orderedLayoutPanes() []protocol.PanePlacement {
 	out := append([]protocol.PanePlacement(nil), s.Layout.Panes...)
 	sort.Slice(out, func(i, j int) bool {
+		if out[i].Rect.Y != out[j].Rect.Y {
+			return out[i].Rect.Y < out[j].Rect.Y
+		}
 		if out[i].Rect.X == out[j].Rect.X {
 			return out[i].PaneID < out[j].PaneID
 		}
