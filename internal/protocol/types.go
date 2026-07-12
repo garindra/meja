@@ -41,6 +41,7 @@ const (
 	MsgDefineStyle
 	MsgPing
 	MsgPong
+	MsgPaneUpdate
 )
 
 const (
@@ -273,6 +274,24 @@ type SetRun struct {
 	Row               int
 	Column            int
 	Cells             []Cell
+}
+
+type CellRun struct {
+	Row    int
+	Column int
+	Cells  []Cell
+}
+
+type PaneUpdate struct {
+	BindingGeneration    uint64
+	BaseGeneration       uint64
+	Generation           uint64
+	Styles               []StyleDefinition
+	Runs                 []CellRun
+	CursorChanged        bool
+	Cursor               Cursor
+	CursorVisibleChanged bool
+	CursorVisible        bool
 }
 
 type SetCursor struct {

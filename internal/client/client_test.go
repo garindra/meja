@@ -1,8 +1,10 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +38,39 @@ func TestParseTargetInvalid(t *testing.T) {
 		if _, err := ParseTarget(tc); err == nil {
 			t.Fatalf("ParseTarget(%q) error = nil, want error", tc)
 		}
+	}
+}
+
+func TestIncomingRenderBurstLog(t *testing.T) {
+	var log bytes.Buffer
+	ui := &runtimeState{debugRender: true, stderr: &log}
+	ui.recordIncomingRenderFrame(protocol.Frame{
+		Type:    protocol.MsgPaneUpdate,
+		Payload: make([]byte, 7),
+	})
+	ui.recordIncomingRenderFrame(protocol.Frame{
+		Type:    protocol.MsgReplacePane,
+		Payload: make([]byte, 3),
+	})
+	ui.flushIncomingRender()
+
+	got := log.String()
+	for _, want := range []string{
+		"incoming burst at=",
+		"window=50ms",
+		"wire_bytes=14",
+		"payload_bytes=10",
+		"commands=2",
+		"types=ReplacePane:1,PaneUpdate:1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("incoming burst log missing %q: %q", want, got)
+		}
+	}
+
+	ui.closeIncomingRenderLog()
+	if strings.Count(log.String(), "incoming burst") != 1 {
+		t.Fatalf("closeIncomingRenderLog() duplicated burst log: %q", log.String())
 	}
 }
 
@@ -137,17 +172,17 @@ func TestProcessInputBytePrefixActions(t *testing.T) {
 	}
 }
 
-func TestProcessInputByteLastWindowTogglesWithWindowZero(t *testing.T) {
+func TestProcessInputByteLastWindowToggles(t *testing.T) {
 	ui := &runtimeState{ui: render.NewClientState()}
 	ui.with(func(state *render.ClientState) {
 		state.ApplyWindowList(protocol.WindowList{
 			Windows: []protocol.WindowInfo{
-				{WindowID: 0, PaneID: 10, Index: 0, Title: "bash"},
-				{WindowID: 1, PaneID: 11, Index: 1, Title: "logs"},
+				{WindowID: 1, PaneID: 10, Index: 0, Title: "bash"},
+				{WindowID: 2, PaneID: 11, Index: 1, Title: "logs"},
 			},
 		})
-		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 0, PaneID: 10})
-		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 11})
+		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
+		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 11})
 	})
 
 	prefix := prefixActive
@@ -156,12 +191,12 @@ func TestProcessInputByteLastWindowTogglesWithWindowZero(t *testing.T) {
 		t.Fatalf("first last-window selection failed: %#v detach=%v", mgmt, detach)
 	}
 	sel, err := protocol.DecodeSelectWindow(mgmt[0].Payload)
-	if err != nil || sel.WindowID != 0 {
+	if err != nil || sel.WindowID != 1 {
 		t.Fatalf("first last SelectWindow = %#v err=%v", sel, err)
 	}
 
 	ui.with(func(state *render.ClientState) {
-		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 0, PaneID: 10})
+		state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
 	})
 	prefix = prefixActive
 	_, mgmt, detach = processInputByte(&prefix, 'l', ui, Config{})
@@ -169,7 +204,7 @@ func TestProcessInputByteLastWindowTogglesWithWindowZero(t *testing.T) {
 		t.Fatalf("second last-window selection failed: %#v detach=%v", mgmt, detach)
 	}
 	sel, err = protocol.DecodeSelectWindow(mgmt[0].Payload)
-	if err != nil || sel.WindowID != 1 {
+	if err != nil || sel.WindowID != 2 {
 		t.Fatalf("second last SelectWindow = %#v err=%v", sel, err)
 	}
 }

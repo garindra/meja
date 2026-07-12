@@ -51,12 +51,58 @@ func TestLFWithoutScrollDoesNotForceFullRedraw(t *testing.T) {
 	}
 }
 
+func TestPrintableOutputTracksDirtyColumnSpan(t *testing.T) {
+	term := New(10, 1)
+	term.CursorX = 4
+	update := term.Apply([]byte("l"))
+	if got, want := update.DirtySpans[0], (DirtySpan{Start: 4, End: 5}); got != want {
+		t.Fatalf("dirty span = %#v, want %#v", got, want)
+	}
+}
+
+func TestPrintableOutputMergesDirtyColumnSpans(t *testing.T) {
+	term := New(10, 1)
+	update := term.Apply([]byte("abc"))
+	if got, want := update.DirtySpans[0], (DirtySpan{Start: 0, End: 3}); got != want {
+		t.Fatalf("dirty span = %#v, want %#v", got, want)
+	}
+}
+
 func TestEraseLine(t *testing.T) {
 	term := New(5, 1)
-	term.Apply([]byte("hello\x1b[3G\x1b[K"))
+	term.Apply([]byte("hello"))
+	update := term.Apply([]byte("\x1b[3G\x1b[K"))
 	got := string([]rune{term.Cells[0].Rune, term.Cells[1].Rune, term.Cells[2].Rune, term.Cells[3].Rune, term.Cells[4].Rune})
 	if got != "he   " {
 		t.Fatalf("got %q", got)
+	}
+	if update.FullRedraw {
+		t.Fatal("erase line forced a full redraw")
+	}
+	if _, ok := update.DirtyRows[0]; !ok {
+		t.Fatal("erase line did not mark its row dirty")
+	}
+	if got, want := update.DirtySpans[0], (DirtySpan{Start: 2, End: 5}); got != want {
+		t.Fatalf("erase line dirty span = %#v, want %#v", got, want)
+	}
+}
+
+func TestEraseCharsMarksOnlyCurrentRowDirty(t *testing.T) {
+	term := New(5, 2)
+	term.Apply([]byte("hello"))
+	term.CursorX = 1
+	update := term.Apply([]byte("\x1b[2X"))
+	if update.FullRedraw {
+		t.Fatal("erase characters forced a full redraw")
+	}
+	if len(update.DirtyRows) != 1 {
+		t.Fatalf("erase characters dirty rows = %#v", update.DirtyRows)
+	}
+	if _, ok := update.DirtyRows[0]; !ok {
+		t.Fatal("erase characters did not mark its row dirty")
+	}
+	if got, want := update.DirtySpans[0], (DirtySpan{Start: 1, End: 3}); got != want {
+		t.Fatalf("erase characters dirty span = %#v, want %#v", got, want)
 	}
 }
 

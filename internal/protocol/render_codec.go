@@ -16,6 +16,11 @@ const (
 	styleFlagReverse
 )
 
+const (
+	cellSequenceRaw byte = iota
+	cellSequenceRLE
+)
+
 func EncodeBindRenderStream(dst []byte, msg BindRenderStream) ([]byte, error) {
 	w := PayloadWriter{Buf: dst}
 	w.Uvarint(uint64(msg.Slot))
@@ -380,10 +385,8 @@ func EncodeReplacePane(dst []byte, msg ReplacePane) ([]byte, error) {
 			return nil, fmt.Errorf("encode ReplacePane: %w", err)
 		}
 	}
-	for _, cell := range msg.Cells {
-		if err := encodeCell(&w, cell); err != nil {
-			return nil, fmt.Errorf("encode ReplacePane: %w", err)
-		}
+	if err := encodeCellSequence(&w, msg.Cells); err != nil {
+		return nil, fmt.Errorf("encode ReplacePane: %w", err)
 	}
 	return w.Buf, nil
 }
@@ -450,13 +453,9 @@ func DecodeReplacePane(payload []byte) (ReplacePane, error) {
 		}
 		styles = append(styles, StyleDefinition{ID: uint32(styleID), Style: style})
 	}
-	cells := make([]Cell, int(cellCount))
-	for i := range cells {
-		cell, err := decodeCell(&r)
-		if err != nil {
-			return ReplacePane{}, fmt.Errorf("decode ReplacePane: %w", err)
-		}
-		cells[i] = cell
+	cells, err := decodeCellSequence(&r, int(cellCount))
+	if err != nil {
+		return ReplacePane{}, fmt.Errorf("decode ReplacePane: %w", err)
 	}
 	if err := r.Done(); err != nil {
 		return ReplacePane{}, fmt.Errorf("decode ReplacePane: %w", err)
@@ -474,4 +473,294 @@ func DecodeReplacePane(payload []byte) (ReplacePane, error) {
 		Styles:            styles,
 		Cells:             cells,
 	}, nil
+}
+
+const (
+	paneUpdateCursorChanged byte = 1 << iota
+	paneUpdateCursorVisibleChanged
+)
+
+func EncodePaneUpdate(dst []byte, msg PaneUpdate) ([]byte, error) {
+	if uint64(len(msg.Styles)) > MaxStyles {
+		return nil, fmt.Errorf("encode PaneUpdate: style count %d exceeds max %d", len(msg.Styles), MaxStyles)
+	}
+	if uint64(len(msg.Runs)) > MaxGridRows {
+		return nil, fmt.Errorf("encode PaneUpdate: run count %d exceeds max %d", len(msg.Runs), MaxGridRows)
+	}
+	if msg.CursorChanged && (msg.Cursor.X < 0 || msg.Cursor.Y < 0) {
+		return nil, fmt.Errorf("encode PaneUpdate: negative cursor")
+	}
+
+	w := PayloadWriter{Buf: dst}
+	w.Uvarint(msg.BindingGeneration)
+	w.Uvarint(msg.BaseGeneration)
+	w.Uvarint(msg.Generation)
+	w.Uvarint(uint64(len(msg.Styles)))
+	for _, def := range msg.Styles {
+		w.Uvarint(uint64(def.ID))
+		if err := encodeStyle(&w, def.Style); err != nil {
+			return nil, fmt.Errorf("encode PaneUpdate: %w", err)
+		}
+	}
+	w.Uvarint(uint64(len(msg.Runs)))
+	for _, run := range msg.Runs {
+		if run.Row < 0 || run.Column < 0 {
+			return nil, fmt.Errorf("encode PaneUpdate: negative run coordinates")
+		}
+		if uint64(len(run.Cells)) > MaxCellRun {
+			return nil, fmt.Errorf("encode PaneUpdate: cell count %d exceeds max %d", len(run.Cells), MaxCellRun)
+		}
+		w.Uvarint(uint64(run.Row))
+		w.Uvarint(uint64(run.Column))
+		w.Uvarint(uint64(len(run.Cells)))
+		if err := encodeCellSequence(&w, run.Cells); err != nil {
+			return nil, fmt.Errorf("encode PaneUpdate: %w", err)
+		}
+	}
+	var flags byte
+	if msg.CursorChanged {
+		flags |= paneUpdateCursorChanged
+	}
+	if msg.CursorVisibleChanged {
+		flags |= paneUpdateCursorVisibleChanged
+	}
+	w.Byte(flags)
+	if msg.CursorChanged {
+		w.Uvarint(uint64(msg.Cursor.X))
+		w.Uvarint(uint64(msg.Cursor.Y))
+	}
+	if msg.CursorVisibleChanged {
+		w.Bool(msg.CursorVisible)
+	}
+	return w.Buf, nil
+}
+
+func DecodePaneUpdate(payload []byte) (PaneUpdate, error) {
+	r := PayloadReader{Data: payload}
+	bindingGeneration, err := r.Uvarint()
+	if err != nil {
+		return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+	}
+	baseGeneration, err := r.Uvarint()
+	if err != nil {
+		return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+	}
+	generation, err := r.Uvarint()
+	if err != nil {
+		return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+	}
+	styleCount, err := readCount(&r, MaxStyles)
+	if err != nil {
+		return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+	}
+	styles := make([]StyleDefinition, 0, styleCount)
+	for i := 0; i < styleCount; i++ {
+		rawID, err := r.Uvarint()
+		if err != nil {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+		}
+		if rawID > MaxStyles {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: style id %d exceeds max %d", rawID, MaxStyles)
+		}
+		style, err := decodeStyle(&r)
+		if err != nil {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+		}
+		styles = append(styles, StyleDefinition{ID: uint32(rawID), Style: style})
+	}
+	runCount, err := readCount(&r, MaxGridRows)
+	if err != nil {
+		return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+	}
+	runs := make([]CellRun, 0, runCount)
+	var totalCells uint64
+	for i := 0; i < runCount; i++ {
+		row, err := readCoord(&r, MaxGridRows)
+		if err != nil {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+		}
+		column, err := readCoord(&r, MaxGridCols)
+		if err != nil {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+		}
+		cellCount, err := readCount(&r, MaxCellRun)
+		if err != nil {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+		}
+		totalCells += uint64(cellCount)
+		if totalCells > MaxCells {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: total cell count exceeds max %d", MaxCells)
+		}
+		cells, err := decodeCellSequence(&r, cellCount)
+		if err != nil {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+		}
+		runs = append(runs, CellRun{Row: row, Column: column, Cells: cells})
+	}
+	flags, err := r.Byte()
+	if err != nil {
+		return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+	}
+	if flags & ^byte(paneUpdateCursorChanged|paneUpdateCursorVisibleChanged) != 0 {
+		return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: unknown flags %#x", flags)
+	}
+	msg := PaneUpdate{
+		BindingGeneration:    bindingGeneration,
+		BaseGeneration:       baseGeneration,
+		Generation:           generation,
+		Styles:               styles,
+		Runs:                 runs,
+		CursorChanged:        flags&paneUpdateCursorChanged != 0,
+		CursorVisibleChanged: flags&paneUpdateCursorVisibleChanged != 0,
+	}
+	if msg.CursorChanged {
+		x, err := readCoord(&r, MaxGridCols)
+		if err != nil {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+		}
+		y, err := readCoord(&r, MaxGridRows)
+		if err != nil {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+		}
+		msg.Cursor = Cursor{X: x, Y: y}
+	}
+	if msg.CursorVisibleChanged {
+		visible, err := r.Bool()
+		if err != nil {
+			return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+		}
+		msg.CursorVisible = visible
+	}
+	if err := r.Done(); err != nil {
+		return PaneUpdate{}, fmt.Errorf("decode PaneUpdate: %w", err)
+	}
+	return msg, nil
+}
+
+func encodeCellSequence(w *PayloadWriter, cells []Cell) error {
+	encoding, err := chooseCellSequenceEncoding(cells)
+	if err != nil {
+		return err
+	}
+	w.Byte(encoding)
+	if encoding == cellSequenceRaw {
+		for _, cell := range cells {
+			if err := encodeCell(w, cell); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	runCount := 0
+	for i := 0; i < len(cells); {
+		runCount++
+		cell := cells[i]
+		i++
+		for i < len(cells) && cells[i] == cell {
+			i++
+		}
+	}
+	w.Uvarint(uint64(runCount))
+	for i := 0; i < len(cells); {
+		start := i
+		cell := cells[i]
+		i++
+		for i < len(cells) && cells[i] == cell {
+			i++
+		}
+		w.Uvarint(uint64(i - start))
+		if err := encodeCell(w, cell); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func decodeCellSequence(r *PayloadReader, cellCount int) ([]Cell, error) {
+	encoding, err := r.Byte()
+	if err != nil {
+		return nil, err
+	}
+	cells := make([]Cell, cellCount)
+	switch encoding {
+	case cellSequenceRaw:
+		for i := range cells {
+			cell, err := decodeCell(r)
+			if err != nil {
+				return nil, err
+			}
+			cells[i] = cell
+		}
+		return cells, nil
+	case cellSequenceRLE:
+		runCount, err := readCount(r, uint64(cellCount))
+		if err != nil {
+			return nil, err
+		}
+		written := 0
+		for i := 0; i < runCount; i++ {
+			runLength, err := r.Uvarint()
+			if err != nil {
+				return nil, err
+			}
+			if runLength == 0 || runLength > uint64(cellCount-written) {
+				return nil, fmt.Errorf("invalid cell run length %d with %d cells remaining", runLength, cellCount-written)
+			}
+			cell, err := decodeCell(r)
+			if err != nil {
+				return nil, err
+			}
+			end := written + int(runLength)
+			for written < end {
+				cells[written] = cell
+				written++
+			}
+		}
+		if written != cellCount {
+			return nil, fmt.Errorf("cell runs decoded %d cells, want %d", written, cellCount)
+		}
+		return cells, nil
+	default:
+		return nil, fmt.Errorf("unknown cell sequence encoding %d", encoding)
+	}
+}
+
+func chooseCellSequenceEncoding(cells []Cell) (byte, error) {
+	rawSize := 0
+	rleBodySize := 0
+	runCount := 0
+	for i := 0; i < len(cells); {
+		cell := cells[i]
+		if !validRune(cell.Rune) {
+			return 0, ErrInvalidRune
+		}
+		if !validCellWidth(cell.Width) {
+			return 0, ErrInvalidCellWidth
+		}
+		start := i
+		i++
+		for i < len(cells) && cells[i] == cell {
+			i++
+		}
+		runLength := i - start
+		cellSize := uvarintEncodedLen(uint64(cell.Rune)) + uvarintEncodedLen(uint64(cell.StyleID)) + 1
+		rawSize += runLength * cellSize
+		rleBodySize += uvarintEncodedLen(uint64(runLength)) + cellSize
+		runCount++
+	}
+	rleSize := uvarintEncodedLen(uint64(runCount)) + rleBodySize
+	if len(cells) > 0 && rleSize < rawSize {
+		return cellSequenceRLE, nil
+	}
+	return cellSequenceRaw, nil
+}
+
+func uvarintEncodedLen(v uint64) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
 }

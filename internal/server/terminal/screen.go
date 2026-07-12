@@ -4,11 +4,17 @@ import "unicode/utf8"
 
 type Update struct {
 	DirtyRows     map[int]struct{}
+	DirtySpans    map[int]DirtySpan
 	FullRedraw    bool
 	DefinedStyles map[uint32]Style
 	CursorChanged bool
 	VisibleChange bool
 	Replies       [][]byte
+}
+
+type DirtySpan struct {
+	Start int
+	End   int
 }
 
 type Row struct {
@@ -151,6 +157,7 @@ type protocolStyleDef struct {
 func (t *TerminalState) Apply(data []byte) Update {
 	update := Update{
 		DirtyRows:     map[int]struct{}{},
+		DirtySpans:    map[int]DirtySpan{},
 		DefinedStyles: map[uint32]Style{},
 	}
 	for len(data) > 0 {
@@ -304,9 +311,10 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 	if added {
 		update.DefinedStyles[styleID] = t.CurrentStyle
 	}
-	t.GridRows[t.CursorY].Cells[t.CursorX] = Cell{Rune: r, StyleID: styleID, Width: 1}
+	writtenColumn := t.CursorX
+	t.GridRows[t.CursorY].Cells[writtenColumn] = Cell{Rune: r, StyleID: styleID, Width: 1}
 	t.syncRowToCells(t.CursorY)
-	update.DirtyRows[t.CursorY] = struct{}{}
+	update.markDirty(t.CursorY, writtenColumn, writtenColumn+1, t.Cols)
 	if t.CursorX == t.Cols-1 {
 		t.wrapPending = true
 	} else {
@@ -375,16 +383,16 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 		update.FullRedraw = true
 	case 'K':
 		t.breakWrapChainAt(t.CursorY)
-		t.eraseLine(paramOr(parsed.Params, 0, 0))
-		update.FullRedraw = true
+		start, end := t.eraseLine(paramOr(parsed.Params, 0, 0))
+		update.markDirty(t.CursorY, start, end, t.Cols)
 	case 'X':
 		t.breakWrapChainAt(t.CursorY)
-		t.eraseChars(max1(parsed.Params, 1))
-		update.FullRedraw = true
+		start, end := t.eraseChars(max1(parsed.Params, 1))
+		update.markDirty(t.CursorY, start, end, t.Cols)
 	case 'P':
 		t.breakWrapChainAt(t.CursorY)
 		t.deleteChars(max1(parsed.Params, 1))
-		update.DirtyRows[t.CursorY] = struct{}{}
+		update.markDirty(t.CursorY, t.CursorX, t.Cols, t.Cols)
 	case 'r':
 		t.setScrollRegion(parsed.Params)
 		t.CursorX, t.CursorY = 0, 0
@@ -512,25 +520,63 @@ func (t *TerminalState) eraseDisplay(mode int) {
 	}
 }
 
-func (t *TerminalState) eraseLine(mode int) {
+func (t *TerminalState) eraseLine(mode int) (int, int) {
 	styleID, _ := t.styleID(t.CurrentStyle)
 	switch mode {
 	case 1:
 		t.fillRow(t.CursorY, 0, t.CursorX+1, styleID)
+		return 0, t.CursorX + 1
 	case 2:
 		t.fillRow(t.CursorY, 0, t.Cols, styleID)
+		return 0, t.Cols
 	default:
 		t.fillRow(t.CursorY, t.CursorX, t.Cols, styleID)
+		return t.CursorX, t.Cols
 	}
 }
 
-func (t *TerminalState) eraseChars(n int) {
+func (t *TerminalState) eraseChars(n int) (int, int) {
 	styleID, _ := t.styleID(t.CurrentStyle)
 	end := t.CursorX + n
 	if end > t.Cols {
 		end = t.Cols
 	}
 	t.fillRow(t.CursorY, t.CursorX, end, styleID)
+	return t.CursorX, end
+}
+
+func (u *Update) markDirty(row, start, end, cols int) {
+	if row < 0 || start >= end || cols <= 0 {
+		return
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > cols {
+		end = cols
+	}
+	if start >= end {
+		return
+	}
+	if u.DirtyRows == nil {
+		u.DirtyRows = map[int]struct{}{}
+	}
+	if u.DirtySpans == nil {
+		u.DirtySpans = map[int]DirtySpan{}
+	}
+	u.DirtyRows[row] = struct{}{}
+	span, ok := u.DirtySpans[row]
+	if !ok {
+		u.DirtySpans[row] = DirtySpan{Start: start, End: end}
+		return
+	}
+	if start < span.Start {
+		span.Start = start
+	}
+	if end > span.End {
+		span.End = end
+	}
+	u.DirtySpans[row] = span
 }
 
 func (t *TerminalState) fillRow(row, start, end int, styleID uint32) {

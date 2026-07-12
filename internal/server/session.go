@@ -47,10 +47,11 @@ type ClientState struct {
 
 func NewSession(id uint64) *Session {
 	return &Session{
-		ID:      id,
-		Windows: map[uint64]*Window{},
-		Panes:   map[uint64]*Pane{},
-		Clients: map[uint64]*ClientState{},
+		ID:           id,
+		Windows:      map[uint64]*Window{},
+		Panes:        map[uint64]*Pane{},
+		Clients:      map[uint64]*ClientState{},
+		NextWindowID: 1,
 	}
 }
 
@@ -107,6 +108,9 @@ func (s *Session) SetClientSize(clientID uint64, cols, rows uint16) *ClientState
 func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *ClientState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.NextWindowID == 0 {
+		s.NextWindowID = 1
+	}
 	windowID := s.NextWindowID
 	s.NextWindowID++
 	window := &Window{

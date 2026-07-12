@@ -123,6 +123,20 @@ func TestRoundTripMessages(t *testing.T) {
 	if setCursor.Cursor.X != 1 || setCursor.Cursor.Y != 2 {
 		t.Fatalf("SetCursor round-trip = %#v", setCursor)
 	}
+	paneUpdate := mustRoundTrip(t, EncodePaneUpdate, DecodePaneUpdate, PaneUpdate{
+		BindingGeneration:    2,
+		BaseGeneration:       3,
+		Generation:           4,
+		Styles:               []StyleDefinition{{ID: 1, Style: Style{Bold: true, FG: Color{Mode: "indexed", Index: 2}}}},
+		Runs:                 []CellRun{{Row: 5, Column: 6, Cells: []Cell{{Rune: 'x', StyleID: 1, Width: 1}}}},
+		CursorChanged:        true,
+		Cursor:               Cursor{X: 7, Y: 8},
+		CursorVisibleChanged: true,
+		CursorVisible:        false,
+	})
+	if len(paneUpdate.Runs) != 1 || paneUpdate.Runs[0].Cells[0].Rune != 'x' || paneUpdate.Cursor.X != 7 || !paneUpdate.CursorVisibleChanged || paneUpdate.CursorVisible {
+		t.Fatalf("PaneUpdate round-trip = %#v", paneUpdate)
+	}
 	replace := mustRoundTrip(t, EncodeReplacePane, DecodeReplacePane, ReplacePane{
 		SessionID:         4,
 		WindowID:          5,
@@ -156,6 +170,63 @@ func TestMalformedPayloads(t *testing.T) {
 	}
 	if _, err := DecodeReplacePane([]byte{0x01, 0x02, 0x02, 0x02, 0x00, 0x00, 0x01, 0x00}); err == nil {
 		t.Fatal("DecodeReplacePane() accepted missing cells")
+	}
+}
+
+func TestReplacePaneCompressesRepeatedCells(t *testing.T) {
+	cells := make([]Cell, 80*24)
+	for i := range cells {
+		cells[i] = Cell{Rune: ' ', StyleID: 0, Width: 1}
+	}
+	msg := ReplacePane{
+		BindingGeneration: 1,
+		Generation:        2,
+		Cols:              80,
+		Rows:              24,
+		Cursor:            Cursor{X: 0, Y: 0},
+		CursorVisible:     true,
+		Cells:             cells,
+	}
+	payload, err := EncodeReplacePane(nil, msg)
+	if err != nil {
+		t.Fatalf("EncodeReplacePane() error = %v", err)
+	}
+	if len(payload) >= 100 {
+		t.Fatalf("compressed ReplacePane payload = %d bytes, want less than 100", len(payload))
+	}
+	decoded, err := DecodeReplacePane(payload)
+	if err != nil {
+		t.Fatalf("DecodeReplacePane() error = %v", err)
+	}
+	if len(decoded.Cells) != len(cells) || decoded.Cells[0] != cells[0] || decoded.Cells[len(decoded.Cells)-1] != cells[len(cells)-1] {
+		t.Fatalf("decoded cells do not match repeated-cell snapshot")
+	}
+}
+
+func TestPaneUpdateCompressesRepeatedCells(t *testing.T) {
+	cells := make([]Cell, 80)
+	for i := range cells {
+		cells[i] = Cell{Rune: ' ', StyleID: 0, Width: 1}
+	}
+	msg := PaneUpdate{
+		BindingGeneration: 1,
+		BaseGeneration:    2,
+		Generation:        3,
+		Runs:              []CellRun{{Row: 4, Column: 0, Cells: cells}},
+	}
+	payload, err := EncodePaneUpdate(nil, msg)
+	if err != nil {
+		t.Fatalf("EncodePaneUpdate() error = %v", err)
+	}
+	if len(payload) >= 40 {
+		t.Fatalf("compressed PaneUpdate payload = %d bytes, want less than 40", len(payload))
+	}
+	decoded, err := DecodePaneUpdate(payload)
+	if err != nil {
+		t.Fatalf("DecodePaneUpdate() error = %v", err)
+	}
+	if len(decoded.Runs) != 1 || len(decoded.Runs[0].Cells) != len(cells) || decoded.Runs[0].Cells[79] != cells[79] {
+		t.Fatalf("decoded run does not match repeated-cell update")
 	}
 }
 

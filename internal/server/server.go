@@ -690,76 +690,49 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		return c.sendReplaceSnapshot(binding, window, pane)
 	}
 
-	if len(update.DefinedStyles) > 0 {
-		ids := make([]int, 0, len(update.DefinedStyles))
-		for id := range update.DefinedStyles {
-			ids = append(ids, int(id))
-		}
-		sort.Ints(ids)
-		for _, rawID := range ids {
-			id := uint32(rawID)
-			if err := sendEncoded(outputFrames, protocol.MsgDefineStyle, protocol.DefineStyle{
-				BindingGeneration: binding.BindingGeneration,
-				ID:                id,
-				Style:             update.DefinedStyles[id],
-			}, protocol.EncodeDefineStyle); err != nil {
-				return err
-			}
-		}
+	styleIDs := make([]int, 0, len(update.DefinedStyles))
+	for id := range update.DefinedStyles {
+		styleIDs = append(styleIDs, int(id))
+	}
+	sort.Ints(styleIDs)
+	styles := make([]protocol.StyleDefinition, 0, len(styleIDs))
+	for _, rawID := range styleIDs {
+		id := uint32(rawID)
+		styles = append(styles, protocol.StyleDefinition{ID: id, Style: update.DefinedStyles[id]})
 	}
 
-	rows := make([]int, 0, len(update.DirtyRows))
-	for row := range update.DirtyRows {
+	rows := make([]int, 0, len(update.DirtySpans))
+	for row := range update.DirtySpans {
 		rows = append(rows, row)
 	}
 	sort.Ints(rows)
+	runs := make([]protocol.CellRun, 0, len(rows))
 	for _, row := range rows {
-		base := pane.Generation
-		pane.Generation++
-		start := row * pane.Terminal.Cols
-		end := start + pane.Terminal.Cols
-		if err := sendEncoded(outputFrames, protocol.MsgSetRun, protocol.SetRun{
-			SessionID:         c.state.session.ID,
-			WindowID:          window.ID,
-			BindingGeneration: binding.BindingGeneration,
-			BaseGeneration:    base,
-			Generation:        pane.Generation,
-			Row:               row,
-			Column:            0,
-			Cells:             append([]protocol.Cell(nil), pane.Terminal.Cells[start:end]...),
-		}, protocol.EncodeSetRun); err != nil {
-			return err
-		}
+		span := update.DirtySpans[row]
+		start := row*pane.Terminal.Cols + span.Start
+		end := row*pane.Terminal.Cols + span.End
+		runs = append(runs, protocol.CellRun{
+			Row:    row,
+			Column: span.Start,
+			Cells:  append([]protocol.Cell(nil), pane.Terminal.Cells[start:end]...),
+		})
 	}
-	if update.CursorChanged {
-		base := pane.Generation
-		pane.Generation++
-		if err := sendEncoded(outputFrames, protocol.MsgSetCursor, protocol.SetCursor{
-			SessionID:         c.state.session.ID,
-			WindowID:          window.ID,
-			BindingGeneration: binding.BindingGeneration,
-			BaseGeneration:    base,
-			Generation:        pane.Generation,
-			Cursor:            protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY},
-		}, protocol.EncodeSetCursor); err != nil {
-			return err
-		}
+	if len(styles) == 0 && len(runs) == 0 && !update.CursorChanged && !update.VisibleChange {
+		return nil
 	}
-	if update.VisibleChange {
-		base := pane.Generation
-		pane.Generation++
-		if err := sendEncoded(outputFrames, protocol.MsgSetCursorVisible, protocol.SetCursorVisible{
-			SessionID:         c.state.session.ID,
-			WindowID:          window.ID,
-			BindingGeneration: binding.BindingGeneration,
-			BaseGeneration:    base,
-			Generation:        pane.Generation,
-			Visible:           pane.Terminal.CursorVisible,
-		}, protocol.EncodeSetCursorVisible); err != nil {
-			return err
-		}
-	}
-	return nil
+	base := pane.Generation
+	pane.Generation++
+	return sendEncoded(outputFrames, protocol.MsgPaneUpdate, protocol.PaneUpdate{
+		BindingGeneration:    binding.BindingGeneration,
+		BaseGeneration:       base,
+		Generation:           pane.Generation,
+		Styles:               styles,
+		Runs:                 runs,
+		CursorChanged:        update.CursorChanged,
+		Cursor:               protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY},
+		CursorVisibleChanged: update.VisibleChange,
+		CursorVisible:        pane.Terminal.CursorVisible,
+	}, protocol.EncodePaneUpdate)
 }
 
 func (c *controller) sendReplaceSnapshot(binding RenderBinding, window *Window, pane *Pane) error {
@@ -814,15 +787,6 @@ func (c *controller) publishBindingsAndSnapshots() error {
 		outputFrames := c.outputFrames[binding.Slot]
 		if outputFrames == nil {
 			return fmt.Errorf("missing output stream for slot %d", binding.Slot)
-		}
-		if err := sendEncoded(outputFrames, protocol.MsgBindRenderStream, protocol.BindRenderStream{
-			Slot:              uint8(binding.Slot),
-			SessionID:         c.state.session.ID,
-			WindowID:          window.ID,
-			PaneID:            pane.ID,
-			BindingGeneration: binding.BindingGeneration,
-		}, protocol.EncodeBindRenderStream); err != nil {
-			return err
 		}
 		if err := c.sendReplaceSnapshot(binding, window, pane); err != nil {
 			return err

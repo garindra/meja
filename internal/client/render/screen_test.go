@@ -55,7 +55,7 @@ func TestGenerationMismatchRejected(t *testing.T) {
 		},
 	})
 	state.ApplyBind(protocol.BindRenderStream{Slot: 0, PaneID: 10, BindingGeneration: 1})
-	state.ApplyReplace(0, protocol.ReplacePane{PaneID: 10, BindingGeneration: 1, Generation: 5, Cols: 1, Rows: 1, Cells: []protocol.Cell{{Rune: 'a', Width: 1}}})
+	state.ApplyReplace(0, protocol.ReplacePane{WindowID: 1, PaneID: 10, BindingGeneration: 1, Generation: 5, Cols: 1, Rows: 1, Cells: []protocol.Cell{{Rune: 'a', Width: 1}}})
 	if state.ApplySetRun(0, protocol.SetRun{BindingGeneration: 1, BaseGeneration: 4, Generation: 6, Row: 0, Column: 0, Cells: []protocol.Cell{{Rune: 'b', Width: 1}}}) {
 		t.Fatal("ApplySetRun() unexpectedly accepted mismatched generation")
 	}
@@ -83,22 +83,22 @@ func TestWindowNavigation(t *testing.T) {
 	}
 }
 
-func TestLastActiveWindowTrackingIncludesWindowZeroToggle(t *testing.T) {
+func TestLastActiveWindowTrackingToggles(t *testing.T) {
 	state := NewClientState()
 	state.ApplyWindowList(protocol.WindowList{
 		Windows: []protocol.WindowInfo{
-			{WindowID: 0, PaneID: 10, Index: 0, Title: "bash"},
-			{WindowID: 1, PaneID: 11, Index: 1, Title: "logs"},
+			{WindowID: 1, PaneID: 10, Index: 0, Title: "bash"},
+			{WindowID: 2, PaneID: 11, Index: 1, Title: "logs"},
 		},
 	})
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 0, PaneID: 10})
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 11})
-	if got, ok := state.LastActiveWindowID(); !ok || got != 0 {
-		t.Fatalf("LastActiveWindowID() after 0->1 = %d, %v; want 0, true", got, ok)
-	}
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 0, PaneID: 10})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 11})
 	if got, ok := state.LastActiveWindowID(); !ok || got != 1 {
-		t.Fatalf("LastActiveWindowID() after 1->0 = %d, %v; want 1, true", got, ok)
+		t.Fatalf("LastActiveWindowID() after 1->2 = %d, %v; want 1, true", got, ok)
+	}
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
+	if got, ok := state.LastActiveWindowID(); !ok || got != 2 {
+		t.Fatalf("LastActiveWindowID() after 2->1 = %d, %v; want 2, true", got, ok)
 	}
 }
 
@@ -106,20 +106,20 @@ func TestWindowListDoesNotOverrideExplicitSelection(t *testing.T) {
 	state := NewClientState()
 	state.ApplyWindowList(protocol.WindowList{
 		Windows: []protocol.WindowInfo{
-			{WindowID: 0, PaneID: 10, Index: 0, Title: "bash", Active: true},
-			{WindowID: 1, PaneID: 11, Index: 1, Title: "logs"},
+			{WindowID: 1, PaneID: 10, Index: 0, Title: "bash", Active: true},
+			{WindowID: 2, PaneID: 11, Index: 1, Title: "logs"},
 		},
-		ActiveWindowID: 0,
+		ActiveWindowID: 1,
 	})
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 11})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 11})
 	state.ApplyWindowList(protocol.WindowList{
 		Windows: []protocol.WindowInfo{
-			{WindowID: 0, PaneID: 10, Index: 0, Title: "bash", Active: true},
-			{WindowID: 1, PaneID: 11, Index: 1, Title: "logs"},
+			{WindowID: 1, PaneID: 10, Index: 0, Title: "bash", Active: true},
+			{WindowID: 2, PaneID: 11, Index: 1, Title: "logs"},
 		},
-		ActiveWindowID: 0,
+		ActiveWindowID: 1,
 	})
-	if state.ActiveWindowID != 1 || state.FocusedPaneID != 11 {
+	if state.ActiveWindowID != 2 || state.FocusedPaneID != 11 {
 		t.Fatalf("window list overwrote explicit selection: window=%d pane=%d", state.ActiveWindowID, state.FocusedPaneID)
 	}
 }
@@ -144,7 +144,7 @@ func TestWindowLayoutStoresMultiplePaneRectsAndFocusOrder(t *testing.T) {
 	}
 }
 
-func TestWindowSelectionResetsStaleSplitLayout(t *testing.T) {
+func TestWindowSelectionKeepsPresentedLayoutUntilReplacement(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(12, 4)
 	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
@@ -155,14 +155,137 @@ func TestWindowSelectionResetsStaleSplitLayout(t *testing.T) {
 			{PaneID: 11, Rect: protocol.Rect{X: 6, Y: 0, Width: 6, Height: 3}},
 		},
 	})
+	state.ApplyReplace(0, protocol.ReplacePane{
+		WindowID:          1,
+		PaneID:            10,
+		BindingGeneration: 1,
+		Generation:        1,
+		Cols:              5,
+		Rows:              3,
+		Cells:             make([]protocol.Cell, 15),
+	})
 
 	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 20})
 
-	if state.Layout.WindowID != 2 || len(state.Layout.Panes) != 1 {
-		t.Fatalf("reset layout = %#v", state.Layout)
+	if state.Layout.WindowID != 1 || len(state.Layout.Panes) != 2 {
+		t.Fatalf("presented layout changed before replacement = %#v", state.Layout)
 	}
-	if got := state.Layout.Panes[0].Rect; got.Width != 12 || got.Height != 3 || got.X != 0 || got.Y != 0 {
-		t.Fatalf("provisional pane rect = %#v", got)
+	if _, bound := state.RenderSlots[0]; bound || !state.transitioningSlots[0] {
+		t.Fatalf("old render slot remained active during transition: slots=%#v transitioning=%#v", state.RenderSlots, state.transitioningSlots)
+	}
+	accepted, presented := state.ApplyReplaceResult(0, protocol.ReplacePane{
+		WindowID:          2,
+		PaneID:            20,
+		BindingGeneration: 3,
+		Generation:        4,
+		Cols:              12,
+		Rows:              3,
+		Cells:             make([]protocol.Cell, 36),
+	})
+	if !accepted || presented {
+		t.Fatalf("replacement before layout = accepted %v presented %v", accepted, presented)
+	}
+	if !state.ApplyWindowLayout(protocol.WindowLayout{
+		WindowID: 2,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 20, Rect: protocol.Rect{X: 0, Y: 0, Width: 12, Height: 3}},
+		},
+	}) {
+		t.Fatal("layout did not present its pending replacement")
+	}
+	if state.Layout.WindowID != 2 || state.RenderSlots[0] != 20 || state.Panes[20].Generation != 4 {
+		t.Fatalf("committed window state = layout %#v slots %#v panes %#v", state.Layout, state.RenderSlots, state.Panes)
+	}
+}
+
+func TestPaneUpdateAppliesRunsStylesAndCursorAtomically(t *testing.T) {
+	state := NewClientState()
+	state.ApplyWindowLayout(protocol.WindowLayout{
+		WindowID: 1,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 10, Rect: protocol.Rect{Width: 3, Height: 1}},
+		},
+	})
+	if !state.ApplyReplace(0, protocol.ReplacePane{
+		WindowID:          1,
+		PaneID:            10,
+		BindingGeneration: 2,
+		Generation:        7,
+		Cols:              3,
+		Rows:              1,
+		Cells:             repeatedCells("abc"),
+	}) {
+		t.Fatal("initial replacement failed")
+	}
+	style := protocol.Style{Bold: true, FG: protocol.Color{Mode: "indexed", Index: 2}}
+	if !state.ApplyPaneUpdate(0, protocol.PaneUpdate{
+		BindingGeneration:    2,
+		BaseGeneration:       7,
+		Generation:           8,
+		Styles:               []protocol.StyleDefinition{{ID: 1, Style: style}},
+		Runs:                 []protocol.CellRun{{Row: 0, Column: 1, Cells: []protocol.Cell{{Rune: 'Z', StyleID: 1, Width: 1}}}},
+		CursorChanged:        true,
+		Cursor:               protocol.Cursor{X: 2, Y: 0},
+		CursorVisibleChanged: true,
+		CursorVisible:        false,
+	}) {
+		t.Fatal("batched pane update failed")
+	}
+	pane := state.Panes[10]
+	if pane.Grid.Cells[1].Rune != 'Z' || pane.Styles[1] != style || pane.Cursor.X != 2 || pane.CursorVisible || pane.Generation != 8 {
+		t.Fatalf("pane after batch = %#v", pane)
+	}
+	if len(state.pendingDamageRects) == 0 || state.pendingDamageRects[len(state.pendingDamageRects)-1] != (protocol.Rect{X: 1, Width: 1, Height: 1}) {
+		t.Fatalf("pane update damage = %#v", state.pendingDamageRects)
+	}
+}
+
+func TestStalePaneUpdateIsDiscardedDuringWindowTransition(t *testing.T) {
+	state := NewClientState()
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
+	state.ApplyWindowLayout(protocol.WindowLayout{
+		WindowID: 1,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 10, Rect: protocol.Rect{Width: 3, Height: 1}},
+		},
+	})
+	state.ApplyReplace(0, protocol.ReplacePane{
+		WindowID:          1,
+		PaneID:            10,
+		BindingGeneration: 1,
+		Generation:        2,
+		Cols:              3,
+		Rows:              1,
+		Cells:             repeatedCells("old"),
+	})
+	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 20})
+
+	accepted, presented := state.ApplyPaneUpdateResult(0, protocol.PaneUpdate{
+		BindingGeneration: 1,
+		BaseGeneration:    2,
+		Generation:        3,
+		Runs:              []protocol.CellRun{{Row: 0, Cells: repeatedCells("OLD")}},
+	})
+	if !accepted || presented {
+		t.Fatalf("stale transitional update = accepted %v presented %v", accepted, presented)
+	}
+	state.ApplyWindowLayout(protocol.WindowLayout{
+		WindowID: 2,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 20, Rect: protocol.Rect{Width: 3, Height: 1}},
+		},
+	})
+	accepted, presented = state.ApplyReplaceResult(0, protocol.ReplacePane{
+		WindowID:          2,
+		PaneID:            20,
+		BindingGeneration: 2,
+		Generation:        4,
+		Cols:              3,
+		Rows:              1,
+		Cells:             repeatedCells("new"),
+	})
+	if !accepted || !presented || state.transitioningSlots[0] {
+		t.Fatalf("new replacement = accepted %v presented %v transitioning %#v", accepted, presented, state.transitioningSlots)
 	}
 }
 
@@ -179,6 +302,7 @@ func TestIncrementalUpdatesApplyToNonZeroPaneID(t *testing.T) {
 	state.ApplyBind(protocol.BindRenderStream{Slot: 0, PaneID: 10, BindingGeneration: 1})
 	state.ApplyBind(protocol.BindRenderStream{Slot: 1, PaneID: 11, BindingGeneration: 2})
 	ok := state.ApplyReplace(1, protocol.ReplacePane{
+		WindowID:          1,
 		PaneID:            11,
 		BindingGeneration: 2,
 		Generation:        10,

@@ -3,6 +3,7 @@ package render
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -12,49 +13,135 @@ import (
 var tabBarBG = protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}
 
 func RenderANSI(state *ClientState) []byte {
-	var buf bytes.Buffer
-	buf.WriteString("\x1b[?25l")
 	contentRows := state.DrawableRows()
-	if state.LastRendered.Cols != state.TerminalCols || state.LastRendered.Rows != contentRows {
-		buf.WriteString("\x1b[H\x1b[2J")
-	}
-	composed := composeContent(state)
-	lastStyleKey := ""
-	for row := 0; row < contentRows; row++ {
-		buf.WriteString(fmt.Sprintf("\x1b[%d;1H", row+1))
-		for col := 0; col < state.TerminalCols; col++ {
-			cell := composed[row*state.TerminalCols+col]
-			styleKey := styleCacheKey(cell.Style)
-			if styleKey != lastStyleKey {
-				buf.WriteString(sgrForStyle(cell.Style))
-				lastStyleKey = styleKey
-			}
-			r := cell.Rune
-			if r == 0 {
-				r = ' '
-			}
-			buf.WriteRune(r)
-		}
-	}
-	buf.WriteString(sgrForStyle(protocol.Style{
-		FG: protocol.Color{Mode: "default"},
-		BG: protocol.Color{Mode: "default"},
-	}))
-	buf.WriteString(fmt.Sprintf("\x1b[%d;1H", state.TerminalRows))
-	buf.WriteString(renderTabBar(state))
-	buf.WriteString(sgrForStyle(protocol.Style{
-		FG: protocol.Color{Mode: "default"},
-		BG: protocol.Color{Mode: "default"},
-	}))
 	cursorX, cursorY, cursorVisible := physicalCursor(state)
-	buf.WriteString(fmt.Sprintf("\x1b[%d;%dH", cursorY+1, cursorX+1))
-	if cursorVisible {
-		buf.WriteString("\x1b[?25h")
-	} else {
+	fullRedraw := state.fullContentDirty || state.LastRendered.Cols != state.TerminalCols ||
+		state.LastRendered.Rows != contentRows
+	tabChanged := fullRedraw || state.tabBarDirty
+	cursorChanged := !state.hasRenderedCursor || cursorX != state.lastCursorX ||
+		cursorY != state.lastCursorY || cursorVisible != state.lastCursorVisible
+
+	var buf bytes.Buffer
+	contentChanged := fullRedraw || len(state.pendingDamageRects) > 0
+	if contentChanged || tabChanged {
 		buf.WriteString("\x1b[?25l")
 	}
+	if fullRedraw {
+		buf.WriteString("\x1b[H\x1b[2J")
+		composed := composeContent(state)
+		renderFullContent(&buf, composed, state.TerminalCols, contentRows)
+	} else if contentChanged {
+		renderDamagedContent(&buf, state, state.pendingDamageRects, state.TerminalCols, contentRows)
+	}
+	if tabChanged {
+		writeCursorPosition(&buf, state.TerminalRows, 1)
+		buf.WriteString(renderTabBar(state))
+	}
+	if contentChanged || tabChanged {
+		buf.WriteString(sgrForStyle(defaultStyle()))
+		writeCursorPosition(&buf, cursorY+1, cursorX+1)
+		if cursorVisible {
+			buf.WriteString("\x1b[?25h")
+		} else {
+			buf.WriteString("\x1b[?25l")
+		}
+	} else if cursorChanged {
+		writeCursorPosition(&buf, cursorY+1, cursorX+1)
+		if cursorVisible {
+			buf.WriteString("\x1b[?25h")
+		} else {
+			buf.WriteString("\x1b[?25l")
+		}
+	}
+
 	state.LastRendered = Screen{Cols: state.TerminalCols, Rows: contentRows}
+	state.pendingDamageRects = state.pendingDamageRects[:0]
+	state.fullContentDirty = false
+	state.tabBarDirty = false
+	state.lastCursorX = cursorX
+	state.lastCursorY = cursorY
+	state.lastCursorVisible = cursorVisible
+	state.hasRenderedCursor = true
 	return buf.Bytes()
+}
+
+func renderFullContent(buf *bytes.Buffer, cells []composedCell, cols, rows int) {
+	for row := 0; row < rows; row++ {
+		writeCursorPosition(buf, row+1, 1)
+		renderCellRun(buf, cells[row*cols:(row+1)*cols])
+	}
+}
+
+type columnSpan struct {
+	start int
+	end   int
+}
+
+func renderDamagedContent(buf *bytes.Buffer, state *ClientState, rects []protocol.Rect, cols, rows int) {
+	spans := make(map[int][]columnSpan)
+	for _, rect := range rects {
+		startX := max(rect.X, 0)
+		endX := min(rect.X+rect.Width, cols)
+		startY := max(rect.Y, 0)
+		endY := min(rect.Y+rect.Height, rows)
+		if startX >= endX || startY >= endY {
+			continue
+		}
+		for row := startY; row < endY; row++ {
+			spans[row] = append(spans[row], columnSpan{start: startX, end: endX})
+		}
+	}
+	orderedRows := make([]int, 0, len(spans))
+	for row := range spans {
+		orderedRows = append(orderedRows, row)
+	}
+	sort.Ints(orderedRows)
+	placements := state.orderedLayoutPanes()
+	var scratch []composedCell
+	for _, row := range orderedRows {
+		rowSpans := spans[row]
+		sort.Slice(rowSpans, func(i, j int) bool { return rowSpans[i].start < rowSpans[j].start })
+		merged := rowSpans[:0]
+		for _, span := range rowSpans {
+			if len(merged) == 0 || span.start > merged[len(merged)-1].end {
+				merged = append(merged, span)
+				continue
+			}
+			merged[len(merged)-1].end = max(merged[len(merged)-1].end, span.end)
+		}
+		for _, span := range merged {
+			width := span.end - span.start
+			if cap(scratch) < width {
+				scratch = make([]composedCell, width)
+			} else {
+				scratch = scratch[:width]
+			}
+			composeRowSpan(scratch, state, placements, row, span.start)
+			writeCursorPosition(buf, row+1, span.start+1)
+			renderCellRun(buf, scratch)
+		}
+	}
+}
+
+func renderCellRun(buf *bytes.Buffer, cells []composedCell) {
+	var currentStyle protocol.Style
+	hasStyle := false
+	for _, cell := range cells {
+		if !hasStyle || cell.Style != currentStyle {
+			buf.WriteString(sgrForStyle(cell.Style))
+			currentStyle = cell.Style
+			hasStyle = true
+		}
+		buf.WriteRune(cell.Rune)
+	}
+}
+
+func writeCursorPosition(buf *bytes.Buffer, row, col int) {
+	buf.WriteString("\x1b[")
+	buf.WriteString(strconv.Itoa(row))
+	buf.WriteByte(';')
+	buf.WriteString(strconv.Itoa(col))
+	buf.WriteByte('H')
 }
 
 type composedCell struct {
@@ -67,51 +154,59 @@ func composeContent(state *ClientState) []composedCell {
 	if state.TerminalCols <= 0 || contentRows <= 0 {
 		return nil
 	}
-	cells := make([]composedCell, state.TerminalCols*contentRows)
-	defaultStyle := protocol.Style{
-		FG: protocol.Color{Mode: "default"},
-		BG: protocol.Color{Mode: "default"},
+	cellCount := state.TerminalCols * contentRows
+	if cap(state.composedCells) < cellCount {
+		state.composedCells = make([]composedCell, cellCount)
+	} else {
+		state.composedCells = state.composedCells[:cellCount]
 	}
-	for i := range cells {
-		cells[i] = composedCell{Rune: ' ', Style: defaultStyle}
+	cells := state.composedCells
+	placements := state.orderedLayoutPanes()
+	for row := 0; row < contentRows; row++ {
+		composeRowSpan(cells[row*state.TerminalCols:(row+1)*state.TerminalCols], state, placements, row, 0)
 	}
-	for _, placement := range state.orderedLayoutPanes() {
-		pane := state.Panes[placement.PaneID]
-		if pane == nil || pane.Grid.Cols == 0 || pane.Grid.Rows == 0 {
-			continue
-		}
-		for row := 0; row < placement.Rect.Height && row < pane.Grid.Rows; row++ {
-			for col := 0; col < placement.Rect.Width && col < pane.Grid.Cols; col++ {
-				dstX := placement.Rect.X + col
-				dstY := placement.Rect.Y + row
-				if dstX < 0 || dstY < 0 || dstX >= state.TerminalCols || dstY >= contentRows {
-					continue
-				}
-				src := pane.Grid.Cells[row*pane.Grid.Cols+col]
-				style := defaultStyle
-				if pane.Styles != nil {
-					if found, ok := pane.Styles[src.StyleID]; ok {
-						style = found
-					}
+	return cells
+}
+
+func composeRowSpan(dst []composedCell, state *ClientState, placements []protocol.PanePlacement, row, startColumn int) {
+	defaultCell := composedCell{Rune: ' ', Style: defaultStyle()}
+	borderX := -1
+	if len(placements) == 2 {
+		borderX = placements[0].Rect.X + placements[0].Rect.Width
+	}
+	for i := range dst {
+		column := startColumn + i
+		cell := defaultCell
+		for _, placement := range placements {
+			if column < placement.Rect.X || column >= placement.Rect.X+placement.Rect.Width ||
+				row < placement.Rect.Y || row >= placement.Rect.Y+placement.Rect.Height {
+				continue
+			}
+			pane := state.Panes[placement.PaneID]
+			if pane == nil {
+				break
+			}
+			localColumn := column - placement.Rect.X
+			localRow := row - placement.Rect.Y
+			if localColumn < pane.Grid.Cols && localRow < pane.Grid.Rows {
+				src := pane.Grid.Cells[localRow*pane.Grid.Cols+localColumn]
+				style := defaultCell.Style
+				if found, ok := pane.Styles[src.StyleID]; ok {
+					style = found
 				}
 				r := src.Rune
 				if r == 0 {
 					r = ' '
 				}
-				cells[dstY*state.TerminalCols+dstX] = composedCell{Rune: r, Style: style}
+				cell = composedCell{Rune: r, Style: style}
 			}
+			break
 		}
-	}
-	if len(state.Layout.Panes) == 2 {
-		panes := state.orderedLayoutPanes()
-		borderX := panes[0].Rect.X + panes[0].Rect.Width
-		for y := 0; y < contentRows; y++ {
-			if borderX >= 0 && borderX < state.TerminalCols {
-				cells[y*state.TerminalCols+borderX] = composedCell{Rune: '│', Style: defaultStyle}
-			}
+		if column == borderX {
+			cell = composedCell{Rune: '│', Style: defaultCell.Style}
 		}
+		dst[i] = cell
 	}
-	return cells
 }
 
 func physicalCursor(state *ClientState) (int, int, bool) {
@@ -186,8 +281,11 @@ func truncateToWidth(s string, width int) string {
 	return s[:width]
 }
 
-func styleCacheKey(style protocol.Style) string {
-	return fmt.Sprintf("%#v", style)
+func defaultStyle() protocol.Style {
+	return protocol.Style{
+		FG: protocol.Color{Mode: "default"},
+		BG: protocol.Color{Mode: "default"},
+	}
 }
 
 func sgrForStyle(style protocol.Style) string {

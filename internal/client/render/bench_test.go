@@ -24,6 +24,7 @@ func BenchmarkRenderANSI(b *testing.B) {
 		cells[i] = protocol.Cell{Rune: 'x', StyleID: 0, Width: 1}
 	}
 	state.ApplyReplace(0, protocol.ReplacePane{
+		WindowID:          1,
 		PaneID:            1,
 		BindingGeneration: 1,
 		Generation:        1,
@@ -33,7 +34,15 @@ func BenchmarkRenderANSI(b *testing.B) {
 		Styles:            []protocol.StyleDefinition{{ID: 0, Style: protocol.Style{FG: protocol.Color{Mode: "default"}, BG: protocol.Color{Mode: "default"}}}},
 	})
 	b.ReportAllocs()
+	_ = RenderANSI(state)
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		if i%2 == 0 {
+			state.Panes[1].Grid.Cells[0].Rune = 'x'
+		} else {
+			state.Panes[1].Grid.Cells[0].Rune = 'y'
+		}
+		state.markDamageRect(protocol.Rect{Width: 1, Height: 1})
 		_ = RenderANSI(state)
 	}
 }

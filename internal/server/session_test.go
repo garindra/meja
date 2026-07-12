@@ -31,7 +31,7 @@ func TestSessionSplitCreatesNewPaneAndBindings(t *testing.T) {
 
 	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash"}
 	window, clientState := s.CreateWindow(pane0, 0)
-	if windowPrimaryPaneID(window) != pane0.ID || clientState.FocusedPaneID != pane0.ID {
+	if window.ID != 1 || windowPrimaryPaneID(window) != pane0.ID || clientState.FocusedPaneID != pane0.ID {
 		t.Fatalf("initial window = %#v client=%#v", window, clientState)
 	}
 

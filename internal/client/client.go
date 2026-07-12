@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	osuser "os/user"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,6 +36,7 @@ const (
 	quicKeepAlivePeriod = 10 * time.Second
 	clientPingPeriod    = 15 * time.Second
 	redrawCoalesceDelay = 2 * time.Millisecond
+	incomingBurstWindow = 50 * time.Millisecond
 )
 
 type Target struct {
@@ -67,6 +70,15 @@ type runtimeState struct {
 	debugRender    bool
 	redrawRequests uint64
 	redrawWrites   uint64
+
+	incomingMu              sync.Mutex
+	incomingBurstStarted    time.Time
+	incomingBurstTimer      *time.Timer
+	incomingClosed          bool
+	incomingWireBytes       uint64
+	incomingPayloadBytes    uint64
+	incomingCommandCount    uint64
+	incomingMessageTypeHits map[uint64]uint64
 }
 
 type prefixState uint8
@@ -180,6 +192,7 @@ func Run(ctx context.Context, cfg Config) error {
 		redrawCh:    make(chan struct{}, 1),
 		debugRender: cfg.DebugRender,
 	}
+	defer ui.closeIncomingRenderLog()
 	go ui.redrawLoop(ctx, streamErrs)
 	outputReady := make(chan struct{}, 1)
 	sessionDone := make(chan error, 2)
@@ -405,6 +418,7 @@ func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, m
 			sessionDone <- fmt.Errorf("read output frame: %w", err)
 			return
 		}
+		ui.recordIncomingRenderFrame(frame)
 		needsRedraw := false
 		requestSnapshot := false
 		var snapshotPaneID uint64
@@ -417,18 +431,29 @@ func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, m
 						return
 					}
 					state.ApplyBind(msg)
-					needsRedraw = true
 					snapshotPaneID = msg.PaneID
 				}
 			case protocol.MsgReplacePane:
 				msg, err := protocol.DecodeReplacePane(frame.Payload)
 				if err == nil {
-					if !state.ApplyReplace(slot, msg) {
+					accepted, presented := state.ApplyReplaceResult(slot, msg)
+					if !accepted {
 						requestSnapshot = true
 						snapshotPaneID = msg.PaneID
 						return
 					}
-					needsRedraw = true
+					needsRedraw = presented
+				}
+			case protocol.MsgPaneUpdate:
+				msg, err := protocol.DecodePaneUpdate(frame.Payload)
+				if err == nil {
+					accepted, presented := state.ApplyPaneUpdateResult(slot, msg)
+					if !accepted {
+						requestSnapshot = true
+						snapshotPaneID = state.RenderSlots[slot]
+						return
+					}
+					needsRedraw = presented
 				}
 			case protocol.MsgDefineStyle:
 				msg, err := protocol.DecodeDefineStyle(frame.Payload)
@@ -486,8 +511,8 @@ func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, m
 				sessionDone <- fmt.Errorf("remote pane exited with code %d signal %s", exited.ExitCode, exited.Signal)
 				return
 			}
-		case protocol.MsgBindRenderStream, protocol.MsgReplacePane, protocol.MsgDefineStyle, protocol.MsgSetRun, protocol.MsgSetCursor, protocol.MsgSetCursorVisible:
-			if frame.Type == protocol.MsgBindRenderStream {
+		case protocol.MsgBindRenderStream, protocol.MsgReplacePane, protocol.MsgPaneUpdate, protocol.MsgDefineStyle, protocol.MsgSetRun, protocol.MsgSetCursor, protocol.MsgSetCursorVisible:
+			if frame.Type == protocol.MsgReplacePane && needsRedraw {
 				ui.setInputBlocked(false)
 			}
 			if needsRedraw {
@@ -521,10 +546,14 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 				done <- err
 				return
 			}
-			ui.with(func(state *render.ClientState) { state.ApplyWindowLayout(msg) })
-			if err := ui.requestRedraw("window-layout"); err != nil {
-				done <- err
-				return
+			presented := false
+			ui.with(func(state *render.ClientState) { presented = state.ApplyWindowLayout(msg) })
+			if presented {
+				ui.setInputBlocked(false)
+				if err := ui.requestRedraw("window-layout-snapshot"); err != nil {
+					done <- err
+					return
+				}
 			}
 		case protocol.MsgWindowList:
 			msg, err := protocol.DecodeWindowList(frame.Payload)
@@ -875,8 +904,17 @@ func (r *runtimeState) redrawLoop(ctx context.Context, errs chan<- error) {
 		case <-r.redrawCh:
 		}
 
+		r.logRenderf("redraw flush")
+		if err := r.redraw(); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			errs <- err
+			return
+		}
+
 		timer := time.NewTimer(redrawCoalesceDelay)
-	coalesce:
+		pending := false
 		for {
 			select {
 			case <-ctx.Done():
@@ -888,19 +926,24 @@ func (r *runtimeState) redrawLoop(ctx context.Context, errs chan<- error) {
 				}
 				return
 			case <-r.redrawCh:
+				pending = true
 			case <-timer.C:
-				break coalesce
+				if !pending {
+					goto nextRedraw
+				}
+				pending = false
+				r.logRenderf("redraw trailing flush")
+				if err := r.redraw(); err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					errs <- err
+					return
+				}
+				timer.Reset(redrawCoalesceDelay)
 			}
 		}
-
-		r.logRenderf("redraw flush")
-		if err := r.redraw(); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			errs <- err
-			return
-		}
+	nextRedraw:
 	}
 }
 
@@ -938,6 +981,110 @@ func (r *runtimeState) logRenderf(format string, args ...any) {
 		return
 	}
 	_, _ = fmt.Fprintf(r.stderr, "tali render: "+format+"\n", args...)
+}
+
+func (r *runtimeState) recordIncomingRenderFrame(frame protocol.Frame) {
+	if !r.debugRender || r.stderr == nil {
+		return
+	}
+
+	r.incomingMu.Lock()
+	if r.incomingClosed {
+		r.incomingMu.Unlock()
+		return
+	}
+	if r.incomingBurstStarted.IsZero() {
+		r.incomingBurstStarted = time.Now()
+		r.incomingMessageTypeHits = make(map[uint64]uint64)
+		r.incomingBurstTimer = time.AfterFunc(incomingBurstWindow, r.flushIncomingRender)
+	}
+	r.incomingWireBytes += uint64(encodedFrameSize(frame))
+	r.incomingPayloadBytes += uint64(len(frame.Payload))
+	r.incomingCommandCount++
+	r.incomingMessageTypeHits[frame.Type]++
+	r.incomingMu.Unlock()
+}
+
+func (r *runtimeState) flushIncomingRender() {
+	r.incomingMu.Lock()
+	defer r.incomingMu.Unlock()
+	if r.incomingBurstStarted.IsZero() {
+		return
+	}
+	if r.incomingBurstTimer != nil {
+		r.incomingBurstTimer.Stop()
+		r.incomingBurstTimer = nil
+	}
+	startedAt := r.incomingBurstStarted
+	types := formatIncomingRenderTypes(r.incomingMessageTypeHits)
+	r.logRenderf(
+		"incoming burst at=%s window=%s elapsed=%s wire_bytes=%d payload_bytes=%d commands=%d types=%s",
+		time.Now().Format(time.RFC3339Nano),
+		incomingBurstWindow,
+		time.Since(startedAt).Round(time.Millisecond),
+		r.incomingWireBytes,
+		r.incomingPayloadBytes,
+		r.incomingCommandCount,
+		types,
+	)
+	r.incomingBurstStarted = time.Time{}
+	r.incomingWireBytes = 0
+	r.incomingPayloadBytes = 0
+	r.incomingCommandCount = 0
+	r.incomingMessageTypeHits = nil
+}
+
+func (r *runtimeState) closeIncomingRenderLog() {
+	r.incomingMu.Lock()
+	r.incomingClosed = true
+	r.incomingMu.Unlock()
+	r.flushIncomingRender()
+}
+
+func formatIncomingRenderTypes(types map[uint64]uint64) string {
+	if len(types) == 0 {
+		return "none"
+	}
+	keys := make([]uint64, 0, len(types))
+	for msgType := range types {
+		keys = append(keys, msgType)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	parts := make([]string, 0, len(keys))
+	for _, msgType := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", incomingRenderMessageName(msgType), types[msgType]))
+	}
+	return strings.Join(parts, ",")
+}
+
+func incomingRenderMessageName(msgType uint64) string {
+	switch msgType {
+	case protocol.MsgBindRenderStream:
+		return "BindRenderStream"
+	case protocol.MsgReplacePane:
+		return "ReplacePane"
+	case protocol.MsgPaneUpdate:
+		return "PaneUpdate"
+	case protocol.MsgDefineStyle:
+		return "DefineStyle"
+	case protocol.MsgSetRun:
+		return "SetRun"
+	case protocol.MsgSetCursor:
+		return "SetCursor"
+	case protocol.MsgSetCursorVisible:
+		return "SetCursorVisible"
+	case protocol.MsgPaneExited:
+		return "PaneExited"
+	default:
+		return fmt.Sprintf("Message%d", msgType)
+	}
+}
+
+func encodedFrameSize(frame protocol.Frame) int {
+	var buf [binary.MaxVarintLen64]byte
+	typeBytes := binary.PutUvarint(buf[:], frame.Type)
+	payloadBytes := binary.PutUvarint(buf[:], uint64(len(frame.Payload)))
+	return typeBytes + payloadBytes + len(frame.Payload)
 }
 
 func (r *runtimeState) activePaneID() uint64 {
