@@ -24,6 +24,8 @@ const (
 	clientID0           = 0
 	quicMaxIdleTimeout  = 60 * time.Second
 	quicKeepAlivePeriod = 10 * time.Second
+	renderIdleFlush     = time.Millisecond
+	renderMaxBatchAge   = 10 * time.Millisecond
 )
 
 type Config struct {
@@ -53,14 +55,15 @@ type sessionState struct {
 }
 
 type controller struct {
-	ctx          context.Context
-	state        *sessionState
-	unixUser     *user.User
-	shell        string
-	mgmtFrames   chan protocol.Frame
-	outputFrames map[int]chan protocol.Frame
-	defaultCwd   string
-	defaultArgv  []string
+	ctx             context.Context
+	state           *sessionState
+	unixUser        *user.User
+	shell           string
+	mgmtFrames      chan protocol.Frame
+	outputFrames    map[int]chan protocol.Frame
+	defaultCwd      string
+	defaultArgv     []string
+	installedStyles map[int]map[uint32]protocol.Style
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -194,12 +197,13 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 	}
 
 	ctrl := &controller{
-		ctx:          ctx,
-		state:        s,
-		unixUser:     unixUser,
-		shell:        shell,
-		mgmtFrames:   mgmtFrames,
-		outputFrames: outputFrames,
+		ctx:             ctx,
+		state:           s,
+		unixUser:        unixUser,
+		shell:           shell,
+		mgmtFrames:      mgmtFrames,
+		outputFrames:    outputFrames,
+		installedStyles: make(map[int]map[uint32]protocol.Style),
 	}
 	s.session.EnsureClient(clientID0)
 
@@ -266,7 +270,9 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 }
 
 func (c *controller) startPane(pane *Pane) {
-	go c.relayPTYToTerminal(pane)
+	updates := make(chan terminal.Update, 256)
+	go c.publishTerminalUpdates(pane, updates)
+	go c.relayPTYToTerminal(pane, updates)
 	go func() {
 		_ = pane.Process.Wait()
 		_ = pane.PTY.Close()
@@ -399,6 +405,14 @@ func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
 						return
 					}
 					break
+				}
+				if translated, consumed, ok := translateApplicationCursor(msg.Data[index:], c.state.session.InputIsNormal(clientID0) && pane.UsesApplicationCursorKeys()); ok {
+					if _, err := pane.WriteInput(translated); err != nil {
+						done <- fmt.Errorf("write application cursor input: %w", err)
+						return
+					}
+					index += consumed - 1
+					continue
 				}
 				b := msg.Data[index]
 				event := c.state.session.ConsumeInputByte(clientID0, b)
@@ -712,8 +726,9 @@ func (c *controller) emitHistoryMove(pane *Pane, move historyMove) error {
 		}
 	}
 	runs := historyMoveRuns(view, move)
+	compiler := newDisplayCompiler(outputFrames, styleDefinitionsMap(view.Snapshot.Styles))
 	for _, run := range runs {
-		if err := c.sendCellCommands(outputFrames, run.Row, run.Column, run.Cells); err != nil {
+		if err := compiler.writeCells(run.Row, run.Column, run.Cells); err != nil {
 			return err
 		}
 	}
@@ -762,50 +777,6 @@ func historyCounterRun(view *HistoryView, viewportRow int, oldLabel, newLabel st
 	return displayCellRun{Row: viewportRow, Column: start, Cells: cells}
 }
 
-func (c *controller) sendCellCommands(ch chan<- protocol.Frame, row, column int, cells []protocol.Cell) error {
-	for i := 0; i < len(cells); {
-		cell := cells[i]
-		if cell.Width == 0 {
-			i++
-			continue
-		}
-		if err := sendEncoded(ch, protocol.MsgSetWritePosition, protocol.SetWritePosition{Row: row, Column: column + i}, protocol.EncodeSetWritePosition); err != nil {
-			return err
-		}
-		if err := sendEncoded(ch, protocol.MsgSetWriteStyle, protocol.SetWriteStyle{StyleID: cell.StyleID}, protocol.EncodeSetWriteStyle); err != nil {
-			return err
-		}
-		if cell.Width == 1 {
-			j := i + 1
-			for j < len(cells) && cells[j] == cell {
-				j++
-			}
-			if j-i >= 3 {
-				if err := sendEncoded(ch, protocol.MsgFill, protocol.Fill{Columns: j - i, Rune: normalizedRune(cell.Rune), Width: 1}, protocol.EncodeFill); err != nil {
-					return err
-				}
-				i = j
-				continue
-			}
-		}
-		width := cell.Width
-		styleID := cell.StyleID
-		text := make([]byte, 0, 32)
-		for i < len(cells) {
-			current := cells[i]
-			if current.Width != width || current.StyleID != styleID || current.Width == 0 {
-				break
-			}
-			text = append(text, string(normalizedRune(current.Rune))...)
-			i += int(current.Width)
-		}
-		if err := sendEncoded(ch, protocol.MsgWriteText, protocol.WriteText{CellWidth: width, Text: text}, protocol.EncodeWriteText); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func normalizedRune(r rune) rune {
 	if r == 0 {
 		return ' '
@@ -813,7 +784,16 @@ func normalizedRune(r rune) rune {
 	return r
 }
 
-func (c *controller) relayPTYToTerminal(pane *Pane) {
+func styleDefinitionsMap(defs []protocol.StyleDefinition) map[uint32]protocol.Style {
+	styles := make(map[uint32]protocol.Style, len(defs))
+	for _, def := range defs {
+		styles[def.ID] = def.Style
+	}
+	return styles
+}
+
+func (c *controller) relayPTYToTerminal(pane *Pane, updates chan<- terminal.Update) {
+	defer close(updates)
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := pane.PTY.Read(buf)
@@ -826,14 +806,101 @@ func (c *controller) relayPTYToTerminal(pane *Pane) {
 					return
 				}
 			}
-			if sendErr := c.emitTerminalUpdate(pane, update); sendErr != nil {
-				return
-			}
+			update.Replies = nil
+			updates <- update
 		}
 		if err != nil {
 			return
 		}
 	}
+}
+
+func (c *controller) publishTerminalUpdates(pane *Pane, updates <-chan terminal.Update) {
+	var aggregate terminal.Update
+	var idle, maxAge *time.Timer
+	var idleC, maxC <-chan time.Time
+	pending := false
+	stop := func(timer *time.Timer) {
+		if timer != nil && !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+	flush := func() bool {
+		if !pending {
+			return true
+		}
+		stop(idle)
+		stop(maxAge)
+		idle, idleC, maxAge, maxC = nil, nil, nil, nil
+		current := aggregate
+		aggregate = terminal.Update{}
+		pending = false
+		return c.emitTerminalUpdate(pane, current) == nil
+	}
+	for {
+		select {
+		case update, ok := <-updates:
+			if !ok {
+				flush()
+				return
+			}
+			mergeTerminalUpdate(&aggregate, update)
+			if !pending {
+				pending = true
+				maxAge = time.NewTimer(renderMaxBatchAge)
+				maxC = maxAge.C
+			}
+			stop(idle)
+			idle = time.NewTimer(renderIdleFlush)
+			idleC = idle.C
+		case <-idleC:
+			if !flush() {
+				return
+			}
+		case <-maxC:
+			if !flush() {
+				return
+			}
+		}
+	}
+}
+
+func mergeTerminalUpdate(dst *terminal.Update, src terminal.Update) {
+	if dst.DirtyRows == nil {
+		dst.DirtyRows = make(map[int]struct{})
+	}
+	if dst.DirtySpans == nil {
+		dst.DirtySpans = make(map[int]terminal.DirtySpan)
+	}
+	if dst.DefinedStyles == nil {
+		dst.DefinedStyles = make(map[uint32]terminal.Style)
+	}
+	for row := range src.DirtyRows {
+		dst.DirtyRows[row] = struct{}{}
+	}
+	for row, span := range src.DirtySpans {
+		current, ok := dst.DirtySpans[row]
+		if !ok {
+			dst.DirtySpans[row] = span
+			continue
+		}
+		if span.Start < current.Start {
+			current.Start = span.Start
+		}
+		if span.End > current.End {
+			current.End = span.End
+		}
+		dst.DirtySpans[row] = current
+	}
+	for id, style := range src.DefinedStyles {
+		dst.DefinedStyles[id] = style
+	}
+	dst.FullRedraw = dst.FullRedraw || src.FullRedraw
+	dst.CursorChanged = dst.CursorChanged || src.CursorChanged
+	dst.VisibleChange = dst.VisibleChange || src.VisibleChange
 }
 
 func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) error {
@@ -860,17 +927,6 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 	pane.terminalMu.Lock()
 	defer pane.terminalMu.Unlock()
 
-	styleIDs := make([]int, 0, len(update.DefinedStyles))
-	for id := range update.DefinedStyles {
-		styleIDs = append(styleIDs, int(id))
-	}
-	sort.Ints(styleIDs)
-	styles := make([]protocol.StyleDefinition, 0, len(styleIDs))
-	for _, rawID := range styleIDs {
-		id := uint32(rawID)
-		styles = append(styles, protocol.StyleDefinition{ID: id, Style: update.DefinedStyles[id]})
-	}
-
 	rows := make([]int, 0, len(update.DirtySpans))
 	for row := range update.DirtySpans {
 		rows = append(rows, row)
@@ -887,16 +943,44 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 			Cells:  append([]protocol.Cell(nil), pane.Terminal.Cells[start:end]...),
 		})
 	}
+	neededStyles := make(map[uint32]struct{})
+	for id := range update.DefinedStyles {
+		neededStyles[id] = struct{}{}
+	}
+	for _, run := range runs {
+		for _, cell := range run.Cells {
+			neededStyles[cell.StyleID] = struct{}{}
+		}
+	}
+	styleByID := make(map[uint32]protocol.Style)
+	for _, def := range pane.Terminal.SnapshotStyles() {
+		styleByID[def.ID] = def.Style
+	}
+	styleIDs := make([]int, 0, len(neededStyles))
+	for id := range neededStyles {
+		styleIDs = append(styleIDs, int(id))
+	}
+	sort.Ints(styleIDs)
+	styles := make([]protocol.StyleDefinition, 0, len(styleIDs))
+	for _, rawID := range styleIDs {
+		id := uint32(rawID)
+		style, ok := styleByID[id]
+		if !ok {
+			return fmt.Errorf("terminal style %d is undefined", id)
+		}
+		styles = append(styles, protocol.StyleDefinition{ID: id, Style: style})
+	}
 	if len(styles) == 0 && len(runs) == 0 && !update.CursorChanged && !update.VisibleChange {
 		return nil
 	}
 	for _, def := range styles {
-		if err := sendEncoded(outputFrames, protocol.MsgStyleInstall, protocol.StyleInstall{ID: def.ID, Style: def.Style}, protocol.EncodeStyleInstall); err != nil {
+		if err := c.installStyle(binding.Slot, outputFrames, def.ID, def.Style); err != nil {
 			return err
 		}
 	}
+	compiler := newDisplayCompiler(outputFrames, styleByID)
 	for _, run := range runs {
-		if err := c.sendCellCommands(outputFrames, run.Row, run.Column, run.Cells); err != nil {
+		if err := compiler.writeCells(run.Row, run.Column, run.Cells); err != nil {
 			return err
 		}
 	}
@@ -916,14 +1000,17 @@ func (c *controller) sendFullRender(binding RenderBinding, pane *Pane) error {
 	pane.terminalMu.Lock()
 	defer pane.terminalMu.Unlock()
 	styleDefs := pane.Terminal.SnapshotStyles()
+	styleByID := make(map[uint32]protocol.Style, len(styleDefs))
 	for _, def := range styleDefs {
-		if err := sendEncoded(outputFrames, protocol.MsgStyleInstall, protocol.StyleInstall{ID: def.ID, Style: def.Style}, protocol.EncodeStyleInstall); err != nil {
+		styleByID[def.ID] = def.Style
+		if err := c.installStyle(binding.Slot, outputFrames, def.ID, def.Style); err != nil {
 			return err
 		}
 	}
+	compiler := newDisplayCompiler(outputFrames, styleByID)
 	for row := 0; row < pane.Terminal.Rows; row++ {
 		start := row * pane.Terminal.Cols
-		if err := c.sendCellCommands(outputFrames, row, 0, pane.Terminal.Cells[start:start+pane.Terminal.Cols]); err != nil {
+		if err := compiler.writeCells(row, 0, pane.Terminal.Cells[start:start+pane.Terminal.Cols]); err != nil {
 			return err
 		}
 	}
@@ -949,14 +1036,15 @@ func (c *controller) sendHistorySnapshot(binding RenderBinding, pane *Pane, view
 	defer pane.terminalMu.Unlock()
 	snapshot := view.Snapshot
 	for _, def := range snapshot.Styles {
-		if err := sendEncoded(outputFrames, protocol.MsgStyleInstall, protocol.StyleInstall{ID: def.ID, Style: def.Style}, protocol.EncodeStyleInstall); err != nil {
+		if err := c.installStyle(binding.Slot, outputFrames, def.ID, def.Style); err != nil {
 			return err
 		}
 	}
 	cells := historyViewport(view)
+	compiler := newDisplayCompiler(outputFrames, styleDefinitionsMap(snapshot.Styles))
 	for row := 0; row < snapshot.ViewportRows; row++ {
 		start := row * snapshot.Cols
-		if err := c.sendCellCommands(outputFrames, row, 0, cells[start:start+snapshot.Cols]); err != nil {
+		if err := compiler.writeCells(row, 0, cells[start:start+snapshot.Cols]); err != nil {
 			return err
 		}
 	}
@@ -965,6 +1053,27 @@ func (c *controller) sendHistorySnapshot(binding RenderBinding, pane *Pane, view
 	}
 	return sendEncoded(outputFrames, protocol.MsgPresent, protocol.Present{}, protocol.EncodePresent)
 }
+
+func (c *controller) installStyle(slot int, ch chan<- protocol.Frame, id uint32, style protocol.Style) error {
+	if c.installedStyles == nil {
+		c.installedStyles = make(map[int]map[uint32]protocol.Style)
+	}
+	styles := c.installedStyles[slot]
+	if styles == nil {
+		styles = make(map[uint32]protocol.Style)
+		c.installedStyles[slot] = styles
+	}
+	if installed, ok := styles[id]; ok && installed == style {
+		return nil
+	}
+	if err := sendEncoded(ch, protocol.MsgStyleInstall, protocol.StyleInstall{ID: id, Style: style}, protocol.EncodeStyleInstall); err != nil {
+		return err
+	}
+	styles[id] = style
+	return nil
+}
+
+func (c *controller) resetInstalledStyles(slot int) { delete(c.installedStyles, slot) }
 
 func (c *controller) sendHistorySnapshotSerialized(binding RenderBinding, pane *Pane, view *HistoryView) error {
 	c.state.renderMu.Lock()
@@ -1039,6 +1148,7 @@ func (c *controller) publishBindingSnapshotsLocked(bindings []RenderBinding) err
 		if err := sendEncoded(outputFrames, protocol.MsgRelayoutBarrier, protocol.RelayoutBarrier{LayoutRevision: window.LayoutRevision}, protocol.EncodeRelayoutBarrier); err != nil {
 			return err
 		}
+		c.resetInstalledStyles(binding.Slot)
 		if err := c.sendCurrentViewSnapshot(binding, pane); err != nil {
 			return err
 		}
@@ -1067,6 +1177,7 @@ func (c *controller) publishVisibleSnapshotsLocked() error {
 		if err := sendEncoded(outputFrames, protocol.MsgRelayoutBarrier, protocol.RelayoutBarrier{LayoutRevision: window.LayoutRevision}, protocol.EncodeRelayoutBarrier); err != nil {
 			return err
 		}
+		c.resetInstalledStyles(binding.Slot)
 		if err := c.sendCurrentViewSnapshot(binding, pane); err != nil {
 			return err
 		}

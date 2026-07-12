@@ -1,10 +1,21 @@
 package server
 
 import (
+	"bytes"
 	"testing"
 
 	"tali/internal/server/terminal"
 )
+
+func TestTranslateApplicationCursor(t *testing.T) {
+	got, consumed, ok := translateApplicationCursor([]byte("\x1b[Drest"), true)
+	if !ok || consumed != 3 || !bytes.Equal(got, []byte("\x1bOD")) {
+		t.Fatalf("translation=%q consumed=%d ok=%v", got, consumed, ok)
+	}
+	if _, _, ok := translateApplicationCursor([]byte("\x1b[D"), false); ok {
+		t.Fatal("translated while mode disabled")
+	}
+}
 
 func TestServerConsumesPrefixCommandsAndForwardsLiteralBytes(t *testing.T) {
 	s := NewSession(0)

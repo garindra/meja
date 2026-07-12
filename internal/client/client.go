@@ -681,44 +681,71 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 				return err
 			}
 		}
-		return present(fmt.Sprintf("present slot=%d", batch.slot))
+		return nil
+	}
+	handleEvent := func(event renderEvent) (bool, string, error) {
+		needsPresent := false
+		reason := ""
+		var err error
+		switch e := event.(type) {
+		case sizeEvent:
+			state.SetTerminalSize(e.cols, e.rows)
+		case statusEvent:
+			state.ApplyStatusBar(e.status)
+			needsPresent = true
+			reason = "status-bar"
+		case layoutEvent:
+			if state.ApplyWindowLayout(e.layout) {
+				needsPresent = true
+				reason = "window-layout"
+			}
+			for revision := range pending {
+				if revision < e.layout.LayoutRevision {
+					delete(pending, revision)
+				}
+			}
+			for _, batch := range pending[e.layout.LayoutRevision] {
+				if err = applyBatch(batch); err != nil {
+					break
+				}
+				needsPresent = true
+				reason = "layout batches"
+			}
+			delete(pending, e.layout.LayoutRevision)
+		case paneBatchEvent:
+			current := state.Layout.LayoutRevision
+			if e.layoutRevision > current {
+				pending[e.layoutRevision] = append(pending[e.layoutRevision], e)
+			} else if e.layoutRevision == current {
+				err = applyBatch(e)
+				needsPresent = err == nil
+				reason = fmt.Sprintf("present slot=%d", e.slot)
+			}
+		}
+		return needsPresent, reason, err
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case event := <-r.events:
-			var err error
-			switch e := event.(type) {
-			case sizeEvent:
-				state.SetTerminalSize(e.cols, e.rows)
-			case statusEvent:
-				state.ApplyStatusBar(e.status)
-				err = present("status-bar")
-			case layoutEvent:
-				if state.ApplyWindowLayout(e.layout) {
-					err = present("window-layout")
-				}
-				for revision := range pending {
-					if revision < e.layout.LayoutRevision {
-						delete(pending, revision)
+			needsPresent, reason, err := handleEvent(event)
+			draining := true
+			for draining && err == nil {
+				select {
+				case next := <-r.events:
+					needed, nextReason, nextErr := handleEvent(next)
+					needsPresent = needsPresent || needed
+					if nextReason != "" {
+						reason = nextReason
 					}
+					err = nextErr
+				default:
+					draining = false
 				}
-				if err == nil {
-					for _, batch := range pending[e.layout.LayoutRevision] {
-						if err = applyBatch(batch); err != nil {
-							break
-						}
-					}
-					delete(pending, e.layout.LayoutRevision)
-				}
-			case paneBatchEvent:
-				current := state.Layout.LayoutRevision
-				if e.layoutRevision > current {
-					pending[e.layoutRevision] = append(pending[e.layoutRevision], e)
-				} else if e.layoutRevision == current {
-					err = applyBatch(e)
-				}
+			}
+			if err == nil && needsPresent {
+				err = present(reason)
 			}
 			if err != nil {
 				if ctx.Err() == nil {

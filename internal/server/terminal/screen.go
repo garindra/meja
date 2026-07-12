@@ -23,23 +23,26 @@ type Row struct {
 }
 
 type TerminalState struct {
-	Cols          int
-	Rows          int
-	Cells         []Cell
-	GridRows      []Row
-	CursorX       int
-	CursorY       int
-	CurrentStyle  Style
-	CursorVisible bool
-	Parser        Parser
-	wrapPending   bool
-	SavedCursor   SavedCursor
-	ScrollTop     int
-	ScrollBottom  int
-	History       []Row
-	HistoryLimit  int
-	Alternate     bool
-	Primary       *screenBuffer
+	Cols                  int
+	Rows                  int
+	Cells                 []Cell
+	GridRows              []Row
+	CursorX               int
+	CursorY               int
+	CurrentStyle          Style
+	CursorVisible         bool
+	Parser                Parser
+	wrapPending           bool
+	SavedCursor           SavedCursor
+	ScrollTop             int
+	ScrollBottom          int
+	History               []Row
+	HistoryLimit          int
+	Alternate             bool
+	Primary               *screenBuffer
+	ApplicationCursorKeys bool
+	LastPrintedRune       rune
+	LastPrintedValid      bool
 
 	styleByID   map[uint32]Style
 	styleToID   map[Style]uint32
@@ -47,15 +50,17 @@ type TerminalState struct {
 }
 
 type screenBuffer struct {
-	Rows          []Row
-	CursorX       int
-	CursorY       int
-	CurrentStyle  Style
-	CursorVisible bool
-	WrapPending   bool
-	SavedCursor   SavedCursor
-	ScrollTop     int
-	ScrollBottom  int
+	Rows             []Row
+	CursorX          int
+	CursorY          int
+	CurrentStyle     Style
+	CursorVisible    bool
+	WrapPending      bool
+	SavedCursor      SavedCursor
+	ScrollTop        int
+	ScrollBottom     int
+	LastPrintedRune  rune
+	LastPrintedValid bool
 }
 
 type SavedCursor struct {
@@ -113,6 +118,9 @@ func (t *TerminalState) Resize(cols, rows int) {
 	next.CursorVisible = t.CursorVisible
 	next.Parser = t.Parser
 	next.wrapPending = t.wrapPending
+	next.ApplicationCursorKeys = t.ApplicationCursorKeys
+	next.LastPrintedRune = t.LastPrintedRune
+	next.LastPrintedValid = t.LastPrintedValid
 	next.styleByID = cloneStyleMap(t.styleByID)
 	next.styleToID = cloneStyleIDMap(t.styleToID)
 	next.nextStyleID = t.nextStyleID
@@ -177,6 +185,8 @@ func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 	primary.SavedCursor = p.SavedCursor
 	primary.ScrollTop = p.ScrollTop
 	primary.ScrollBottom = p.ScrollBottom
+	primary.LastPrintedRune = p.LastPrintedRune
+	primary.LastPrintedValid = p.LastPrintedValid
 	primary.History = cloneRows(t.History)
 	primary.HistoryLimit = t.HistoryLimit
 	primary.styleByID = cloneStyleMap(t.styleByID)
@@ -198,7 +208,7 @@ func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 	t.clampCursor()
 	t.syncCellsFromRows()
 	t.History = primary.History
-	t.Primary = &screenBuffer{Rows: cloneRows(primary.GridRows), CursorX: primary.CursorX, CursorY: primary.CursorY, CurrentStyle: primary.CurrentStyle, CursorVisible: primary.CursorVisible, WrapPending: primary.wrapPending, SavedCursor: primary.SavedCursor, ScrollTop: primary.ScrollTop, ScrollBottom: primary.ScrollBottom}
+	t.Primary = &screenBuffer{Rows: cloneRows(primary.GridRows), CursorX: primary.CursorX, CursorY: primary.CursorY, CurrentStyle: primary.CurrentStyle, CursorVisible: primary.CursorVisible, WrapPending: primary.wrapPending, SavedCursor: primary.SavedCursor, ScrollTop: primary.ScrollTop, ScrollBottom: primary.ScrollBottom, LastPrintedRune: primary.LastPrintedRune, LastPrintedValid: primary.LastPrintedValid}
 }
 
 func (t *TerminalState) SnapshotStyles() []protocolStyleDef {
@@ -373,6 +383,8 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 	}
 	writtenColumn := t.CursorX
 	t.GridRows[t.CursorY].Cells[writtenColumn] = Cell{Rune: r, StyleID: styleID, Width: 1}
+	t.LastPrintedRune = r
+	t.LastPrintedValid = true
 	t.syncRowToCells(t.CursorY)
 	update.markDirty(t.CursorY, writtenColumn, writtenColumn+1, t.Cols)
 	if t.CursorX == t.Cols-1 {
@@ -393,6 +405,10 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 	case '?':
 		switch parsed.Final {
 		case 'h':
+			if len(parsed.Params) == 1 && parsed.Params[0] == 1 {
+				t.ApplicationCursorKeys = true
+				return
+			}
 			if hasScreenMode(parsed.Params) {
 				t.enterAlternateScreen()
 				update.FullRedraw = true
@@ -407,6 +423,10 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 			}
 			logUnsupportedf("unsupported private CSI ?%s", seq)
 		case 'l':
+			if len(parsed.Params) == 1 && parsed.Params[0] == 1 {
+				t.ApplicationCursorKeys = false
+				return
+			}
 			if hasScreenMode(parsed.Params) {
 				t.exitAlternateScreen()
 				update.FullRedraw = true
@@ -465,8 +485,26 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 		update.markDirty(t.CursorY, start, end, t.Cols)
 	case 'P':
 		t.breakWrapChainAt(t.CursorY)
-		t.deleteChars(max1(parsed.Params, 1))
+		styleID, added := t.styleID(t.CurrentStyle)
+		if added {
+			update.DefinedStyles[styleID] = t.CurrentStyle
+		}
+		t.deleteChars(max1(parsed.Params, 1), styleID)
 		update.markDirty(t.CursorY, t.CursorX, t.Cols, t.Cols)
+	case '@':
+		t.breakWrapChainAt(t.CursorY)
+		styleID, added := t.styleID(t.CurrentStyle)
+		if added {
+			update.DefinedStyles[styleID] = t.CurrentStyle
+		}
+		t.insertChars(max1(parsed.Params, 1), styleID)
+		update.markDirty(t.CursorY, t.CursorX, t.Cols, t.Cols)
+	case 'b':
+		if t.LastPrintedValid {
+			for count := 0; count < max1(parsed.Params, 1); count++ {
+				t.putRune(t.LastPrintedRune, update)
+			}
+		}
 	case 'r':
 		t.setScrollRegion(parsed.Params)
 		t.CursorX, t.CursorY = 0, 0
@@ -701,7 +739,7 @@ func (t *TerminalState) enterAlternateScreen() {
 	if t.Alternate {
 		return
 	}
-	t.Primary = &screenBuffer{Rows: cloneRows(t.GridRows), CursorX: t.CursorX, CursorY: t.CursorY, CurrentStyle: t.CurrentStyle, CursorVisible: t.CursorVisible, WrapPending: t.wrapPending, SavedCursor: t.SavedCursor, ScrollTop: t.ScrollTop, ScrollBottom: t.ScrollBottom}
+	t.Primary = &screenBuffer{Rows: cloneRows(t.GridRows), CursorX: t.CursorX, CursorY: t.CursorY, CurrentStyle: t.CurrentStyle, CursorVisible: t.CursorVisible, WrapPending: t.wrapPending, SavedCursor: t.SavedCursor, ScrollTop: t.ScrollTop, ScrollBottom: t.ScrollBottom, LastPrintedRune: t.LastPrintedRune, LastPrintedValid: t.LastPrintedValid}
 	t.GridRows = make([]Row, t.Rows)
 	for row := range t.GridRows {
 		t.GridRows[row] = blankRow(t.Cols, 0)
@@ -713,6 +751,7 @@ func (t *TerminalState) enterAlternateScreen() {
 	t.SavedCursor = SavedCursor{}
 	t.ScrollTop = 0
 	t.ScrollBottom = t.Rows - 1
+	t.LastPrintedValid = false
 	t.Alternate = true
 	t.syncCellsFromRows()
 }
@@ -731,6 +770,8 @@ func (t *TerminalState) exitAlternateScreen() {
 	t.SavedCursor = p.SavedCursor
 	t.ScrollTop = p.ScrollTop
 	t.ScrollBottom = p.ScrollBottom
+	t.LastPrintedRune = p.LastPrintedRune
+	t.LastPrintedValid = p.LastPrintedValid
 	t.Alternate = false
 	t.Primary = nil
 	t.clampCursor()
@@ -822,7 +863,7 @@ func (t *TerminalState) setScrollRegion(params []int) {
 	t.wrapPending = false
 }
 
-func (t *TerminalState) deleteChars(n int) {
+func (t *TerminalState) deleteChars(n int, styleID uint32) {
 	if t.CursorY < 0 || t.CursorY >= t.Rows || n <= 0 {
 		return
 	}
@@ -835,7 +876,23 @@ func (t *TerminalState) deleteChars(n int) {
 	}
 	copy(row[t.CursorX:], row[t.CursorX+n:])
 	for i := len(row) - n; i < len(row); i++ {
-		row[i] = blankCell(0)
+		row[i] = blankCell(styleID)
+	}
+	t.normalizeRow(t.CursorY)
+	t.syncRowToCells(t.CursorY)
+}
+
+func (t *TerminalState) insertChars(n int, styleID uint32) {
+	if t.CursorY < 0 || t.CursorY >= t.Rows || t.CursorX < 0 || t.CursorX >= t.Cols || n <= 0 {
+		return
+	}
+	row := t.GridRows[t.CursorY].Cells
+	if n > len(row)-t.CursorX {
+		n = len(row) - t.CursorX
+	}
+	copy(row[t.CursorX+n:], row[t.CursorX:len(row)-n])
+	for i := t.CursorX; i < t.CursorX+n; i++ {
+		row[i] = blankCell(styleID)
 	}
 	t.normalizeRow(t.CursorY)
 	t.syncRowToCells(t.CursorY)

@@ -159,6 +159,22 @@ func TestAlternateResizePreservesPrimary(t *testing.T) {
 	}
 }
 
+func TestApplicationCursorMode(t *testing.T) {
+	term := New(8, 3)
+	term.Apply([]byte("\x1b[?1h"))
+	if !term.ApplicationCursorKeys {
+		t.Fatal("application cursor mode not enabled")
+	}
+	term.Resize(10, 4)
+	if !term.ApplicationCursorKeys {
+		t.Fatal("resize lost application cursor mode")
+	}
+	term.Apply([]byte("\x1b[?1l"))
+	if term.ApplicationCursorKeys {
+		t.Fatal("application cursor mode not disabled")
+	}
+}
+
 func TestEraseCharsMarksOnlyCurrentRowDirty(t *testing.T) {
 	term := New(5, 2)
 	term.Apply([]byte("hello"))
@@ -175,6 +191,42 @@ func TestEraseCharsMarksOnlyCurrentRowDirty(t *testing.T) {
 	}
 	if got, want := update.DirtySpans[0], (DirtySpan{Start: 1, End: 3}); got != want {
 		t.Fatalf("erase characters dirty span = %#v, want %#v", got, want)
+	}
+}
+
+func TestInsertCharactersShiftsExistingTextRight(t *testing.T) {
+	term := New(12, 1)
+	term.Apply([]byte("abcdef\r\x1b[3C\x1b[3@zzz"))
+	if got := cellsString(term.GridRows[0].Cells[:9]); got != "abczzzdef" {
+		t.Fatalf("inserted text=%q", got)
+	}
+}
+
+func TestRepeatPrecedingCharacterPreservesStyle(t *testing.T) {
+	term := New(8, 1)
+	update := term.Apply([]byte("\x1b[44m \x1b[6b"))
+	if update.FullRedraw {
+		t.Fatal("REP forced full redraw")
+	}
+	for column := 0; column < 7; column++ {
+		cell := term.GridRows[0].Cells[column]
+		if cell.Rune != ' ' || term.styleByID[cell.StyleID].BG.Index != 4 {
+			t.Fatalf("column %d=%#v style=%#v", column, cell, term.styleByID[cell.StyleID])
+		}
+	}
+}
+
+func TestDeleteCharactersUsesCurrentBackground(t *testing.T) {
+	term := New(8, 1)
+	term.Apply([]byte("abcdefgh\r\x1b[44m\x1b[3P"))
+	if got := cellsString(term.GridRows[0].Cells); got != "defgh   " {
+		t.Fatalf("DCH row=%q", got)
+	}
+	for column := 5; column < 8; column++ {
+		style := term.styleByID[term.GridRows[0].Cells[column].StyleID]
+		if style.BG.Mode != "indexed" || style.BG.Index != 4 {
+			t.Fatalf("column %d background=%#v", column, style.BG)
+		}
 	}
 }
 

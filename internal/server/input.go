@@ -100,6 +100,20 @@ func (s *Session) ConsumeInputByte(clientID uint64, b byte) serverInputEvent {
 	return serverInputEvent{}
 }
 
+func (s *Session) InputIsNormal(clientID uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	client := s.Clients[clientID]
+	return client != nil && client.InputState == serverInputNormal
+}
+
+func translateApplicationCursor(data []byte, enabled bool) ([]byte, int, bool) {
+	if !enabled || len(data) < 3 || data[0] != 0x1b || data[1] != '[' || data[2] < 'A' || data[2] > 'D' {
+		return nil, 0, false
+	}
+	return []byte{0x1b, 'O', data[2]}, 3, true
+}
+
 func (s *Session) RelativeWindowID(clientID uint64, delta int) (uint64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

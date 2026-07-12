@@ -34,6 +34,12 @@ func (p *Pane) TerminalSize() (int, int) {
 	return p.Terminal.Cols, p.Terminal.Rows
 }
 
+func (p *Pane) UsesApplicationCursorKeys() bool {
+	p.terminalMu.Lock()
+	defer p.terminalMu.Unlock()
+	return p.Terminal.ApplicationCursorKeys
+}
+
 func StartPane(unixUser *user.User, paneID uint64, request paneRequest) (*Pane, error) {
 	shell := request.Shell
 	if shell == "" {
