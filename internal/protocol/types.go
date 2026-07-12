@@ -2,7 +2,7 @@ package protocol
 
 import "time"
 
-const ALPN = "tali/2"
+const ALPN = "tali/3"
 
 const (
 	MsgOpenManagementStream uint64 = iota + 1
@@ -20,19 +20,7 @@ const (
 	MsgInputBytes
 	MsgResizePane
 	MsgRequestPaneSnapshot
-	MsgCreateWindow
-	MsgWindowCreated
-	MsgCloseWindow
-	MsgWindowClosed
-	MsgSelectWindow
-	MsgWindowSelected
-	MsgListWindows
-	MsgWindowList
-	MsgWindowTitleChanged
 	MsgWindowLayout
-	MsgCreateSplit
-	MsgFocusPane
-	MsgClosePane
 	MsgBindRenderStream
 	MsgReplacePane
 	MsgSetRun
@@ -42,8 +30,8 @@ const (
 	MsgPing
 	MsgPong
 	MsgPaneUpdate
-	MsgEnterHistory
 	MsgScrollPane
+	MsgStatusBar
 )
 
 const (
@@ -106,69 +94,20 @@ type PaneExited struct {
 }
 
 type InputBytes struct {
-	PaneID uint64
-	Data   []byte
+	Data []byte
 }
 
 type InputBytesView struct {
-	PaneID uint64
-	Data   []byte
+	Data []byte
 }
 
 type ResizePane struct {
-	PaneID uint64
-	Cols   uint16
-	Rows   uint16
+	Cols uint16
+	Rows uint16
 }
 
 type RequestPaneSnapshot struct {
 	PaneID uint64
-}
-
-type CreateWindow struct {
-	Cwd  string
-	Argv []string
-}
-
-type WindowInfo struct {
-	WindowID uint64
-	PaneID   uint64
-	Index    int
-	Title    string
-	Active   bool
-}
-
-type WindowCreated struct {
-	Window WindowInfo
-}
-
-type CloseWindow struct {
-	WindowID uint64
-}
-
-type WindowClosed struct {
-	WindowID uint64
-}
-
-type SelectWindow struct {
-	WindowID uint64
-}
-
-type WindowSelected struct {
-	WindowID uint64
-	PaneID   uint64
-}
-
-type ListWindows struct{}
-
-type WindowList struct {
-	Windows        []WindowInfo
-	ActiveWindowID uint64
-}
-
-type WindowTitleChanged struct {
-	WindowID uint64
-	Title    string
 }
 
 type Rect struct {
@@ -185,32 +124,15 @@ type PanePlacement struct {
 
 type WindowLayout struct {
 	WindowID       uint64
+	FocusedPaneID  uint64
 	LayoutRevision uint64
 	Panes          []PanePlacement
 }
 
-type CreateSplit struct {
-	PaneID    uint64
-	Direction SplitDirection
-}
-
-type SplitDirection uint8
-
-const (
-	SplitVertical SplitDirection = iota
-	SplitHorizontal
-)
-
-type FocusPane struct {
-	PaneID uint64
-}
-
-type ClosePane struct {
-	PaneID uint64
-}
-
-type EnterHistory struct {
-	PaneID uint64
+type StatusBar struct {
+	Cols   int
+	Cells  []Cell
+	Styles []StyleDefinition
 }
 
 type ScrollPane struct {

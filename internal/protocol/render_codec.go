@@ -23,6 +23,63 @@ func DecodeScrollPane(payload []byte) (ScrollPane, error) {
 	return ScrollPane{Delta: int(delta)}, nil
 }
 
+func EncodeStatusBar(dst []byte, msg StatusBar) ([]byte, error) {
+	if msg.Cols <= 0 || uint64(msg.Cols) > MaxGridCols || len(msg.Cells) != msg.Cols {
+		return nil, fmt.Errorf("encode StatusBar: invalid width %d with %d cells", msg.Cols, len(msg.Cells))
+	}
+	if uint64(len(msg.Styles)) > MaxStyles {
+		return nil, fmt.Errorf("encode StatusBar: style count %d exceeds max %d", len(msg.Styles), MaxStyles)
+	}
+	w := PayloadWriter{Buf: dst}
+	w.Uvarint(uint64(msg.Cols))
+	w.Uvarint(uint64(len(msg.Styles)))
+	for _, def := range msg.Styles {
+		w.Uvarint(uint64(def.ID))
+		if err := encodeStyle(&w, def.Style); err != nil {
+			return nil, fmt.Errorf("encode StatusBar: %w", err)
+		}
+	}
+	if err := encodeCellSequence(&w, msg.Cells); err != nil {
+		return nil, fmt.Errorf("encode StatusBar: %w", err)
+	}
+	return w.Buf, nil
+}
+
+func DecodeStatusBar(payload []byte) (StatusBar, error) {
+	r := PayloadReader{Data: payload}
+	cols, err := readCoord(&r, MaxGridCols)
+	if err != nil {
+		return StatusBar{}, fmt.Errorf("decode StatusBar: %w", err)
+	}
+	if cols <= 0 {
+		return StatusBar{}, fmt.Errorf("decode StatusBar: invalid width %d", cols)
+	}
+	styleCount, err := readCount(&r, MaxStyles)
+	if err != nil {
+		return StatusBar{}, fmt.Errorf("decode StatusBar: %w", err)
+	}
+	styles := make([]StyleDefinition, 0, styleCount)
+	for i := 0; i < styleCount; i++ {
+		id, err := r.Uvarint()
+		if err != nil {
+			return StatusBar{}, fmt.Errorf("decode StatusBar: %w", err)
+		}
+		style, err := decodeStyle(&r)
+		if err != nil {
+			return StatusBar{}, fmt.Errorf("decode StatusBar: %w", err)
+		}
+		styles = append(styles, StyleDefinition{ID: uint32(id), Style: style})
+	}
+	cells, err := decodeCellSequence(&r, cols)
+	if err != nil {
+		return StatusBar{}, fmt.Errorf("decode StatusBar: %w", err)
+	}
+	if err := r.Done(); err != nil {
+		return StatusBar{}, fmt.Errorf("decode StatusBar: %w", err)
+	}
+	return StatusBar{Cols: cols, Cells: cells, Styles: styles}, nil
+}
+
 const (
 	colorKindDefault byte = iota
 	colorKindIndexed

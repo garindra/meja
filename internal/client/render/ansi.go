@@ -2,15 +2,12 @@ package render
 
 import (
 	"bytes"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
 	"tali/internal/protocol"
 )
-
-var tabBarBG = protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}
 
 func RenderANSI(state *ClientState) []byte {
 	contentRows := state.DrawableRows()
@@ -35,7 +32,7 @@ func RenderANSI(state *ClientState) []byte {
 	}
 	if tabChanged {
 		writeCursorPosition(&buf, state.TerminalRows, 1)
-		buf.WriteString(renderTabBar(state))
+		renderStatusBar(&buf, state)
 	}
 	if contentChanged || tabChanged {
 		buf.WriteString(sgrForStyle(defaultStyle()))
@@ -63,6 +60,28 @@ func RenderANSI(state *ClientState) []byte {
 	state.lastCursorVisible = cursorVisible
 	state.hasRenderedCursor = true
 	return buf.Bytes()
+}
+
+func renderStatusBar(buf *bytes.Buffer, state *ClientState) {
+	if state.StatusBar.Cols == state.TerminalCols && len(state.StatusBar.Cells) == state.TerminalCols {
+		cells := make([]composedCell, len(state.StatusBar.Cells))
+		for i, src := range state.StatusBar.Cells {
+			style := defaultStyle()
+			if found, ok := state.StatusStyles[src.StyleID]; ok {
+				style = found
+			}
+			r := src.Rune
+			if r == 0 {
+				r = ' '
+			}
+			cells[i] = composedCell{Rune: r, Style: style}
+		}
+		renderCellRun(buf, cells)
+		return
+	}
+	for i := 0; i < state.TerminalCols; i++ {
+		buf.WriteByte(' ')
+	}
 }
 
 func renderFullContent(buf *bytes.Buffer, cells []composedCell, cols, rows int) {
@@ -250,62 +269,6 @@ func physicalCursor(state *ClientState) (int, int, bool) {
 		y = 0
 	}
 	return x, y, pane.CursorVisible
-}
-
-func renderTabBar(state *ClientState) string {
-	width := state.TerminalCols
-	if width <= 0 {
-		return ""
-	}
-	var buf strings.Builder
-	defaultStyle := protocol.Style{
-		FG: protocol.Color{Mode: "default"},
-		BG: tabBarBG,
-	}
-
-	prefix := fmt.Sprintf("[%d] ", state.SessionID)
-	if len(prefix) > width {
-		prefix = truncateToWidth(prefix, width)
-	}
-
-	entries := make([]string, 0, len(state.Windows))
-	for _, w := range state.Windows {
-		marker := ' '
-		if w.WindowID == state.ActiveWindowID {
-			marker = '*'
-		}
-		entries = append(entries, fmt.Sprintf("%d:%s%c ", w.Index, w.Title, marker))
-	}
-
-	used := 0
-	buf.WriteString(sgrForStyle(defaultStyle))
-	buf.WriteString(prefix)
-	used += len(prefix)
-	for _, entry := range entries {
-		remaining := width - used
-		if remaining <= 0 {
-			break
-		}
-		if len(entry) > remaining {
-			entry = truncateToWidth(entry, remaining)
-		}
-		buf.WriteString(entry)
-		used += len(entry)
-	}
-	if used < width {
-		buf.WriteString(strings.Repeat(" ", width-used))
-	}
-	return buf.String()
-}
-
-func truncateToWidth(s string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	if len(s) <= width {
-		return s
-	}
-	return s[:width]
 }
 
 func defaultStyle() protocol.Style {

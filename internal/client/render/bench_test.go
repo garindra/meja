@@ -11,7 +11,6 @@ func BenchmarkRenderANSI(b *testing.B) {
 	state.SetTerminalSize(80, 24)
 	state.SessionID = 0
 	state.ActiveWindowID = 1
-	state.Windows = []protocol.WindowInfo{{WindowID: 1, PaneID: 1, Index: 0, Title: "bash", Active: true}}
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{

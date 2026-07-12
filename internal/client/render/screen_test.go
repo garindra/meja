@@ -6,6 +6,12 @@ import (
 	"tali/internal/protocol"
 )
 
+func selectTestPane(state *ClientState, windowID, paneID uint64) {
+	state.ActiveWindowID = windowID
+	state.HasActiveWindow = true
+	state.FocusedPaneID = paneID
+}
+
 func TestPaneStateRoundTripAndSetRun(t *testing.T) {
 	state := NewClientState()
 	state.ApplyWindowLayout(protocol.WindowLayout{
@@ -61,75 +67,13 @@ func TestGenerationMismatchRejected(t *testing.T) {
 	}
 }
 
-func TestWindowNavigation(t *testing.T) {
-	state := NewClientState()
-	state.ApplyWindowList(protocol.WindowList{
-		Windows: []protocol.WindowInfo{
-			{WindowID: 10, PaneID: 10, Index: 0, Title: "bash", Active: true},
-			{WindowID: 20, PaneID: 20, Index: 1, Title: "logs"},
-			{WindowID: 30, PaneID: 30, Index: 2, Title: "vim"},
-		},
-		ActiveWindowID: 10,
-	})
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 10, PaneID: 10})
-	if got, _ := state.NextWindowID(); got != 20 {
-		t.Fatalf("NextWindowID() = %d, want 20", got)
-	}
-	if got, _ := state.PreviousWindowID(); got != 30 {
-		t.Fatalf("PreviousWindowID() = %d, want 30", got)
-	}
-	if got, _ := state.WindowIDByIndex(2); got != 30 {
-		t.Fatalf("WindowIDByIndex() = %d, want 30", got)
-	}
-}
-
-func TestLastActiveWindowTrackingToggles(t *testing.T) {
-	state := NewClientState()
-	state.ApplyWindowList(protocol.WindowList{
-		Windows: []protocol.WindowInfo{
-			{WindowID: 1, PaneID: 10, Index: 0, Title: "bash"},
-			{WindowID: 2, PaneID: 11, Index: 1, Title: "logs"},
-		},
-	})
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 11})
-	if got, ok := state.LastActiveWindowID(); !ok || got != 1 {
-		t.Fatalf("LastActiveWindowID() after 1->2 = %d, %v; want 1, true", got, ok)
-	}
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
-	if got, ok := state.LastActiveWindowID(); !ok || got != 2 {
-		t.Fatalf("LastActiveWindowID() after 2->1 = %d, %v; want 2, true", got, ok)
-	}
-}
-
-func TestWindowListDoesNotOverrideExplicitSelection(t *testing.T) {
-	state := NewClientState()
-	state.ApplyWindowList(protocol.WindowList{
-		Windows: []protocol.WindowInfo{
-			{WindowID: 1, PaneID: 10, Index: 0, Title: "bash", Active: true},
-			{WindowID: 2, PaneID: 11, Index: 1, Title: "logs"},
-		},
-		ActiveWindowID: 1,
-	})
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 11})
-	state.ApplyWindowList(protocol.WindowList{
-		Windows: []protocol.WindowInfo{
-			{WindowID: 1, PaneID: 10, Index: 0, Title: "bash", Active: true},
-			{WindowID: 2, PaneID: 11, Index: 1, Title: "logs"},
-		},
-		ActiveWindowID: 1,
-	})
-	if state.ActiveWindowID != 2 || state.FocusedPaneID != 11 {
-		t.Fatalf("window list overwrote explicit selection: window=%d pane=%d", state.ActiveWindowID, state.FocusedPaneID)
-	}
-}
-
 func TestWindowLayoutStoresMultiplePaneRectsAndFocusOrder(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(12, 4)
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
+	selectTestPane(state, 1, 10)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID:       1,
+		FocusedPaneID:  10,
 		LayoutRevision: 2,
 		Panes: []protocol.PanePlacement{
 			{PaneID: 10, Rect: protocol.Rect{X: 0, Y: 0, Width: 5, Height: 3}},
@@ -139,41 +83,11 @@ func TestWindowLayoutStoresMultiplePaneRectsAndFocusOrder(t *testing.T) {
 	if len(state.Panes) != 2 || state.Panes[11].Rect.X != 6 {
 		t.Fatalf("ApplyWindowLayout() panes = %#v", state.Panes)
 	}
-	if got, ok := state.NextFocusablePaneID(); !ok || got != 11 {
-		t.Fatalf("NextFocusablePaneID() = %d, %v; want 11, true", got, ok)
-	}
-}
-
-func TestDirectionalFocusCanSelectPaneZero(t *testing.T) {
-	state := NewClientState()
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 1})
-	state.ApplyWindowLayout(protocol.WindowLayout{
-		WindowID: 1,
-		Panes: []protocol.PanePlacement{
-			{PaneID: 0, Rect: protocol.Rect{X: 0, Y: 0, Width: 80, Height: 11}},
-			{PaneID: 1, Rect: protocol.Rect{X: 0, Y: 12, Width: 80, Height: 11}},
-		},
-	})
-	if got, ok := state.FocusablePaneID('A'); !ok || got != 0 {
-		t.Fatalf("FocusablePaneID(up) = %d, %v; want 0, true", got, ok)
-	}
-
-	state.FocusedPaneID = 2
-	state.ApplyWindowLayout(protocol.WindowLayout{
-		WindowID: 1,
-		Panes: []protocol.PanePlacement{
-			{PaneID: 0, Rect: protocol.Rect{X: 0, Y: 0, Width: 39, Height: 23}},
-			{PaneID: 2, Rect: protocol.Rect{X: 40, Y: 0, Width: 40, Height: 23}},
-		},
-	})
-	if got, ok := state.FocusablePaneID('D'); !ok || got != 0 {
-		t.Fatalf("FocusablePaneID(left) = %d, %v; want 0, true", got, ok)
-	}
 }
 
 func TestReplaceAcceptsNewPaneAfterShiftedPaneArrivesOnAnotherSlot(t *testing.T) {
 	state := NewClientState()
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 1})
+	selectTestPane(state, 1, 1)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{
@@ -186,7 +100,7 @@ func TestReplaceAcceptsNewPaneAfterShiftedPaneArrivesOnAnotherSlot(t *testing.T)
 		t.Fatal("initial pane bindings rejected")
 	}
 
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 2})
+	selectTestPane(state, 1, 2)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{
@@ -239,7 +153,7 @@ func paneCellString(cells []protocol.Cell) string {
 func TestWindowSelectionKeepsPresentedLayoutUntilReplacement(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(12, 4)
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
+	selectTestPane(state, 1, 10)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{
@@ -257,13 +171,8 @@ func TestWindowSelectionKeepsPresentedLayoutUntilReplacement(t *testing.T) {
 		Cells:             make([]protocol.Cell, 15),
 	})
 
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 20})
-
 	if state.Layout.WindowID != 1 || len(state.Layout.Panes) != 2 {
 		t.Fatalf("presented layout changed before replacement = %#v", state.Layout)
-	}
-	if _, bound := state.RenderSlots[0]; bound || !state.transitioningSlots[0] {
-		t.Fatalf("old render slot remained active during transition: slots=%#v transitioning=%#v", state.RenderSlots, state.transitioningSlots)
 	}
 	accepted, presented := state.ApplyReplaceResult(0, protocol.ReplacePane{
 		WindowID:          2,
@@ -278,7 +187,8 @@ func TestWindowSelectionKeepsPresentedLayoutUntilReplacement(t *testing.T) {
 		t.Fatalf("replacement before layout = accepted %v presented %v", accepted, presented)
 	}
 	if !state.ApplyWindowLayout(protocol.WindowLayout{
-		WindowID: 2,
+		WindowID:      2,
+		FocusedPaneID: 20,
 		Panes: []protocol.PanePlacement{
 			{PaneID: 20, Rect: protocol.Rect{X: 0, Y: 0, Width: 12, Height: 3}},
 		},
@@ -334,7 +244,7 @@ func TestPaneUpdateAppliesRunsStylesAndCursorAtomically(t *testing.T) {
 
 func TestStalePaneUpdateIsDiscardedDuringWindowTransition(t *testing.T) {
 	state := NewClientState()
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
+	selectTestPane(state, 1, 10)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{
@@ -350,7 +260,13 @@ func TestStalePaneUpdateIsDiscardedDuringWindowTransition(t *testing.T) {
 		Rows:              1,
 		Cells:             repeatedCells("old"),
 	})
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 2, PaneID: 20})
+	state.ApplyWindowLayout(protocol.WindowLayout{
+		WindowID:      2,
+		FocusedPaneID: 20,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 20, Rect: protocol.Rect{Width: 3, Height: 1}},
+		},
+	})
 
 	accepted, presented := state.ApplyPaneUpdateResult(0, protocol.PaneUpdate{
 		BindingGeneration: 1,
@@ -361,12 +277,6 @@ func TestStalePaneUpdateIsDiscardedDuringWindowTransition(t *testing.T) {
 	if !accepted || presented {
 		t.Fatalf("stale transitional update = accepted %v presented %v", accepted, presented)
 	}
-	state.ApplyWindowLayout(protocol.WindowLayout{
-		WindowID: 2,
-		Panes: []protocol.PanePlacement{
-			{PaneID: 20, Rect: protocol.Rect{Width: 3, Height: 1}},
-		},
-	})
 	accepted, presented = state.ApplyReplaceResult(0, protocol.ReplacePane{
 		WindowID:          2,
 		PaneID:            20,
@@ -383,7 +293,7 @@ func TestStalePaneUpdateIsDiscardedDuringWindowTransition(t *testing.T) {
 
 func TestIncrementalUpdatesApplyToNonZeroPaneID(t *testing.T) {
 	state := NewClientState()
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 11})
+	selectTestPane(state, 1, 11)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{

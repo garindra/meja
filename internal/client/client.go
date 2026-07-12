@@ -27,10 +27,6 @@ import (
 	"tali/internal/sshconfig"
 )
 
-const prefixByte = 0x02
-
-var errDetachRequested = errors.New("detach requested")
-
 const (
 	quicMaxIdleTimeout  = 60 * time.Second
 	quicKeepAlivePeriod = 10 * time.Second
@@ -65,7 +61,6 @@ type runtimeState struct {
 	ui             *render.ClientState
 	stdout         io.Writer
 	stderr         io.Writer
-	inputBlocked   bool
 	redrawCh       chan struct{}
 	debugRender    bool
 	redrawRequests uint64
@@ -80,15 +75,6 @@ type runtimeState struct {
 	incomingCommandCount    uint64
 	incomingMessageTypeHits map[uint64]uint64
 }
-
-type prefixState uint8
-
-const (
-	prefixIdle prefixState = iota
-	prefixActive
-	prefixArrowESC
-	prefixArrowCSI
-)
 
 func ParseTarget(raw string) (Target, error) {
 	parsed, err := sshconfig.ParseTarget(raw)
@@ -319,7 +305,6 @@ func Run(ctx context.Context, cfg Config) error {
 	ui.with(func(state *render.ClientState) {
 		state.FocusedPaneID = created.PaneID
 	})
-	ui.setInputBlocked(true)
 
 	select {
 	case <-outputReady:
@@ -335,7 +320,7 @@ func Run(ctx context.Context, cfg Config) error {
 	copyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	clientDone := make(chan error, 1)
-	go forwardInput(copyCtx, cfg.Stdin, inputFrames, mgmtFrames, ui, cfg, streamErrs, clientDone)
+	go forwardInput(copyCtx, cfg.Stdin, inputFrames, streamErrs, clientDone)
 	go forwardResize(copyCtx, cfg.Stdin, inputFrames, ui, streamErrs)
 	go sendPeriodicPing(copyCtx, mgmtFrames, streamErrs)
 
@@ -350,9 +335,6 @@ func Run(ctx context.Context, cfg Config) error {
 		case err := <-mgmtDone:
 			return err
 		case err := <-clientDone:
-			if errors.Is(err, errDetachRequested) {
-				return nil
-			}
 			return err
 		case <-ctx.Done():
 			return ctx.Err()
@@ -526,9 +508,6 @@ func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, m
 				return
 			}
 		case protocol.MsgBindRenderStream, protocol.MsgReplacePane, protocol.MsgPaneUpdate, protocol.MsgScrollPane, protocol.MsgDefineStyle, protocol.MsgSetRun, protocol.MsgSetCursor, protocol.MsgSetCursorVisible:
-			if frame.Type == protocol.MsgReplacePane && needsRedraw {
-				ui.setInputBlocked(false)
-			}
 			if needsRedraw {
 				if err := ui.requestRedraw(fmt.Sprintf("output-stream slot=%d msg=%d", slot, frame.Type)); err != nil {
 					sessionDone <- err
@@ -560,64 +539,25 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 				done <- err
 				return
 			}
-			presented := false
-			ui.with(func(state *render.ClientState) { presented = state.ApplyWindowLayout(msg) })
-			if presented {
-				ui.setInputBlocked(false)
-				if err := ui.requestRedraw("window-layout-snapshot"); err != nil {
+			needsRedraw := false
+			ui.with(func(state *render.ClientState) { needsRedraw = state.ApplyWindowLayout(msg) })
+			if needsRedraw {
+				if err := ui.requestRedraw("window-layout"); err != nil {
 					done <- err
 					return
 				}
 			}
-		case protocol.MsgWindowList:
-			msg, err := protocol.DecodeWindowList(frame.Payload)
+		case protocol.MsgStatusBar:
+			msg, err := protocol.DecodeStatusBar(frame.Payload)
 			if err != nil {
 				done <- err
 				return
 			}
-			ui.with(func(state *render.ClientState) { state.ApplyWindowList(msg) })
-			if err := ui.requestRedraw("window-list"); err != nil {
+			ui.with(func(state *render.ClientState) { state.ApplyStatusBar(msg) })
+			if err := ui.requestRedraw("status-bar"); err != nil {
 				done <- err
 				return
 			}
-		case protocol.MsgWindowCreated:
-			msg, err := protocol.DecodeWindowCreated(frame.Payload)
-			if err != nil {
-				done <- err
-				return
-			}
-			ui.with(func(state *render.ClientState) {
-				if msg.Window.Active {
-					state.ApplyWindowSelected(protocol.WindowSelected{
-						WindowID: msg.Window.WindowID,
-						PaneID:   msg.Window.PaneID,
-					})
-				}
-			})
-		case protocol.MsgWindowSelected:
-			msg, err := protocol.DecodeWindowSelected(frame.Payload)
-			if err != nil {
-				done <- err
-				return
-			}
-			ui.with(func(state *render.ClientState) { state.ApplyWindowSelected(msg) })
-			if err := ui.requestRedraw("window-selected"); err != nil {
-				done <- err
-				return
-			}
-		case protocol.MsgWindowClosed:
-			msg, err := protocol.DecodeWindowClosed(frame.Payload)
-			if err != nil {
-				done <- err
-				return
-			}
-			ui.with(func(state *render.ClientState) { state.ApplyWindowClosed(msg.WindowID) })
-			if err := ui.requestRedraw("window-closed"); err != nil {
-				done <- err
-				return
-			}
-		case protocol.MsgWindowTitleChanged:
-			// WINDOW_LIST carries the canonical metadata; ignore these for now.
 		case protocol.MsgPong:
 			if _, err := protocol.DecodePong(frame.Payload); err != nil {
 				done <- err
@@ -640,63 +580,16 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 	}
 }
 
-func forwardInput(ctx context.Context, stdin *os.File, inputFrames, mgmtFrames chan<- protocol.Frame, ui *runtimeState, cfg Config, errs chan<- error, done chan<- error) {
+func forwardInput(ctx context.Context, stdin *os.File, inputFrames chan<- protocol.Frame, errs chan<- error, done chan<- error) {
 	buf := make([]byte, 4096)
-	pending := make([]byte, 0, len(buf))
-	prefix := prefixIdle
-	flushPending := func() error {
-		if len(pending) == 0 {
-			return nil
-		}
-		if waitErr := ui.waitForInputReady(ctx); waitErr != nil {
-			return waitErr
-		}
-		if sendErr := sendInputBytes(inputFrames, ui.activePaneID(), append([]byte(nil), pending...)); sendErr != nil {
-			return sendErr
-		}
-		pending = pending[:0]
-		return nil
-	}
 	for {
 		n, err := stdin.Read(buf)
 		if n > 0 {
-			for _, b := range buf[:n] {
-				inputs, mgmts, detach := processInputByte(&prefix, b, ui, cfg)
-				if detach {
-					if flushErr := flushPending(); flushErr != nil {
-						if ctx.Err() != nil {
-							return
-						}
-						errs <- flushErr
-						return
-					}
-					done <- errDetachRequested
-					return
-				}
-				for _, payload := range inputs {
-					pending = append(pending, payload...)
-				}
-				if len(mgmts) > 0 {
-					if flushErr := flushPending(); flushErr != nil {
-						if ctx.Err() != nil {
-							return
-						}
-						errs <- flushErr
-						return
-					}
-				}
-				for _, msg := range mgmts {
-					if sendErr := enqueueFrame(mgmtFrames, msg); sendErr != nil {
-						errs <- sendErr
-						return
-					}
-				}
-			}
-			if flushErr := flushPending(); flushErr != nil {
+			if sendErr := sendInputBytes(inputFrames, append([]byte(nil), buf[:n]...)); sendErr != nil {
 				if ctx.Err() != nil {
 					return
 				}
-				errs <- flushErr
+				errs <- sendErr
 				return
 			}
 		}
@@ -708,105 +601,6 @@ func forwardInput(ctx context.Context, stdin *os.File, inputFrames, mgmtFrames c
 			return
 		}
 	}
-}
-
-func processInputByte(prefix *prefixState, b byte, ui *runtimeState, cfg Config) ([][]byte, []protocol.Frame, bool) {
-	switch *prefix {
-	case prefixActive:
-		if b == 0x1b {
-			*prefix = prefixArrowESC
-			return nil, nil, false
-		}
-		*prefix = prefixIdle
-		switch b {
-		case prefixByte:
-			return [][]byte{{prefixByte}}, nil, false
-		case 'c':
-			payload, _ := protocol.EncodeCreateWindow(nil, protocol.CreateWindow{Cwd: cfg.Cwd, Argv: cfg.Argv})
-			frame := protocol.Frame{Type: protocol.MsgCreateWindow, Payload: payload}
-			ui.setInputBlocked(true)
-			return nil, []protocol.Frame{frame}, false
-		case '%':
-			payload, _ := protocol.EncodeCreateSplit(nil, protocol.CreateSplit{PaneID: ui.activePaneID(), Direction: protocol.SplitVertical})
-			frame := protocol.Frame{Type: protocol.MsgCreateSplit, Payload: payload}
-			ui.setInputBlocked(true)
-			return nil, []protocol.Frame{frame}, false
-		case '"':
-			payload, _ := protocol.EncodeCreateSplit(nil, protocol.CreateSplit{PaneID: ui.activePaneID(), Direction: protocol.SplitHorizontal})
-			frame := protocol.Frame{Type: protocol.MsgCreateSplit, Payload: payload}
-			ui.setInputBlocked(true)
-			return nil, []protocol.Frame{frame}, false
-		case 'd':
-			return nil, nil, true
-		case 'n':
-			if windowID, ok := ui.nextWindowID(); ok {
-				payload, _ := protocol.EncodeSelectWindow(nil, protocol.SelectWindow{WindowID: windowID})
-				frame := protocol.Frame{Type: protocol.MsgSelectWindow, Payload: payload}
-				ui.setInputBlocked(true)
-				return nil, []protocol.Frame{frame}, false
-			}
-			return nil, nil, false
-		case 'p':
-			if windowID, ok := ui.previousWindowID(); ok {
-				payload, _ := protocol.EncodeSelectWindow(nil, protocol.SelectWindow{WindowID: windowID})
-				frame := protocol.Frame{Type: protocol.MsgSelectWindow, Payload: payload}
-				ui.setInputBlocked(true)
-				return nil, []protocol.Frame{frame}, false
-			}
-			return nil, nil, false
-		case 'l':
-			if windowID, ok := ui.lastWindowID(); ok {
-				payload, _ := protocol.EncodeSelectWindow(nil, protocol.SelectWindow{WindowID: windowID})
-				frame := protocol.Frame{Type: protocol.MsgSelectWindow, Payload: payload}
-				ui.setInputBlocked(true)
-				return nil, []protocol.Frame{frame}, false
-			}
-			return nil, nil, false
-		case 'x':
-			payload, _ := protocol.EncodeClosePane(nil, protocol.ClosePane{PaneID: ui.activePaneID()})
-			frame := protocol.Frame{Type: protocol.MsgClosePane, Payload: payload}
-			ui.setInputBlocked(true)
-			return nil, []protocol.Frame{frame}, false
-		case '[':
-			payload, _ := protocol.EncodeEnterHistory(nil, protocol.EnterHistory{PaneID: ui.activePaneID()})
-			frame := protocol.Frame{Type: protocol.MsgEnterHistory, Payload: payload}
-			ui.setInputBlocked(true)
-			return nil, []protocol.Frame{frame}, false
-		default:
-			if b >= '0' && b <= '9' {
-				if windowID, ok := ui.windowIDByIndex(int(b - '0')); ok {
-					payload, _ := protocol.EncodeSelectWindow(nil, protocol.SelectWindow{WindowID: windowID})
-					frame := protocol.Frame{Type: protocol.MsgSelectWindow, Payload: payload}
-					ui.setInputBlocked(true)
-					return nil, []protocol.Frame{frame}, false
-				}
-			}
-			return nil, nil, false
-		}
-	case prefixArrowESC:
-		if b == '[' {
-			*prefix = prefixArrowCSI
-			return nil, nil, false
-		}
-		*prefix = prefixIdle
-		return nil, nil, false
-	case prefixArrowCSI:
-		*prefix = prefixIdle
-		switch b {
-		case 'A', 'B', 'C', 'D':
-			if paneID, ok := ui.focusablePaneID(b); ok {
-				payload, _ := protocol.EncodeFocusPane(nil, protocol.FocusPane{PaneID: paneID})
-				frame := protocol.Frame{Type: protocol.MsgFocusPane, Payload: payload}
-				return nil, []protocol.Frame{frame}, false
-			}
-		}
-		return nil, nil, false
-	}
-	if b == prefixByte {
-		*prefix = prefixActive
-		return nil, nil, false
-	}
-	return [][]byte{{b}}, nil, false
 }
 
 func forwardResize(ctx context.Context, tty *os.File, inputFrames chan<- protocol.Frame, ui *runtimeState, errs chan<- error) {
@@ -825,9 +619,8 @@ func forwardResize(ctx context.Context, tty *os.File, inputFrames chan<- protoco
 			}
 			ui.with(func(state *render.ClientState) { state.SetTerminalSize(int(cols), int(rows)) })
 			if sendErr := enqueueEncoded(inputFrames, protocol.MsgResizePane, protocol.ResizePane{
-				PaneID: ui.activePaneID(),
-				Cols:   cols,
-				Rows:   uint16(ui.drawableRows()),
+				Cols: cols,
+				Rows: uint16(ui.drawableRows()),
 			}, protocol.EncodeResizePane); sendErr != nil {
 				errs <- sendErr
 				return
@@ -883,8 +676,8 @@ func writeFrames(stream io.Writer, frames <-chan protocol.Frame, errs chan<- err
 	}
 }
 
-func sendInputBytes(ch chan<- protocol.Frame, paneID uint64, data []byte) error {
-	return enqueueEncoded(ch, protocol.MsgInputBytes, protocol.InputBytes{PaneID: paneID, Data: data}, protocol.EncodeInputBytes)
+func sendInputBytes(ch chan<- protocol.Frame, data []byte) error {
+	return enqueueEncoded(ch, protocol.MsgInputBytes, protocol.InputBytes{Data: data}, protocol.EncodeInputBytes)
 }
 
 func enqueueFrame(ch chan<- protocol.Frame, frame protocol.Frame) error {
@@ -1113,78 +906,8 @@ func encodedFrameSize(frame protocol.Frame) int {
 	return typeBytes + payloadBytes + len(frame.Payload)
 }
 
-func (r *runtimeState) activePaneID() uint64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ui.FocusedPaneID
-}
-
-func (r *runtimeState) activeWindowID() uint64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ui.ActiveWindowID
-}
-
-func (r *runtimeState) nextWindowID() (uint64, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ui.NextWindowID()
-}
-
-func (r *runtimeState) previousWindowID() (uint64, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ui.PreviousWindowID()
-}
-
-func (r *runtimeState) lastWindowID() (uint64, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ui.LastActiveWindowID()
-}
-
-func (r *runtimeState) nextFocusablePaneID() (uint64, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ui.NextFocusablePaneID()
-}
-
-func (r *runtimeState) focusablePaneID(direction byte) (uint64, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ui.FocusablePaneID(direction)
-}
-
-func (r *runtimeState) windowIDByIndex(index int) (uint64, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.ui.WindowIDByIndex(index)
-}
-
 func (r *runtimeState) drawableRows() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.ui.DrawableRows()
-}
-
-func (r *runtimeState) setInputBlocked(blocked bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.inputBlocked = blocked
-}
-
-func (r *runtimeState) waitForInputReady(ctx context.Context) error {
-	for {
-		r.mu.Lock()
-		blocked := r.inputBlocked
-		r.mu.Unlock()
-		if !blocked {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
 }

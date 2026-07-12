@@ -7,21 +7,13 @@ import (
 	"tali/internal/protocol"
 )
 
-func TestTabBarShowsActiveMarkerAndSessionID(t *testing.T) {
+func TestStatusBarRendersServerCells(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(20, 5)
-	state.SessionID = 7
-	state.Windows = []protocol.WindowInfo{
-		{WindowID: 1, PaneID: 1, Index: 0, Title: "bash", Active: true},
-		{WindowID: 2, PaneID: 2, Index: 1, Title: "logs"},
-	}
-	state.ActiveWindowID = 1
+	state.ApplyStatusBar(protocol.StatusBar{Cols: 20, Cells: repeatedCells("[7] 0:bash*         ")})
 	got := string(RenderANSI(state))
-	if !strings.Contains(got, "[7]") {
-		t.Fatalf("RenderANSI() missing active session id prefix: %q", got)
-	}
 	if !strings.Contains(got, "[7] 0:bash* ") {
-		t.Fatalf("RenderANSI() missing active tab marker: %q", got)
+		t.Fatalf("RenderANSI() missing server status cells: %q", got)
 	}
 }
 
@@ -29,7 +21,7 @@ func TestRenderANSIComposesMultiplePaneGridsAndBorder(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(9, 4)
 	state.SessionID = 7
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
+	selectTestPane(state, 1, 10)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{
@@ -69,20 +61,13 @@ func TestRenderANSIComposesMultiplePaneGridsAndBorder(t *testing.T) {
 	}
 }
 
-func TestTabBarTruncatesWithoutWrapping(t *testing.T) {
+func TestStatusBarNeverWraps(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(10, 3)
-	state.SessionID = 7
-	state.Windows = []protocol.WindowInfo{
-		{WindowID: 1, PaneID: 1, Index: 0, Title: "verylongtitle", Active: true},
-	}
-	state.ActiveWindowID = 1
-	bar := renderTabBar(state)
-	if len(bar) < 10 {
-		t.Fatalf("tab bar too short: %d", len(bar))
-	}
-	if strings.Contains(bar, "\n") {
-		t.Fatalf("tab bar wrapped: %q", bar)
+	state.ApplyStatusBar(protocol.StatusBar{Cols: 10, Cells: repeatedCells("0123456789")})
+	got := string(RenderANSI(state))
+	if strings.Contains(got, "\n") {
+		t.Fatalf("status bar wrapped: %q", got)
 	}
 }
 
@@ -90,7 +75,7 @@ func TestRenderANSIDoesNotClearScreenOnSteadyStateRedraw(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(4, 3)
 	state.SessionID = 7
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 1})
+	selectTestPane(state, 1, 1)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{
@@ -125,7 +110,7 @@ func TestRenderANSIDoesNotClearScreenOnSteadyStateRedraw(t *testing.T) {
 func TestRenderANSIEmitsOnlyReportedCellRun(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(4, 3)
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 1})
+	selectTestPane(state, 1, 1)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{
@@ -230,8 +215,7 @@ func TestRenderANSIPreservesDisjointDamageSpans(t *testing.T) {
 func TestPaneFocusChangeDoesNotRedrawTabBar(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(9, 3)
-	state.Windows = []protocol.WindowInfo{{WindowID: 1, Index: 0, Title: "bash", Active: true}}
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 10})
+	selectTestPane(state, 1, 10)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{
@@ -243,17 +227,17 @@ func TestPaneFocusChangeDoesNotRedrawTabBar(t *testing.T) {
 	state.ApplyReplace(1, protocol.ReplacePane{WindowID: 1, PaneID: 11, BindingGeneration: 2, Cols: 4, Rows: 2, Cells: repeatedCells("ABCDEFGH")})
 	_ = RenderANSI(state)
 
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 11})
+	selectTestPane(state, 1, 11)
 	got := string(RenderANSI(state))
-	if strings.Contains(got, "0:bash") {
-		t.Fatalf("pane focus change redrew unchanged tab bar: %q", got)
+	if strings.Contains(got, "\x1b[3;1H") {
+		t.Fatalf("pane focus change redrew unchanged status bar: %q", got)
 	}
 }
 
 func TestRenderANSIRepaintsEntireReplacementPaneWithoutDiffing(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(4, 3)
-	state.ApplyWindowSelected(protocol.WindowSelected{WindowID: 1, PaneID: 1})
+	selectTestPane(state, 1, 1)
 	state.ApplyWindowLayout(protocol.WindowLayout{
 		WindowID: 1,
 		Panes: []protocol.PanePlacement{

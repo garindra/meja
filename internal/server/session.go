@@ -44,6 +44,9 @@ type ClientState struct {
 	NextBindingGeneration uint64
 	RenderBindings        []RenderBinding
 	HistoryViews          map[uint64]*HistoryView
+	InputState            serverInputState
+	LastWindowID          uint64
+	HasLastWindow         bool
 }
 
 func NewSession(id uint64) *Session {
@@ -126,6 +129,10 @@ func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *Client
 	s.Windows[windowID] = window
 	s.Panes[pane.ID] = pane
 	client := s.ensureClientLocked(activateFor)
+	if client.ActiveWindowID != windowID {
+		client.LastWindowID = client.ActiveWindowID
+		client.HasLastWindow = client.LastWindowID != 0
+	}
 	client.ActiveWindowID = windowID
 	client.FocusedPaneID = pane.ID
 	s.rebuildBindingsLocked(client, window)
@@ -213,6 +220,10 @@ func (s *Session) SelectWindow(clientID, windowID uint64) (*Window, *ClientState
 	window := s.Windows[windowID]
 	if window == nil {
 		return nil, nil, fmt.Errorf("unknown window %d", windowID)
+	}
+	if client.ActiveWindowID != windowID {
+		client.LastWindowID = client.ActiveWindowID
+		client.HasLastWindow = client.LastWindowID != 0
 	}
 	client.ActiveWindowID = windowID
 	client.FocusedPaneID = windowPrimaryPaneID(window)
@@ -374,7 +385,14 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	return closed, closedPanes, cloneWindow(nextWindow), pane, cloneClientState(c), false, nil
 }
 
-func (s *Session) WindowList(clientID uint64) protocol.WindowList {
+type WindowStatus struct {
+	WindowID uint64
+	Index    int
+	Title    string
+	Active   bool
+}
+
+func (s *Session) WindowStatuses(clientID uint64) []WindowStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
@@ -383,18 +401,17 @@ func (s *Session) WindowList(clientID uint64) protocol.WindowList {
 		active = client.ActiveWindowID
 	}
 	ids := s.windowIDsLocked()
-	list := make([]protocol.WindowInfo, 0, len(ids))
+	list := make([]WindowStatus, 0, len(ids))
 	for idx, id := range ids {
 		window := s.Windows[id]
-		list = append(list, protocol.WindowInfo{
+		list = append(list, WindowStatus{
 			WindowID: window.ID,
-			PaneID:   windowPrimaryPaneID(window),
 			Index:    idx,
 			Title:    window.Name,
 			Active:   window.ID == active,
 		})
 	}
-	return protocol.WindowList{Windows: list, ActiveWindowID: active}
+	return list
 }
 
 func (s *Session) WindowLayout(clientID uint64) (protocol.WindowLayout, error) {
@@ -424,6 +441,7 @@ func (s *Session) WindowLayout(clientID uint64) (protocol.WindowLayout, error) {
 	}
 	return protocol.WindowLayout{
 		WindowID:       window.ID,
+		FocusedPaneID:  client.FocusedPaneID,
 		LayoutRevision: window.LayoutRevision,
 		Panes:          out,
 	}, nil

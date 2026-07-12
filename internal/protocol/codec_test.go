@@ -15,13 +15,13 @@ func TestGoldenPayloads(t *testing.T) {
 	}{
 		{
 			name: "InputBytes",
-			got:  mustEncode(t, EncodeInputBytes, InputBytes{PaneID: 7, Data: []byte("ls\n")}),
-			want: []byte{0x07, 'l', 's', '\n'},
+			got:  mustEncode(t, EncodeInputBytes, InputBytes{Data: []byte("ls\n")}),
+			want: []byte{'l', 's', '\n'},
 		},
 		{
 			name: "ResizePane",
-			got:  mustEncode(t, EncodeResizePane, ResizePane{PaneID: 9, Cols: 80, Rows: 23}),
-			want: []byte{0x09, 0x50, 0x17},
+			got:  mustEncode(t, EncodeResizePane, ResizePane{Cols: 80, Rows: 23}),
+			want: []byte{0x50, 0x17},
 		},
 		{
 			name: "BindRenderStream",
@@ -57,21 +57,6 @@ func TestGoldenPayloads(t *testing.T) {
 			want: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x02, 0x41, 0x00, 0x01, 0x42, 0x01, 0x01},
 		},
 		{
-			name: "WindowList",
-			got: mustEncode(t, EncodeWindowList, WindowList{
-				ActiveWindowID: 2,
-				Windows: []WindowInfo{
-					{WindowID: 1, PaneID: 11, Index: 0, Title: "bash", Active: false},
-					{WindowID: 2, PaneID: 12, Index: 1, Title: "logs", Active: true},
-				},
-			}),
-			want: []byte{
-				0x02, 0x02,
-				0x01, 0x0b, 0x00, 0x04, 'b', 'a', 's', 'h', 0x00,
-				0x02, 0x0c, 0x01, 0x04, 'l', 'o', 'g', 's', 0x01,
-			},
-		},
-		{
 			name: "WindowLayout",
 			got: mustEncode(t, EncodeWindowLayout, WindowLayout{
 				WindowID:       2,
@@ -82,7 +67,7 @@ func TestGoldenPayloads(t *testing.T) {
 				},
 			}),
 			want: []byte{
-				0x02, 0x03, 0x02,
+				0x02, 0x00, 0x03, 0x02,
 				0x0b, 0x00, 0x00, 0x3b, 0x27,
 				0x0c, 0x3c, 0x00, 0x3c, 0x27,
 			},
@@ -111,6 +96,27 @@ func TestScrollPaneCodecContainsOnlySignedDelta(t *testing.T) {
 	decoded, err := DecodeScrollPane(encoded)
 	if err != nil || decoded.Delta != -1 {
 		t.Fatalf("DecodeScrollPane() = %#v, %v", decoded, err)
+	}
+}
+
+func TestStatusBarCodecRoundTrip(t *testing.T) {
+	want := StatusBar{
+		Cols: 4,
+		Cells: []Cell{
+			{Rune: '[', Width: 1}, {Rune: '0', Width: 1}, {Rune: ']', Width: 1}, {Rune: ' ', Width: 1},
+		},
+		Styles: []StyleDefinition{{ID: 0, Style: Style{BG: Color{Mode: "rgb", R: 42, G: 99, B: 158}}}},
+	}
+	payload, err := EncodeStatusBar(nil, want)
+	if err != nil {
+		t.Fatalf("EncodeStatusBar() error = %v", err)
+	}
+	got, err := DecodeStatusBar(payload)
+	if err != nil {
+		t.Fatalf("DecodeStatusBar() error = %v", err)
+	}
+	if got.Cols != want.Cols || !bytes.Equal([]byte(string([]rune{got.Cells[0].Rune, got.Cells[1].Rune, got.Cells[2].Rune, got.Cells[3].Rune})), []byte("[0] ")) {
+		t.Fatalf("StatusBar round trip = %#v", got)
 	}
 }
 

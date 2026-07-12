@@ -34,11 +34,8 @@ type ClientState struct {
 	SessionID uint64
 
 	ActiveWindowID  uint64
-	LastWindowID    uint64
 	HasActiveWindow bool
-	HasLastWindow   bool
 	FocusedPaneID   uint64
-	Windows         []protocol.WindowInfo
 
 	Layout             LayoutDescription
 	Panes              map[uint64]*PaneViewState
@@ -51,6 +48,8 @@ type ClientState struct {
 
 	LastRendered  Screen
 	composedCells []composedCell
+	StatusBar     Screen
+	StatusStyles  map[uint32]protocol.Style
 
 	pendingDamageRects []protocol.Rect
 	fullContentDirty   bool
@@ -60,6 +59,15 @@ type ClientState struct {
 	lastCursorY       int
 	lastCursorVisible bool
 	hasRenderedCursor bool
+}
+
+func (s *ClientState) ApplyStatusBar(msg protocol.StatusBar) {
+	s.StatusBar = Screen{Cols: msg.Cols, Rows: 1, Cells: append([]protocol.Cell(nil), msg.Cells...)}
+	s.StatusStyles = defaultStyles()
+	for _, def := range msg.Styles {
+		s.StatusStyles[def.ID] = def.Style
+	}
+	s.tabBarDirty = true
 }
 
 func NewClientState() *ClientState {
@@ -90,18 +98,10 @@ func (s *ClientState) DrawableRows() int {
 	return s.TerminalRows - 1
 }
 
-func (s *ClientState) ApplyWindowList(msg protocol.WindowList) {
-	s.Windows = append([]protocol.WindowInfo(nil), msg.Windows...)
-	s.syncWindowSelection()
-	s.tabBarDirty = true
-}
-
-func (s *ClientState) ApplyWindowSelected(msg protocol.WindowSelected) {
-	selectionChanged := !s.HasActiveWindow || s.ActiveWindowID != msg.WindowID
-	windowChanged := s.HasActiveWindow && selectionChanged
+func (s *ClientState) ApplyWindowLayout(msg protocol.WindowLayout) bool {
+	windowChanged := s.HasActiveWindow && s.ActiveWindowID != msg.WindowID
+	focusChanged := s.HasActiveWindow && !windowChanged && s.FocusedPaneID != msg.FocusedPaneID
 	if windowChanged {
-		s.LastWindowID = s.ActiveWindowID
-		s.HasLastWindow = true
 		s.pendingDamageRects = s.pendingDamageRects[:0]
 		for slot := range s.RenderSlots {
 			s.transitioningSlots[slot] = true
@@ -110,34 +110,7 @@ func (s *ClientState) ApplyWindowSelected(msg protocol.WindowSelected) {
 	}
 	s.ActiveWindowID = msg.WindowID
 	s.HasActiveWindow = true
-	s.FocusedPaneID = msg.PaneID
-	s.syncWindowSelection()
-	if selectionChanged {
-		s.tabBarDirty = true
-	}
-}
-
-func (s *ClientState) ApplyWindowClosed(windowID uint64) {
-	out := s.Windows[:0]
-	for _, w := range s.Windows {
-		if w.WindowID != windowID {
-			out = append(out, w)
-		}
-	}
-	s.Windows = out
-	if s.HasLastWindow && s.LastWindowID == windowID {
-		s.LastWindowID = 0
-		s.HasLastWindow = false
-	}
-	if s.HasActiveWindow && s.ActiveWindowID == windowID {
-		s.ActiveWindowID = 0
-		s.HasActiveWindow = false
-	}
-	s.syncWindowSelection()
-	s.tabBarDirty = true
-}
-
-func (s *ClientState) ApplyWindowLayout(msg protocol.WindowLayout) bool {
+	s.FocusedPaneID = msg.FocusedPaneID
 	layoutChanged := !sameLayout(s.Layout, msg)
 	s.Layout = LayoutDescription{
 		WindowID:       msg.WindowID,
@@ -175,7 +148,7 @@ func (s *ClientState) ApplyWindowLayout(msg protocol.WindowLayout) bool {
 			presented = true
 		}
 	}
-	return presented
+	return presented || focusChanged
 }
 
 func (s *ClientState) ApplyBind(msg protocol.BindRenderStream) {
@@ -408,15 +381,6 @@ func (s *ClientState) DefineStyle(slot uint8, msg protocol.DefineStyle) bool {
 	return true
 }
 
-func (s *ClientState) syncWindowSelection() {
-	for i := range s.Windows {
-		s.Windows[i].Active = s.Windows[i].WindowID == s.ActiveWindowID
-		if s.Windows[i].Active {
-			s.Windows[i].PaneID = s.FocusedPaneID
-		}
-	}
-}
-
 func (s *ClientState) markDamageRect(rect protocol.Rect) {
 	if rect.Width <= 0 || rect.Height <= 0 {
 		return
@@ -471,131 +435,6 @@ func (s *ClientState) layoutContainsPane(paneID uint64) bool {
 		}
 	}
 	return false
-}
-
-func (s *ClientState) NextWindowID() (uint64, bool) {
-	if len(s.Windows) == 0 {
-		return 0, false
-	}
-	for i, w := range s.Windows {
-		if w.WindowID == s.ActiveWindowID {
-			return s.Windows[(i+1)%len(s.Windows)].WindowID, true
-		}
-	}
-	return s.Windows[0].WindowID, true
-}
-
-func (s *ClientState) PreviousWindowID() (uint64, bool) {
-	if len(s.Windows) == 0 {
-		return 0, false
-	}
-	for i, w := range s.Windows {
-		if w.WindowID == s.ActiveWindowID {
-			return s.Windows[(i-1+len(s.Windows))%len(s.Windows)].WindowID, true
-		}
-	}
-	return s.Windows[0].WindowID, true
-}
-
-func (s *ClientState) WindowIDByIndex(index int) (uint64, bool) {
-	for _, w := range s.Windows {
-		if w.Index == index {
-			return w.WindowID, true
-		}
-	}
-	return 0, false
-}
-
-func (s *ClientState) LastActiveWindowID() (uint64, bool) {
-	if !s.HasLastWindow || (s.HasActiveWindow && s.LastWindowID == s.ActiveWindowID) {
-		return 0, false
-	}
-	for _, w := range s.Windows {
-		if w.WindowID == s.LastWindowID {
-			return w.WindowID, true
-		}
-	}
-	return 0, false
-}
-
-func (s *ClientState) NextFocusablePaneID() (uint64, bool) {
-	ordered := s.orderedLayoutPanes()
-	if len(ordered) <= 1 {
-		return 0, false
-	}
-	for i, pane := range ordered {
-		if pane.PaneID == s.FocusedPaneID {
-			return ordered[(i+1)%len(ordered)].PaneID, true
-		}
-	}
-	return ordered[0].PaneID, true
-}
-
-func (s *ClientState) FocusablePaneID(direction byte) (uint64, bool) {
-	var current protocol.PanePlacement
-	foundCurrent := false
-	for _, pane := range s.Layout.Panes {
-		if pane.PaneID == s.FocusedPaneID {
-			current = pane
-			foundCurrent = true
-			break
-		}
-	}
-	if !foundCurrent {
-		return s.NextFocusablePaneID()
-	}
-	currentX := current.Rect.X*2 + current.Rect.Width
-	currentY := current.Rect.Y*2 + current.Rect.Height
-	bestScore := int(^uint(0) >> 1)
-	bestPaneID := uint64(0)
-	foundCandidate := false
-	for _, candidate := range s.Layout.Panes {
-		if candidate.PaneID == current.PaneID {
-			continue
-		}
-		x := candidate.Rect.X*2 + candidate.Rect.Width
-		y := candidate.Rect.Y*2 + candidate.Rect.Height
-		dx, dy := x-currentX, y-currentY
-		primary, secondary := 0, 0
-		switch direction {
-		case 'A':
-			if dy >= 0 {
-				continue
-			}
-			primary, secondary = -dy, absInt(dx)
-		case 'B':
-			if dy <= 0 {
-				continue
-			}
-			primary, secondary = dy, absInt(dx)
-		case 'C':
-			if dx <= 0 {
-				continue
-			}
-			primary, secondary = dx, absInt(dy)
-		case 'D':
-			if dx >= 0 {
-				continue
-			}
-			primary, secondary = -dx, absInt(dy)
-		default:
-			return 0, false
-		}
-		score := primary*10000 + secondary
-		if score < bestScore {
-			bestScore = score
-			bestPaneID = candidate.PaneID
-			foundCandidate = true
-		}
-	}
-	return bestPaneID, foundCandidate
-}
-
-func absInt(value int) int {
-	if value < 0 {
-		return -value
-	}
-	return value
 }
 
 func (s *ClientState) orderedLayoutPanes() []protocol.PanePlacement {

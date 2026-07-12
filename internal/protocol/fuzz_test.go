@@ -23,13 +23,6 @@ func FuzzDecodeReplacePane(f *testing.F) {
 	})
 }
 
-func FuzzDecodeWindowList(f *testing.F) {
-	f.Add([]byte{0x01, 0x00})
-	f.Fuzz(func(t *testing.T, payload []byte) {
-		_, _ = DecodeWindowList(payload)
-	})
-}
-
 func FuzzDecodeDefineStyle(f *testing.F) {
 	f.Add([]byte{0x01, 0x01, 0x00, 0x00})
 	f.Fuzz(func(t *testing.T, payload []byte) {

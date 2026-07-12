@@ -90,23 +90,17 @@ func DecodePaneExited(payload []byte) (PaneExited, error) {
 
 func EncodeInputBytes(dst []byte, msg InputBytes) ([]byte, error) {
 	w := PayloadWriter{Buf: dst}
-	w.Uvarint(msg.PaneID)
 	w.Raw(msg.Data)
 	return w.Buf, nil
 }
 
 func DecodeInputBytes(payload []byte) (InputBytesView, error) {
 	r := PayloadReader{Data: payload}
-	paneID, err := r.Uvarint()
-	if err != nil {
-		return InputBytesView{}, fmt.Errorf("decode InputBytes: %w", err)
-	}
-	return InputBytesView{PaneID: paneID, Data: r.Remaining()}, nil
+	return InputBytesView{Data: r.Remaining()}, nil
 }
 
 func EncodeResizePane(dst []byte, msg ResizePane) ([]byte, error) {
 	w := PayloadWriter{Buf: dst}
-	w.Uvarint(msg.PaneID)
 	w.Uvarint(uint64(msg.Cols))
 	w.Uvarint(uint64(msg.Rows))
 	return w.Buf, nil
@@ -114,10 +108,6 @@ func EncodeResizePane(dst []byte, msg ResizePane) ([]byte, error) {
 
 func DecodeResizePane(payload []byte) (ResizePane, error) {
 	r := PayloadReader{Data: payload}
-	paneID, err := r.Uvarint()
-	if err != nil {
-		return ResizePane{}, fmt.Errorf("decode ResizePane: %w", err)
-	}
 	cols, err := r.Uvarint()
 	if err != nil {
 		return ResizePane{}, fmt.Errorf("decode ResizePane: %w", err)
@@ -132,7 +122,7 @@ func DecodeResizePane(payload []byte) (ResizePane, error) {
 	if err := r.Done(); err != nil {
 		return ResizePane{}, fmt.Errorf("decode ResizePane: %w", err)
 	}
-	return ResizePane{PaneID: paneID, Cols: uint16(cols), Rows: uint16(rows)}, nil
+	return ResizePane{Cols: uint16(cols), Rows: uint16(rows)}, nil
 }
 
 func EncodeRequestPaneSnapshot(dst []byte, msg RequestPaneSnapshot) ([]byte, error) {

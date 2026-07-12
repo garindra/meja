@@ -3,7 +3,7 @@ package protocol
 import "testing"
 
 func BenchmarkEncodeInputBytes(b *testing.B) {
-	msg := InputBytes{PaneID: 7, Data: []byte("echo hello world\n")}
+	msg := InputBytes{Data: []byte("echo hello world\n")}
 	var payload []byte
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -16,7 +16,7 @@ func BenchmarkEncodeInputBytes(b *testing.B) {
 }
 
 func BenchmarkDecodeInputBytes(b *testing.B) {
-	payload, _ := EncodeInputBytes(nil, InputBytes{PaneID: 7, Data: []byte("echo hello world\n")})
+	payload, _ := EncodeInputBytes(nil, InputBytes{Data: []byte("echo hello world\n")})
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		if _, err := DecodeInputBytes(payload); err != nil {
