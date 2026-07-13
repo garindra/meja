@@ -70,9 +70,9 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 	session.CreateWindow(pane, 0)
 	var wire bytes.Buffer
 	state := &sessionState{session: session}
-	ctrl := &controller{state: state}
+	handler := &connectionHandler{state: state}
 	state.attachConnection(nil, map[int]io.Writer{0: &wire})
-	if err := ctrl.publishBindingsAndSnapshots(nil); err != nil {
+	if err := handler.state.publishBindingsAndSnapshots(nil); err != nil {
 		t.Fatal(err)
 	}
 	commands := decodePendingCommands(t, wire.Bytes())
@@ -83,9 +83,9 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 
 func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 	pane := &Pane{ID: 1, Terminal: terminal.New(8, 3), renderCommands: make(chan paneRenderCommand), rendererDone: make(chan struct{})}
-	ctrl := &controller{state: &sessionState{session: NewSession(0)}}
+	handler := &connectionHandler{state: &sessionState{session: NewSession(0)}}
 	updates := make(chan terminal.Update)
-	go ctrl.runPaneRenderer(pane, updates)
+	go handler.state.runPaneRenderer(pane, updates)
 	defer close(updates)
 
 	var first, second bytes.Buffer
@@ -136,9 +136,9 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 
 func TestOldStreamCleanupDoesNotDetachReplacement(t *testing.T) {
 	pane := &Pane{ID: 1, Terminal: terminal.New(8, 3), renderCommands: make(chan paneRenderCommand), rendererDone: make(chan struct{})}
-	ctrl := &controller{state: &sessionState{session: NewSession(0)}}
+	handler := &connectionHandler{state: &sessionState{session: NewSession(0)}}
 	updates := make(chan terminal.Update)
-	go ctrl.runPaneRenderer(pane, updates)
+	go handler.state.runPaneRenderer(pane, updates)
 	defer close(updates)
 
 	var oldStream, replacement bytes.Buffer
@@ -166,9 +166,9 @@ func TestOldStreamCleanupDoesNotDetachReplacement(t *testing.T) {
 
 func TestPaneRendererCanAttachReplacementAfterWriteFailure(t *testing.T) {
 	pane := &Pane{ID: 1, Terminal: terminal.New(8, 3), renderCommands: make(chan paneRenderCommand), rendererDone: make(chan struct{})}
-	ctrl := &controller{state: &sessionState{session: NewSession(0)}}
+	handler := &connectionHandler{state: &sessionState{session: NewSession(0)}}
 	updates := make(chan terminal.Update)
-	go ctrl.runPaneRenderer(pane, updates)
+	go handler.state.runPaneRenderer(pane, updates)
 	defer close(updates)
 
 	writeErr := errors.New("stream closed")
@@ -210,22 +210,22 @@ func TestOutputHandoffAttachesEachReleasedSlotImmediately(t *testing.T) {
 	}
 	firstUpdates := make(chan terminal.Update)
 	secondUpdates := make(chan terminal.Update)
-	ctrl := &controller{state: &sessionState{session: session}}
-	go ctrl.runPaneRenderer(first, firstUpdates)
-	go ctrl.runPaneRenderer(second, secondUpdates)
+	handler := &connectionHandler{state: &sessionState{session: session}}
+	go handler.state.runPaneRenderer(first, firstUpdates)
+	go handler.state.runPaneRenderer(second, secondUpdates)
 	defer close(firstUpdates)
 	defer close(secondUpdates)
 
 	firstWritten := newSignalWriter()
 	secondWritten := newSignalWriter()
-	ctrl.state.attachConnection(nil, map[int]io.Writer{0: firstWritten, 1: secondWritten})
+	handler.state.attachConnection(nil, map[int]io.Writer{0: firstWritten, 1: secondWritten})
 	bindings, _ := session.RenderBindings(0)
 	handoff := &outputHandoff{
 		released: make(chan int, 2),
 		pending:  map[int]struct{}{0: {}, 1: {}},
 	}
 	finished := make(chan error, 1)
-	go func() { finished <- ctrl.finishOutputHandoff(handoff, bindings) }()
+	go func() { finished <- handler.state.finishOutputHandoff(handoff, bindings) }()
 
 	handoff.released <- 0
 	select {
@@ -255,10 +255,10 @@ func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 	client := session.NewClient(0)
 	client.TerminalCols = 16
 	client.TerminalRows = 4
-	ctrl := &controller{state: &sessionState{session: session}}
+	handler := &connectionHandler{state: &sessionState{session: session}}
 
-	first, firstUpdates := startTestPaneRenderer(ctrl, session.AddPaneID(), 8, 4)
-	second, secondUpdates := startTestPaneRenderer(ctrl, session.AddPaneID(), 8, 4)
+	first, firstUpdates := startTestPaneRenderer(handler, session.AddPaneID(), 8, 4)
+	second, secondUpdates := startTestPaneRenderer(handler, session.AddPaneID(), 8, 4)
 	defer close(firstUpdates)
 	defer close(secondUpdates)
 	firstWindow, _ := session.CreateWindow(first, 0)
@@ -266,27 +266,27 @@ func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 		t.Fatal(err)
 	}
 	var slot0, slot1 bytes.Buffer
-	ctrl.state.attachConnection(nil, map[int]io.Writer{0: &slot0, 1: &slot1})
-	if err := ctrl.publishBindingsAndSnapshots(nil); err != nil {
+	handler.state.attachConnection(nil, map[int]io.Writer{0: &slot0, 1: &slot1})
+	if err := handler.state.publishBindingsAndSnapshots(nil); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, first)
 	syncPaneRenderer(t, second)
 
-	handoff := ctrl.beginOutputHandoff()
-	third, thirdUpdates := startTestPaneRenderer(ctrl, session.AddPaneID(), 16, 4)
+	handoff := handler.state.beginOutputHandoff()
+	third, thirdUpdates := startTestPaneRenderer(handler, session.AddPaneID(), 16, 4)
 	defer close(thirdUpdates)
 	session.CreateWindow(third, 0)
-	if err := ctrl.publishBindingsAndSnapshots(handoff); err != nil {
+	if err := handler.state.publishBindingsAndSnapshots(handoff); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, third)
 
-	handoff = ctrl.beginOutputHandoff()
+	handoff = handler.state.beginOutputHandoff()
 	if _, _, err := session.SelectWindow(0, firstWindow.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := ctrl.publishBindingsAndSnapshots(handoff); err != nil {
+	if err := handler.state.publishBindingsAndSnapshots(handoff); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, first)
@@ -311,10 +311,10 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 	client := session.NewClient(0)
 	client.TerminalCols = 16
 	client.TerminalRows = 4
-	ctrl := &controller{state: &sessionState{session: session}}
+	handler := &connectionHandler{state: &sessionState{session: session}}
 
-	first, firstUpdates := startTestPaneRenderer(ctrl, session.AddPaneID(), 8, 4)
-	second, secondUpdates := startTestPaneRenderer(ctrl, session.AddPaneID(), 8, 4)
+	first, firstUpdates := startTestPaneRenderer(handler, session.AddPaneID(), 8, 4)
+	second, secondUpdates := startTestPaneRenderer(handler, session.AddPaneID(), 8, 4)
 	defer close(firstUpdates)
 	defer close(secondUpdates)
 	session.CreateWindow(first, 0)
@@ -322,18 +322,18 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 		t.Fatal(err)
 	}
 	var slot0, slot1 bytes.Buffer
-	ctrl.state.attachConnection(nil, map[int]io.Writer{0: &slot0, 1: &slot1})
-	if err := ctrl.publishBindingsAndSnapshots(nil); err != nil {
+	handler.state.attachConnection(nil, map[int]io.Writer{0: &slot0, 1: &slot1})
+	if err := handler.state.publishBindingsAndSnapshots(nil); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, first)
 	syncPaneRenderer(t, second)
 
-	if err := ctrl.commandClosePaneNow(); err != nil {
+	if err := handler.commandClosePaneNow(); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, first)
-	if err := ctrl.handlePaneProcessExitNow(second.ID); err != nil {
+	if err := handler.handlePaneProcessExitNow(second.ID); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, first)
@@ -352,18 +352,18 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 	}
 }
 
-func startTestPaneRenderer(ctrl *controller, id uint64, cols, rows int) (*Pane, chan terminal.Update) {
+func startTestPaneRenderer(handler *connectionHandler, id uint64, cols, rows int) (*Pane, chan terminal.Update) {
 	pane := &Pane{ID: id, Terminal: terminal.New(cols, rows), renderCommands: make(chan paneRenderCommand, 2), rendererDone: make(chan struct{})}
 	updates := make(chan terminal.Update)
-	go ctrl.runPaneRenderer(pane, updates)
+	go handler.state.runPaneRenderer(pane, updates)
 	return pane, updates
 }
 
 func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
 	pane := &Pane{ID: 1, Terminal: terminal.New(8, 3), renderCommands: make(chan paneRenderCommand, 2), rendererDone: make(chan struct{})}
-	ctrl := &controller{state: &sessionState{session: NewSession(0)}}
+	handler := &connectionHandler{state: &sessionState{session: NewSession(0)}}
 	updates := make(chan terminal.Update)
-	go ctrl.runPaneRenderer(pane, updates)
+	go handler.state.runPaneRenderer(pane, updates)
 	defer close(updates)
 
 	stream := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
@@ -396,9 +396,9 @@ func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
 func TestPaneReleaseAcknowledgesRendererExit(t *testing.T) {
 	for attempt := 0; attempt < 100; attempt++ {
 		pane := &Pane{ID: 1, Terminal: terminal.New(8, 3), renderCommands: make(chan paneRenderCommand, 2), rendererDone: make(chan struct{})}
-		ctrl := &controller{state: &sessionState{session: NewSession(0)}}
+		handler := &connectionHandler{state: &sessionState{session: NewSession(0)}}
 		updates := make(chan terminal.Update)
-		go ctrl.runPaneRenderer(pane, updates)
+		go handler.state.runPaneRenderer(pane, updates)
 		released := make(chan int, 1)
 		pane.releaseOutput(0, released)
 		close(updates)
@@ -562,11 +562,11 @@ func TestColoredEraseInstallsReferencedStyle(t *testing.T) {
 	session.CreateWindow(pane, 0)
 	output := newRenderOutput()
 	state := &sessionState{session: session}
-	ctrl := &controller{state: state}
+	handler := &connectionHandler{state: state}
 	pane.terminalMu.Lock()
 	update := pane.Terminal.Apply([]byte("\x1b[44m\x1b[2K"))
 	pane.terminalMu.Unlock()
-	if err := ctrl.emitTerminalUpdate(output, pane, update); err != nil {
+	if err := handler.state.emitTerminalUpdate(output, pane, update); err != nil {
 		t.Fatal(err)
 	}
 	installed := map[uint32]bool{}

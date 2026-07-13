@@ -6,6 +6,13 @@ import (
 	"tali/internal/protocol"
 )
 
+func normalizedRune(r rune) rune {
+	if r == 0 {
+		return ' '
+	}
+	return r
+}
+
 type displayCompiler struct {
 	output        *renderOutput
 	positionValid bool

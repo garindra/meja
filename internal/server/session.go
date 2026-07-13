@@ -2,11 +2,78 @@ package server
 
 import (
 	"fmt"
+	"io"
 	"sort"
 	"sync"
+	"time"
+
+	"github.com/quic-go/quic-go"
 
 	"tali/internal/protocol"
 )
+
+type sessionState struct {
+	session        *Session
+	sessionID      uint64
+	attachMu       sync.Mutex
+	attachToken    []byte
+	attachExpires  time.Time
+	attachConsumed bool
+	resumeTokens   map[string]uint64
+	generation     uint64
+	activeConn     quic.Connection
+	mgmtFrames     chan protocol.Frame
+	outputStreams  map[int]io.Writer
+	operations     chan sessionOperation
+}
+
+type sessionOperation struct {
+	run  func() error
+	done chan error
+}
+
+func (s *sessionState) coordinate(run func() error) error {
+	if s.operations == nil {
+		return run()
+	}
+	done := make(chan error, 1)
+	s.operations <- sessionOperation{run: run, done: done}
+	return <-done
+}
+
+func (s *sessionState) runOperations() {
+	for operation := range s.operations {
+		operation.done <- operation.run()
+	}
+}
+
+func (s *sessionState) attachConnection(mgmtFrames chan protocol.Frame, outputStreams map[int]io.Writer) {
+	s.attachMu.Lock()
+	s.mgmtFrames = mgmtFrames
+	s.outputStreams = outputStreams
+	s.attachMu.Unlock()
+}
+
+func (s *sessionState) detachConnection(mgmtFrames chan protocol.Frame) {
+	s.attachMu.Lock()
+	if s.mgmtFrames == mgmtFrames {
+		s.mgmtFrames = nil
+		s.outputStreams = nil
+	}
+	s.attachMu.Unlock()
+}
+
+func (s *sessionState) currentManagementFrames() chan protocol.Frame {
+	s.attachMu.Lock()
+	defer s.attachMu.Unlock()
+	return s.mgmtFrames
+}
+
+func (s *sessionState) currentOutputStream(slot int) io.Writer {
+	s.attachMu.Lock()
+	defer s.attachMu.Unlock()
+	return s.outputStreams[slot]
+}
 
 type Session struct {
 	ID      uint64

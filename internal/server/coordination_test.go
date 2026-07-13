@@ -59,15 +59,15 @@ func TestStaleControllerCannotRunSessionOperation(t *testing.T) {
 		operations: make(chan sessionOperation),
 	}
 	go state.runOperations()
-	controller := &controller{state: state, mgmtFrames: stale}
+	connectionHandler := &connectionHandler{state: state, mgmtFrames: stale}
 	run := false
-	if err := controller.coordinate(func() error {
+	if err := connectionHandler.coordinate(func() error {
 		run = true
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if run {
-		t.Fatal("stale controller operation ran")
+		t.Fatal("stale connection handler operation ran")
 	}
 }

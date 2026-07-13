@@ -14,14 +14,14 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	window, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, 0)
 	frames := make(chan protocol.Frame, 32)
 	state := &sessionState{session: s}
-	ctrl := &controller{
+	handler := &connectionHandler{
 		state:      state,
 		mgmtFrames: frames,
 	}
 	state.attachConnection(frames, nil)
 
 	s.ConsumeInputByte(0, 0x02)
-	if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, ',')); err != nil {
+	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, ',')); err != nil {
 		t.Fatal(err)
 	}
 	status := readStatusBar(t, frames)
@@ -35,17 +35,17 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 		}
 	}
 
-	if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, 'x')); err != nil {
+	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, 'x')); err != nil {
 		t.Fatal(err)
 	}
 	readStatusBar(t, frames)
-	if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, 0x7f)); err != nil {
+	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, 0x7f)); err != nil {
 		t.Fatal(err)
 	}
 	readStatusBar(t, frames)
 
 	for _, b := range []byte("xy") {
-		if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, b)); err != nil {
+		if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, b)); err != nil {
 			t.Fatal(err)
 		}
 		readStatusBar(t, frames)
@@ -54,24 +54,24 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	if consumed != 4 || len(events) != 1 || terminated {
 		t.Fatalf("delete sequence consumed=%d events=%#v", consumed, events)
 	}
-	if err := runStatusEvent(t, ctrl, events[0]); err != nil {
+	if err := runStatusEvent(t, handler, events[0]); err != nil {
 		t.Fatal(err)
 	}
 	readStatusBar(t, frames)
 
 	for i := 0; i < len("bashx"); i++ {
-		if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, 0x7f)); err != nil {
+		if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, 0x7f)); err != nil {
 			t.Fatal(err)
 		}
 		readStatusBar(t, frames)
 	}
 	for _, b := range []byte("zsh") {
-		if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, b)); err != nil {
+		if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, b)); err != nil {
 			t.Fatal(err)
 		}
 		readStatusBar(t, frames)
 	}
-	if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, '\r')); err != nil {
+	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, '\r')); err != nil {
 		t.Fatal(err)
 	}
 	status = readStatusBar(t, frames)
@@ -81,12 +81,12 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	}
 
 	s.ConsumeInputByte(0, 0x02)
-	if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, ',')); err != nil {
+	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, ',')); err != nil {
 		t.Fatal(err)
 	}
 	readStatusBar(t, frames)
 	s.ConsumeInputByte(0, 0x1b)
-	if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, 'x')); err != nil {
+	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, 'x')); err != nil {
 		t.Fatal(err)
 	}
 	status = readStatusBar(t, frames)
@@ -96,20 +96,20 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	}
 
 	s.ConsumeInputByte(0, 0x02)
-	if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, ',')); err != nil {
+	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, ',')); err != nil {
 		t.Fatal(err)
 	}
 	readStatusBar(t, frames)
-	if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, 0x03)); err != nil {
+	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, 0x03)); err != nil {
 		t.Fatal(err)
 	}
 	status = readStatusBar(t, frames)
 	assertStatusText(t, status, "[0] 0:zsh* ")
 }
 
-func runStatusEvent(t *testing.T, ctrl *controller, event serverInputEvent) error {
+func runStatusEvent(t *testing.T, handler *connectionHandler, event serverInputEvent) error {
 	t.Helper()
-	_, err := ctrl.handleServerInputEvent(event)
+	_, err := handler.handleServerInputEvent(event)
 	return err
 }
 

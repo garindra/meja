@@ -50,9 +50,9 @@ func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	ctrl := &controller{state: &sessionState{session: s}}
+	handler := &connectionHandler{state: &sessionState{session: s}}
 	done := make(chan error, 1)
-	ctrl.handleInput(protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
+	handler.handleInput(protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -182,10 +182,10 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := &sessionState{session: s}
-	ctrl := &controller{state: state, mgmtFrames: make(chan protocol.Frame, 8)}
-	state.attachConnection(ctrl.mgmtFrames, nil)
+	handler := &connectionHandler{state: state, mgmtFrames: make(chan protocol.Frame, 8)}
+	state.attachConnection(handler.mgmtFrames, nil)
 	done := make(chan error, 1)
-	ctrl.handleInput(protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
+	handler.handleInput(protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
