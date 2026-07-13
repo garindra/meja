@@ -287,3 +287,50 @@ func TestCreateWindowSizePrefersClientDimensionsOverSplitPane(t *testing.T) {
 		t.Fatalf("createWindowSize() = %dx%d, want 120x39", cols, rows)
 	}
 }
+
+func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	first, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "one"}, 0)
+	second, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "two"}, 0)
+	third, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "three"}, 0)
+	if first.DisplayIndex != 0 || second.DisplayIndex != 1 || third.DisplayIndex != 2 {
+		t.Fatalf("initial display indices = %d, %d, %d", first.DisplayIndex, second.DisplayIndex, third.DisplayIndex)
+	}
+
+	if _, _, err := s.SelectWindow(0, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, _, _, err := s.CloseWindow(0, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	statuses := s.WindowStatuses(0)
+	if len(statuses) != 2 || statuses[0].Index != 1 || statuses[1].Index != 2 {
+		t.Fatalf("statuses after deleting display index 0 = %#v", statuses)
+	}
+	if got, ok := s.WindowIDByIndex(0); ok || got != 0 {
+		t.Fatalf("deleted display index lookup = %d, %v", got, ok)
+	}
+	if got, ok := s.WindowIDByIndex(2); !ok || got != third.ID {
+		t.Fatalf("display index 2 lookup = %d, %v; want %d, true", got, ok, third.ID)
+	}
+	s.ConsumeInputByte(0, 0x02)
+	event := s.ConsumeInputByte(0, '2')
+	if event.Command != serverCommandSelectIndex || event.Index != 2 {
+		t.Fatalf("numeric selection event = %#v", event)
+	}
+
+	fourth, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "four"}, 0)
+	if fourth.DisplayIndex != 3 {
+		t.Fatalf("new window display index = %d, want 3", fourth.DisplayIndex)
+	}
+	if got, ok := s.WindowIDByIndex(3); !ok || got != fourth.ID {
+		t.Fatalf("display index 3 lookup = %d, %v; want %d, true", got, ok, fourth.ID)
+	}
+	if _, _, err := s.SelectWindow(0, third.ID); err != nil {
+		t.Fatal(err)
+	}
+	if state := s.SnapshotClient(0); state.ActiveWindowID != third.ID {
+		t.Fatalf("numeric-selection target = %d, want %d", state.ActiveWindowID, third.ID)
+	}
+}

@@ -58,11 +58,11 @@ func TestParseTargetInvalid(t *testing.T) {
 func TestIncomingRenderBurstLog(t *testing.T) {
 	var log bytes.Buffer
 	ui := &runtimeState{debugRender: true, stderr: &log}
-	ui.recordIncomingRenderFrame(protocol.Frame{
+	ui.recordIncomingRenderFrame(0, protocol.Frame{
 		Type:    protocol.MsgWriteText,
 		Payload: make([]byte, 7),
 	})
-	ui.recordIncomingRenderFrame(protocol.Frame{
+	ui.recordIncomingRenderFrame(0, protocol.Frame{
 		Type:    protocol.MsgPresent,
 		Payload: make([]byte, 3),
 	})
@@ -85,6 +85,17 @@ func TestIncomingRenderBurstLog(t *testing.T) {
 	ui.closeIncomingRenderLog()
 	if strings.Count(log.String(), "incoming burst") != 1 {
 		t.Fatalf("closeIncomingRenderLog() duplicated burst log: %q", log.String())
+	}
+}
+
+func TestFormatIncomingWriteStyles(t *testing.T) {
+	plain := renderStyleKey{slot: 0, id: 1}
+	bold := renderStyleKey{slot: 0, id: 2}
+	got := formatIncomingWriteStyles(map[renderStyleKey]uint64{plain: 20, bold: 15}, map[renderStyleKey]protocol.Style{plain: {FG: protocol.Color{Mode: "indexed", Index: 7}}, bold: {Bold: true, FG: protocol.Color{Mode: "indexed", Index: 7}}})
+	for _, want := range []string{"slot0/id1:20{plain,fg=idx7,bg=default}", "slot0/id2:15{bold,fg=idx7,bg=default}"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("styles %q missing %q", got, want)
+		}
 	}
 }
 

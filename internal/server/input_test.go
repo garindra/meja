@@ -2,8 +2,11 @@ package server
 
 import (
 	"bytes"
+	"io"
+	"os"
 	"testing"
 
+	"tali/internal/protocol"
 	"tali/internal/server/terminal"
 )
 
@@ -47,6 +50,156 @@ func TestServerParsesPrefixArrowAndWindowIndex(t *testing.T) {
 	s.ConsumeInputByte(0, 0x02)
 	if event := s.ConsumeInputByte(0, '3'); event.Command != serverCommandSelectIndex || event.Index != 3 {
 		t.Fatalf("numeric window event = %#v", event)
+	}
+}
+
+func TestServerPromptEditsAndCancelsAuthoritatively(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	pane := &Pane{ID: s.AddPaneID(), Title: "bash"}
+	window, _ := s.CreateWindow(pane, 0)
+
+	s.ConsumeInputByte(0, 0x02)
+	if event := s.ConsumeInputByte(0, ','); event.Command != serverCommandBeginPrompt {
+		t.Fatalf("rename prompt event = %#v", event)
+	}
+	if _, err := s.BeginRenameWindowPrompt(0); err != nil {
+		t.Fatal(err)
+	}
+	if event := s.ConsumeInputByte(0, 'x'); event.Command != serverCommandPrompt || event.PromptAction != PromptActionChanged {
+		t.Fatalf("prompt text event = %#v", event)
+	}
+	if got := string(s.ActivePrompt(0).Text); got != "bashx" {
+		t.Fatalf("prompt text after typing = %q", got)
+	}
+	if event := s.ConsumeInputByte(0, 0x7f); event.Command != serverCommandPrompt || event.PromptAction != PromptActionChanged {
+		t.Fatalf("backspace event = %#v", event)
+	}
+	if got := string(s.ActivePrompt(0).Text); got != "bash" {
+		t.Fatalf("prompt text after backspace = %q", got)
+	}
+	for _, b := range []byte("xy") {
+		s.ConsumeInputByte(0, b)
+	}
+	consumed, events, terminated := s.ConsumePromptInput(0, []byte("\x1b[3~"))
+	if consumed != 4 || len(events) != 1 || events[0].PromptAction != PromptActionChanged || terminated {
+		t.Fatalf("delete sequence consumed=%d events=%#v terminated=%v", consumed, events, terminated)
+	}
+	if got := string(s.ActivePrompt(0).Text); got != "bashx" {
+		t.Fatalf("prompt text after delete = %q", got)
+	}
+	if event := s.ConsumeInputByte(0, 0x1b); event.Command != serverCommandNone {
+		t.Fatalf("escape prefix event = %#v", event)
+	}
+	if event := s.ConsumeInputByte(0, 'x'); event.Command != serverCommandPrompt || event.PromptAction != PromptActionCancel {
+		t.Fatalf("bare escape cancel event = %#v", event)
+	}
+	if s.ActivePrompt(0) != nil {
+		t.Fatal("prompt remained active after escape")
+	}
+	if s.Windows[window.ID].Name != "bash" {
+		t.Fatalf("cancel changed window name to %q", s.Windows[window.ID].Name)
+	}
+}
+
+func TestPromptDeleteSequenceSurvivesEveryPayloadBoundary(t *testing.T) {
+	sequence := []byte{0x1b, '[', '3', '~'}
+	for boundary := 1; boundary < len(sequence); boundary++ {
+		s := NewSession(0)
+		s.NewClient(0)
+		s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, 0)
+		if _, err := s.BeginRenameWindowPrompt(0); err != nil {
+			t.Fatal(err)
+		}
+		for _, b := range []byte("x") {
+			s.ConsumeInputByte(0, b)
+		}
+
+		consumed, events, terminated := s.ConsumePromptInput(0, sequence[:boundary])
+		if consumed != boundary || len(events) != 0 || terminated {
+			t.Fatalf("boundary %d first payload consumed=%d events=%#v terminated=%v", boundary, consumed, events, terminated)
+		}
+		prompt := s.ActivePrompt(0)
+		if prompt == nil || !bytes.Equal(prompt.PendingEscape, sequence[:boundary]) {
+			var pending []byte
+			if prompt != nil {
+				pending = prompt.PendingEscape
+			}
+			t.Fatalf("boundary %d pending escape=%#v prompt=%#v", boundary, pending, prompt)
+		}
+
+		consumed, events, terminated = s.ConsumePromptInput(0, sequence[boundary:])
+		if consumed != len(sequence)-boundary || len(events) != 1 || events[0].PromptAction != PromptActionChanged || terminated {
+			t.Fatalf("boundary %d second payload consumed=%d events=%#v terminated=%v", boundary, consumed, events, terminated)
+		}
+		if got := string(s.ActivePrompt(0).Text); got != "bash" {
+			t.Fatalf("boundary %d prompt text=%q, want bash", boundary, got)
+		}
+	}
+}
+
+func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 23
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	pane := &Pane{ID: s.AddPaneID(), PTY: writer, Terminal: terminal.New(80, 23), Title: "bash"}
+	window, _ := s.CreateWindow(pane, 0)
+	if _, err := s.BeginRenameWindowPrompt(0); err != nil {
+		t.Fatal(err)
+	}
+
+	var input bytes.Buffer
+	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: []byte("x\rLEAK")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	state := &sessionState{session: s}
+	ctrl := &controller{state: state, mgmtFrames: make(chan protocol.Frame, 8)}
+	done := make(chan error, 1)
+	ctrl.handleInput(protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("prompt input leaked to PTY: %q", got)
+	}
+	if window.Name != "bashx" || s.ActivePrompt(0) != nil {
+		t.Fatalf("prompt termination state window=%q prompt=%#v", window.Name, s.ActivePrompt(0))
+	}
+}
+
+func TestPromptBufferIsRuneAware(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, 0)
+	if _, err := s.BeginPrompt(0, PromptKindRenameWindow, "prompt ", "猫"); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []byte("é") {
+		s.ConsumeInputByte(0, b)
+	}
+	prompt := s.ActivePrompt(0)
+	if got := string(prompt.Text); got != "猫é" || prompt.Cursor != 2 {
+		t.Fatalf("rune prompt = %#v, want text 猫é cursor 2", prompt)
+	}
+	s.ConsumeInputByte(0, 0x7f)
+	if got := string(s.ActivePrompt(0).Text); got != "猫" {
+		t.Fatalf("rune prompt after backspace = %q", got)
 	}
 }
 

@@ -71,6 +71,13 @@ type runtimeState struct {
 	incomingPayloadBytes    uint64
 	incomingCommandCount    uint64
 	incomingMessageTypeHits map[uint64]uint64
+	incomingWriteStyleHits  map[renderStyleKey]uint64
+	installedRenderStyles   map[renderStyleKey]protocol.Style
+}
+
+type renderStyleKey struct {
+	slot uint8
+	id   uint32
 }
 
 type renderEvent interface{ renderEvent() }
@@ -414,7 +421,7 @@ func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, s
 			sessionDone <- fmt.Errorf("read output frame: %w", err)
 			return
 		}
-		ui.recordIncomingRenderFrame(frame)
+		ui.recordIncomingRenderFrame(slot, frame)
 		if frame.Type == protocol.MsgRelayoutBarrier {
 			msg, err := protocol.DecodeRelayoutBarrier(frame.Payload)
 			if err != nil {
@@ -766,7 +773,7 @@ func (r *runtimeState) logRenderf(format string, args ...any) {
 	_, _ = fmt.Fprintf(r.stderr, "tali render: "+format+"\n", args...)
 }
 
-func (r *runtimeState) recordIncomingRenderFrame(frame protocol.Frame) {
+func (r *runtimeState) recordIncomingRenderFrame(slot uint8, frame protocol.Frame) {
 	if !r.debugRender || r.stderr == nil {
 		return
 	}
@@ -779,12 +786,29 @@ func (r *runtimeState) recordIncomingRenderFrame(frame protocol.Frame) {
 	if r.incomingBurstStarted.IsZero() {
 		r.incomingBurstStarted = time.Now()
 		r.incomingMessageTypeHits = make(map[uint64]uint64)
+		r.incomingWriteStyleHits = make(map[renderStyleKey]uint64)
 		r.incomingBurstTimer = time.AfterFunc(incomingBurstWindow, r.flushIncomingRender)
 	}
 	r.incomingWireBytes += uint64(encodedFrameSize(frame))
 	r.incomingPayloadBytes += uint64(len(frame.Payload))
 	r.incomingCommandCount++
 	r.incomingMessageTypeHits[frame.Type]++
+	key := renderStyleKey{slot: slot}
+	if frame.Type == protocol.MsgStyleInstall {
+		if msg, err := protocol.DecodeStyleInstall(frame.Payload); err == nil {
+			key.id = msg.ID
+			if r.installedRenderStyles == nil {
+				r.installedRenderStyles = make(map[renderStyleKey]protocol.Style)
+			}
+			r.installedRenderStyles[key] = msg.Style
+		}
+	}
+	if frame.Type == protocol.MsgSetWriteStyle {
+		if msg, err := protocol.DecodeSetWriteStyle(frame.Payload); err == nil {
+			key.id = msg.StyleID
+			r.incomingWriteStyleHits[key]++
+		}
+	}
 	r.incomingMu.Unlock()
 }
 
@@ -800,8 +824,9 @@ func (r *runtimeState) flushIncomingRender() {
 	}
 	startedAt := r.incomingBurstStarted
 	types := formatIncomingRenderTypes(r.incomingMessageTypeHits)
+	writeStyles := formatIncomingWriteStyles(r.incomingWriteStyleHits, r.installedRenderStyles)
 	r.logRenderf(
-		"incoming burst at=%s window=%s elapsed=%s wire_bytes=%d payload_bytes=%d commands=%d types=%s",
+		"incoming burst at=%s window=%s elapsed=%s wire_bytes=%d payload_bytes=%d commands=%d types=%s write_styles=%s",
 		time.Now().Format(time.RFC3339Nano),
 		incomingBurstWindow,
 		time.Since(startedAt).Round(time.Millisecond),
@@ -809,12 +834,72 @@ func (r *runtimeState) flushIncomingRender() {
 		r.incomingPayloadBytes,
 		r.incomingCommandCount,
 		types,
+		writeStyles,
 	)
 	r.incomingBurstStarted = time.Time{}
 	r.incomingWireBytes = 0
 	r.incomingPayloadBytes = 0
 	r.incomingCommandCount = 0
 	r.incomingMessageTypeHits = nil
+	r.incomingWriteStyleHits = nil
+}
+
+func formatIncomingWriteStyles(hits map[renderStyleKey]uint64, styles map[renderStyleKey]protocol.Style) string {
+	if len(hits) == 0 {
+		return "none"
+	}
+	keys := make([]renderStyleKey, 0, len(hits))
+	for key := range hits {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].slot != keys[j].slot {
+			return keys[i].slot < keys[j].slot
+		}
+		return keys[i].id < keys[j].id
+	})
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		style, ok := styles[key]
+		description := "unknown"
+		if ok {
+			description = formatRenderStyle(style)
+		}
+		parts = append(parts, fmt.Sprintf("slot%d/id%d:%d{%s}", key.slot, key.id, hits[key], description))
+	}
+	return strings.Join(parts, ",")
+}
+func formatRenderStyle(style protocol.Style) string {
+	flags := make([]string, 0, 5)
+	if style.Bold {
+		flags = append(flags, "bold")
+	}
+	if style.Dim {
+		flags = append(flags, "dim")
+	}
+	if style.Italic {
+		flags = append(flags, "italic")
+	}
+	if style.Underline {
+		flags = append(flags, "underline")
+	}
+	if style.Reverse {
+		flags = append(flags, "reverse")
+	}
+	if len(flags) == 0 {
+		flags = append(flags, "plain")
+	}
+	return fmt.Sprintf("%s,fg=%s,bg=%s", strings.Join(flags, "+"), formatRenderColor(style.FG), formatRenderColor(style.BG))
+}
+func formatRenderColor(color protocol.Color) string {
+	switch color.Mode {
+	case "indexed":
+		return fmt.Sprintf("idx%d", color.Index)
+	case "rgb":
+		return fmt.Sprintf("#%02x%02x%02x", color.R, color.G, color.B)
+	default:
+		return "default"
+	}
 }
 
 func (r *runtimeState) closeIncomingRenderLog() {

@@ -15,6 +15,7 @@ type Session struct {
 	Clients map[uint64]*ClientState
 
 	NextWindowID       uint64
+	NextWindowIndex    int
 	NextPaneID         uint64
 	NextLayoutRevision uint64
 
@@ -23,9 +24,36 @@ type Session struct {
 
 type Window struct {
 	ID             uint64
+	DisplayIndex   int
 	Name           string
 	Layout         LayoutNode
 	LayoutRevision uint64
+}
+
+type PromptKind uint8
+
+const (
+	PromptKindRenameWindow PromptKind = iota + 1
+)
+
+type PromptAction uint8
+
+const (
+	PromptActionNone PromptAction = iota
+	PromptActionChanged
+	PromptActionSubmit
+	PromptActionCancel
+)
+
+type PromptState struct {
+	Kind           PromptKind
+	Action         PromptAction
+	TargetWindowID uint64
+	Label          string
+	Text           []rune
+	Cursor         int
+	pendingUTF8    []byte
+	PendingEscape  []byte
 }
 
 type RenderBinding struct {
@@ -44,6 +72,7 @@ type ClientState struct {
 	RenderBindings []RenderBinding
 	HistoryViews   map[uint64]*HistoryView
 	InputState     serverInputState
+	Prompt         *PromptState
 	LastWindowID   uint64
 	HasLastWindow  bool
 }
@@ -92,6 +121,62 @@ func (s *Session) ensureClientLocked(id uint64) *ClientState {
 	return client
 }
 
+func (s *Session) BeginPrompt(clientID uint64, kind PromptKind, label, initial string) (*PromptState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client := s.Clients[clientID]
+	if client == nil {
+		return nil, fmt.Errorf("unknown client %d", clientID)
+	}
+	window := s.Windows[client.ActiveWindowID]
+	if window == nil {
+		return nil, fmt.Errorf("client %d has no active window", clientID)
+	}
+	text := []rune(initial)
+	client.InputState = serverInputNormal
+	client.Prompt = &PromptState{
+		Kind:           kind,
+		TargetWindowID: window.ID,
+		Label:          label,
+		Text:           text,
+		Cursor:         len(text),
+	}
+	return clonePromptState(client.Prompt), nil
+}
+
+func (s *Session) BeginRenameWindowPrompt(clientID uint64) (*PromptState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client := s.Clients[clientID]
+	if client == nil {
+		return nil, fmt.Errorf("unknown client %d", clientID)
+	}
+	window := s.Windows[client.ActiveWindowID]
+	if window == nil {
+		return nil, fmt.Errorf("client %d has no active window", clientID)
+	}
+	text := []rune(window.Name)
+	client.InputState = serverInputNormal
+	client.Prompt = &PromptState{
+		Kind:           PromptKindRenameWindow,
+		TargetWindowID: window.ID,
+		Label:          "(rename-window) ",
+		Text:           text,
+		Cursor:         len(text),
+	}
+	return clonePromptState(client.Prompt), nil
+}
+
+func (s *Session) ActivePrompt(clientID uint64) *PromptState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	client := s.Clients[clientID]
+	if client == nil {
+		return nil
+	}
+	return clonePromptState(client.Prompt)
+}
+
 func (s *Session) ensureClientFocusLocked(client *ClientState) {
 	if len(s.Windows) == 0 {
 		return
@@ -129,8 +214,11 @@ func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *Client
 	}
 	windowID := s.NextWindowID
 	s.NextWindowID++
+	displayIndex := s.NextWindowIndex
+	s.NextWindowIndex++
 	window := &Window{
 		ID:             windowID,
+		DisplayIndex:   displayIndex,
 		Name:           pane.Title,
 		Layout:         &PaneLayout{PaneID: pane.ID},
 		LayoutRevision: s.nextLayoutRevisionLocked(),
@@ -238,6 +326,18 @@ func (s *Session) SelectWindow(clientID, windowID uint64) (*Window, *ClientState
 	client.FocusedPaneID = windowPrimaryPaneID(window)
 	s.rebuildBindingsLocked(client, window)
 	return cloneWindow(window), cloneClientState(client), nil
+}
+
+func (s *Session) RenameWindow(windowID uint64, name string) (*Window, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	window := s.Windows[windowID]
+	if window == nil {
+		return nil, fmt.Errorf("unknown window %d", windowID)
+	}
+	// Empty names are valid; normal status projection remains well-formed.
+	window.Name = name
+	return cloneWindow(window), nil
 }
 
 func (s *Session) FocusPane(clientID, paneID uint64) (*Window, *ClientState, error) {
@@ -461,17 +561,16 @@ func (s *Session) WindowStatuses(clientID uint64) []WindowStatus {
 	if client != nil {
 		active = client.ActiveWindowID
 	}
-	ids := s.windowIDsLocked()
-	list := make([]WindowStatus, 0, len(ids))
-	for idx, id := range ids {
-		window := s.Windows[id]
+	list := make([]WindowStatus, 0, len(s.Windows))
+	for _, window := range s.Windows {
 		list = append(list, WindowStatus{
 			WindowID: window.ID,
-			Index:    idx,
+			Index:    window.DisplayIndex,
 			Title:    window.Name,
 			Active:   window.ID == active,
 		})
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Index < list[j].Index })
 	return list
 }
 
@@ -654,7 +753,13 @@ func (s *Session) windowIDsLocked() []uint64 {
 	for id := range s.Windows {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	sort.Slice(ids, func(i, j int) bool {
+		left, right := s.Windows[ids[i]], s.Windows[ids[j]]
+		if left.DisplayIndex != right.DisplayIndex {
+			return left.DisplayIndex < right.DisplayIndex
+		}
+		return ids[i] < ids[j]
+	})
 	return ids
 }
 
@@ -765,10 +870,22 @@ func cloneWindow(window *Window) *Window {
 	}
 	return &Window{
 		ID:             window.ID,
+		DisplayIndex:   window.DisplayIndex,
 		Name:           window.Name,
 		Layout:         window.Layout,
 		LayoutRevision: window.LayoutRevision,
 	}
+}
+
+func clonePromptState(prompt *PromptState) *PromptState {
+	if prompt == nil {
+		return nil
+	}
+	out := *prompt
+	out.Text = append([]rune(nil), prompt.Text...)
+	out.pendingUTF8 = append([]byte(nil), prompt.pendingUTF8...)
+	out.PendingEscape = append([]byte(nil), prompt.PendingEscape...)
+	return &out
 }
 
 func cloneClientState(c *ClientState) *ClientState {
@@ -777,5 +894,6 @@ func cloneClientState(c *ClientState) *ClientState {
 	}
 	out := *c
 	out.RenderBindings = append([]RenderBinding(nil), c.RenderBindings...)
+	out.Prompt = clonePromptState(c.Prompt)
 	return &out
 }

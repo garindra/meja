@@ -395,6 +395,27 @@ func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
 				return
 			}
 			for index := 0; index < len(msg.Data); index++ {
+				if c.state.session.ActivePrompt(clientID0) != nil {
+					consumed, events, terminated := c.state.session.ConsumePromptInput(clientID0, msg.Data[index:])
+					for _, event := range events {
+						detach, err := c.handleServerInputEvent(event)
+						if err != nil {
+							done <- err
+							return
+						}
+						if detach {
+							done <- nil
+							return
+						}
+					}
+					if consumed > 0 {
+						index += consumed - 1
+						if terminated {
+							break
+						}
+						continue
+					}
+				}
 				pane, _ := c.state.session.ActivePane(clientID0)
 				if pane == nil {
 					break
@@ -510,8 +531,38 @@ func (c *controller) handleServerInputEvent(event serverInputEvent) (bool, error
 			return false, err
 		}
 		return false, c.publishWindowLayout()
+	case serverCommandBeginPrompt:
+		return false, c.commandBeginRenameWindowPrompt()
+	case serverCommandPrompt:
+		return false, c.handlePromptEvent(event)
 	}
 	return false, nil
+}
+
+func (c *controller) commandBeginRenameWindowPrompt() error {
+	if _, err := c.state.session.BeginRenameWindowPrompt(clientID0); err != nil {
+		return err
+	}
+	return c.publishStatusBar()
+}
+
+func (c *controller) handlePromptEvent(event serverInputEvent) error {
+	switch event.PromptAction {
+	case PromptActionChanged, PromptActionCancel:
+		return c.publishStatusBar()
+	case PromptActionSubmit:
+		switch event.PromptKind {
+		case PromptKindRenameWindow:
+			if _, err := c.state.session.RenameWindow(event.PromptWindowID, event.PromptText); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported prompt kind %d", event.PromptKind)
+		}
+		return c.publishStatusBar()
+	default:
+		return nil
+	}
 }
 
 func (c *controller) commandCreateWindow() error {
@@ -1089,30 +1140,42 @@ func (c *controller) publishStatusBar() error {
 	width := int(client.TerminalCols)
 	cells := make([]protocol.Cell, width)
 	for i := range cells {
-		cells[i] = protocol.Cell{Rune: ' ', Width: 1}
+		cells[i] = protocol.Cell{Rune: ' ', StyleID: 0, Width: 1}
 	}
-	list := c.state.session.WindowStatuses(clientID0)
-	text := fmt.Sprintf("[%d] ", c.state.session.ID)
-	for _, window := range list {
-		marker := ' '
-		if window.Active {
-			marker = '*'
+	style := protocol.Style{
+		FG: protocol.Color{Mode: "default"},
+		BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158},
+	}
+	text := ""
+	if prompt := c.state.session.ActivePrompt(clientID0); prompt != nil {
+		style = protocol.Style{
+			FG: protocol.Color{Mode: "indexed", Index: 0},
+			BG: protocol.Color{Mode: "indexed", Index: 3},
 		}
-		text += fmt.Sprintf("%d:%s%c ", window.Index, window.Title, marker)
+		text = prompt.Label + string(prompt.Text)
+	} else {
+		list := c.state.session.WindowStatuses(clientID0)
+		text = fmt.Sprintf("[%d] ", c.state.session.ID)
+		for _, window := range list {
+			marker := ' '
+			if window.Active {
+				marker = '*'
+			}
+			text += fmt.Sprintf("%d:%s%c ", window.Index, window.Title, marker)
+		}
 	}
-	for i, r := range text {
-		if i >= len(cells) {
+	column := 0
+	for _, r := range text {
+		if column >= len(cells) {
 			break
 		}
-		cells[i].Rune = r
+		cells[column].Rune = r
+		column++
 	}
 	return sendEncoded(c.mgmtFrames, protocol.MsgStatusBar, protocol.StatusBar{
-		Cols:  width,
-		Cells: cells,
-		Styles: []protocol.StyleDefinition{{ID: 0, Style: protocol.Style{
-			FG: protocol.Color{Mode: "default"},
-			BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158},
-		}}},
+		Cols:   width,
+		Cells:  cells,
+		Styles: []protocol.StyleDefinition{{ID: 0, Style: style}},
 	}, protocol.EncodeStatusBar)
 }
 
