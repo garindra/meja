@@ -92,6 +92,37 @@ func TestLFWithoutScrollDoesNotForceFullRedraw(t *testing.T) {
 	}
 }
 
+func TestFullViewportLineFeedReportsScrollAndNewRowDamage(t *testing.T) {
+	term := New(3, 2)
+	term.Apply([]byte("aaa\r\nbbb"))
+
+	update := term.Apply([]byte("\r\nccc"))
+
+	if update.FullRedraw {
+		t.Fatal("full viewport scroll forced full redraw")
+	}
+	if update.ScrollDelta != -1 {
+		t.Fatalf("scroll delta = %d, want -1", update.ScrollDelta)
+	}
+	if len(update.DirtySpans) != 1 {
+		t.Fatalf("dirty spans = %#v, want only newly exposed row", update.DirtySpans)
+	}
+	if got, want := update.DirtySpans[1], (DirtySpan{Start: 0, End: 3}); got != want {
+		t.Fatalf("bottom row damage = %#v, want %#v", got, want)
+	}
+}
+
+func TestPartialRegionLineFeedStillRequiresFullRedraw(t *testing.T) {
+	term := New(4, 4)
+	term.Apply([]byte("\x1b[2;3r\x1b[3;1H"))
+
+	update := term.Apply([]byte("\n"))
+
+	if !update.FullRedraw || update.ScrollDelta != 0 {
+		t.Fatalf("partial scroll update = %#v, want full redraw without viewport scroll", update)
+	}
+}
+
 func TestPrintableOutputTracksDirtyColumnSpan(t *testing.T) {
 	term := New(10, 1)
 	term.CursorX = 4

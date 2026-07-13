@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/creack/pty"
@@ -17,30 +18,47 @@ import (
 )
 
 type Pane struct {
-	ID       uint64
-	PTY      *os.File
-	Process  *exec.Cmd
-	User     *user.User
-	Terminal *terminal.TerminalState
-	Title    string
+	ID      uint64
+	PTY     *os.File
+	Process *exec.Cmd
+	User    *user.User
+	Title   string
 
-	writeMu        sync.Mutex
-	terminalMu     sync.Mutex
-	renderCommands chan paneRenderCommand
-	rendererDone   chan struct{}
+	terminal   *terminal.TerminalState
+	metadata   atomic.Pointer[paneTerminalMetadata]
+	ptyOutput  chan []byte
+	ptyInput   chan []byte
+	commands   chan paneCommand
+	mainDone   chan struct{}
+	writerDone chan struct{}
+	done       chan struct{}
+	stopping   atomic.Bool
 
-	// Owned exclusively by the pane renderer goroutine. Production attaches
+	// Owned exclusively by the pane main goroutine. Production attaches
 	// the actual QUIC stream; tests can provide the narrower write capability.
 	outputStream io.Writer
 }
 
-type paneRenderCommand struct {
+type paneCommand struct {
 	attach  io.Writer
 	detach  io.Writer
 	release *paneOutputRelease
 	refresh func(*renderOutput) error
 	apply   func(*renderOutput) error
+	resize  *paneResize
+	history chan<- *HistorySnapshot
 	done    chan error
+}
+
+type paneResize struct {
+	cols uint16
+	rows uint16
+}
+
+type paneTerminalMetadata struct {
+	cols                  int
+	rows                  int
+	applicationCursorKeys bool
 }
 
 type paneOutputRelease struct {
@@ -58,15 +76,46 @@ func (r *paneOutputRelease) acknowledge() {
 }
 
 func (p *Pane) TerminalSize() (int, int) {
-	p.terminalMu.Lock()
-	defer p.terminalMu.Unlock()
-	return p.Terminal.Cols, p.Terminal.Rows
+	if metadata := p.metadata.Load(); metadata != nil {
+		return metadata.cols, metadata.rows
+	}
+	if p.terminal != nil {
+		return p.terminal.Cols, p.terminal.Rows
+	}
+	return 0, 0
 }
 
 func (p *Pane) UsesApplicationCursorKeys() bool {
-	p.terminalMu.Lock()
-	defer p.terminalMu.Unlock()
-	return p.Terminal.ApplicationCursorKeys
+	metadata := p.metadata.Load()
+	return metadata != nil && metadata.applicationCursorKeys
+}
+
+func (p *Pane) initializeRuntime() {
+	if p.commands != nil {
+		return
+	}
+	p.ptyOutput = make(chan []byte, 16)
+	p.ptyInput = make(chan []byte, 64)
+	p.commands = make(chan paneCommand, 8)
+	p.mainDone = make(chan struct{})
+	p.writerDone = make(chan struct{})
+	p.done = make(chan struct{})
+	p.publishTerminalMetadata()
+}
+
+func (p *Pane) publishTerminalMetadata() {
+	if p.terminal == nil {
+		return
+	}
+	next := paneTerminalMetadata{
+		cols:                  p.terminal.Cols,
+		rows:                  p.terminal.Rows,
+		applicationCursorKeys: p.terminal.ApplicationCursorKeys,
+	}
+	if current := p.metadata.Load(); current != nil && *current == next {
+		return
+	}
+	p.metadata.Store(&next)
 }
 
 func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
@@ -106,19 +155,55 @@ func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
 		PTY:      ptmx,
 		Process:  cmd,
 		User:     unixUser,
-		Terminal: terminal.New(int(request.Cols), int(request.Rows)),
+		terminal: terminal.New(int(request.Cols), int(request.Rows)),
 		Title:    paneTitle(shell, request.Command),
 	}, nil
 }
 
-func (p *Pane) Resize(cols, rows uint16) error {
-	return pty.Setsize(p.PTY, &pty.Winsize{Cols: cols, Rows: rows})
+func (p *Pane) resize(cols, rows uint16) error {
+	if p.commands == nil {
+		var err error
+		if p.PTY != nil {
+			err = pty.Setsize(p.PTY, &pty.Winsize{Cols: cols, Rows: rows})
+		}
+		p.terminal.Resize(int(cols), int(rows))
+		p.publishTerminalMetadata()
+		return err
+	}
+	return p.sendRenderCommand(paneCommand{resize: &paneResize{cols: cols, rows: rows}})
 }
 
-func (p *Pane) WriteInput(data []byte) (int, error) {
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
-	return p.PTY.Write(data)
+func (p *Pane) sendInput(data []byte) error {
+	return p.sendOwnedInput(append([]byte(nil), data...))
+}
+
+func (p *Pane) sendOwnedInput(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if p.ptyInput == nil {
+		return writeAll(p.PTY, data)
+	}
+	select {
+	case p.ptyInput <- data:
+		return nil
+	case <-p.writerDone:
+		return io.ErrClosedPipe
+	case <-p.done:
+		return io.ErrClosedPipe
+	}
+}
+
+func (p *Pane) stop() {
+	if !p.stopping.CompareAndSwap(false, true) {
+		return
+	}
+	if p.done != nil {
+		close(p.done)
+	}
+	if p.PTY != nil {
+		_ = p.PTY.Close()
+	}
 }
 
 func resolveCommand(shell string, argv []string) (string, []string) {

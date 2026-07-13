@@ -4,28 +4,31 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 	"time"
+
+	"github.com/creack/pty"
 
 	"tali/internal/protocol"
 	"tali/internal/server/terminal"
 )
 
-func relayPTYToTerminal(pane *Pane, updates chan<- terminal.Update) {
-	defer close(updates)
-	buf := make([]byte, 32*1024)
+var ptyReadBuffers = sync.Pool{New: func() any { return make([]byte, 32*1024) }}
+
+func relayPTYOutput(pane *Pane) {
+	defer close(pane.ptyOutput)
 	for {
+		buf := ptyReadBuffers.Get().([]byte)
 		n, err := pane.PTY.Read(buf)
 		if n > 0 {
-			pane.terminalMu.Lock()
-			update := pane.Terminal.Apply(buf[:n])
-			pane.terminalMu.Unlock()
-			for _, reply := range update.Replies {
-				if _, err := pane.WriteInput(reply); err != nil {
-					return
-				}
+			select {
+			case pane.ptyOutput <- buf[:n]:
+			case <-pane.done:
+				ptyReadBuffers.Put(buf[:cap(buf)])
+				return
 			}
-			update.Replies = nil
-			updates <- update
+		} else {
+			ptyReadBuffers.Put(buf[:cap(buf)])
 		}
 		if err != nil {
 			return
@@ -33,8 +36,23 @@ func relayPTYToTerminal(pane *Pane, updates chan<- terminal.Update) {
 	}
 }
 
-func (s *sessionState) runPaneRenderer(pane *Pane, updates <-chan terminal.Update) {
-	defer close(pane.rendererDone)
+func runPTYWriter(pane *Pane, failed func(error)) {
+	defer close(pane.writerDone)
+	for {
+		select {
+		case data := <-pane.ptyInput:
+			if err := writeAll(pane.PTY, data); err != nil {
+				failed(err)
+				return
+			}
+		case <-pane.done:
+			return
+		}
+	}
+}
+
+func (s *sessionState) runPane(pane *Pane) {
+	defer close(pane.mainDone)
 	var output *renderOutput
 	var aggregate terminal.Update
 	var idle, maxAge *time.Timer
@@ -67,7 +85,7 @@ func (s *sessionState) runPaneRenderer(pane *Pane, updates <-chan terminal.Updat
 	}
 	for {
 		select {
-		case command := <-pane.renderCommands:
+		case command := <-pane.commands:
 			stop(idle)
 			stop(maxAge)
 			idle, idleC, maxAge, maxC = nil, nil, nil, nil
@@ -105,15 +123,35 @@ func (s *sessionState) runPaneRenderer(pane *Pane, updates <-chan terminal.Updat
 					output = nil
 				}
 				command.done <- err
+			} else if command.resize != nil {
+				err := error(nil)
+				if pane.PTY != nil {
+					err = pty.Setsize(pane.PTY, &pty.Winsize{Cols: command.resize.cols, Rows: command.resize.rows})
+				}
+				pane.terminal.Resize(int(command.resize.cols), int(command.resize.rows))
+				pane.publishTerminalMetadata()
+				command.done <- err
+			} else if command.history != nil {
+				command.history <- captureTerminalHistorySnapshot(pane.terminal)
+				command.done <- nil
 			} else {
 				command.done <- nil
 			}
-		case update, ok := <-updates:
+		case data, ok := <-pane.ptyOutput:
 			if !ok {
 				flush()
 				return
 			}
-			mergeTerminalUpdate(&aggregate, update)
+			update := pane.terminal.Apply(data)
+			ptyReadBuffers.Put(data[:cap(data)])
+			for _, reply := range update.Replies {
+				if err := pane.sendOwnedInput(reply); err != nil {
+					return
+				}
+			}
+			update.Replies = nil
+			pane.publishTerminalMetadata()
+			aggregate.Merge(update, pane.terminal.Rows)
 			if !pending {
 				pending = true
 				maxAge = time.NewTimer(renderMaxBatchAge)
@@ -126,43 +164,10 @@ func (s *sessionState) runPaneRenderer(pane *Pane, updates <-chan terminal.Updat
 			flush()
 		case <-maxC:
 			flush()
+		case <-pane.done:
+			return
 		}
 	}
-}
-
-func mergeTerminalUpdate(dst *terminal.Update, src terminal.Update) {
-	if dst.DirtyRows == nil {
-		dst.DirtyRows = make(map[int]struct{})
-	}
-	if dst.DirtySpans == nil {
-		dst.DirtySpans = make(map[int]terminal.DirtySpan)
-	}
-	if dst.DefinedStyles == nil {
-		dst.DefinedStyles = make(map[uint32]terminal.Style)
-	}
-	for row := range src.DirtyRows {
-		dst.DirtyRows[row] = struct{}{}
-	}
-	for row, span := range src.DirtySpans {
-		current, ok := dst.DirtySpans[row]
-		if !ok {
-			dst.DirtySpans[row] = span
-			continue
-		}
-		if span.Start < current.Start {
-			current.Start = span.Start
-		}
-		if span.End > current.End {
-			current.End = span.End
-		}
-		dst.DirtySpans[row] = current
-	}
-	for id, style := range src.DefinedStyles {
-		dst.DefinedStyles[id] = style
-	}
-	dst.FullRedraw = dst.FullRedraw || src.FullRedraw
-	dst.CursorChanged = dst.CursorChanged || src.CursorChanged
-	dst.VisibleChange = dst.VisibleChange || src.VisibleChange
 }
 
 func (s *sessionState) emitHistoryMove(pane *Pane, move historyMove) error {
@@ -171,8 +176,6 @@ func (s *sessionState) emitHistoryMove(pane *Pane, move historyMove) error {
 		return nil
 	}
 	return pane.applyRender(func(output *renderOutput) error {
-		pane.terminalMu.Lock()
-		defer pane.terminalMu.Unlock()
 		if move.Delta != 0 {
 			if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: move.Delta}); err != nil {
 				return err
@@ -245,9 +248,6 @@ func (s *sessionState) emitTerminalUpdate(output *renderOutput, pane *Pane, upda
 	if update.FullRedraw {
 		return s.sendFullRender(output, pane)
 	}
-	pane.terminalMu.Lock()
-	defer pane.terminalMu.Unlock()
-
 	rows := make([]int, 0, len(update.DirtySpans))
 	for row := range update.DirtySpans {
 		rows = append(rows, row)
@@ -256,9 +256,9 @@ func (s *sessionState) emitTerminalUpdate(output *renderOutput, pane *Pane, upda
 	runs := make([]displayCellRun, 0, len(rows))
 	for _, row := range rows {
 		span := update.DirtySpans[row]
-		start := row*pane.Terminal.Cols + span.Start
-		end := row*pane.Terminal.Cols + span.End
-		runs = append(runs, displayCellRun{Row: row, Column: span.Start, Cells: append([]protocol.Cell(nil), pane.Terminal.Cells[start:end]...)})
+		start := row*pane.terminal.Cols + span.Start
+		end := row*pane.terminal.Cols + span.End
+		runs = append(runs, displayCellRun{Row: row, Column: span.Start, Cells: append([]protocol.Cell(nil), pane.terminal.Cells[start:end]...)})
 	}
 	neededStyles := make(map[uint32]struct{})
 	for id := range update.DefinedStyles {
@@ -270,7 +270,7 @@ func (s *sessionState) emitTerminalUpdate(output *renderOutput, pane *Pane, upda
 		}
 	}
 	styleByID := make(map[uint32]protocol.Style)
-	for _, def := range pane.Terminal.SnapshotStyles() {
+	for _, def := range pane.terminal.SnapshotStyles() {
 		styleByID[def.ID] = def.Style
 	}
 	styleIDs := make([]int, 0, len(neededStyles))
@@ -288,7 +288,14 @@ func (s *sessionState) emitTerminalUpdate(output *renderOutput, pane *Pane, upda
 		styles = append(styles, protocol.StyleDefinition{ID: id, Style: style})
 	}
 	if len(styles) == 0 && len(runs) == 0 && !update.CursorChanged && !update.VisibleChange {
-		return nil
+		if update.ScrollDelta == 0 {
+			return nil
+		}
+	}
+	if update.ScrollDelta != 0 {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: update.ScrollDelta}); err != nil {
+			return err
+		}
 	}
 	for _, def := range styles {
 		if err := installStyle(output, def.ID, def.Style); err != nil {
@@ -302,7 +309,7 @@ func (s *sessionState) emitTerminalUpdate(output *renderOutput, pane *Pane, upda
 		}
 	}
 	if update.CursorChanged || update.VisibleChange {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY}, Visible: pane.Terminal.CursorVisible}}); err != nil {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.terminal.CursorX, Y: pane.terminal.CursorY}, Visible: pane.terminal.CursorVisible}}); err != nil {
 			return err
 		}
 	}
@@ -310,9 +317,7 @@ func (s *sessionState) emitTerminalUpdate(output *renderOutput, pane *Pane, upda
 }
 
 func (s *sessionState) sendFullRender(output *renderOutput, pane *Pane) error {
-	pane.terminalMu.Lock()
-	defer pane.terminalMu.Unlock()
-	styleDefs := pane.Terminal.SnapshotStyles()
+	styleDefs := pane.terminal.SnapshotStyles()
 	styleByID := make(map[uint32]protocol.Style, len(styleDefs))
 	for _, def := range styleDefs {
 		styleByID[def.ID] = def.Style
@@ -321,13 +326,13 @@ func (s *sessionState) sendFullRender(output *renderOutput, pane *Pane) error {
 		}
 	}
 	compiler := newDisplayCompiler(output, styleByID)
-	for row := 0; row < pane.Terminal.Rows; row++ {
-		start := row * pane.Terminal.Cols
-		if err := compiler.writeCells(row, 0, pane.Terminal.Cells[start:start+pane.Terminal.Cols]); err != nil {
+	for row := 0; row < pane.terminal.Rows; row++ {
+		start := row * pane.terminal.Cols
+		if err := compiler.writeCells(row, 0, pane.terminal.Cells[start:start+pane.terminal.Cols]); err != nil {
 			return err
 		}
 	}
-	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY}, Visible: pane.Terminal.CursorVisible}}); err != nil {
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.terminal.CursorX, Y: pane.terminal.CursorY}, Visible: pane.terminal.CursorVisible}}); err != nil {
 		return err
 	}
 	return output.present()
@@ -341,8 +346,6 @@ func (s *sessionState) sendCurrentViewSnapshot(output *renderOutput, pane *Pane)
 }
 
 func (s *sessionState) sendHistorySnapshot(output *renderOutput, pane *Pane, view *HistoryView) error {
-	pane.terminalMu.Lock()
-	defer pane.terminalMu.Unlock()
 	snapshot := view.Snapshot
 	for _, def := range snapshot.Styles {
 		if err := installStyle(output, def.ID, def.Style); err != nil {

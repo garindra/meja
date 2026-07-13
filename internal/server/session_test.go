@@ -306,9 +306,9 @@ func TestCreateWindowSizePrefersClientDimensionsOverSplitPane(t *testing.T) {
 	client.TerminalCols = 120
 	client.TerminalRows = 39
 
-	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash", Terminal: terminal.New(120, 39)}
+	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash", terminal: terminal.New(120, 39)}
 	s.CreateWindow(pane0, 0)
-	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs", Terminal: terminal.New(59, 39)}
+	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs", terminal: terminal.New(59, 39)}
 	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}

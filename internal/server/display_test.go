@@ -66,7 +66,7 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 	client := session.NewClient(0)
 	client.TerminalCols = 8
 	client.TerminalRows = 3
-	pane := &Pane{ID: session.AddPaneID(), Terminal: terminal.New(8, 3)}
+	pane := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 3)}
 	session.CreateWindow(pane, 0)
 	var wire bytes.Buffer
 	state := &sessionState{session: session}
@@ -82,11 +82,10 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 }
 
 func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
-	pane := &Pane{ID: 1, Terminal: terminal.New(8, 3), renderCommands: make(chan paneRenderCommand), rendererDone: make(chan struct{})}
+	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
 	handler := &connectionHandler{state: &sessionState{session: NewSession(0)}}
-	updates := make(chan terminal.Update)
-	go handler.state.runPaneRenderer(pane, updates)
-	defer close(updates)
+	output := startTestPaneLoop(handler.state, pane)
+	defer close(output)
 
 	var first, second bytes.Buffer
 	if err := pane.attachOutput(&first, func(output *renderOutput) error {
@@ -135,11 +134,10 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 }
 
 func TestOldStreamCleanupDoesNotDetachReplacement(t *testing.T) {
-	pane := &Pane{ID: 1, Terminal: terminal.New(8, 3), renderCommands: make(chan paneRenderCommand), rendererDone: make(chan struct{})}
+	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
 	handler := &connectionHandler{state: &sessionState{session: NewSession(0)}}
-	updates := make(chan terminal.Update)
-	go handler.state.runPaneRenderer(pane, updates)
-	defer close(updates)
+	output := startTestPaneLoop(handler.state, pane)
+	defer close(output)
 
 	var oldStream, replacement bytes.Buffer
 	if err := pane.attachOutput(&oldStream, nil); err != nil {
@@ -165,11 +163,10 @@ func TestOldStreamCleanupDoesNotDetachReplacement(t *testing.T) {
 }
 
 func TestPaneRendererCanAttachReplacementAfterWriteFailure(t *testing.T) {
-	pane := &Pane{ID: 1, Terminal: terminal.New(8, 3), renderCommands: make(chan paneRenderCommand), rendererDone: make(chan struct{})}
+	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
 	handler := &connectionHandler{state: &sessionState{session: NewSession(0)}}
-	updates := make(chan terminal.Update)
-	go handler.state.runPaneRenderer(pane, updates)
-	defer close(updates)
+	output := startTestPaneLoop(handler.state, pane)
+	defer close(output)
 
 	writeErr := errors.New("stream closed")
 	if err := pane.attachOutput(errorWriter{err: writeErr}, func(output *renderOutput) error {
@@ -202,17 +199,15 @@ func TestOutputHandoffAttachesEachReleasedSlotImmediately(t *testing.T) {
 	client := session.NewClient(0)
 	client.TerminalCols = 16
 	client.TerminalRows = 4
-	first := &Pane{ID: session.AddPaneID(), Terminal: terminal.New(8, 4), renderCommands: make(chan paneRenderCommand, 2), rendererDone: make(chan struct{})}
-	second := &Pane{ID: session.AddPaneID(), Terminal: terminal.New(8, 4), renderCommands: make(chan paneRenderCommand, 2), rendererDone: make(chan struct{})}
+	first := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 4)}
+	second := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 4)}
 	session.CreateWindow(first, 0)
 	if _, _, err := session.SplitFocusedPane(0, second, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
-	firstUpdates := make(chan terminal.Update)
-	secondUpdates := make(chan terminal.Update)
 	handler := &connectionHandler{state: &sessionState{session: session}}
-	go handler.state.runPaneRenderer(first, firstUpdates)
-	go handler.state.runPaneRenderer(second, secondUpdates)
+	firstUpdates := startTestPaneLoop(handler.state, first)
+	secondUpdates := startTestPaneLoop(handler.state, second)
 	defer close(firstUpdates)
 	defer close(secondUpdates)
 
@@ -352,19 +347,22 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 	}
 }
 
-func startTestPaneRenderer(handler *connectionHandler, id uint64, cols, rows int) (*Pane, chan terminal.Update) {
-	pane := &Pane{ID: id, Terminal: terminal.New(cols, rows), renderCommands: make(chan paneRenderCommand, 2), rendererDone: make(chan struct{})}
-	updates := make(chan terminal.Update)
-	go handler.state.runPaneRenderer(pane, updates)
-	return pane, updates
+func startTestPaneRenderer(handler *connectionHandler, id uint64, cols, rows int) (*Pane, chan []byte) {
+	pane := &Pane{ID: id, terminal: terminal.New(cols, rows)}
+	return pane, startTestPaneLoop(handler.state, pane)
+}
+
+func startTestPaneLoop(state *sessionState, pane *Pane) chan []byte {
+	pane.initializeRuntime()
+	go state.runPane(pane)
+	return pane.ptyOutput
 }
 
 func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
-	pane := &Pane{ID: 1, Terminal: terminal.New(8, 3), renderCommands: make(chan paneRenderCommand, 2), rendererDone: make(chan struct{})}
+	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
 	handler := &connectionHandler{state: &sessionState{session: NewSession(0)}}
-	updates := make(chan terminal.Update)
-	go handler.state.runPaneRenderer(pane, updates)
-	defer close(updates)
+	output := startTestPaneLoop(handler.state, pane)
+	defer close(output)
 
 	stream := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
 	attached := make(chan error, 1)
@@ -395,13 +393,12 @@ func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
 
 func TestPaneReleaseAcknowledgesRendererExit(t *testing.T) {
 	for attempt := 0; attempt < 100; attempt++ {
-		pane := &Pane{ID: 1, Terminal: terminal.New(8, 3), renderCommands: make(chan paneRenderCommand, 2), rendererDone: make(chan struct{})}
+		pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
 		handler := &connectionHandler{state: &sessionState{session: NewSession(0)}}
-		updates := make(chan terminal.Update)
-		go handler.state.runPaneRenderer(pane, updates)
+		output := startTestPaneLoop(handler.state, pane)
 		released := make(chan int, 1)
 		pane.releaseOutput(0, released)
-		close(updates)
+		close(output)
 		select {
 		case slot := <-released:
 			if slot != 0 {
@@ -558,14 +555,12 @@ func TestColoredEraseInstallsReferencedStyle(t *testing.T) {
 	client := session.NewClient(0)
 	client.TerminalCols = 8
 	client.TerminalRows = 3
-	pane := &Pane{ID: session.AddPaneID(), Terminal: terminal.New(8, 3)}
+	pane := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 3)}
 	session.CreateWindow(pane, 0)
 	output := newRenderOutput()
 	state := &sessionState{session: session}
 	handler := &connectionHandler{state: state}
-	pane.terminalMu.Lock()
-	update := pane.Terminal.Apply([]byte("\x1b[44m\x1b[2K"))
-	pane.terminalMu.Unlock()
+	update := pane.terminal.Apply([]byte("\x1b[44m\x1b[2K"))
 	if err := handler.state.emitTerminalUpdate(output, pane, update); err != nil {
 		t.Fatal(err)
 	}
@@ -579,6 +574,59 @@ func TestColoredEraseInstallsReferencedStyle(t *testing.T) {
 				t.Fatalf("style %d selected before installation", command.StyleID)
 			}
 		}
+	}
+}
+
+func TestBottomEdgeOutputEmitsScrollBeforeNewRow(t *testing.T) {
+	session := NewSession(0)
+	client := session.NewClient(0)
+	client.TerminalCols = 3
+	client.TerminalRows = 3
+	pane := &Pane{ID: session.AddPaneID(), terminal: terminal.New(3, 2)}
+	session.CreateWindow(pane, 0)
+	pane.terminal.Apply([]byte("aaa\r\nbbb"))
+	update := pane.terminal.Apply([]byte("\r\nccc"))
+
+	var wire bytes.Buffer
+	state := &sessionState{session: session}
+	if err := state.emitTerminalUpdate(newRenderOutput(&wire), pane, update); err != nil {
+		t.Fatal(err)
+	}
+	commands := decodePendingCommands(t, wire.Bytes())
+	if len(commands) == 0 || commands[0].Opcode != protocol.DisplayOpcodeScroll || commands[0].Delta != -1 {
+		t.Fatalf("first command = %#v, want scroll -1", commands)
+	}
+	positions := 0
+	for _, command := range commands {
+		if command.Opcode != protocol.DisplayOpcodeSetWritePosition {
+			continue
+		}
+		positions++
+		if command.Row != 1 {
+			t.Fatalf("write position row = %d, want only bottom row 1", command.Row)
+		}
+	}
+	if positions != 1 {
+		t.Fatalf("write positions = %d, want one bottom-row write", positions)
+	}
+}
+
+func TestMergedDamageMovesWithLaterScroll(t *testing.T) {
+	aggregate := terminal.Update{}
+	aggregate.Merge(terminal.Update{
+		DirtyRows:  map[int]struct{}{1: {}},
+		DirtySpans: map[int]terminal.DirtySpan{1: {Start: 0, End: 3}},
+	}, 3)
+	aggregate.Merge(terminal.Update{ScrollDelta: -1}, 3)
+
+	if aggregate.ScrollDelta != -1 {
+		t.Fatalf("scroll delta = %d, want -1", aggregate.ScrollDelta)
+	}
+	if _, ok := aggregate.DirtySpans[0]; !ok {
+		t.Fatalf("damage was not shifted with scroll: %#v", aggregate.DirtySpans)
+	}
+	if _, ok := aggregate.DirtySpans[1]; ok {
+		t.Fatalf("old damage row survived scroll: %#v", aggregate.DirtySpans)
 	}
 }
 

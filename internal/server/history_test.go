@@ -9,21 +9,21 @@ import (
 )
 
 func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {
-	pane := &Pane{ID: 0, Terminal: terminal.New(4, 3)}
-	pane.Terminal.History = []terminal.Row{
+	pane := &Pane{ID: 0, terminal: terminal.New(4, 3)}
+	pane.terminal.History = []terminal.Row{
 		historyTestRow("old1"),
 		historyTestRow("old2"),
 	}
-	pane.Terminal.GridRows = []terminal.Row{
+	pane.terminal.GridRows = []terminal.Row{
 		historyTestRow("live"),
 		historyTestRow("mid "),
 		historyTestRow("end "),
 	}
-	pane.Terminal.CursorY = 2
-	pane.Terminal.Cells = append(append(append([]protocol.Cell{}, pane.Terminal.GridRows[0].Cells...), pane.Terminal.GridRows[1].Cells...), pane.Terminal.GridRows[2].Cells...)
+	pane.terminal.CursorY = 2
+	pane.terminal.Cells = append(append(append([]protocol.Cell{}, pane.terminal.GridRows[0].Cells...), pane.terminal.GridRows[1].Cells...), pane.terminal.GridRows[2].Cells...)
 
-	snapshot := captureHistorySnapshot(pane)
-	pane.Terminal.History[0].Cells[0].Rune = 'X'
+	snapshot := captureTerminalHistorySnapshot(pane.terminal)
+	pane.terminal.History[0].Cells[0].Rune = 'X'
 	if got := string(snapshot.Rows[0].Cells[0].Rune); got != "o" {
 		t.Fatalf("snapshot aliased canonical history: %q", got)
 	}
@@ -51,19 +51,19 @@ func TestClientRetainsHistoryViewsForMultiplePanes(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
 	client.TerminalCols, client.TerminalRows = 8, 4
-	pane0 := &Pane{ID: s.AddPaneID(), Terminal: terminal.New(8, 4)}
+	pane0 := &Pane{ID: s.AddPaneID(), terminal: terminal.New(8, 4)}
 	s.CreateWindow(pane0, 0)
-	pane1 := &Pane{ID: s.AddPaneID(), Terminal: terminal.New(8, 4)}
+	pane1 := &Pane{ID: s.AddPaneID(), terminal: terminal.New(8, 4)}
 	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
-	if err := s.InstallHistoryView(0, pane1.ID, captureHistorySnapshot(pane1)); err != nil {
+	if err := s.InstallHistoryView(0, pane1.ID, captureTerminalHistorySnapshot(pane1.terminal)); err != nil {
 		t.Fatalf("install pane1 history = %v", err)
 	}
 	if _, _, err := s.FocusPane(0, pane0.ID); err != nil {
 		t.Fatalf("FocusPane() error = %v", err)
 	}
-	if err := s.InstallHistoryView(0, pane0.ID, captureHistorySnapshot(pane0)); err != nil {
+	if err := s.InstallHistoryView(0, pane0.ID, captureTerminalHistorySnapshot(pane0.terminal)); err != nil {
 		t.Fatalf("install pane0 history = %v", err)
 	}
 	if s.HistoryView(0, pane0.ID) == nil || s.HistoryView(0, pane1.ID) == nil {

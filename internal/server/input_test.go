@@ -41,7 +41,7 @@ func TestServerConsumesPrefixCommandsAndForwardsLiteralBytes(t *testing.T) {
 func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	s := NewSession(1)
 	s.NewClient(0)
-	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash", Terminal: terminal.New(80, 24)}, 0)
+	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash", terminal: terminal.New(80, 24)}, 0)
 	var input bytes.Buffer
 	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: []byte{0x02, 'd', 0x02, 'd'}})
 	if err != nil {
@@ -167,7 +167,7 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	pane := &Pane{ID: s.AddPaneID(), PTY: writer, Terminal: terminal.New(80, 23), Title: "bash"}
+	pane := &Pane{ID: s.AddPaneID(), PTY: writer, terminal: terminal.New(80, 23), Title: "bash"}
 	window, _ := s.CreateWindow(pane, 0)
 	if _, err := s.BeginRenameWindowPrompt(0); err != nil {
 		t.Fatal(err)
@@ -228,9 +228,9 @@ func TestServerOwnsLastAndRelativeWindowSelection(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
 	client.TerminalCols, client.TerminalRows = 80, 23
-	first := &Pane{ID: s.AddPaneID(), Terminal: terminal.New(80, 23)}
+	first := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 23)}
 	window1, _ := s.CreateWindow(first, 0)
-	second := &Pane{ID: s.AddPaneID(), Terminal: terminal.New(80, 23)}
+	second := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 23)}
 	window2, _ := s.CreateWindow(second, 0)
 	if got, ok := s.LastWindowID(0); !ok || got != window1.ID {
 		t.Fatalf("LastWindowID() = %d, %v; want %d, true", got, ok, window1.ID)
@@ -250,9 +250,9 @@ func TestServerGeometricFocusHandlesPaneZero(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
 	client.TerminalCols, client.TerminalRows = 80, 23
-	top := &Pane{ID: s.AddPaneID(), Terminal: terminal.New(80, 23)}
+	top := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 23)}
 	s.CreateWindow(top, 0)
-	bottom := &Pane{ID: s.AddPaneID(), Terminal: terminal.New(80, 23)}
+	bottom := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 23)}
 	if _, _, err := s.SplitFocusedPane(0, bottom, SplitHorizontal); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}

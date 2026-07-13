@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"io"
 	"strconv"
 
 	"tali/internal/protocol"
@@ -35,15 +36,13 @@ type historyMove struct {
 	Changed    bool
 }
 
-func captureHistorySnapshot(pane *Pane) *HistorySnapshot {
-	pane.terminalMu.Lock()
-	defer pane.terminalMu.Unlock()
-	history, primary := pane.Terminal.SnapshotRows()
-	cols, rows := pane.Terminal.Cols, pane.Terminal.Rows
+func captureTerminalHistorySnapshot(state *terminal.TerminalState) *HistorySnapshot {
+	history, primary := state.SnapshotRows()
+	cols, rows := state.Cols, state.Rows
 	projected := projectHistoryRows(history, cols)
 	initialTop := len(projected)
 	projected = append(projected, normalizeRows(primary, cols)...)
-	styles := pane.Terminal.SnapshotStyles()
+	styles := state.SnapshotStyles()
 	styleDefs := make([]protocol.StyleDefinition, 0, len(styles)+1)
 	var maxStyleID uint32
 	for _, def := range styles {
@@ -67,8 +66,31 @@ func captureHistorySnapshot(pane *Pane) *HistorySnapshot {
 		Cols:          cols,
 		ViewportRows:  rows,
 		InitialTop:    initialTop,
-		InitialCursor: protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY},
+		InitialCursor: protocol.Cursor{X: state.CursorX, Y: state.CursorY},
 		CounterStyle:  counterStyle,
+	}
+}
+
+func (p *Pane) captureHistorySnapshot() (*HistorySnapshot, error) {
+	if p.commands == nil {
+		return captureTerminalHistorySnapshot(p.terminal), nil
+	}
+	result := make(chan *HistorySnapshot, 1)
+	done := make(chan error, 1)
+	select {
+	case p.commands <- paneCommand{history: result, done: done}:
+	case <-p.mainDone:
+		return nil, io.ErrClosedPipe
+	case <-p.done:
+		return nil, io.ErrClosedPipe
+	}
+	select {
+	case snapshot := <-result:
+		return snapshot, nil
+	case <-p.mainDone:
+		return nil, io.ErrClosedPipe
+	case <-p.done:
+		return nil, io.ErrClosedPipe
 	}
 }
 

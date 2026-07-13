@@ -824,10 +824,7 @@ func (s *Session) ResizeAll(cols, rows uint16) {
 	}
 	s.mu.Unlock()
 	for _, target := range targets {
-		_ = target.pane.Resize(uint16(target.rect.Width), uint16(target.rect.Height))
-		target.pane.terminalMu.Lock()
-		target.pane.Terminal.Resize(target.rect.Width, target.rect.Height)
-		target.pane.terminalMu.Unlock()
+		_ = target.pane.resize(uint16(target.rect.Width), uint16(target.rect.Height))
 	}
 }
 

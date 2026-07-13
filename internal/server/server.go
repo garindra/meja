@@ -14,7 +14,6 @@ import (
 
 	"tali/internal/control"
 	"tali/internal/protocol"
-	"tali/internal/server/terminal"
 )
 
 const (
@@ -239,84 +238,96 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 }
 
 func (c *connectionHandler) startPane(pane *Pane) {
-	updates := make(chan terminal.Update, 256)
-	pane.renderCommands = make(chan paneRenderCommand, 2)
-	pane.rendererDone = make(chan struct{})
-	go c.state.runPaneRenderer(pane, updates)
-	go relayPTYToTerminal(pane, updates)
+	pane.initializeRuntime()
+	go c.state.runPane(pane)
+	go relayPTYOutput(pane)
+	go runPTYWriter(pane, func(error) {
+		_ = terminatePane(pane)
+		_ = c.handlePaneProcessExit(pane.ID)
+	})
 	go func() {
 		_ = pane.Process.Wait()
-		_ = pane.PTY.Close()
+		pane.stop()
 		_ = c.handlePaneProcessExit(pane.ID)
 	}()
 }
 
 func (p *Pane) attachOutput(stream io.Writer, refresh func(*renderOutput) error) error {
-	if p.renderCommands == nil {
+	if p.commands == nil {
 		if refresh == nil {
 			return nil
 		}
 		return refresh(newRenderOutput(stream))
 	}
 	select {
-	case p.renderCommands <- paneRenderCommand{attach: stream, refresh: refresh}:
+	case p.commands <- paneCommand{attach: stream, refresh: refresh}:
 		return nil
-	case <-p.rendererDone:
+	case <-p.mainDone:
+		return nil
+	case <-p.done:
 		return nil
 	}
 }
 
 func (p *Pane) detachOutput(stream io.Writer) error {
-	if p.renderCommands == nil {
+	if p.commands == nil {
 		return nil
 	}
-	return p.sendRenderCommand(paneRenderCommand{detach: stream})
+	return p.sendRenderCommand(paneCommand{detach: stream})
 }
 
 func (p *Pane) releaseOutput(slot int, done chan<- int) {
-	if p.renderCommands == nil {
+	if p.commands == nil {
 		done <- slot
 		return
 	}
 	release := &paneOutputRelease{slot: slot, done: done, acked: make(chan struct{})}
 	select {
-	case p.renderCommands <- paneRenderCommand{release: release}:
+	case p.commands <- paneCommand{release: release}:
 		go func() {
 			select {
-			case <-p.rendererDone:
+			case <-p.mainDone:
 				release.acknowledge()
 			case <-release.acked:
 			}
 		}()
-	case <-p.rendererDone:
+	case <-p.mainDone:
+		release.acknowledge()
+	case <-p.done:
 		release.acknowledge()
 	}
 }
 
 func (p *Pane) applyRender(render func(*renderOutput) error) error {
-	if p.renderCommands == nil {
+	if p.commands == nil {
 		return nil
 	}
-	return p.sendRenderCommand(paneRenderCommand{apply: render})
+	return p.sendRenderCommand(paneCommand{apply: render})
 }
 
-func (p *Pane) sendRenderCommand(command paneRenderCommand) error {
+func (p *Pane) sendRenderCommand(command paneCommand) error {
 	done := make(chan error, 1)
 	command.done = done
 	select {
-	case p.renderCommands <- command:
-	case <-p.rendererDone:
+	case p.commands <- command:
+	case <-p.mainDone:
+		return nil
+	case <-p.done:
 		return nil
 	}
 	select {
 	case err := <-done:
 		return err
-	case <-p.rendererDone:
+	case <-p.mainDone:
+		return nil
+	case <-p.done:
 		return nil
 	}
 }
 
 func (c *connectionHandler) handlePaneProcessExit(paneID uint64) error {
+	// Pane lifetime is session-owned and can outlive the connection that
+	// started it, so process exit is intentionally not connection-gated.
 	return c.state.coordinate(func() error { return c.handlePaneProcessExitNow(paneID) })
 }
 
@@ -472,7 +483,7 @@ func (c *connectionHandler) handleInput(decoder *protocol.Decoder, done chan<- e
 					break
 				}
 				if translated, consumed, ok := translateApplicationCursor(msg.Data[index:], c.state.session.InputIsNormal(clientID0) && pane.UsesApplicationCursorKeys()); ok {
-					if _, err := pane.WriteInput(translated); err != nil {
+					if err := pane.sendInput(translated); err != nil {
 						done <- fmt.Errorf("write application cursor input: %w", err)
 						return
 					}
@@ -539,8 +550,7 @@ func (c *connectionHandler) handleServerInputEvent(event serverInputEvent) (bool
 		if pane == nil {
 			return false, nil
 		}
-		_, err := pane.WriteInput([]byte{event.Byte})
-		if err != nil {
+		if err := pane.sendInput([]byte{event.Byte}); err != nil {
 			return false, fmt.Errorf("write pty: %w", err)
 		}
 		return false, nil
@@ -707,7 +717,11 @@ func (c *connectionHandler) commandEnterHistoryNow() error {
 		return nil
 	}
 	handoff := c.state.beginOutputHandoff()
-	if err := c.state.session.InstallHistoryView(clientID0, pane.ID, captureHistorySnapshot(pane)); err != nil {
+	snapshot, err := pane.captureHistorySnapshot()
+	if err != nil {
+		return err
+	}
+	if err := c.state.session.InstallHistoryView(clientID0, pane.ID, snapshot); err != nil {
 		return err
 	}
 	return c.state.publishBindingsAndSnapshots(handoff)
@@ -838,9 +852,7 @@ func terminatePane(pane *Pane) error {
 	if pane.Process != nil && pane.Process.Process != nil {
 		_ = pane.Process.Process.Signal(syscall.SIGHUP)
 	}
-	if pane.PTY != nil {
-		_ = pane.PTY.Close()
-	}
+	pane.stop()
 	return nil
 }
 

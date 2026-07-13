@@ -5,6 +5,7 @@ import "unicode/utf8"
 type Update struct {
 	DirtyRows     map[int]struct{}
 	DirtySpans    map[int]DirtySpan
+	ScrollDelta   int
 	FullRedraw    bool
 	DefinedStyles map[uint32]Style
 	CursorChanged bool
@@ -254,7 +255,7 @@ func (t *TerminalState) Apply(data []byte) Update {
 					t.CursorX = 0
 				}
 				if t.lineFeed() {
-					update.FullRedraw = true
+					update.recordScroll(t.fullViewportScrollDelta(-1), t.Rows)
 				}
 				t.wrapPending = false
 				update.CursorChanged = true
@@ -372,7 +373,7 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 		t.CursorX = 0
 		if t.CursorY == t.Rows-1 {
 			t.scrollUp()
-			update.FullRedraw = true
+			update.recordScroll(t.fullViewportScrollDelta(-1), t.Rows)
 		} else {
 			t.CursorY++
 		}
@@ -691,6 +692,75 @@ func (u *Update) markDirty(row, start, end, cols int) {
 	u.DirtySpans[row] = span
 }
 
+func (u *Update) recordScroll(delta, rows int) {
+	if delta == 0 || (u.ScrollDelta != 0 && (u.ScrollDelta < 0) != (delta < 0)) {
+		u.FullRedraw = true
+		u.ScrollDelta = 0
+		return
+	}
+	if u.FullRedraw {
+		return
+	}
+	shiftedRows := make(map[int]struct{}, len(u.DirtyRows))
+	shiftedSpans := make(map[int]DirtySpan, len(u.DirtySpans))
+	for row, span := range u.DirtySpans {
+		row += delta
+		if row < 0 || row >= rows {
+			continue
+		}
+		shiftedRows[row] = struct{}{}
+		shiftedSpans[row] = span
+	}
+	u.DirtyRows = shiftedRows
+	u.DirtySpans = shiftedSpans
+	u.ScrollDelta += delta
+	if u.ScrollDelta < -rows {
+		u.ScrollDelta = -rows
+	} else if u.ScrollDelta > rows {
+		u.ScrollDelta = rows
+	}
+}
+
+func (u *Update) Merge(next Update, rows int) {
+	if u.DirtyRows == nil {
+		u.DirtyRows = make(map[int]struct{})
+	}
+	if u.DirtySpans == nil {
+		u.DirtySpans = make(map[int]DirtySpan)
+	}
+	if u.DefinedStyles == nil {
+		u.DefinedStyles = make(map[uint32]Style)
+	}
+	if next.FullRedraw {
+		u.FullRedraw = true
+		u.ScrollDelta = 0
+	} else if next.ScrollDelta != 0 {
+		u.recordScroll(next.ScrollDelta, rows)
+	}
+	for row := range next.DirtyRows {
+		u.DirtyRows[row] = struct{}{}
+	}
+	for row, span := range next.DirtySpans {
+		current, ok := u.DirtySpans[row]
+		if !ok {
+			u.DirtySpans[row] = span
+			continue
+		}
+		if span.Start < current.Start {
+			current.Start = span.Start
+		}
+		if span.End > current.End {
+			current.End = span.End
+		}
+		u.DirtySpans[row] = current
+	}
+	for id, style := range next.DefinedStyles {
+		u.DefinedStyles[id] = style
+	}
+	u.CursorChanged = u.CursorChanged || next.CursorChanged
+	u.VisibleChange = u.VisibleChange || next.VisibleChange
+}
+
 func (t *TerminalState) fillRow(row, start, end int, styleID uint32) {
 	if row < 0 || row >= t.Rows {
 		return
@@ -822,7 +892,7 @@ func (t *TerminalState) reverseIndex(update *Update) {
 		return
 	}
 	t.scrollDownRegion(t.ScrollTop, t.ScrollBottom)
-	update.FullRedraw = true
+	update.recordScroll(t.fullViewportScrollDelta(1), t.Rows)
 	update.CursorChanged = true
 }
 
@@ -938,6 +1008,13 @@ func (t *TerminalState) lineFeed() bool {
 	}
 	t.CursorY++
 	return false
+}
+
+func (t *TerminalState) fullViewportScrollDelta(delta int) int {
+	if t.ScrollTop == 0 && t.ScrollBottom == t.Rows-1 {
+		return delta
+	}
+	return 0
 }
 
 func (t *TerminalState) styleID(style Style) (uint32, bool) {
