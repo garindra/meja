@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -448,6 +449,17 @@ func (c *connectionHandler) handleInput(decoder *protocol.Decoder, done chan<- e
 			if err != nil {
 				done <- err
 				return
+			}
+			pane, _ := c.state.session.ActivePane(clientID0)
+			if pane != nil && c.state.session.InputIsNormal(clientID0) &&
+				!c.state.session.IsHistoryPane(clientID0, pane.ID) &&
+				bytes.IndexByte(msg.Data, 0x02) < 0 &&
+				(!pane.UsesApplicationCursorKeys() || bytes.IndexByte(msg.Data, 0x1b) < 0) {
+				if err := pane.sendInput(msg.Data); err != nil {
+					done <- fmt.Errorf("write pty input: %w", err)
+					return
+				}
+				continue
 			}
 			for index := 0; index < len(msg.Data); index++ {
 				if c.state.session.ActivePrompt(clientID0) != nil {

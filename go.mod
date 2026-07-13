@@ -8,6 +8,7 @@ require (
 	github.com/creack/pty v1.1.21
 	github.com/quic-go/quic-go v0.48.2
 	golang.org/x/term v0.23.0
+	golang.org/x/text v0.17.0
 )
 
 require (

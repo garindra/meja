@@ -378,23 +378,62 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 			t.CursorY++
 		}
 	}
+	cellWidth := int(runeCellWidth(r))
+	if cellWidth > t.Cols {
+		cellWidth = 1
+	}
+	if t.CursorX+cellWidth > t.Cols {
+		t.setRowWrapped(t.CursorY, true)
+		t.CursorX = 0
+		if t.CursorY == t.Rows-1 {
+			t.scrollUp()
+			update.recordScroll(t.fullViewportScrollDelta(-1), t.Rows)
+		} else {
+			t.CursorY++
+		}
+	}
 	styleID, added := t.styleID(t.CurrentStyle)
 	if added {
 		update.DefinedStyles[styleID] = t.CurrentStyle
 	}
 	writtenColumn := t.CursorX
-	t.GridRows[t.CursorY].Cells[writtenColumn] = Cell{Rune: r, StyleID: styleID, Width: 1}
+	dirtyStart, dirtyEnd := t.clearGlyphsForWrite(t.CursorY, writtenColumn, cellWidth, styleID)
+	t.GridRows[t.CursorY].Cells[writtenColumn] = Cell{Rune: r, StyleID: styleID, Width: uint8(cellWidth)}
+	for column := writtenColumn + 1; column < writtenColumn+cellWidth; column++ {
+		t.GridRows[t.CursorY].Cells[column] = Cell{StyleID: styleID, Width: 0}
+	}
 	t.LastPrintedRune = r
 	t.LastPrintedValid = true
 	t.syncRowToCells(t.CursorY)
-	update.markDirty(t.CursorY, writtenColumn, writtenColumn+1, t.Cols)
-	if t.CursorX == t.Cols-1 {
+	update.markDirty(t.CursorY, dirtyStart, dirtyEnd, t.Cols)
+	if t.CursorX+cellWidth == t.Cols {
+		t.CursorX = t.Cols - 1
 		t.wrapPending = true
 	} else {
-		t.CursorX++
+		t.CursorX += cellWidth
 		t.setRowWrapped(t.CursorY, false)
 	}
 	update.CursorChanged = true
+}
+
+func (t *TerminalState) clearGlyphsForWrite(row, start, cellWidth int, styleID uint32) (int, int) {
+	dirtyStart, dirtyEnd := start, start+cellWidth
+	for column := start; column < start+cellWidth; column++ {
+		cell := t.GridRows[row].Cells[column]
+		switch {
+		case cell.Width == 2:
+			t.GridRows[row].Cells[column] = blankCell(styleID)
+			if column+1 < t.Cols {
+				t.GridRows[row].Cells[column+1] = blankCell(styleID)
+				dirtyEnd = max(dirtyEnd, column+2)
+			}
+		case cell.Width == 0 && column > 0 && t.GridRows[row].Cells[column-1].Width == 2:
+			t.GridRows[row].Cells[column-1] = blankCell(styleID)
+			t.GridRows[row].Cells[column] = blankCell(styleID)
+			dirtyStart = min(dirtyStart, column-1)
+		}
+	}
+	return dirtyStart, dirtyEnd
 }
 
 func (t *TerminalState) executeCSI(seq string, update *Update) {

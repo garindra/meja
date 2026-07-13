@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"os/user"
+	"slices"
 	"testing"
 	"time"
 
@@ -24,14 +26,16 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 	writeFailed := make(chan error, 1)
 	go runPTYWriter(pane, func(err error) { writeFailed <- err })
 
-	if err := pane.sendInput([]byte("user")); err != nil {
-		t.Fatal(err)
+	for _, b := range []byte("用户") {
+		if err := pane.sendInput([]byte{b}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	query := ptyReadBuffers.Get().([]byte)
 	n := copy(query, "\x1b[?1h\x1b[6n")
 	pane.ptyOutput <- query[:n]
 
-	want := []byte("user\x1b[1;1R")
+	want := []byte("用户\x1b[1;1R")
 	got := make([]byte, len(want))
 	readDone := make(chan error, 1)
 	go func() {
@@ -59,6 +63,17 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 	<-pane.mainDone
 	pane.stop()
 	<-pane.writerDone
+}
+
+func TestBuildEnvPreservesUTF8Locale(t *testing.T) {
+	t.Setenv("LANG", "zh_CN.UTF-8")
+	t.Setenv("LC_ALL", "")
+	t.Setenv("LC_CTYPE", "zh_CN.UTF-8")
+
+	env := buildEnv(&user.User{HomeDir: "/home/test", Username: "test"}, "/bin/sh")
+	if !slices.Contains(env, "LANG=zh_CN.UTF-8") || !slices.Contains(env, "LC_CTYPE=zh_CN.UTF-8") {
+		t.Fatalf("pane environment omitted UTF-8 locale: %#v", env)
+	}
 }
 
 func TestPaneResizeRunsOnPaneMainLoop(t *testing.T) {

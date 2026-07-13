@@ -1,11 +1,27 @@
 package render
 
 import (
+	"bytes"
 	"strings"
 	"tali/internal/protocol"
 	"testing"
 	"time"
 )
+
+func TestRenderCellRunSkipsWideContinuationCell(t *testing.T) {
+	var output bytes.Buffer
+	renderCellRun(&output, []composedCell{
+		{Rune: '界', Width: 2, Style: defaultStyle()},
+		{Width: 0, Style: defaultStyle()},
+		{Rune: 'x', Width: 1, Style: defaultStyle()},
+	})
+	if !bytes.Contains(output.Bytes(), []byte("界x")) {
+		t.Fatalf("ANSI output=%q, want adjacent wide rune and x", output.Bytes())
+	}
+	if bytes.Contains(output.Bytes(), []byte("界 x")) {
+		t.Fatalf("ANSI output rendered continuation as a space: %q", output.Bytes())
+	}
+}
 
 func TestReconnectStatusPreservesExactMessageAndOrangeStyle(t *testing.T) {
 	state := NewClientState()

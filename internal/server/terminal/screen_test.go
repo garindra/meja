@@ -38,6 +38,39 @@ func TestFragmentedUTF8(t *testing.T) {
 	}
 }
 
+func TestChineseRuneOccupiesTwoCells(t *testing.T) {
+	term := New(5, 1)
+	encoded := []byte("界")
+	term.Apply(encoded[:1])
+	term.Apply(encoded[1:2])
+	update := term.Apply(encoded[2:])
+
+	if got := term.GridRows[0].Cells[0]; got.Rune != '界' || got.Width != 2 {
+		t.Fatalf("leading cell = %#v, want width-two 界", got)
+	}
+	if got := term.GridRows[0].Cells[1]; got.Width != 0 {
+		t.Fatalf("continuation cell = %#v, want width zero", got)
+	}
+	if term.CursorX != 2 {
+		t.Fatalf("cursor column = %d, want 2", term.CursorX)
+	}
+	if got, want := update.DirtySpans[0], (DirtySpan{Start: 0, End: 2}); got != want {
+		t.Fatalf("dirty span = %#v, want %#v", got, want)
+	}
+}
+
+func TestChineseRuneWrapsBeforeLastColumn(t *testing.T) {
+	term := New(4, 2)
+	term.Apply([]byte("abc界"))
+
+	if term.GridRows[1].Cells[0].Rune != '界' || term.GridRows[1].Cells[0].Width != 2 {
+		t.Fatalf("wrapped row = %#v", term.GridRows[1].Cells)
+	}
+	if term.CursorY != 1 || term.CursorX != 2 {
+		t.Fatalf("cursor = %d,%d, want 2,1", term.CursorX, term.CursorY)
+	}
+}
+
 func TestCROverwrite(t *testing.T) {
 	term := New(5, 1)
 	term.Apply([]byte("10%\r30%"))

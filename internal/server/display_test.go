@@ -611,6 +611,28 @@ func TestBottomEdgeOutputEmitsScrollBeforeNewRow(t *testing.T) {
 	}
 }
 
+func TestChineseTerminalOutputUsesWidthTwoDisplayCommand(t *testing.T) {
+	session := NewSession(0)
+	client := session.NewClient(0)
+	client.TerminalCols = 8
+	client.TerminalRows = 2
+	pane := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 1)}
+	session.CreateWindow(pane, 0)
+	update := pane.terminal.Apply([]byte("界"))
+
+	var wire bytes.Buffer
+	state := &sessionState{session: session}
+	if err := state.emitTerminalUpdate(newRenderOutput(&wire), pane, update); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range decodePendingCommands(t, wire.Bytes()) {
+		if command.Opcode == protocol.DisplayOpcodeWriteText && command.Width == 2 && string(command.Text) == "界" {
+			return
+		}
+	}
+	t.Fatalf("display commands did not contain width-two Chinese output: %#v", decodePendingCommands(t, wire.Bytes()))
+}
+
 func TestMergedDamageMovesWithLaterScroll(t *testing.T) {
 	aggregate := terminal.Update{}
 	aggregate.Merge(terminal.Update{

@@ -214,7 +214,7 @@ func resolveCommand(shell string, argv []string) (string, []string) {
 }
 
 func buildEnv(unixUser *user.User, shell string) []string {
-	return []string{
+	env := []string{
 		"HOME=" + unixUser.HomeDir,
 		"USER=" + unixUser.Username,
 		"LOGNAME=" + unixUser.Username,
@@ -222,6 +222,12 @@ func buildEnv(unixUser *user.User, shell string) []string {
 		"TERM=xterm-256color",
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	}
+	for _, key := range []string{"LANG", "LC_ALL", "LC_CTYPE"} {
+		if value, ok := os.LookupEnv(key); ok && value != "" {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
 }
 
 func loginShellForUser(unixUser *user.User) string {

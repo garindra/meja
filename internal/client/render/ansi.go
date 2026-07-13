@@ -80,7 +80,7 @@ func renderReconnectStatusBar(buf *bytes.Buffer, state *ClientState, now time.Ti
 	cells := make([]composedCell, state.TerminalCols)
 	style := protocol.Style{FG: protocol.Color{Mode: "rgb", R: 255, G: 165, B: 0}, BG: protocol.Color{Mode: "default"}}
 	for i := range cells {
-		cells[i] = composedCell{Rune: ' ', Style: style}
+		cells[i] = composedCell{Rune: ' ', Width: 1, Style: style}
 	}
 	for i, r := range []rune(text) {
 		if i >= len(cells) {
@@ -103,7 +103,7 @@ func renderStatusBar(buf *bytes.Buffer, state *ClientState) {
 			if r == 0 {
 				r = ' '
 			}
-			cells[i] = composedCell{Rune: r, Style: style}
+			cells[i] = composedCell{Rune: r, Width: src.Width, Style: style}
 		}
 		renderCellRun(buf, cells)
 		return
@@ -175,6 +175,9 @@ func renderCellRun(buf *bytes.Buffer, cells []composedCell) {
 	var currentStyle protocol.Style
 	hasStyle := false
 	for _, cell := range cells {
+		if cell.Width == 0 {
+			continue
+		}
 		if !hasStyle || cell.Style != currentStyle {
 			buf.WriteString(sgrForStyle(cell.Style))
 			currentStyle = cell.Style
@@ -194,6 +197,7 @@ func writeCursorPosition(buf *bytes.Buffer, row, col int) {
 
 type composedCell struct {
 	Rune  rune
+	Width uint8
 	Style protocol.Style
 }
 
@@ -217,7 +221,7 @@ func composeContent(state *ClientState) []composedCell {
 }
 
 func composeRowSpan(dst []composedCell, state *ClientState, placements []protocol.PanePlacement, row, startColumn int) {
-	defaultCell := composedCell{Rune: ' ', Style: defaultStyle()}
+	defaultCell := composedCell{Rune: ' ', Width: 1, Style: defaultStyle()}
 	for i := range dst {
 		column := startColumn + i
 		cell := defaultCell
@@ -244,13 +248,13 @@ func composeRowSpan(dst []composedCell, state *ClientState, placements []protoco
 				if r == 0 {
 					r = ' '
 				}
-				cell = composedCell{Rune: r, Style: style}
+				cell = composedCell{Rune: r, Width: src.Width, Style: style}
 			}
 			break
 		}
 		if !insidePane {
 			if border := paneBorderRune(placements, column, row); border != 0 {
-				cell = composedCell{Rune: border, Style: defaultCell.Style}
+				cell = composedCell{Rune: border, Width: 1, Style: defaultCell.Style}
 			}
 		}
 		dst[i] = cell

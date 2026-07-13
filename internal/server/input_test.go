@@ -204,6 +204,47 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 	}
 }
 
+func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 23
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	pane := &Pane{ID: s.AddPaneID(), PTY: writer, terminal: terminal.New(80, 23), Title: "bash"}
+	s.CreateWindow(pane, 0)
+
+	want := []byte("你好，世界")
+	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input bytes.Buffer
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	state := &sessionState{session: s}
+	handler := &connectionHandler{state: state, mgmtFrames: make(chan protocol.Frame, 1)}
+	state.attachConnection(handler.mgmtFrames, nil)
+	done := make(chan error, 1)
+	handler.handleInput(protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("PTY input = %q, want %q", got, want)
+	}
+}
+
 func TestPromptBufferIsRuneAware(t *testing.T) {
 	s := NewSession(0)
 	s.NewClient(0)
