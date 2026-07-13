@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -23,8 +24,37 @@ type Pane struct {
 	Terminal *terminal.TerminalState
 	Title    string
 
-	writeMu    sync.Mutex
-	terminalMu sync.Mutex
+	writeMu        sync.Mutex
+	terminalMu     sync.Mutex
+	renderCommands chan paneRenderCommand
+	rendererDone   chan struct{}
+
+	// Owned exclusively by the pane renderer goroutine. Production attaches
+	// the actual QUIC stream; tests can provide the narrower write capability.
+	outputStream io.Writer
+}
+
+type paneRenderCommand struct {
+	attach  io.Writer
+	detach  io.Writer
+	release *paneOutputRelease
+	refresh func(*renderOutput) error
+	apply   func(*renderOutput) error
+	done    chan error
+}
+
+type paneOutputRelease struct {
+	slot  int
+	done  chan<- int
+	acked chan struct{}
+	once  sync.Once
+}
+
+func (r *paneOutputRelease) acknowledge() {
+	r.once.Do(func() {
+		r.done <- r.slot
+		close(r.acked)
+	})
 }
 
 func (p *Pane) TerminalSize() (int, int) {

@@ -8,7 +8,6 @@ import (
 	"os/user"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -53,22 +52,46 @@ type sessionState struct {
 	resumeTokens   map[string]uint64
 	generation     uint64
 	activeConn     quic.Connection
+	mgmtFrames     chan protocol.Frame
+	outputStreams  map[int]io.Writer
+	operations     chan sessionOperation
+}
 
-	mu                sync.RWMutex
-	outputFrames      map[int]*renderOutput
-	renderMu          sync.Mutex
-	currentConnection atomic.Pointer[controller]
+type sessionOperation struct {
+	run  func() error
+	done chan error
+}
+
+func (s *sessionState) coordinate(run func() error) error {
+	if s.operations == nil {
+		return run()
+	}
+	done := make(chan error, 1)
+	s.operations <- sessionOperation{run: run, done: done}
+	return <-done
+}
+
+func (s *sessionState) runOperations() {
+	for operation := range s.operations {
+		operation.done <- operation.run()
+	}
 }
 
 type controller struct {
-	ctx             context.Context
-	state           *sessionState
-	shell           string
-	mgmtFrames      chan protocol.Frame
-	outputFrames    map[int]*renderOutput
-	defaultCwd      string
-	defaultArgv     []string
-	installedStyles map[int]map[uint32]protocol.Style
+	state       *sessionState
+	shell       string
+	mgmtFrames  chan protocol.Frame
+	defaultCwd  string
+	defaultArgv []string
+}
+
+func (c *controller) coordinate(run func() error) error {
+	return c.state.coordinate(func() error {
+		if c.state.currentManagementFrames() != c.mgmtFrames {
+			return nil
+		}
+		return run()
+	})
 }
 
 func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
@@ -159,7 +182,7 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 	}
 	shell := loginShellForUser(current)
 
-	outputFrames := make(map[int]*renderOutput, int(protocol.MaxRenderSlots))
+	outputStreams := make(map[int]io.Writer, int(protocol.MaxRenderSlots))
 	for slot := 0; slot < int(protocol.MaxRenderSlots); slot++ {
 		outputStream, err := conn.OpenStreamSync(ctx)
 		if err != nil {
@@ -172,23 +195,20 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 		if err := protocol.NewEncoder(outputStream).WriteFrame(protocol.Frame{Type: protocol.MsgOpenPaneOutputStream, Payload: openPayload}); err != nil {
 			return err
 		}
-		frames := newRenderOutput()
-		outputFrames[slot] = frames
-		go writeDisplayStream(outputStream, frames.batches, frames.recycle, writerErrs)
-		defer close(frames.batches)
-		s.setOutputFrames(slot, frames)
-		defer s.clearOutputFrames(slot, frames)
+		outputStreams[slot] = outputStream
 	}
 
 	ctrl := &controller{
-		ctx:             ctx,
-		state:           s,
-		shell:           shell,
-		mgmtFrames:      mgmtFrames,
-		outputFrames:    outputFrames,
-		installedStyles: make(map[int]map[uint32]protocol.Style),
+		state:      s,
+		shell:      shell,
+		mgmtFrames: mgmtFrames,
 	}
-	s.currentConnection.Store(ctrl)
+	s.attachConnection(mgmtFrames, outputStreams)
+	defer func() {
+		_ = conn.CloseWithError(0, "")
+		_ = ctrl.detachStreams(outputStreams)
+		s.detachConnection(mgmtFrames)
+	}()
 	s.session.EnsureClient(clientID0)
 
 	createPane, err := expectDecoded(mgmtDecoder, protocol.MsgCreatePane, protocol.DecodeCreatePane)
@@ -197,26 +217,27 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 	}
 	ctrl.defaultCwd = createPane.Cwd
 	ctrl.defaultArgv = append([]string(nil), createPane.Argv...)
-	s.session.SetClientSize(clientID0, createPane.Cols, createPane.Rows)
-	if !s.session.HasWindows() {
-		initialPane, _, _, err := ctrl.createWindow(createPane.Cwd, createPane.Argv, createPane.Cols, createPane.Rows)
-		if err != nil {
-			return err
+	if err := s.coordinate(func() error {
+		s.session.SetClientSize(clientID0, createPane.Cols, createPane.Rows)
+		if !s.session.HasWindows() {
+			initialPane, _, _, err := ctrl.createWindow(createPane.Cwd, createPane.Argv, createPane.Cols, createPane.Rows)
+			if err != nil {
+				return err
+			}
+			if err := sendEncoded(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: initialPane.ID}, protocol.EncodePaneCreated); err != nil {
+				return err
+			}
+			if err := ctrl.publishStatusBar(); err != nil {
+				return err
+			}
+			if err := ctrl.publishWindowLayout(); err != nil {
+				return err
+			}
+			ctrl.startPane(initialPane)
+			return ctrl.publishBindingsAndSnapshots(nil)
 		}
-		if err := sendEncoded(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: initialPane.ID}, protocol.EncodePaneCreated); err != nil {
-			return err
-		}
-		if err := ctrl.publishStatusBar(); err != nil {
-			return err
-		}
-		if err := ctrl.publishWindowLayout(); err != nil {
-			return err
-		}
-		if err := ctrl.publishBindingsAndSnapshots(); err != nil {
-			return err
-		}
-		ctrl.startPane(initialPane)
-	} else {
+
+		handoff := ctrl.beginOutputHandoff()
 		s.session.ResizeAll(createPane.Cols, createPane.Rows)
 		_, pane, _, err := s.session.ReattachClient(clientID0)
 		if err != nil {
@@ -231,9 +252,9 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 		if err := ctrl.publishWindowLayout(); err != nil {
 			return err
 		}
-		if err := ctrl.publishBindingsAndSnapshots(); err != nil {
-			return err
-		}
+		return ctrl.publishBindingsAndSnapshots(handoff)
+	}); err != nil {
+		return err
 	}
 
 	mgmtErrs := make(chan error, 1)
@@ -255,18 +276,91 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 
 func (c *controller) startPane(pane *Pane) {
 	updates := make(chan terminal.Update, 256)
-	go c.publishTerminalUpdates(pane, updates)
+	pane.renderCommands = make(chan paneRenderCommand, 2)
+	pane.rendererDone = make(chan struct{})
+	go c.runPaneRenderer(pane, updates)
 	go c.relayPTYToTerminal(pane, updates)
 	go func() {
 		_ = pane.Process.Wait()
 		_ = pane.PTY.Close()
-		if connection := c.state.currentConnection.Load(); connection != nil {
-			_ = connection.handlePaneProcessExit(pane.ID)
-		}
+		_ = c.handlePaneProcessExit(pane.ID)
 	}()
 }
 
+func (p *Pane) attachOutput(stream io.Writer, refresh func(*renderOutput) error) error {
+	if p.renderCommands == nil {
+		if refresh == nil {
+			return nil
+		}
+		return refresh(newRenderOutput(stream))
+	}
+	select {
+	case p.renderCommands <- paneRenderCommand{attach: stream, refresh: refresh}:
+		return nil
+	case <-p.rendererDone:
+		return nil
+	}
+}
+
+func (p *Pane) detachOutput(stream io.Writer) error {
+	if p.renderCommands == nil {
+		return nil
+	}
+	return p.sendRenderCommand(paneRenderCommand{detach: stream})
+}
+
+func (p *Pane) releaseOutput(slot int, done chan<- int) {
+	if p.renderCommands == nil {
+		done <- slot
+		return
+	}
+	release := &paneOutputRelease{slot: slot, done: done, acked: make(chan struct{})}
+	select {
+	case p.renderCommands <- paneRenderCommand{release: release}:
+		go func() {
+			select {
+			case <-p.rendererDone:
+				release.acknowledge()
+			case <-release.acked:
+			}
+		}()
+	case <-p.rendererDone:
+		release.acknowledge()
+	}
+}
+
+func (p *Pane) applyRender(render func(*renderOutput) error) error {
+	if p.renderCommands == nil {
+		return nil
+	}
+	return p.sendRenderCommand(paneRenderCommand{apply: render})
+}
+
+func (p *Pane) sendRenderCommand(command paneRenderCommand) error {
+	done := make(chan error, 1)
+	command.done = done
+	select {
+	case p.renderCommands <- command:
+	case <-p.rendererDone:
+		return nil
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-p.rendererDone:
+		return nil
+	}
+}
+
 func (c *controller) handlePaneProcessExit(paneID uint64) error {
+	return c.state.coordinate(func() error { return c.handlePaneProcessExitNow(paneID) })
+}
+
+func (c *controller) handlePaneProcessExitNow(paneID uint64) error {
+	if c.state.session.Pane(paneID) == nil {
+		return nil
+	}
+	handoff := c.beginOutputHandoff()
 	window, clientState, finalPane, removed, err := c.state.session.RemovePane(paneID, clientID0)
 	if err != nil || !removed {
 		return err
@@ -293,7 +387,7 @@ func (c *controller) handlePaneProcessExit(paneID uint64) error {
 	if err := c.publishWindowLayout(); err != nil {
 		return err
 	}
-	return c.publishBindingsAndSnapshots()
+	return c.publishBindingsAndSnapshots(handoff)
 }
 
 func (c *controller) createWindow(cwd string, argv []string, cols, rows uint16) (*Pane, *Window, *ClientState, error) {
@@ -455,8 +549,11 @@ func (c *controller) handleInput(decoder *protocol.Decoder, done chan<- error) {
 }
 
 func (c *controller) resizeClient(cols, rows uint16) error {
-	c.state.renderMu.Lock()
-	defer c.state.renderMu.Unlock()
+	return c.coordinate(func() error { return c.resizeClientNow(cols, rows) })
+}
+
+func (c *controller) resizeClientNow(cols, rows uint16) error {
+	handoff := c.beginOutputHandoff()
 	c.state.session.ClearHistoryViews()
 	c.state.session.SetClientSize(clientID0, cols, rows)
 	c.state.session.ResizeAll(cols, rows)
@@ -466,7 +563,7 @@ func (c *controller) resizeClient(cols, rows uint16) error {
 	if err := c.publishWindowLayout(); err != nil {
 		return err
 	}
-	return c.publishVisibleSnapshotsLocked()
+	return c.publishVisibleSnapshots(handoff)
 }
 
 func (c *controller) handleServerInputEvent(event serverInputEvent) (bool, error) {
@@ -512,11 +609,12 @@ func (c *controller) handleServerInputEvent(event serverInputEvent) (bool, error
 	case serverCommandEnterHistory:
 		return false, c.commandEnterHistory()
 	case serverCommandFocusDirection:
-		_, _, err := c.state.session.FocusPaneDirection(clientID0, event.Direction)
-		if err != nil {
-			return false, err
-		}
-		return false, c.publishWindowLayout()
+		return false, c.coordinate(func() error {
+			if _, _, err := c.state.session.FocusPaneDirection(clientID0, event.Direction); err != nil {
+				return err
+			}
+			return c.publishWindowLayout()
+		})
 	case serverCommandBeginPrompt:
 		return false, c.commandBeginRenameWindowPrompt()
 	case serverCommandPrompt:
@@ -552,6 +650,11 @@ func (c *controller) handlePromptEvent(event serverInputEvent) error {
 }
 
 func (c *controller) commandCreateWindow() error {
+	return c.coordinate(c.commandCreateWindowNow)
+}
+
+func (c *controller) commandCreateWindowNow() error {
+	handoff := c.beginOutputHandoff()
 	cols, rows, err := c.createWindowSize()
 	if err != nil {
 		return err
@@ -566,14 +669,19 @@ func (c *controller) commandCreateWindow() error {
 	if err := c.publishWindowLayout(); err != nil {
 		return err
 	}
-	if err := c.publishBindingsAndSnapshots(); err != nil {
+	c.startPane(pane)
+	if err := c.publishBindingsAndSnapshots(handoff); err != nil {
 		return err
 	}
-	c.startPane(pane)
 	return nil
 }
 
 func (c *controller) commandSelectWindow(windowID uint64) error {
+	return c.coordinate(func() error { return c.commandSelectWindowNow(windowID) })
+}
+
+func (c *controller) commandSelectWindowNow(windowID uint64) error {
+	handoff := c.beginOutputHandoff()
 	if _, _, err := c.state.session.SelectWindow(clientID0, windowID); err != nil {
 		return err
 	}
@@ -583,16 +691,21 @@ func (c *controller) commandSelectWindow(windowID uint64) error {
 	if err := c.publishWindowLayout(); err != nil {
 		return err
 	}
-	return c.publishBindingsAndSnapshots()
+	return c.publishBindingsAndSnapshots(handoff)
 }
 
 func (c *controller) commandSplit(direction SplitDirection) error {
+	return c.coordinate(func() error { return c.commandSplitNow(direction) })
+}
+
+func (c *controller) commandSplitNow(direction SplitDirection) error {
 	activePane, clientState := c.state.session.ActivePane(clientID0)
 	if activePane == nil || clientState == nil {
 		return nil
 	}
 	if err := c.state.session.CanSplitFocusedPane(clientID0); err != nil {
-		return c.publishVisibleSnapshots()
+		handoff := c.beginOutputHandoff()
+		return c.publishVisibleSnapshots(handoff)
 	}
 	paneID := c.state.session.AddPaneID()
 	cols, rows := activePane.TerminalSize()
@@ -600,6 +713,7 @@ func (c *controller) commandSplit(direction SplitDirection) error {
 	if err != nil {
 		return fmt.Errorf("start split pane: %w", err)
 	}
+	handoff := c.beginOutputHandoff()
 	_, clientState, err = c.state.session.SplitFocusedPane(clientID0, newPane, direction)
 	if err != nil {
 		_ = terminatePane(newPane)
@@ -609,27 +723,38 @@ func (c *controller) commandSplit(direction SplitDirection) error {
 	if err := c.publishWindowLayout(); err != nil {
 		return err
 	}
-	if err := c.publishBindingsAndSnapshots(); err != nil {
+	c.startPane(newPane)
+	if err := c.publishBindingsAndSnapshots(handoff); err != nil {
 		return err
 	}
-	c.startPane(newPane)
 	return nil
 }
 
 func (c *controller) commandEnterHistory() error {
+	return c.coordinate(c.commandEnterHistoryNow)
+}
+
+func (c *controller) commandEnterHistoryNow() error {
 	pane, clientState := c.state.session.ActivePane(clientID0)
 	if pane == nil || clientState == nil {
 		return nil
 	}
-	if !c.state.session.IsHistoryPane(clientID0, pane.ID) {
-		if err := c.state.session.InstallHistoryView(clientID0, pane.ID, captureHistorySnapshot(pane)); err != nil {
-			return err
-		}
+	if c.state.session.IsHistoryPane(clientID0, pane.ID) {
+		return nil
 	}
-	return c.publishBindingsAndSnapshots()
+	handoff := c.beginOutputHandoff()
+	if err := c.state.session.InstallHistoryView(clientID0, pane.ID, captureHistorySnapshot(pane)); err != nil {
+		return err
+	}
+	return c.publishBindingsAndSnapshots(handoff)
 }
 
 func (c *controller) commandClosePane() error {
+	return c.coordinate(c.commandClosePaneNow)
+}
+
+func (c *controller) commandClosePaneNow() error {
+	handoff := c.beginOutputHandoff()
 	closedPane, window, clientState, windowClosed, _, autoCreate, err := c.state.session.CloseFocusedPane(clientID0)
 	if err != nil {
 		return err
@@ -655,12 +780,16 @@ func (c *controller) commandClosePane() error {
 		if err := c.publishWindowLayout(); err != nil {
 			return err
 		}
-		return c.publishBindingsAndSnapshots()
+		return c.publishBindingsAndSnapshots(handoff)
 	}
 	return nil
 }
 
 func (c *controller) handleHistoryInput(pane *Pane, data []byte) error {
+	return c.coordinate(func() error { return c.handleHistoryInputNow(pane, data) })
+}
+
+func (c *controller) handleHistoryInputNow(pane *Pane, data []byte) error {
 	for len(data) > 0 {
 		direction, count, exit, consumed := decodeHistoryInput(data)
 		if consumed <= 0 {
@@ -668,20 +797,18 @@ func (c *controller) handleHistoryInput(pane *Pane, data []byte) error {
 		}
 		data = data[min(consumed, len(data)):]
 		if exit {
-			c.state.renderMu.Lock()
-			defer c.state.renderMu.Unlock()
+			handoff := c.beginOutputHandoff()
 			if bindings, ok := c.state.session.exitHistoryAndRebuild(clientID0, pane.ID); ok {
-				return c.publishBindingSnapshotsLocked(bindings)
+				return c.finishOutputHandoff(handoff, bindings)
 			}
 			return nil
 		}
 		if count < 0 {
 			if c.state.session.jumpHistory(clientID0, pane.ID, count == -1) {
-				binding, ok := c.state.session.BindingForPane(clientID0, pane.ID)
 				window := c.windowForPane(pane.ID)
 				view := c.state.session.HistoryView(clientID0, pane.ID)
-				if ok && window != nil && view != nil {
-					if err := c.sendHistorySnapshotSerialized(binding, pane, view); err != nil {
+				if window != nil && view != nil {
+					if err := c.sendHistorySnapshotSerialized(pane, view); err != nil {
 						return err
 					}
 				}
@@ -741,38 +868,30 @@ func decodeHistoryInput(data []byte) (direction, count int, exit bool, consumed 
 }
 
 func (c *controller) emitHistoryMove(pane *Pane, move historyMove) error {
-	c.state.renderMu.Lock()
-	defer c.state.renderMu.Unlock()
 	view := c.state.session.HistoryView(clientID0, pane.ID)
 	if view == nil {
 		return nil
 	}
-	binding, ok := c.state.session.BindingForPane(clientID0, pane.ID)
-	if !ok {
-		return nil
-	}
-	outputFrames := c.state.currentOutputFrames(binding.Slot)
-	if outputFrames == nil {
-		return nil
-	}
-	pane.terminalMu.Lock()
-	defer pane.terminalMu.Unlock()
-	if move.Delta != 0 {
-		if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: move.Delta}); err != nil {
+	return pane.applyRender(func(outputFrames *renderOutput) error {
+		pane.terminalMu.Lock()
+		defer pane.terminalMu.Unlock()
+		if move.Delta != 0 {
+			if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: move.Delta}); err != nil {
+				return err
+			}
+		}
+		runs := historyMoveRuns(view, move)
+		compiler := newDisplayCompiler(outputFrames, styleDefinitionsMap(view.Snapshot.Styles))
+		for _, run := range runs {
+			if err := compiler.writeCells(run.Row, run.Column, run.Cells); err != nil {
+				return err
+			}
+		}
+		if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: move.Cursor, Visible: true}}); err != nil {
 			return err
 		}
-	}
-	runs := historyMoveRuns(view, move)
-	compiler := newDisplayCompiler(outputFrames, styleDefinitionsMap(view.Snapshot.Styles))
-	for _, run := range runs {
-		if err := compiler.writeCells(run.Row, run.Column, run.Cells); err != nil {
-			return err
-		}
-	}
-	if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: move.Cursor, Visible: true}}); err != nil {
-		return err
-	}
-	return outputFrames.present()
+		return outputFrames.present()
+	})
 }
 
 type displayCellRun struct {
@@ -852,7 +971,9 @@ func (c *controller) relayPTYToTerminal(pane *Pane, updates chan<- terminal.Upda
 	}
 }
 
-func (c *controller) publishTerminalUpdates(pane *Pane, updates <-chan terminal.Update) {
+func (c *controller) runPaneRenderer(pane *Pane, updates <-chan terminal.Update) {
+	defer close(pane.rendererDone)
+	var output *renderOutput
 	var aggregate terminal.Update
 	var idle, maxAge *time.Timer
 	var idleC, maxC <-chan time.Time
@@ -865,9 +986,9 @@ func (c *controller) publishTerminalUpdates(pane *Pane, updates <-chan terminal.
 			}
 		}
 	}
-	flush := func() bool {
+	flush := func() {
 		if !pending {
-			return true
+			return
 		}
 		stop(idle)
 		stop(maxAge)
@@ -875,11 +996,56 @@ func (c *controller) publishTerminalUpdates(pane *Pane, updates <-chan terminal.
 		current := aggregate
 		aggregate = terminal.Update{}
 		pending = false
-		connection := c.state.currentConnection.Load()
-		return connection == nil || connection.emitTerminalUpdate(pane, current) == nil
+		if output != nil {
+			if err := c.emitTerminalUpdate(output, pane, current); err != nil {
+				output = nil
+				pane.outputStream = nil
+			}
+		}
 	}
 	for {
 		select {
+		case command := <-pane.renderCommands:
+			stop(idle)
+			stop(maxAge)
+			idle, idleC, maxAge, maxC = nil, nil, nil, nil
+			aggregate = terminal.Update{}
+			pending = false
+			if command.release != nil {
+				pane.outputStream = nil
+				output = nil
+				command.release.acknowledge()
+				continue
+			}
+			if command.detach != nil {
+				if pane.outputStream == command.detach {
+					pane.outputStream = nil
+					output = nil
+				}
+				command.done <- nil
+				continue
+			}
+			if command.attach != nil {
+				pane.outputStream = command.attach
+				output = newRenderOutput(command.attach)
+				if command.refresh != nil {
+					if err := command.refresh(output); err != nil {
+						pane.outputStream = nil
+						output = nil
+					}
+				}
+				continue
+			}
+			if command.apply != nil && output != nil {
+				err := command.apply(output)
+				if err != nil {
+					pane.outputStream = nil
+					output = nil
+				}
+				command.done <- err
+			} else {
+				command.done <- nil
+			}
 		case update, ok := <-updates:
 			if !ok {
 				flush()
@@ -895,13 +1061,9 @@ func (c *controller) publishTerminalUpdates(pane *Pane, updates <-chan terminal.
 			idle = time.NewTimer(renderIdleFlush)
 			idleC = idle.C
 		case <-idleC:
-			if !flush() {
-				return
-			}
+			flush()
 		case <-maxC:
-			if !flush() {
-				return
-			}
+			flush()
 		}
 	}
 }
@@ -941,18 +1103,8 @@ func mergeTerminalUpdate(dst *terminal.Update, src terminal.Update) {
 	dst.VisibleChange = dst.VisibleChange || src.VisibleChange
 }
 
-func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) error {
-	c.state.renderMu.Lock()
-	defer c.state.renderMu.Unlock()
+func (c *controller) emitTerminalUpdate(outputFrames *renderOutput, pane *Pane, update terminal.Update) error {
 	if c.state.session.IsHistoryPane(clientID0, pane.ID) {
-		return nil
-	}
-	binding, ok := c.state.session.BindingForPane(clientID0, pane.ID)
-	if !ok {
-		return nil
-	}
-	outputFrames := c.state.currentOutputFrames(binding.Slot)
-	if outputFrames == nil {
 		return nil
 	}
 	window := c.windowForPane(pane.ID)
@@ -960,7 +1112,7 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		return nil
 	}
 	if update.FullRedraw {
-		return c.sendFullRender(binding, pane)
+		return c.sendFullRender(outputFrames, pane)
 	}
 	pane.terminalMu.Lock()
 	defer pane.terminalMu.Unlock()
@@ -1012,7 +1164,7 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		return nil
 	}
 	for _, def := range styles {
-		if err := c.installStyle(binding.Slot, outputFrames, def.ID, def.Style); err != nil {
+		if err := installStyle(outputFrames, def.ID, def.Style); err != nil {
 			return err
 		}
 	}
@@ -1030,18 +1182,14 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 	return outputFrames.present()
 }
 
-func (c *controller) sendFullRender(binding RenderBinding, pane *Pane) error {
-	outputFrames := c.outputFrames[binding.Slot]
-	if outputFrames == nil {
-		return fmt.Errorf("missing output stream for slot %d", binding.Slot)
-	}
+func (c *controller) sendFullRender(outputFrames *renderOutput, pane *Pane) error {
 	pane.terminalMu.Lock()
 	defer pane.terminalMu.Unlock()
 	styleDefs := pane.Terminal.SnapshotStyles()
 	styleByID := make(map[uint32]protocol.Style, len(styleDefs))
 	for _, def := range styleDefs {
 		styleByID[def.ID] = def.Style
-		if err := c.installStyle(binding.Slot, outputFrames, def.ID, def.Style); err != nil {
+		if err := installStyle(outputFrames, def.ID, def.Style); err != nil {
 			return err
 		}
 	}
@@ -1058,23 +1206,19 @@ func (c *controller) sendFullRender(binding RenderBinding, pane *Pane) error {
 	return outputFrames.present()
 }
 
-func (c *controller) sendCurrentViewSnapshot(binding RenderBinding, pane *Pane) error {
+func (c *controller) sendCurrentViewSnapshot(outputFrames *renderOutput, pane *Pane) error {
 	if view := c.state.session.HistoryView(clientID0, pane.ID); view != nil {
-		return c.sendHistorySnapshot(binding, pane, view)
+		return c.sendHistorySnapshot(outputFrames, pane, view)
 	}
-	return c.sendFullRender(binding, pane)
+	return c.sendFullRender(outputFrames, pane)
 }
 
-func (c *controller) sendHistorySnapshot(binding RenderBinding, pane *Pane, view *HistoryView) error {
-	outputFrames := c.outputFrames[binding.Slot]
-	if outputFrames == nil {
-		return fmt.Errorf("missing output stream for slot %d", binding.Slot)
-	}
+func (c *controller) sendHistorySnapshot(outputFrames *renderOutput, pane *Pane, view *HistoryView) error {
 	pane.terminalMu.Lock()
 	defer pane.terminalMu.Unlock()
 	snapshot := view.Snapshot
 	for _, def := range snapshot.Styles {
-		if err := c.installStyle(binding.Slot, outputFrames, def.ID, def.Style); err != nil {
+		if err := installStyle(outputFrames, def.ID, def.Style); err != nil {
 			return err
 		}
 	}
@@ -1092,34 +1236,24 @@ func (c *controller) sendHistorySnapshot(binding RenderBinding, pane *Pane, view
 	return outputFrames.present()
 }
 
-func (c *controller) installStyle(slot int, output *renderOutput, id uint32, style protocol.Style) error {
+func installStyle(output *renderOutput, id uint32, style protocol.Style) error {
 	if id == protocol.CanonicalDefaultStyleID && !protocol.IsCanonicalDefaultStyle(style) {
 		return fmt.Errorf("style %d must be canonical default", id)
 	}
-	if c.installedStyles == nil {
-		c.installedStyles = make(map[int]map[uint32]protocol.Style)
-	}
-	styles := c.installedStyles[slot]
-	if styles == nil {
-		styles = make(map[uint32]protocol.Style)
-		c.installedStyles[slot] = styles
-	}
-	if installed, ok := styles[id]; ok && installed == style {
+	if installed, ok := output.installedStyles[id]; ok && installed == style {
 		return nil
 	}
 	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: id, Style: style}); err != nil {
 		return err
 	}
-	styles[id] = style
+	output.installedStyles[id] = style
 	return nil
 }
 
-func (c *controller) resetInstalledStyles(slot int) { delete(c.installedStyles, slot) }
-
-func (c *controller) sendHistorySnapshotSerialized(binding RenderBinding, pane *Pane, view *HistoryView) error {
-	c.state.renderMu.Lock()
-	defer c.state.renderMu.Unlock()
-	return c.sendHistorySnapshot(binding, pane, view)
+func (c *controller) sendHistorySnapshotSerialized(pane *Pane, view *HistoryView) error {
+	return pane.applyRender(func(output *renderOutput) error {
+		return c.sendHistorySnapshot(output, pane, view)
+	})
 }
 
 func (c *controller) publishStatusBar() error {
@@ -1162,7 +1296,11 @@ func (c *controller) publishStatusBar() error {
 		cells[column].Rune = r
 		column++
 	}
-	return sendEncoded(c.mgmtFrames, protocol.MsgStatusBar, protocol.StatusBar{
+	mgmtFrames := c.state.currentManagementFrames()
+	if mgmtFrames == nil {
+		return nil
+	}
+	return sendEncoded(mgmtFrames, protocol.MsgStatusBar, protocol.StatusBar{
 		Cols:   width,
 		Cells:  cells,
 		Styles: []protocol.StyleDefinition{{ID: 0, Style: style}},
@@ -1174,71 +1312,106 @@ func (c *controller) publishWindowLayout() error {
 	if err != nil {
 		return err
 	}
-	return sendEncoded(c.mgmtFrames, protocol.MsgWindowLayout, layout, protocol.EncodeWindowLayout)
+	mgmtFrames := c.state.currentManagementFrames()
+	if mgmtFrames == nil {
+		return nil
+	}
+	return sendEncoded(mgmtFrames, protocol.MsgWindowLayout, layout, protocol.EncodeWindowLayout)
 }
 
-func (c *controller) publishBindingsAndSnapshots() error {
-	c.state.renderMu.Lock()
-	defer c.state.renderMu.Unlock()
+type outputHandoff struct {
+	released chan int
+	pending  map[int]struct{}
+}
+
+func (c *controller) beginOutputHandoff() *outputHandoff {
+	bindings, _ := c.state.session.RenderBindings(clientID0)
+	handoff := &outputHandoff{
+		released: make(chan int, len(bindings)),
+		pending:  make(map[int]struct{}, len(bindings)),
+	}
+	for _, binding := range bindings {
+		pane := c.state.session.Pane(binding.PaneID)
+		if pane == nil {
+			continue
+		}
+		handoff.pending[binding.Slot] = struct{}{}
+		pane.releaseOutput(binding.Slot, handoff.released)
+	}
+	return handoff
+}
+
+func (c *controller) publishBindingsAndSnapshots(handoff *outputHandoff) error {
 	bindings, _, _, err := c.state.session.RebuildRenderBindings(clientID0)
 	if err != nil {
 		return err
 	}
-	return c.publishBindingSnapshotsLocked(bindings)
+	return c.finishOutputHandoff(handoff, bindings)
 }
 
-func (c *controller) publishBindingSnapshotsLocked(bindings []RenderBinding) error {
+func (c *controller) finishOutputHandoff(handoff *outputHandoff, bindings []RenderBinding) error {
+	bySlot := make(map[int]RenderBinding, len(bindings))
 	for _, binding := range bindings {
-		pane := c.state.session.Panes[binding.PaneID]
-		window := c.windowForPane(binding.PaneID)
-		if pane == nil || window == nil {
-			continue
+		bySlot[binding.Slot] = binding
+	}
+	if handoff == nil {
+		for _, binding := range bindings {
+			if err := c.attachBinding(binding); err != nil {
+				return err
+			}
 		}
-		outputFrames := c.outputFrames[binding.Slot]
-		if outputFrames == nil {
-			return fmt.Errorf("missing output stream for slot %d", binding.Slot)
+		return nil
+	}
+	for _, binding := range bindings {
+		if _, waiting := handoff.pending[binding.Slot]; !waiting {
+			if err := c.attachBinding(binding); err != nil {
+				return err
+			}
 		}
-		if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: window.LayoutRevision}); err != nil {
-			return err
-		}
-		c.resetInstalledStyles(binding.Slot)
-		if err := c.installStyle(binding.Slot, outputFrames, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {
-			return err
-		}
-		if err := c.sendCurrentViewSnapshot(binding, pane); err != nil {
-			return err
+	}
+	for range handoff.pending {
+		slot := <-handoff.released
+		if binding, ok := bySlot[slot]; ok {
+			if err := c.attachBinding(binding); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func (c *controller) publishVisibleSnapshots() error {
-	c.state.renderMu.Lock()
-	defer c.state.renderMu.Unlock()
-	return c.publishVisibleSnapshotsLocked()
+func (c *controller) attachBinding(binding RenderBinding) error {
+	pane := c.state.session.Pane(binding.PaneID)
+	window := c.windowForPane(binding.PaneID)
+	if pane == nil || window == nil {
+		return nil
+	}
+	stream := c.state.currentOutputStream(binding.Slot)
+	if stream == nil {
+		return nil
+	}
+	return pane.attachOutput(stream, func(output *renderOutput) error {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: window.LayoutRevision}); err != nil {
+			return err
+		}
+		if err := installStyle(output, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {
+			return err
+		}
+		return c.sendCurrentViewSnapshot(output, pane)
+	})
 }
 
-func (c *controller) publishVisibleSnapshotsLocked() error {
+func (c *controller) publishVisibleSnapshots(handoff *outputHandoff) error {
 	bindings, _ := c.state.session.RenderBindings(clientID0)
-	for _, binding := range bindings {
-		pane := c.state.session.Panes[binding.PaneID]
-		window := c.windowForPane(binding.PaneID)
-		if pane == nil || window == nil {
-			continue
-		}
-		outputFrames := c.outputFrames[binding.Slot]
-		if outputFrames == nil {
-			return fmt.Errorf("missing output stream for slot %d", binding.Slot)
-		}
-		if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: window.LayoutRevision}); err != nil {
-			return err
-		}
-		c.resetInstalledStyles(binding.Slot)
-		if err := c.installStyle(binding.Slot, outputFrames, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {
-			return err
-		}
-		if err := c.sendCurrentViewSnapshot(binding, pane); err != nil {
-			return err
+	return c.finishOutputHandoff(handoff, bindings)
+}
+
+func (c *controller) detachStreams(streams map[int]io.Writer) error {
+	for _, pane := range c.state.session.PanesSnapshot() {
+		for _, stream := range streams {
+			if err := pane.detachOutput(stream); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1260,10 +1433,12 @@ func terminatePane(pane *Pane) error {
 	if pane == nil {
 		return nil
 	}
-	if pane.Process.Process != nil {
+	if pane.Process != nil && pane.Process.Process != nil {
 		_ = pane.Process.Process.Signal(syscall.SIGHUP)
 	}
-	_ = pane.PTY.Close()
+	if pane.PTY != nil {
+		_ = pane.PTY.Close()
+	}
 	return nil
 }
 
@@ -1332,23 +1507,22 @@ func writeStream(stream io.Writer, frames <-chan protocol.Frame, errs chan<- err
 }
 
 type renderOutput struct {
-	batches chan []byte
-	recycle chan []byte
-	pending []byte
+	stream          io.Writer
+	pending         []byte
+	installedStyles map[uint32]protocol.Style
 }
 
-func newRenderOutput() *renderOutput {
-	return &renderOutput{batches: make(chan []byte, 256), recycle: make(chan []byte, 2)}
+func newRenderOutput(stream ...io.Writer) *renderOutput {
+	output := &renderOutput{stream: io.Discard, installedStyles: make(map[uint32]protocol.Style)}
+	if len(stream) > 0 {
+		output.stream = stream[0]
+	}
+	return output
 }
 
 func (o *renderOutput) append(command protocol.DisplayCommand) error {
 	if o.pending == nil {
-		select {
-		case o.pending = <-o.recycle:
-			o.pending = o.pending[:0]
-		default:
-			o.pending = make([]byte, 0, 4096)
-		}
+		o.pending = make([]byte, 0, 4096)
 	}
 	encoder := protocol.NewDisplayEncoder(o.pending)
 	if err := encoder.AppendCommand(command); err != nil {
@@ -1364,8 +1538,7 @@ func (o *renderOutput) commit() error {
 	}
 	data := o.pending
 	o.pending = nil
-	o.batches <- data
-	return nil
+	return writeAll(o.stream, data)
 }
 
 func (o *renderOutput) present() error {
@@ -1373,19 +1546,6 @@ func (o *renderOutput) present() error {
 		return err
 	}
 	return o.commit()
-}
-
-func writeDisplayStream(stream io.Writer, batches <-chan []byte, recycle chan<- []byte, errs chan<- error) {
-	for data := range batches {
-		if err := writeAll(stream, data); err != nil {
-			errs <- fmt.Errorf("write display batch: %w", err)
-			return
-		}
-		select {
-		case recycle <- data[:0]:
-		default:
-		}
-	}
 }
 
 func writeAll(w io.Writer, data []byte) error {
@@ -1402,22 +1562,30 @@ func writeAll(w io.Writer, data []byte) error {
 	return nil
 }
 
-func (s *sessionState) setOutputFrames(slot int, outputFrames *renderOutput) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.outputFrames[slot] = outputFrames
+func (s *sessionState) attachConnection(mgmtFrames chan protocol.Frame, outputStreams map[int]io.Writer) {
+	s.attachMu.Lock()
+	s.mgmtFrames = mgmtFrames
+	s.outputStreams = outputStreams
+	s.attachMu.Unlock()
 }
 
-func (s *sessionState) clearOutputFrames(slot int, outputFrames *renderOutput) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.outputFrames[slot] == outputFrames {
-		delete(s.outputFrames, slot)
+func (s *sessionState) detachConnection(mgmtFrames chan protocol.Frame) {
+	s.attachMu.Lock()
+	if s.mgmtFrames == mgmtFrames {
+		s.mgmtFrames = nil
+		s.outputStreams = nil
 	}
+	s.attachMu.Unlock()
 }
 
-func (s *sessionState) currentOutputFrames(slot int) *renderOutput {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.outputFrames[slot]
+func (s *sessionState) currentManagementFrames() chan protocol.Frame {
+	s.attachMu.Lock()
+	defer s.attachMu.Unlock()
+	return s.mgmtFrames
+}
+
+func (s *sessionState) currentOutputStream(slot int) io.Writer {
+	s.attachMu.Lock()
+	defer s.attachMu.Unlock()
+	return s.outputStreams[slot]
 }

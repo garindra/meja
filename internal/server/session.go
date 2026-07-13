@@ -242,6 +242,22 @@ func (s *Session) HasWindows() bool {
 	return len(s.Windows) > 0
 }
 
+func (s *Session) PanesSnapshot() []*Pane {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	panes := make([]*Pane, 0, len(s.Panes))
+	for _, pane := range s.Panes {
+		panes = append(panes, pane)
+	}
+	return panes
+}
+
+func (s *Session) Pane(id uint64) *Pane {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Panes[id]
+}
+
 func (s *Session) ReattachClient(clientID uint64) (*Window, *Pane, *ClientState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

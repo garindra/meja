@@ -191,7 +191,14 @@ func (d *daemon) disconnectActiveClients() {
 }
 
 func newSessionState(id uint64) *sessionState {
-	return &sessionState{sessionID: id, session: NewSession(id), outputFrames: map[int]*renderOutput{}, resumeTokens: map[string]uint64{}}
+	state := &sessionState{
+		sessionID:    id,
+		session:      NewSession(id),
+		resumeTokens: map[string]uint64{},
+		operations:   make(chan sessionOperation),
+	}
+	go state.runOperations()
+	return state
 }
 
 func (d *daemon) session(id uint64) *sessionState {

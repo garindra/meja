@@ -13,10 +13,12 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	client.TerminalCols, client.TerminalRows = 80, 23
 	window, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, 0)
 	frames := make(chan protocol.Frame, 32)
+	state := &sessionState{session: s}
 	ctrl := &controller{
-		state:      &sessionState{session: s},
+		state:      state,
 		mgmtFrames: frames,
 	}
+	state.attachConnection(frames, nil)
 
 	s.ConsumeInputByte(0, 0x02)
 	if err := runStatusEvent(t, ctrl, s.ConsumeInputByte(0, ',')); err != nil {
