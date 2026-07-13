@@ -86,6 +86,33 @@ func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
 	}
 }
 
+func TestDisplayStyleRoundTripsExtendedAttributesWithoutChangingOldFlags(t *testing.T) {
+	style := Style{Bold: true, Dim: true, Blink: true, Italic: true, Underline: true, Reverse: true, Invisible: true, FG: Color{Mode: "default"}, BG: Color{Mode: "default"}}
+	encoder := NewDisplayEncoder(nil)
+	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.AppendStyleInstall(StyleInstall{ID: 1, Style: style}); err != nil {
+		t.Fatal(err)
+	}
+	encoder.AppendPresent()
+	batch, err := NewDisplayDecoder(bytes.NewReader(encoder.Bytes())).ReadBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Commands) != 1 || batch.Commands[0].Style != style {
+		t.Fatalf("decoded style=%#v want %#v", batch.Commands, style)
+	}
+
+	var writer PayloadWriter
+	if err := encodeStyle(&writer, Style{Italic: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := writer.Buf[0]; got != byte(styleFlagItalic) {
+		t.Fatalf("legacy italic flag byte=%#x want %#x", got, styleFlagItalic)
+	}
+}
+
 func TestDisplayEncoderStyleInstallFailurePreservesBytes(t *testing.T) {
 	encoder := NewDisplayEncoder(nil)
 	encoder.AppendPresent()

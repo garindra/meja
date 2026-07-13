@@ -13,6 +13,8 @@ const (
 	styleFlagItalic
 	styleFlagUnderline
 	styleFlagReverse
+	styleFlagBlink
+	styleFlagInvisible
 )
 
 func encodeColor(w *PayloadWriter, c Color) error {
@@ -66,6 +68,9 @@ func encodeStyle(w *PayloadWriter, s Style) error {
 	if s.Dim {
 		f |= styleFlagDim
 	}
+	if s.Blink {
+		f |= styleFlagBlink
+	}
 	if s.Italic {
 		f |= styleFlagItalic
 	}
@@ -74,6 +79,9 @@ func encodeStyle(w *PayloadWriter, s Style) error {
 	}
 	if s.Reverse {
 		f |= styleFlagReverse
+	}
+	if s.Invisible {
+		f |= styleFlagInvisible
 	}
 	w.Uvarint(f)
 	if err := encodeColor(w, s.FG); err != nil {
@@ -94,7 +102,7 @@ func decodeStyle(r *PayloadReader) (Style, error) {
 	if e != nil {
 		return Style{}, e
 	}
-	return Style{Bold: f&styleFlagBold != 0, Dim: f&styleFlagDim != 0, Italic: f&styleFlagItalic != 0, Underline: f&styleFlagUnderline != 0, Reverse: f&styleFlagReverse != 0, FG: fg, BG: bg}, nil
+	return Style{Bold: f&styleFlagBold != 0, Dim: f&styleFlagDim != 0, Blink: f&styleFlagBlink != 0, Italic: f&styleFlagItalic != 0, Underline: f&styleFlagUnderline != 0, Reverse: f&styleFlagReverse != 0, Invisible: f&styleFlagInvisible != 0, FG: fg, BG: bg}, nil
 }
 
 func EncodeStatusBar(dst []byte, msg StatusBar) ([]byte, error) {

@@ -42,6 +42,13 @@ type TerminalState struct {
 	Alternate             bool
 	Primary               *screenBuffer
 	ApplicationCursorKeys bool
+	AutoWrap              bool
+	OriginMode            bool
+	InsertMode            bool
+	G0Charset             byte
+	G1Charset             byte
+	ActiveCharset         int
+	TabStops              []bool
 	LastPrintedRune       rune
 	LastPrintedValid      bool
 
@@ -62,6 +69,9 @@ type screenBuffer struct {
 	ScrollBottom     int
 	LastPrintedRune  rune
 	LastPrintedValid bool
+	G0Charset        byte
+	G1Charset        byte
+	ActiveCharset    int
 }
 
 type SavedCursor struct {
@@ -69,6 +79,10 @@ type SavedCursor struct {
 	Y           int
 	Style       Style
 	WrapPending bool
+	OriginMode  bool
+	G0Charset   byte
+	G1Charset   byte
+	ActiveGL    int
 	Valid       bool
 }
 
@@ -97,7 +111,11 @@ func New(cols, rows int) *TerminalState {
 		nextStyleID:   1,
 		ScrollBottom:  rows - 1,
 		HistoryLimit:  2000,
+		AutoWrap:      true,
+		G0Charset:     'B',
+		G1Charset:     'B',
 	}
+	t.TabStops = defaultTabStops(cols)
 	t.GridRows = make([]Row, rows)
 	for row := range t.GridRows {
 		t.GridRows[row] = blankRow(cols, 0)
@@ -117,9 +135,17 @@ func (t *TerminalState) Resize(cols, rows int) {
 	next := New(cols, rows)
 	next.CurrentStyle = t.CurrentStyle
 	next.CursorVisible = t.CursorVisible
-	next.Parser = t.Parser
+	next.Parser = t.Parser.clone()
 	next.wrapPending = t.wrapPending
+	next.SavedCursor = t.SavedCursor
 	next.ApplicationCursorKeys = t.ApplicationCursorKeys
+	next.AutoWrap = t.AutoWrap
+	next.OriginMode = t.OriginMode
+	next.InsertMode = t.InsertMode
+	next.G0Charset = t.G0Charset
+	next.G1Charset = t.G1Charset
+	next.ActiveCharset = t.ActiveCharset
+	next.TabStops = resizedTabStops(t.TabStops, t.Cols, cols)
 	next.LastPrintedRune = t.LastPrintedRune
 	next.LastPrintedValid = t.LastPrintedValid
 	next.styleByID = cloneStyleMap(t.styleByID)
@@ -174,6 +200,7 @@ func (t *TerminalState) Resize(cols, rows int) {
 }
 
 func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
+	oldCols := t.Cols
 	p := t.Primary
 	primary := New(t.Cols, t.Rows)
 	primary.GridRows = cloneRows(p.Rows)
@@ -203,13 +230,14 @@ func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 		active[row].WrapsNext = t.GridRows[row].WrapsNext
 	}
 	t.Cols, t.Rows = cols, rows
+	t.TabStops = resizedTabStops(t.TabStops, oldCols, cols)
 	t.GridRows = active
 	t.ScrollTop = 0
 	t.ScrollBottom = rows - 1
 	t.clampCursor()
 	t.syncCellsFromRows()
 	t.History = primary.History
-	t.Primary = &screenBuffer{Rows: cloneRows(primary.GridRows), CursorX: primary.CursorX, CursorY: primary.CursorY, CurrentStyle: primary.CurrentStyle, CursorVisible: primary.CursorVisible, WrapPending: primary.wrapPending, SavedCursor: primary.SavedCursor, ScrollTop: primary.ScrollTop, ScrollBottom: primary.ScrollBottom, LastPrintedRune: primary.LastPrintedRune, LastPrintedValid: primary.LastPrintedValid}
+	t.Primary = &screenBuffer{Rows: cloneRows(primary.GridRows), CursorX: primary.CursorX, CursorY: primary.CursorY, CurrentStyle: primary.CurrentStyle, CursorVisible: primary.CursorVisible, WrapPending: primary.wrapPending, SavedCursor: primary.SavedCursor, ScrollTop: primary.ScrollTop, ScrollBottom: primary.ScrollBottom, LastPrintedRune: primary.LastPrintedRune, LastPrintedValid: primary.LastPrintedValid, G0Charset: p.G0Charset, G1Charset: p.G1Charset, ActiveCharset: p.ActiveCharset}
 }
 
 func (t *TerminalState) SnapshotStyles() []protocolStyleDef {
@@ -232,6 +260,13 @@ func (t *TerminalState) Apply(data []byte) Update {
 		DefinedStyles: map[uint32]Style{},
 	}
 	for len(data) > 0 {
+		if t.Parser.state != parserText && (data[0] == 0x18 || data[0] == 0x1a) {
+			t.Parser.state = parserText
+			t.Parser.csiBuf = t.Parser.csiBuf[:0]
+			t.Parser.oscBuf = t.Parser.oscBuf[:0]
+			data = data[1:]
+			continue
+		}
 		switch t.Parser.state {
 		case parserText:
 			if len(t.Parser.utf8Buf) > 0 || data[0] >= 0x80 {
@@ -250,13 +285,11 @@ func (t *TerminalState) Apply(data []byte) Update {
 				t.CursorX = 0
 				t.wrapPending = false
 				update.CursorChanged = true
-			case '\n':
+			case '\n', '\v', '\f':
 				if t.wrapPending {
 					t.CursorX = 0
 				}
-				if t.lineFeed() {
-					update.recordScroll(t.fullViewportScrollDelta(-1), t.Rows)
-				}
+				t.lineFeed(&update)
 				t.wrapPending = false
 				update.CursorChanged = true
 			case '\b':
@@ -266,30 +299,29 @@ func (t *TerminalState) Apply(data []byte) Update {
 				t.wrapPending = false
 				update.CursorChanged = true
 			case '\t':
-				next := ((t.CursorX / 8) + 1) * 8
-				if next >= t.Cols {
-					next = t.Cols - 1
-					if next < 0 {
-						next = 0
-					}
-				}
-				t.CursorX = next
+				t.CursorX = t.nextTabStop(t.CursorX)
 				t.wrapPending = false
 				update.CursorChanged = true
+			case 0x0e:
+				t.ActiveCharset = 1
+			case 0x0f:
+				t.ActiveCharset = 0
 			case 0x07:
 			default:
 				if b >= 0x20 && b <= 0x7e {
-					t.putRune(rune(b), &update)
+					t.putRune(t.translateByte(b), &update)
 				}
 			}
 		case parserESC:
 			switch data[0] {
 			case '[':
 				t.Parser.state = parserCSI
-				t.Parser.csiBuf.Reset()
+				t.Parser.csiBuf = t.Parser.csiBuf[:0]
 			case ']':
 				t.Parser.state = parserOSC
-				t.Parser.oscBuf.Reset()
+				t.Parser.oscBuf = t.Parser.oscBuf[:0]
+			case 'P':
+				t.Parser.state = parserDCS
 			case '7':
 				t.saveCursor()
 				t.Parser.state = parserText
@@ -299,7 +331,37 @@ func (t *TerminalState) Apply(data []byte) Update {
 			case 'M':
 				t.reverseIndex(&update)
 				t.Parser.state = parserText
-			case '(', ')', '*', '+', '-', '.', '/':
+			case 'D':
+				t.lineFeed(&update)
+				t.wrapPending = false
+				update.CursorChanged = true
+				t.Parser.state = parserText
+			case 'E':
+				t.CursorX = 0
+				t.lineFeed(&update)
+				t.wrapPending = false
+				update.CursorChanged = true
+				t.Parser.state = parserText
+			case 'H':
+				t.setTabStop(t.CursorX)
+				t.Parser.state = parserText
+			case 'c':
+				t.reset()
+				update.FullRedraw = true
+				update.CursorChanged = true
+				update.VisibleChange = true
+				t.Parser.state = parserText
+			case '=', '>':
+				// Application/numeric keypad mode does not affect Tali's input protocol.
+				t.Parser.state = parserText
+			case '(', ')', '*', '+', '-', '.', '/', '%':
+				if data[0] == '(' {
+					t.Parser.charsetTarget = 0
+				} else if data[0] == ')' {
+					t.Parser.charsetTarget = 1
+				} else {
+					t.Parser.charsetTarget = -1
+				}
 				t.Parser.state = parserESCCharset
 			default:
 				logUnsupportedf("unsupported ESC %q", data[0])
@@ -307,16 +369,22 @@ func (t *TerminalState) Apply(data []byte) Update {
 			}
 			data = data[1:]
 		case parserESCCharset:
+			switch t.Parser.charsetTarget {
+			case 0:
+				t.G0Charset = data[0]
+			case 1:
+				t.G1Charset = data[0]
+			}
 			t.Parser.state = parserText
 			data = data[1:]
 		case parserCSI:
 			b := data[0]
 			data = data[1:]
-			t.Parser.csiBuf.WriteByte(b)
+			t.Parser.csiBuf = append(t.Parser.csiBuf, b)
 			if b >= 0x40 && b <= 0x7e {
-				t.executeCSI(t.Parser.csiBuf.String(), &update)
+				t.executeCSI(string(t.Parser.csiBuf), &update)
 				t.Parser.state = parserText
-				t.Parser.csiBuf.Reset()
+				t.Parser.csiBuf = t.Parser.csiBuf[:0]
 			}
 		case parserOSC:
 			b := data[0]
@@ -324,23 +392,36 @@ func (t *TerminalState) Apply(data []byte) Update {
 			switch b {
 			case 0x07:
 				t.Parser.state = parserText
-				t.Parser.oscBuf.Reset()
+				t.Parser.oscBuf = t.Parser.oscBuf[:0]
 			case 0x1b:
 				t.Parser.state = parserOSCESC
 			default:
-				t.Parser.oscBuf.WriteByte(b)
+				t.Parser.oscBuf = append(t.Parser.oscBuf, b)
 			}
 		case parserOSCESC:
 			b := data[0]
 			data = data[1:]
 			if b == '\\' {
 				t.Parser.state = parserText
-				t.Parser.oscBuf.Reset()
+				t.Parser.oscBuf = t.Parser.oscBuf[:0]
 				continue
 			}
-			t.Parser.oscBuf.WriteByte(0x1b)
-			t.Parser.oscBuf.WriteByte(b)
+			t.Parser.oscBuf = append(t.Parser.oscBuf, 0x1b, b)
 			t.Parser.state = parserOSC
+		case parserDCS:
+			b := data[0]
+			data = data[1:]
+			if b == 0x1b {
+				t.Parser.state = parserDCSESC
+			}
+		case parserDCSESC:
+			b := data[0]
+			data = data[1:]
+			if b == '\\' {
+				t.Parser.state = parserText
+			} else if b != 0x1b {
+				t.Parser.state = parserDCS
+			}
 		}
 	}
 	return update
@@ -368,14 +449,11 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 		return
 	}
 	if t.wrapPending {
-		t.setRowWrapped(t.CursorY, true)
 		t.wrapPending = false
-		t.CursorX = 0
-		if t.CursorY == t.Rows-1 {
-			t.scrollUp()
-			update.recordScroll(t.fullViewportScrollDelta(-1), t.Rows)
-		} else {
-			t.CursorY++
+		if t.AutoWrap {
+			t.setRowWrapped(t.CursorY, true)
+			t.CursorX = 0
+			t.wrapLine(update)
 		}
 	}
 	cellWidth := int(runeCellWidth(r))
@@ -383,13 +461,13 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 		cellWidth = 1
 	}
 	if t.CursorX+cellWidth > t.Cols {
-		t.setRowWrapped(t.CursorY, true)
-		t.CursorX = 0
-		if t.CursorY == t.Rows-1 {
-			t.scrollUp()
-			update.recordScroll(t.fullViewportScrollDelta(-1), t.Rows)
+		if t.AutoWrap {
+			t.setRowWrapped(t.CursorY, true)
+			t.CursorX = 0
+			t.wrapLine(update)
 		} else {
-			t.CursorY++
+			cellWidth = 1
+			t.CursorX = t.Cols - 1
 		}
 	}
 	styleID, added := t.styleID(t.CurrentStyle)
@@ -397,6 +475,9 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 		update.DefinedStyles[styleID] = t.CurrentStyle
 	}
 	writtenColumn := t.CursorX
+	if t.InsertMode {
+		t.insertChars(cellWidth, styleID)
+	}
 	dirtyStart, dirtyEnd := t.clearGlyphsForWrite(t.CursorY, writtenColumn, cellWidth, styleID)
 	t.GridRows[t.CursorY].Cells[writtenColumn] = Cell{Rune: r, StyleID: styleID, Width: uint8(cellWidth)}
 	for column := writtenColumn + 1; column < writtenColumn+cellWidth; column++ {
@@ -408,7 +489,7 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 	update.markDirty(t.CursorY, dirtyStart, dirtyEnd, t.Cols)
 	if t.CursorX+cellWidth == t.Cols {
 		t.CursorX = t.Cols - 1
-		t.wrapPending = true
+		t.wrapPending = t.AutoWrap
 	} else {
 		t.CursorX += cellWidth
 		t.setRowWrapped(t.CursorY, false)
@@ -445,41 +526,9 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 	case '?':
 		switch parsed.Final {
 		case 'h':
-			if len(parsed.Params) == 1 && parsed.Params[0] == 1 {
-				t.ApplicationCursorKeys = true
-				return
-			}
-			if hasScreenMode(parsed.Params) {
-				t.enterAlternateScreen()
-				update.FullRedraw = true
-				update.CursorChanged = true
-				update.VisibleChange = true
-				return
-			}
-			if len(parsed.Params) == 1 && parsed.Params[0] == 25 {
-				t.CursorVisible = true
-				update.VisibleChange = true
-				return
-			}
-			logUnsupportedf("unsupported private CSI ?%s", seq)
+			t.setPrivateModes(parsed.Params, true, update)
 		case 'l':
-			if len(parsed.Params) == 1 && parsed.Params[0] == 1 {
-				t.ApplicationCursorKeys = false
-				return
-			}
-			if hasScreenMode(parsed.Params) {
-				t.exitAlternateScreen()
-				update.FullRedraw = true
-				update.CursorChanged = true
-				update.VisibleChange = true
-				return
-			}
-			if len(parsed.Params) == 1 && parsed.Params[0] == 25 {
-				t.CursorVisible = false
-				update.VisibleChange = true
-				return
-			}
-			logUnsupportedf("unsupported private CSI ?%s", seq)
+			t.setPrivateModes(parsed.Params, false, update)
 		default:
 			logUnsupportedf("unsupported private CSI ?%s", seq)
 		}
@@ -505,16 +554,30 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 		t.breakWrapChainAt(t.CursorY)
 		row := paramOr(parsed.Params, 0, 1) - 1
 		col := paramOr(parsed.Params, 1, 1) - 1
+		if t.OriginMode {
+			row += t.ScrollTop
+			row = min(max(row, t.ScrollTop), t.ScrollBottom)
+		}
 		t.CursorY, t.CursorX = row, col
 	case 'G':
 		t.CursorX = paramOr(parsed.Params, 0, 1) - 1
 	case 'd':
 		t.breakWrapChainAt(t.CursorY)
-		t.CursorY = paramOr(parsed.Params, 0, 1) - 1
+		row := paramOr(parsed.Params, 0, 1) - 1
+		if t.OriginMode {
+			row += t.ScrollTop
+			row = min(max(row, t.ScrollTop), t.ScrollBottom)
+		}
+		t.CursorY = row
 	case 'J':
-		t.breakAllWrapChains()
-		t.eraseDisplay(paramOr(parsed.Params, 0, 0))
-		update.FullRedraw = true
+		mode := paramOr(parsed.Params, 0, 0)
+		if mode == 3 {
+			t.History = nil
+		} else {
+			t.breakAllWrapChains()
+			t.eraseDisplay(mode)
+			update.FullRedraw = true
+		}
 	case 'K':
 		t.breakWrapChainAt(t.CursorY)
 		start, end := t.eraseLine(paramOr(parsed.Params, 0, 0))
@@ -539,6 +602,53 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 		}
 		t.insertChars(max1(parsed.Params, 1), styleID)
 		update.markDirty(t.CursorY, t.CursorX, t.Cols, t.Cols)
+	case 'L':
+		styleID := t.eraseStyleID(update)
+		t.insertLines(max1(parsed.Params, 1), styleID)
+		update.FullRedraw = true
+	case 'M':
+		styleID := t.eraseStyleID(update)
+		t.deleteLines(max1(parsed.Params, 1), styleID)
+		update.FullRedraw = true
+	case 'S':
+		count := min(max1(parsed.Params, 1), t.ScrollBottom-t.ScrollTop+1)
+		styleID := t.eraseStyleID(update)
+		for range count {
+			t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
+		}
+		if t.ScrollTop == 0 && t.ScrollBottom == t.Rows-1 {
+			update.recordScroll(-count, t.Rows)
+		} else {
+			update.FullRedraw = true
+		}
+		for row := t.ScrollBottom - count + 1; row <= t.ScrollBottom; row++ {
+			update.markDirty(row, 0, t.Cols, t.Cols)
+		}
+	case 'T':
+		count := min(max1(parsed.Params, 1), t.ScrollBottom-t.ScrollTop+1)
+		styleID := t.eraseStyleID(update)
+		for range count {
+			t.scrollDownRegion(t.ScrollTop, t.ScrollBottom, styleID)
+		}
+		if t.ScrollTop == 0 && t.ScrollBottom == t.Rows-1 {
+			update.recordScroll(count, t.Rows)
+		} else {
+			update.FullRedraw = true
+		}
+		for row := t.ScrollTop; row < t.ScrollTop+count; row++ {
+			update.markDirty(row, 0, t.Cols, t.Cols)
+		}
+	case 'Z':
+		for range max1(parsed.Params, 1) {
+			t.CursorX = t.previousTabStop(t.CursorX)
+		}
+	case 'g':
+		switch paramOr(parsed.Params, 0, 0) {
+		case 0:
+			t.clearTabStop(t.CursorX)
+		case 3:
+			clear(t.TabStops)
+		}
 	case 'b':
 		if t.LastPrintedValid {
 			for count := 0; count < max1(parsed.Params, 1); count++ {
@@ -547,10 +657,30 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 		}
 	case 'r':
 		t.setScrollRegion(parsed.Params)
-		t.CursorX, t.CursorY = 0, 0
+		t.CursorX = 0
+		t.CursorY = 0
+		if t.OriginMode {
+			t.CursorY = t.ScrollTop
+		}
+	case 's':
+		if len(parsed.Params) != 0 || len(parsed.Intermediates) != 0 {
+			logUnsupportedf("unsupported CSI %s", seq)
+			return
+		}
+		t.saveCursor()
+	case 'u':
+		if len(parsed.Params) != 0 || len(parsed.Intermediates) != 0 {
+			logUnsupportedf("unsupported CSI %s", seq)
+			return
+		}
+		t.restoreCursor()
 	case 'n':
 		if len(parsed.Params) == 1 && parsed.Params[0] == 6 {
-			update.Replies = append(update.Replies, []byte(formatDSR(t.CursorY+1, t.CursorX+1)))
+			row := t.CursorY + 1
+			if t.OriginMode {
+				row -= t.ScrollTop
+			}
+			update.Replies = append(update.Replies, []byte(formatDSR(row, t.CursorX+1)))
 			return
 		}
 		logUnsupportedf("unsupported CSI %s", seq)
@@ -561,6 +691,24 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 	case 'm':
 		t.applySGR(parsed.Params, update)
 	case 'h', 'l':
+		set := parsed.Final == 'h'
+		for _, mode := range parsed.Params {
+			switch mode {
+			case 4:
+				t.InsertMode = set
+			default:
+				logUnsupportedf("unsupported mode %d%c", mode, parsed.Final)
+			}
+		}
+	case 'p':
+		if len(parsed.Intermediates) == 1 && parsed.Intermediates[0] == '!' {
+			t.softReset()
+			update.CursorChanged = true
+			update.VisibleChange = true
+			return
+		}
+		logUnsupportedf("unsupported CSI %s", seq)
+		return
 	default:
 		logUnsupportedf("unsupported CSI %s", seq)
 		return
@@ -582,20 +730,31 @@ func (t *TerminalState) applySGR(params []int, update *Update) {
 			t.CurrentStyle = DefaultStyle
 		case 1:
 			t.CurrentStyle.Bold = true
+		case 2:
+			t.CurrentStyle.Dim = true
 		case 3:
 			t.CurrentStyle.Italic = true
 		case 4:
 			t.CurrentStyle.Underline = true
+		case 5:
+			t.CurrentStyle.Blink = true
 		case 7:
 			t.CurrentStyle.Reverse = true
+		case 8:
+			t.CurrentStyle.Invisible = true
 		case 22:
 			t.CurrentStyle.Bold = false
+			t.CurrentStyle.Dim = false
 		case 23:
 			t.CurrentStyle.Italic = false
 		case 24:
 			t.CurrentStyle.Underline = false
+		case 25:
+			t.CurrentStyle.Blink = false
 		case 27:
 			t.CurrentStyle.Reverse = false
+		case 28:
+			t.CurrentStyle.Invisible = false
 		case 39:
 			t.CurrentStyle.FG = Color{Mode: "default"}
 		case 49:
@@ -817,38 +976,25 @@ func (t *TerminalState) fillRow(row, start, end int, styleID uint32) {
 	t.syncRowToCells(row)
 }
 
-func (t *TerminalState) scrollUp() {
-	t.scrollUpRegion(t.ScrollTop, t.ScrollBottom)
-}
-
-func (t *TerminalState) scrollUpRegion(top, bottom int) {
-	if top < 0 || bottom >= len(t.GridRows) || top >= bottom {
+func (t *TerminalState) scrollUpRegion(top, bottom int, styleID uint32) {
+	if top < 0 || bottom >= len(t.GridRows) || top > bottom {
 		return
 	}
 	if !t.Alternate && top == 0 && bottom == len(t.GridRows)-1 {
 		t.appendHistoryRow(t.GridRows[0])
 	}
 	copy(t.GridRows[top:bottom], t.GridRows[top+1:bottom+1])
-	t.GridRows[bottom] = blankRow(t.Cols, 0)
+	t.GridRows[bottom] = blankRow(t.Cols, styleID)
 	t.breakWrapChainAt(top)
 	t.breakWrapChainAt(bottom)
 	t.syncCellsFromRows()
-}
-
-func hasScreenMode(params []int) bool {
-	for _, mode := range params {
-		if mode == 47 || mode == 1047 || mode == 1049 {
-			return true
-		}
-	}
-	return false
 }
 
 func (t *TerminalState) enterAlternateScreen() {
 	if t.Alternate {
 		return
 	}
-	t.Primary = &screenBuffer{Rows: cloneRows(t.GridRows), CursorX: t.CursorX, CursorY: t.CursorY, CurrentStyle: t.CurrentStyle, CursorVisible: t.CursorVisible, WrapPending: t.wrapPending, SavedCursor: t.SavedCursor, ScrollTop: t.ScrollTop, ScrollBottom: t.ScrollBottom, LastPrintedRune: t.LastPrintedRune, LastPrintedValid: t.LastPrintedValid}
+	t.Primary = &screenBuffer{Rows: cloneRows(t.GridRows), CursorX: t.CursorX, CursorY: t.CursorY, CurrentStyle: t.CurrentStyle, CursorVisible: t.CursorVisible, WrapPending: t.wrapPending, SavedCursor: t.SavedCursor, ScrollTop: t.ScrollTop, ScrollBottom: t.ScrollBottom, LastPrintedRune: t.LastPrintedRune, LastPrintedValid: t.LastPrintedValid, G0Charset: t.G0Charset, G1Charset: t.G1Charset, ActiveCharset: t.ActiveCharset}
 	t.GridRows = make([]Row, t.Rows)
 	for row := range t.GridRows {
 		t.GridRows[row] = blankRow(t.Cols, 0)
@@ -881,6 +1027,9 @@ func (t *TerminalState) exitAlternateScreen() {
 	t.ScrollBottom = p.ScrollBottom
 	t.LastPrintedRune = p.LastPrintedRune
 	t.LastPrintedValid = p.LastPrintedValid
+	t.G0Charset = p.G0Charset
+	t.G1Charset = p.G1Charset
+	t.ActiveCharset = p.ActiveCharset
 	t.Alternate = false
 	t.Primary = nil
 	t.clampCursor()
@@ -913,25 +1062,32 @@ func cloneRows(rows []Row) []Row {
 	return out
 }
 
-func (t *TerminalState) scrollDownRegion(top, bottom int) {
-	if top < 0 || bottom >= len(t.GridRows) || top >= bottom {
+func (t *TerminalState) scrollDownRegion(top, bottom int, styleID uint32) {
+	if top < 0 || bottom >= len(t.GridRows) || top > bottom {
 		return
 	}
 	copy(t.GridRows[top+1:bottom+1], t.GridRows[top:bottom])
-	t.GridRows[top] = blankRow(t.Cols, 0)
+	t.GridRows[top] = blankRow(t.Cols, styleID)
 	t.breakWrapChainAt(top)
 	t.breakWrapChainAt(bottom)
 	t.syncCellsFromRows()
 }
 
 func (t *TerminalState) reverseIndex(update *Update) {
-	if t.CursorY > t.ScrollTop {
-		t.CursorY--
+	if t.CursorY != t.ScrollTop {
+		if t.CursorY > 0 {
+			t.CursorY--
+		}
 		update.CursorChanged = true
 		return
 	}
-	t.scrollDownRegion(t.ScrollTop, t.ScrollBottom)
-	update.recordScroll(t.fullViewportScrollDelta(1), t.Rows)
+	styleID := t.eraseStyleID(update)
+	t.scrollDownRegion(t.ScrollTop, t.ScrollBottom, styleID)
+	delta := t.fullViewportScrollDelta(1)
+	update.recordScroll(delta, t.Rows)
+	if delta != 0 {
+		update.markDirty(t.ScrollTop, 0, t.Cols, t.Cols)
+	}
 	update.CursorChanged = true
 }
 
@@ -941,6 +1097,10 @@ func (t *TerminalState) saveCursor() {
 		Y:           t.CursorY,
 		Style:       t.CurrentStyle,
 		WrapPending: t.wrapPending,
+		OriginMode:  t.OriginMode,
+		G0Charset:   t.G0Charset,
+		G1Charset:   t.G1Charset,
+		ActiveGL:    t.ActiveCharset,
 		Valid:       true,
 	}
 }
@@ -953,6 +1113,10 @@ func (t *TerminalState) restoreCursor() {
 	t.CursorY = t.SavedCursor.Y
 	t.CurrentStyle = t.SavedCursor.Style
 	t.wrapPending = t.SavedCursor.WrapPending
+	t.OriginMode = t.SavedCursor.OriginMode
+	t.G0Charset = t.SavedCursor.G0Charset
+	t.G1Charset = t.SavedCursor.G1Charset
+	t.ActiveCharset = t.SavedCursor.ActiveGL
 	t.clampCursor()
 }
 
@@ -1007,13 +1171,179 @@ func (t *TerminalState) insertChars(n int, styleID uint32) {
 	t.syncRowToCells(t.CursorY)
 }
 
+func (t *TerminalState) insertLines(n int, styleID uint32) {
+	if t.CursorY < t.ScrollTop || t.CursorY > t.ScrollBottom || n <= 0 {
+		return
+	}
+	n = min(n, t.ScrollBottom-t.CursorY+1)
+	copy(t.GridRows[t.CursorY+n:t.ScrollBottom+1], t.GridRows[t.CursorY:t.ScrollBottom+1-n])
+	for row := t.CursorY; row < t.CursorY+n; row++ {
+		t.GridRows[row] = blankRow(t.Cols, styleID)
+	}
+	t.breakAllWrapChains()
+	t.syncCellsFromRows()
+}
+
+func (t *TerminalState) deleteLines(n int, styleID uint32) {
+	if t.CursorY < t.ScrollTop || t.CursorY > t.ScrollBottom || n <= 0 {
+		return
+	}
+	n = min(n, t.ScrollBottom-t.CursorY+1)
+	copy(t.GridRows[t.CursorY:t.ScrollBottom+1-n], t.GridRows[t.CursorY+n:t.ScrollBottom+1])
+	for row := t.ScrollBottom + 1 - n; row <= t.ScrollBottom; row++ {
+		t.GridRows[row] = blankRow(t.Cols, styleID)
+	}
+	t.breakAllWrapChains()
+	t.syncCellsFromRows()
+}
+
+func (t *TerminalState) setPrivateModes(modes []int, enabled bool, update *Update) {
+	for _, mode := range modes {
+		switch mode {
+		case 1:
+			t.ApplicationCursorKeys = enabled
+		case 6:
+			t.OriginMode = enabled
+			t.CursorX = 0
+			t.CursorY = 0
+			if enabled {
+				t.CursorY = t.ScrollTop
+			}
+			t.wrapPending = false
+			update.CursorChanged = true
+		case 7:
+			t.AutoWrap = enabled
+			if !enabled {
+				t.wrapPending = false
+			}
+		case 25:
+			t.CursorVisible = enabled
+			update.VisibleChange = true
+		case 47, 1047, 1049:
+			if enabled {
+				t.enterAlternateScreen()
+			} else {
+				t.exitAlternateScreen()
+			}
+			update.FullRedraw = true
+			update.CursorChanged = true
+			update.VisibleChange = true
+		case 1048:
+			if enabled {
+				t.saveCursor()
+			} else {
+				t.restoreCursor()
+			}
+			update.CursorChanged = true
+		case 3, 4, 12:
+			// Pane width, smooth scrolling, and cursor blinking are controlled
+			// outside the emulated terminal. Consume common xterm init modes.
+		default:
+			logUnsupportedf("unsupported private mode ?%d%c", mode, map[bool]byte{true: 'h', false: 'l'}[enabled])
+		}
+	}
+}
+
+func (t *TerminalState) softReset() {
+	t.CurrentStyle = DefaultStyle
+	t.CursorVisible = true
+	t.InsertMode = false
+	t.OriginMode = false
+	t.AutoWrap = true
+	t.ApplicationCursorKeys = false
+	t.G0Charset = 'B'
+	t.G1Charset = 'B'
+	t.ActiveCharset = 0
+	t.ScrollTop = 0
+	t.ScrollBottom = t.Rows - 1
+	t.wrapPending = false
+}
+
+func (t *TerminalState) reset() {
+	cols, rows, historyLimit := t.Cols, t.Rows, t.HistoryLimit
+	*t = *New(cols, rows)
+	t.HistoryLimit = historyLimit
+}
+
+func defaultTabStops(cols int) []bool {
+	stops := make([]bool, max(cols, 0))
+	for column := 8; column < cols; column += 8 {
+		stops[column] = true
+	}
+	return stops
+}
+
+func resizedTabStops(current []bool, oldCols, cols int) []bool {
+	stops := make([]bool, max(cols, 0))
+	copy(stops, current)
+	for column := 8; column < cols; column += 8 {
+		if column >= oldCols {
+			stops[column] = true
+		}
+	}
+	return stops
+}
+
+func (t *TerminalState) setTabStop(column int) {
+	if column >= 0 && column < len(t.TabStops) {
+		t.TabStops[column] = true
+	}
+}
+
+func (t *TerminalState) clearTabStop(column int) {
+	if column >= 0 && column < len(t.TabStops) {
+		t.TabStops[column] = false
+	}
+}
+
+func (t *TerminalState) nextTabStop(column int) int {
+	for next := column + 1; next < len(t.TabStops); next++ {
+		if t.TabStops[next] {
+			return next
+		}
+	}
+	return max(t.Cols-1, 0)
+}
+
+func (t *TerminalState) previousTabStop(column int) int {
+	for previous := column - 1; previous >= 0; previous-- {
+		if t.TabStops[previous] {
+			return previous
+		}
+	}
+	return 0
+}
+
+func (t *TerminalState) translateByte(b byte) rune {
+	charset := t.G0Charset
+	if t.ActiveCharset == 1 {
+		charset = t.G1Charset
+	}
+	if charset != '0' {
+		return rune(b)
+	}
+	if translated, ok := decSpecialGraphics[b]; ok {
+		return translated
+	}
+	return rune(b)
+}
+
+var decSpecialGraphics = map[byte]rune{
+	'`': '◆', 'a': '▒', 'b': '␉', 'c': '␌', 'd': '␍', 'e': '␊', 'f': '°', 'g': '±',
+	'h': '␤', 'i': '␋', 'j': '┘', 'k': '┐', 'l': '┌', 'm': '└', 'n': '┼', 'o': '⎺',
+	'p': '⎻', 'q': '─', 'r': '⎼', 's': '⎽', 't': '├', 'u': '┤', 'v': '┴', 'w': '┬',
+	'x': '│', 'y': '≤', 'z': '≥', '{': 'π', '|': '≠', '}': '£', '~': '·',
+}
+
 func (t *TerminalState) normalizeRow(row int) {
 	if row < 0 || row >= t.Rows {
 		return
 	}
 	cells := t.GridRows[row].Cells
 	for i := 0; i < len(cells); i++ {
-		if cells[i].Width == 0 {
+		if cells[i].Width == 2 && (i+1 >= len(cells) || cells[i+1].Width != 0) {
+			cells[i] = blankCell(0)
+		} else if cells[i].Width == 0 {
 			if i == 0 || cells[i-1].Width <= 1 {
 				cells[i] = blankCell(0)
 			}
@@ -1039,14 +1369,45 @@ func itoa(v int) string {
 	return string(buf[i:])
 }
 
-func (t *TerminalState) lineFeed() bool {
+func (t *TerminalState) lineFeed(update *Update) {
 	t.breakWrapChainAt(t.CursorY)
 	if t.CursorY == t.ScrollBottom {
-		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom)
-		return true
+		styleID := t.eraseStyleID(update)
+		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
+		delta := t.fullViewportScrollDelta(-1)
+		update.recordScroll(delta, t.Rows)
+		if delta != 0 {
+			update.markDirty(t.ScrollBottom, 0, t.Cols, t.Cols)
+		}
+		return
 	}
-	t.CursorY++
-	return false
+	if t.CursorY < t.Rows-1 {
+		t.CursorY++
+	}
+}
+
+func (t *TerminalState) wrapLine(update *Update) {
+	if t.CursorY == t.ScrollBottom {
+		styleID := t.eraseStyleID(update)
+		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
+		delta := t.fullViewportScrollDelta(-1)
+		update.recordScroll(delta, t.Rows)
+		if delta != 0 {
+			update.markDirty(t.ScrollBottom, 0, t.Cols, t.Cols)
+		}
+		return
+	}
+	if t.CursorY < t.Rows-1 {
+		t.CursorY++
+	}
+}
+
+func (t *TerminalState) eraseStyleID(update *Update) uint32 {
+	styleID, added := t.styleID(t.CurrentStyle)
+	if added {
+		update.DefinedStyles[styleID] = t.CurrentStyle
+	}
+	return styleID
 }
 
 func (t *TerminalState) fullViewportScrollDelta(delta int) int {
@@ -1079,6 +1440,9 @@ func (t *TerminalState) clampCursor() {
 	}
 	if t.Rows > 0 && t.CursorY >= t.Rows {
 		t.CursorY = t.Rows - 1
+	}
+	if t.OriginMode && t.Rows > 0 {
+		t.CursorY = min(max(t.CursorY, t.ScrollTop), t.ScrollBottom)
 	}
 }
 

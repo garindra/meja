@@ -14,13 +14,27 @@ const (
 	parserCSI
 	parserOSC
 	parserOSCESC
+	parserDCS
+	parserDCSESC
 )
 
 type Parser struct {
-	state   parserState
-	csiBuf  strings.Builder
-	utf8Buf []byte
-	oscBuf  strings.Builder
+	state         parserState
+	csiBuf        []byte
+	utf8Buf       []byte
+	oscBuf        []byte
+	charsetTarget int
+}
+
+func (p *Parser) clone() Parser {
+	next := Parser{
+		state:         p.state,
+		csiBuf:        append([]byte(nil), p.csiBuf...),
+		utf8Buf:       append([]byte(nil), p.utf8Buf...),
+		oscBuf:        append([]byte(nil), p.oscBuf...),
+		charsetTarget: p.charsetTarget,
+	}
+	return next
 }
 
 type CSISequence struct {

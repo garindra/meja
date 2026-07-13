@@ -29,6 +29,17 @@ func TestFragmentedCSIAndCursorPositioning(t *testing.T) {
 	}
 }
 
+func TestResizePreservesIncrementalParserAndSavedCursor(t *testing.T) {
+	term := New(5, 2)
+	term.CursorX, term.CursorY = 4, 1
+	term.Apply([]byte("\x1b7\x1b[2"))
+	term.Resize(8, 3)
+	term.Apply([]byte("D!\x1b8"))
+	if term.GridRows[1].Cells[0].Rune != '!' || term.CursorX != 4 || term.CursorY != 1 {
+		t.Fatalf("resized parser/cursor state cursor=%d,%d row=%q", term.CursorX, term.CursorY, rowString(term, 1, 8))
+	}
+}
+
 func TestFragmentedUTF8(t *testing.T) {
 	term := New(5, 1)
 	term.Apply([]byte{0xe2, 0x82})
@@ -142,6 +153,32 @@ func TestFullViewportLineFeedReportsScrollAndNewRowDamage(t *testing.T) {
 	}
 	if got, want := update.DirtySpans[1], (DirtySpan{Start: 0, End: 3}); got != want {
 		t.Fatalf("bottom row damage = %#v, want %#v", got, want)
+	}
+}
+
+func TestBareLineFeedReportsStyledExposedRow(t *testing.T) {
+	term := New(3, 2)
+	term.Apply([]byte("aaa\r\nbbb\x1b[44m"))
+
+	update := term.Apply([]byte("\n"))
+
+	if update.ScrollDelta != -1 || update.FullRedraw {
+		t.Fatalf("bare line-feed update = %#v", update)
+	}
+	if got, want := update.DirtySpans[1], (DirtySpan{Start: 0, End: 3}); got != want {
+		t.Fatalf("exposed-row damage = %#v, want %#v", got, want)
+	}
+	style := term.styleByID[term.GridRows[1].Cells[0].StyleID]
+	if style.BG.Mode != "indexed" || style.BG.Index != 4 {
+		t.Fatalf("exposed-row style = %#v", style)
+	}
+}
+
+func TestLineFeedOutsideScrollRegionStaysWithinGrid(t *testing.T) {
+	term := New(4, 4)
+	term.Apply([]byte("\x1b[2;3r\x1b[4;1H\nX"))
+	if term.CursorY != 3 || term.GridRows[3].Cells[0].Rune != 'X' {
+		t.Fatalf("cursor=%d,%d row=%q", term.CursorX, term.CursorY, rowString(term, 3, 4))
 	}
 }
 
@@ -340,6 +377,22 @@ func TestOSCSTTerminatorIsConsumed(t *testing.T) {
 	}
 }
 
+func TestDCSAndUTF8DesignationAreConsumed(t *testing.T) {
+	term := New(8, 1)
+	term.Apply([]byte("\x1b%G\x1bP$qm\x1b\\prompt"))
+	if got := rowString(term, 0, 6); got != "prompt" {
+		t.Fatalf("control strings leaked into display: %q", got)
+	}
+}
+
+func TestCANAndSUBCancelIncompleteControlSequences(t *testing.T) {
+	term := New(4, 1)
+	term.Apply([]byte("\x1b[31\x18\x1b[1\x1aOK"))
+	if got := rowString(term, 0, 2); got != "OK" {
+		t.Fatalf("canceled controls leaked into display: %q", got)
+	}
+}
+
 func TestCharsetDesignationIsConsumedAndNotPrinted(t *testing.T) {
 	term := New(8, 1)
 	term.Apply([]byte("\x1b(Bprompt"))
@@ -459,9 +512,9 @@ func TestUnsupportedCSIIsLogged(t *testing.T) {
 	defer SetDebugLogger(nil)
 
 	term := New(5, 1)
-	term.Apply([]byte("\x1b[1L"))
+	term.Apply([]byte("\x1b[1v"))
 
-	if got := buf.String(); !strings.Contains(got, "unsupported CSI 1L") {
+	if got := buf.String(); !strings.Contains(got, "unsupported CSI 1v") {
 		t.Fatalf("debug log = %q", got)
 	}
 }
@@ -530,6 +583,236 @@ func TestDSRReply(t *testing.T) {
 	update := term.Apply([]byte("\x1b[6n"))
 	if len(update.Replies) != 1 || string(update.Replies[0]) != "\x1b[2;3R" {
 		t.Fatalf("DSR replies = %#v", update.Replies)
+	}
+}
+
+func TestDECSpecialGraphicsG0AndFragmentedDesignation(t *testing.T) {
+	term := New(8, 1)
+	term.Apply([]byte("\x1b("))
+	term.Apply([]byte("0lqkxmqj"))
+	term.Apply([]byte("\x1b(Bq"))
+	if got := rowString(term, 0, 8); got != "┌─┐│└─┘q" {
+		t.Fatalf("DEC graphics row = %q", got)
+	}
+}
+
+func TestDECSpecialGraphicsG1SelectedByShiftOut(t *testing.T) {
+	term := New(8, 1)
+	term.Apply([]byte("\x1b)0\x0elqk\x0fq"))
+	if got := rowString(term, 0, 4); got != "┌─┐q" {
+		t.Fatalf("G1 graphics row = %q", got)
+	}
+}
+
+func TestCursorSaveRestoreIncludesCharset(t *testing.T) {
+	term := New(4, 1)
+	term.Apply([]byte("\x1b(0\x1b7\x1b(B\x1b8q"))
+	if got := term.GridRows[0].Cells[0].Rune; got != '─' {
+		t.Fatalf("restored charset rendered %q", got)
+	}
+}
+
+func TestIndexNextLineAndReverseIndex(t *testing.T) {
+	term := New(4, 3)
+	term.Apply([]byte("a\x1bDb\x1bEc"))
+	if term.CursorX != 1 || term.CursorY != 2 || term.GridRows[1].Cells[1].Rune != 'b' || term.GridRows[2].Cells[0].Rune != 'c' {
+		t.Fatalf("IND/NEL state cursor=%d,%d rows=%q/%q", term.CursorX, term.CursorY, rowString(term, 1, 4), rowString(term, 2, 4))
+	}
+}
+
+func TestVerticalTabAndFormFeedActAsLineFeed(t *testing.T) {
+	term := New(4, 3)
+	term.Apply([]byte("a\vb\fc"))
+	if term.CursorY != 2 || term.GridRows[1].Cells[1].Rune != 'b' || term.GridRows[2].Cells[2].Rune != 'c' {
+		t.Fatalf("VT/FF cursor=%d,%d rows=%q/%q", term.CursorX, term.CursorY, rowString(term, 1, 4), rowString(term, 2, 4))
+	}
+}
+
+func TestTabStopsHTSTBCCBTAndResize(t *testing.T) {
+	term := New(20, 1)
+	term.Apply([]byte("\t"))
+	if term.CursorX != 8 {
+		t.Fatalf("default tab cursor=%d", term.CursorX)
+	}
+	term.Apply([]byte("\x1b[g\r\t"))
+	if term.CursorX != 16 {
+		t.Fatalf("cleared first stop cursor=%d", term.CursorX)
+	}
+	term.CursorX = 5
+	term.Apply([]byte("\x1bH\r\t\x1b[Z"))
+	if term.CursorX != 0 {
+		t.Fatalf("HTS/CBT cursor=%d", term.CursorX)
+	}
+	term.Resize(28, 1)
+	term.CursorX = 17
+	term.Apply([]byte("\t"))
+	if term.CursorX != 24 {
+		t.Fatalf("grown default tab cursor=%d", term.CursorX)
+	}
+	term.Apply([]byte("\x1b[3g\r\t"))
+	if term.CursorX != 27 {
+		t.Fatalf("clear-all tabs cursor=%d", term.CursorX)
+	}
+}
+
+func TestInsertDeleteLinesWithinScrollRegion(t *testing.T) {
+	term := New(4, 4)
+	term.Apply([]byte("1111\r\n2222\r\n3333\r\n4444"))
+	term.Apply([]byte("\x1b[2;3r\x1b[2;1H\x1b[L"))
+	if got := []string{rowString(term, 0, 4), rowString(term, 1, 4), rowString(term, 2, 4), rowString(term, 3, 4)}; strings.Join(got, "/") != "1111/    /2222/4444" {
+		t.Fatalf("IL rows=%v", got)
+	}
+	term.Apply([]byte("\x1b[M"))
+	if got := []string{rowString(term, 0, 4), rowString(term, 1, 4), rowString(term, 2, 4), rowString(term, 3, 4)}; strings.Join(got, "/") != "1111/2222/    /4444" {
+		t.Fatalf("DL rows=%v", got)
+	}
+}
+
+func TestScrollUpDownCommandsAndDamage(t *testing.T) {
+	term := New(4, 3)
+	term.Apply([]byte("1111\r\n2222\r\n3333"))
+	update := term.Apply([]byte("\x1b[S"))
+	if update.ScrollDelta != -1 || update.FullRedraw || rowString(term, 0, 4) != "2222" {
+		t.Fatalf("SU update=%#v row0=%q", update, rowString(term, 0, 4))
+	}
+	update = term.Apply([]byte("\x1b[T"))
+	if update.ScrollDelta != 1 || update.FullRedraw || rowString(term, 0, 4) != "    " {
+		t.Fatalf("SD update=%#v row0=%q", update, rowString(term, 0, 4))
+	}
+}
+
+func TestScrollCommandsUseCurrentBackgroundForExposedRows(t *testing.T) {
+	term := New(3, 2)
+	update := term.Apply([]byte("abc\r\ndef\x1b[44m\x1b[S"))
+	style := term.styleByID[term.GridRows[1].Cells[0].StyleID]
+	if style.BG.Mode != "indexed" || style.BG.Index != 4 {
+		t.Fatalf("scrolled blank style=%#v", style)
+	}
+	if len(update.DefinedStyles) == 0 {
+		t.Fatal("scroll did not publish newly used erase style")
+	}
+}
+
+func TestOriginModePositionsRelativeToMargins(t *testing.T) {
+	term := New(8, 6)
+	term.Apply([]byte("\x1b[2;5r\x1b[?6h\x1b[2;3H"))
+	if term.CursorX != 2 || term.CursorY != 2 {
+		t.Fatalf("origin CUP cursor=%d,%d", term.CursorX, term.CursorY)
+	}
+	term.Apply([]byte("\x1b[99B"))
+	if term.CursorY != 4 {
+		t.Fatalf("origin movement escaped bottom margin: %d", term.CursorY)
+	}
+	term.Apply([]byte("\x1b[?6l"))
+	if term.CursorX != 0 || term.CursorY != 0 {
+		t.Fatalf("origin reset did not home cursor: %d,%d", term.CursorX, term.CursorY)
+	}
+}
+
+func TestAutowrapAndInsertModes(t *testing.T) {
+	term := New(5, 2)
+	term.Apply([]byte("\x1b[?7labcdef"))
+	if term.CursorY != 0 || rowString(term, 0, 5) != "abcdf" {
+		t.Fatalf("disabled autowrap cursor=%d,%d row=%q", term.CursorX, term.CursorY, rowString(term, 0, 5))
+	}
+	term.Apply([]byte("\r\x1b[4hZ"))
+	if got := rowString(term, 0, 5); got != "Zabcd" {
+		t.Fatalf("insert mode row=%q", got)
+	}
+}
+
+func TestInsertModePreservesWideCellIntegrity(t *testing.T) {
+	term := New(6, 1)
+	term.Apply([]byte("界ab\r\x1b[4hZ"))
+	if got := rowString(term, 0, 5); got != "Z界 ab" {
+		t.Fatalf("wide insert row=%q", got)
+	}
+	if term.GridRows[0].Cells[1].Width != 2 || term.GridRows[0].Cells[2].Width != 0 {
+		t.Fatalf("wide insert cells=%#v", term.GridRows[0].Cells)
+	}
+}
+
+func TestCSIAndDECCursorSaveRestore(t *testing.T) {
+	for _, sequences := range [][2]string{{"\x1b[s", "\x1b[u"}, {"\x1b7", "\x1b8"}} {
+		term := New(5, 2)
+		term.CursorX, term.CursorY = 3, 1
+		term.Apply([]byte(sequences[0]))
+		term.CursorX, term.CursorY = 0, 0
+		term.Apply([]byte(sequences[1]))
+		if term.CursorX != 3 || term.CursorY != 1 {
+			t.Fatalf("save/restore %q cursor=%d,%d", sequences, term.CursorX, term.CursorY)
+		}
+	}
+}
+
+func TestParameterizedCSISIsNotMistakenForCursorSave(t *testing.T) {
+	term := New(8, 2)
+	term.CursorX, term.CursorY = 3, 1
+	term.Apply([]byte("\x1b[1;7s")) // DECSLRM when horizontal-margin mode is enabled.
+	term.CursorX, term.CursorY = 0, 0
+	term.Apply([]byte("\x1b[u"))
+	if term.CursorX != 0 || term.CursorY != 0 {
+		t.Fatalf("unsupported DECSLRM was mistaken for cursor save: %d,%d", term.CursorX, term.CursorY)
+	}
+}
+
+func TestDEC1048And1049CursorAndCharsetSemantics(t *testing.T) {
+	term := New(8, 2)
+	term.CursorX, term.CursorY = 3, 1
+	term.Apply([]byte("\x1b[?1048h\x1b[H\x1b[?1048l"))
+	if term.CursorX != 3 || term.CursorY != 1 {
+		t.Fatalf("1048 cursor=%d,%d", term.CursorX, term.CursorY)
+	}
+
+	term.Apply([]byte("\x1b(0"))
+	term.CursorX, term.CursorY = 4, 1
+	term.Apply([]byte("\x1b[?1049h\x1b(Balt\x1b[?1049lq"))
+	if term.Alternate || term.CursorY != 1 || term.GridRows[1].Cells[4].Rune != '─' {
+		t.Fatalf("1049 restore alternate=%v cursor=%d,%d row=%q charset=%q", term.Alternate, term.CursorX, term.CursorY, rowString(term, 1, 8), term.G0Charset)
+	}
+}
+
+func TestDECCursorSaveRestoreIncludesOriginMode(t *testing.T) {
+	term := New(8, 6)
+	term.Apply([]byte("\x1b[2;5r\x1b[?6h\x1b[3;2H\x1b7\x1b[?6l\x1b8"))
+	if !term.OriginMode || term.CursorX != 1 || term.CursorY != 3 {
+		t.Fatalf("restored origin=%v cursor=%d,%d", term.OriginMode, term.CursorX, term.CursorY)
+	}
+}
+
+func TestSGRDimBlinkInvisibleAndResets(t *testing.T) {
+	term := New(4, 1)
+	term.Apply([]byte("\x1b[1;2;5;8mA\x1b[22;25;28mB"))
+	first := term.styleByID[term.GridRows[0].Cells[0].StyleID]
+	second := term.styleByID[term.GridRows[0].Cells[1].StyleID]
+	if !first.Bold || !first.Dim || !first.Blink || !first.Invisible {
+		t.Fatalf("set style=%#v", first)
+	}
+	if second.Bold || second.Dim || second.Blink || second.Invisible {
+		t.Fatalf("reset style=%#v", second)
+	}
+}
+
+func TestED3ClearsOnlyHistory(t *testing.T) {
+	term := New(4, 2)
+	term.Apply([]byte("1111\r\n2222\r\n3333"))
+	before := rowString(term, 0, 4) + rowString(term, 1, 4)
+	update := term.Apply([]byte("\x1b[3J"))
+	if len(term.History) != 0 || rowString(term, 0, 4)+rowString(term, 1, 4) != before || update.FullRedraw {
+		t.Fatalf("ED3 history=%d screen=%q update=%#v", len(term.History), rowString(term, 0, 4)+rowString(term, 1, 4), update)
+	}
+}
+
+func TestSoftAndHardReset(t *testing.T) {
+	term := New(4, 2)
+	term.HistoryLimit = 17
+	term.Apply([]byte("text\x1b[?6h\x1b[4h\x1b[!p"))
+	if term.OriginMode || term.InsertMode || !term.AutoWrap || rowString(term, 0, 4) != "text" {
+		t.Fatalf("soft reset state origin=%v insert=%v wrap=%v row=%q", term.OriginMode, term.InsertMode, term.AutoWrap, rowString(term, 0, 4))
+	}
+	term.Apply([]byte("\x1bc"))
+	if rowString(term, 0, 4) != "    " || term.CursorX != 0 || term.CursorY != 0 || term.HistoryLimit != 17 {
+		t.Fatalf("hard reset row=%q cursor=%d,%d history-limit=%d", rowString(term, 0, 4), term.CursorX, term.CursorY, term.HistoryLimit)
 	}
 }
 

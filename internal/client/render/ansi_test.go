@@ -23,6 +23,16 @@ func TestRenderCellRunSkipsWideContinuationCell(t *testing.T) {
 	}
 }
 
+func TestSGRForStyleRendersAdvertisedAttributes(t *testing.T) {
+	got := sgrForStyle(protocol.Style{
+		Bold: true, Dim: true, Blink: true, Italic: true, Underline: true, Reverse: true, Invisible: true,
+		FG: protocol.Color{Mode: "default"}, BG: protocol.Color{Mode: "default"},
+	})
+	if got != "\x1b[0;1;2;5;3;4;7;8;39;49m" {
+		t.Fatalf("attribute SGR=%q", got)
+	}
+}
+
 func TestReconnectStatusPreservesExactMessageAndOrangeStyle(t *testing.T) {
 	state := NewClientState()
 	state.SetTerminalSize(80, 24)

@@ -1079,12 +1079,15 @@ func formatIncomingWriteStyles(hits map[renderStyleKey]uint64, styles map[render
 	return strings.Join(parts, ",")
 }
 func formatRenderStyle(style protocol.Style) string {
-	flags := make([]string, 0, 5)
+	flags := make([]string, 0, 7)
 	if style.Bold {
 		flags = append(flags, "bold")
 	}
 	if style.Dim {
 		flags = append(flags, "dim")
+	}
+	if style.Blink {
+		flags = append(flags, "blink")
 	}
 	if style.Italic {
 		flags = append(flags, "italic")
@@ -1094,6 +1097,9 @@ func formatRenderStyle(style protocol.Style) string {
 	}
 	if style.Reverse {
 		flags = append(flags, "reverse")
+	}
+	if style.Invisible {
+		flags = append(flags, "invisible")
 	}
 	if len(flags) == 0 {
 		flags = append(flags, "plain")

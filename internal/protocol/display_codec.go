@@ -466,7 +466,7 @@ func (d *DisplayDecoder) readStyle() (Style, error) {
 	if err != nil {
 		return Style{}, err
 	}
-	return Style{Bold: flags&styleFlagBold != 0, Dim: flags&styleFlagDim != 0, Italic: flags&styleFlagItalic != 0, Underline: flags&styleFlagUnderline != 0, Reverse: flags&styleFlagReverse != 0, FG: fg, BG: bg}, nil
+	return Style{Bold: flags&styleFlagBold != 0, Dim: flags&styleFlagDim != 0, Blink: flags&styleFlagBlink != 0, Italic: flags&styleFlagItalic != 0, Underline: flags&styleFlagUnderline != 0, Reverse: flags&styleFlagReverse != 0, Invisible: flags&styleFlagInvisible != 0, FG: fg, BG: bg}, nil
 }
 
 func (d *DisplayDecoder) readColor() (Color, error) {

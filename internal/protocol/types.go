@@ -176,9 +176,11 @@ type Color struct {
 type Style struct {
 	Bold      bool
 	Dim       bool
+	Blink     bool
 	Italic    bool
 	Underline bool
 	Reverse   bool
+	Invisible bool
 	FG        Color
 	BG        Color
 }

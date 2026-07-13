@@ -316,6 +316,12 @@ func sgrForStyle(style protocol.Style) string {
 	if style.Bold {
 		codes = append(codes, "1")
 	}
+	if style.Dim {
+		codes = append(codes, "2")
+	}
+	if style.Blink {
+		codes = append(codes, "5")
+	}
 	if style.Italic {
 		codes = append(codes, "3")
 	}
@@ -324,6 +330,9 @@ func sgrForStyle(style protocol.Style) string {
 	}
 	if style.Reverse {
 		codes = append(codes, "7")
+	}
+	if style.Invisible {
+		codes = append(codes, "8")
 	}
 	codes = append(codes, colorCodes(style.FG, true)...)
 	codes = append(codes, colorCodes(style.BG, false)...)
