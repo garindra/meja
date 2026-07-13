@@ -76,6 +76,17 @@ func TestBuildEnvPreservesUTF8Locale(t *testing.T) {
 	}
 }
 
+func TestDefaultShellUsesEnvironmentWithSafeFallback(t *testing.T) {
+	t.Setenv("SHELL", "/bin/zsh")
+	if got := defaultShell(); got != "/bin/zsh" {
+		t.Fatalf("default shell = %q, want /bin/zsh", got)
+	}
+	t.Setenv("SHELL", "relative-shell")
+	if got := defaultShell(); got != "/bin/sh" {
+		t.Fatalf("relative shell fallback = %q, want /bin/sh", got)
+	}
+}
+
 func TestPaneResizeRunsOnPaneMainLoop(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
 	pane.initializeRuntime()

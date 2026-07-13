@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -125,7 +124,7 @@ func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
 	}
 	shell := request.Shell
 	if shell == "" {
-		shell = loginShellForUser(unixUser)
+		shell = defaultShell()
 	}
 
 	cmdPath, argv := resolveCommand(shell, request.Command)
@@ -230,28 +229,10 @@ func buildEnv(unixUser *user.User, shell string) []string {
 	return env
 }
 
-func loginShellForUser(unixUser *user.User) string {
-	if unixUser == nil || unixUser.Username == "" {
-		return "/bin/sh"
+func defaultShell() string {
+	if shell := os.Getenv("SHELL"); filepath.IsAbs(shell) {
+		return shell
 	}
-
-	data, err := os.ReadFile("/etc/passwd")
-	if err != nil {
-		return "/bin/sh"
-	}
-
-	prefix := unixUser.Username + ":"
-	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, prefix) {
-			continue
-		}
-		fields := strings.Split(line, ":")
-		if len(fields) >= 7 && filepath.IsAbs(fields[6]) {
-			return fields[6]
-		}
-		break
-	}
-
 	return "/bin/sh"
 }
 

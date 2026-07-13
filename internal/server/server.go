@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/user"
 	"sync"
 	"syscall"
 	"time"
@@ -140,11 +139,7 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 	} else if err := sendEncoded(mgmtFrames, protocol.MsgSessionAttachOK, protocol.SessionAttachOK{Version: protocol.ProtocolVersion, SessionID: s.sessionID, ResumeToken: resumeEncoded, Generation: generation}, protocol.EncodeSessionAttachOK); err != nil {
 		return err
 	}
-	current, err := user.Current()
-	if err != nil {
-		return fmt.Errorf("resolve daemon user: %w", err)
-	}
-	shell := loginShellForUser(current)
+	shell := defaultShell()
 
 	outputStreams := make(map[int]io.Writer, int(protocol.MaxRenderSlots))
 	for slot := 0; slot < int(protocol.MaxRenderSlots); slot++ {
