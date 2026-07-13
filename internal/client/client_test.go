@@ -55,25 +55,30 @@ func TestParseTargetInvalid(t *testing.T) {
 	}
 }
 
+func TestControllerCommandSelectsStartOrConnect(t *testing.T) {
+	start, err := controllerCommand("/opt/tali-ctrl", 0)
+	if err != nil || start != "'/opt/tali-ctrl' start-session" {
+		t.Fatalf("start command = %q, %v", start, err)
+	}
+	connect, err := controllerCommand("/opt/tali-ctrl", 42)
+	if err != nil || connect != "'/opt/tali-ctrl' connect-session 42" {
+		t.Fatalf("connect command = %q, %v", connect, err)
+	}
+}
+
 func TestIncomingRenderBurstLog(t *testing.T) {
 	var log bytes.Buffer
 	ui := &runtimeState{debugRender: true, stderr: &log}
-	ui.recordIncomingRenderFrame(0, protocol.Frame{
-		Type:    protocol.MsgWriteText,
-		Payload: make([]byte, 7),
-	})
-	ui.recordIncomingRenderFrame(0, protocol.Frame{
-		Type:    protocol.MsgPresent,
-		Payload: make([]byte, 3),
-	})
+	ui.recordIncomingRenderCommand(0, protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteText, Text: []byte("x")}, 3)
+	ui.recordIncomingRenderCommand(0, protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}, 1)
 	ui.flushIncomingRender()
 
 	got := log.String()
 	for _, want := range []string{
 		"incoming burst at=",
 		"window=50ms",
-		"wire_bytes=14",
-		"payload_bytes=10",
+		"wire_bytes=4",
+		"text_bytes=1",
 		"commands=2",
 		"types=WriteText:1,Present:1",
 	} {
@@ -112,28 +117,28 @@ func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
 	defer reader.Close()
 	defer writer.Close()
 	done := make(chan error, 1)
-	go readOutputStream(0, protocol.NewDecoder(reader, protocol.DefaultMaxFrameSize), ui, done)
-	enc := protocol.NewEncoder(writer)
-	write := func(kind uint64, payload []byte) {
+	go readOutputStream(0, protocol.NewDisplayDecoder(reader), ui, done)
+	write := func(data []byte) {
 		t.Helper()
-		if err := enc.WriteFrame(protocol.Frame{Type: kind, Payload: payload}); err != nil {
+		if _, err := writer.Write(data); err != nil {
 			t.Fatal(err)
 		}
 	}
-	b, _ := protocol.EncodeRelayoutBarrier(nil, protocol.RelayoutBarrier{LayoutRevision: 1})
-	write(protocol.MsgRelayoutBarrier, b)
-	b, _ = protocol.EncodeSetWritePosition(nil, protocol.SetWritePosition{})
-	write(protocol.MsgSetWritePosition, b)
-	b, _ = protocol.EncodeSetWriteStyle(nil, protocol.SetWriteStyle{})
-	write(protocol.MsgSetWriteStyle, b)
-	b, _ = protocol.EncodeWriteText(nil, protocol.WriteText{CellWidth: 1, Text: []byte("x")})
-	write(protocol.MsgWriteText, b)
+	encoder := protocol.NewDisplayEncoder(nil)
+	encoder.AppendRelayoutBarrier(protocol.RelayoutBarrier{LayoutRevision: 1})
+	write(encoder.Bytes())
+	encoder.Reset(nil)
+	encoder.AppendSetWritePosition(protocol.SetWritePosition{})
+	encoder.AppendSetWriteStyle(protocol.SetWriteStyle{})
+	encoder.AppendWriteTextUTF8([]byte("x"))
+	write(encoder.Bytes())
 	time.Sleep(10 * time.Millisecond)
 	if stdout.Len() != 0 {
 		t.Fatalf("rendered %d bytes before PRESENT", stdout.Len())
 	}
-	b, _ = protocol.EncodePresent(nil, protocol.Present{})
-	write(protocol.MsgPresent, b)
+	encoder.Reset(nil)
+	encoder.AppendPresent()
+	write(encoder.Bytes())
 	deadline := time.Now().Add(time.Second)
 	for stdout.Len() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)

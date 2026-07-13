@@ -1,45 +1,116 @@
 package server
 
 import (
-	"encoding/binary"
+	"bytes"
+	"io"
 	"testing"
-	"unicode/utf8"
 
 	"tali/internal/protocol"
 	"tali/internal/server/terminal"
 )
 
-func TestSendCellCommandsUsesFillAndText(t *testing.T) {
-	ch := make(chan protocol.Frame, 16)
+func TestDisplayCompilerUsesSpecializedTextAndFill(t *testing.T) {
+	output := newRenderOutput()
 	cells := []protocol.Cell{{Rune: ' ', Width: 1}, {Rune: ' ', Width: 1}, {Rune: ' ', Width: 1}, {Rune: 'o', Width: 1}, {Rune: 'k', Width: 1}}
-	if err := newDisplayCompiler(ch, map[uint32]protocol.Style{0: {}}).writeCells(2, 4, cells); err != nil {
+	if err := newDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(2, 4, cells); err != nil {
 		t.Fatal(err)
 	}
-	close(ch)
-	var types []uint64
-	for frame := range ch {
-		types = append(types, frame.Type)
+	commands := decodePendingCommands(t, output.pending)
+	want := []protocol.DisplayOpcode{protocol.DisplayOpcodeSetWritePosition, protocol.DisplayOpcodeSetWriteStyle, protocol.DisplayOpcodeFill, protocol.DisplayOpcodeWriteTextUTF8}
+	if len(commands) != len(want) {
+		t.Fatalf("commands=%#v", commands)
 	}
-	want := []uint64{protocol.MsgSetWritePosition, protocol.MsgSetWriteStyle, protocol.MsgFill, protocol.MsgWriteText}
-	if len(types) != len(want) {
-		t.Fatalf("types=%v", types)
-	}
-	for i := range want {
-		if types[i] != want[i] {
-			t.Fatalf("types=%v want=%v", types, want)
+	for i, opcode := range want {
+		if commands[i].Opcode != opcode {
+			t.Fatalf("commands[%d]=0x%02x want 0x%02x", i, commands[i].Opcode, opcode)
 		}
 	}
 }
 
-func TestDisplayCompilerSavings(t *testing.T) {
-	rows := compilerBenchmarkRows()
-	baseline := compileDisplayRows(t, rows, false)
-	optimized := compileDisplayRows(t, rows, true)
-	baseBytes := displayFramesSize(baseline)
-	optimizedBytes := displayFramesSize(optimized)
-	t.Logf("display compiler: commands %d -> %d (%.1f%% saved), wire bytes %d -> %d (%.1f%% saved)", len(baseline), len(optimized), savingPercent(len(baseline), len(optimized)), baseBytes, optimizedBytes, savingPercent(baseBytes, optimizedBytes))
-	if len(optimized) >= len(baseline) || optimizedBytes >= baseBytes {
-		t.Fatal("stateful compiler did not reduce output")
+func TestRenderOutputPublishesOnePhysicalBatchAtPresent(t *testing.T) {
+	output := newRenderOutput()
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := output.present(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case batch := <-output.batches:
+		if len(batch) == 0 || batch[len(batch)-1] != byte(protocol.DisplayOpcodePresent) {
+			t.Fatalf("batch=% x", batch)
+		}
+	default:
+		t.Fatal("PRESENT did not publish a batch")
+	}
+	select {
+	case <-output.batches:
+		t.Fatal("commands were published as multiple batches")
+	default:
+	}
+}
+
+func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
+	session := NewSession(0)
+	client := session.NewClient(0)
+	client.TerminalCols = 8
+	client.TerminalRows = 3
+	pane := &Pane{ID: session.AddPaneID(), Terminal: terminal.New(8, 3)}
+	session.CreateWindow(pane, 0)
+	output := newRenderOutput()
+	state := &sessionState{session: session, outputFrames: map[int]*renderOutput{0: output}}
+	ctrl := &controller{state: state, outputFrames: map[int]*renderOutput{0: output}}
+	if err := ctrl.publishBindingsAndSnapshots(); err != nil {
+		t.Fatal(err)
+	}
+	var batch []byte
+	select {
+	case batch = <-output.batches:
+	default:
+		t.Fatal("snapshot did not queue a batch")
+	}
+	commands := decodePendingCommands(t, batch)
+	if len(commands) < 2 || commands[0].Opcode != protocol.DisplayOpcodeRelayoutBarrier || commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
+		t.Fatalf("commands=%#v", commands)
+	}
+	select {
+	case extra := <-output.batches:
+		t.Fatalf("standalone write queued before transaction: % x", extra)
+	default:
+	}
+}
+
+func TestDisplayCompilerDefaultOverrideDoesNotLatchStyle(t *testing.T) {
+	output := newRenderOutput()
+	styles := map[uint32]protocol.Style{0: {}, 2: {Bold: true}}
+	compiler := newDisplayCompiler(output, styles)
+	cells := append(textCells("bold", 2), textCells(" default", 0)...)
+	cells = append(cells, textCells("bold", 2)...)
+	if err := compiler.writeCells(0, 0, cells); err != nil {
+		t.Fatal(err)
+	}
+	commands := decodePendingCommands(t, output.pending)
+	var opcodes []protocol.DisplayOpcode
+	for _, command := range commands {
+		opcodes = append(opcodes, command.Opcode)
+	}
+	if !containsOpcode(opcodes, protocol.DisplayOpcodeWriteTextUTF8Default) || countOpcode(opcodes, protocol.DisplayOpcodeSetWriteStyle) != 1 {
+		t.Fatalf("opcodes=%v", opcodes)
+	}
+}
+
+func TestDisplayCompilerKeepsWidthTwoFallback(t *testing.T) {
+	output := newRenderOutput()
+	cells := []protocol.Cell{{Rune: '界', Width: 2, StyleID: 0}}
+	if err := newDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
+		t.Fatal(err)
+	}
+	commands := decodePendingCommands(t, output.pending)
+	if len(commands) == 0 || commands[len(commands)-1].Opcode != protocol.DisplayOpcodeWriteText || commands[len(commands)-1].Width != 2 {
+		t.Fatalf("commands=%#v", commands)
 	}
 }
 
@@ -47,51 +118,151 @@ func TestCompilerBridgesVisuallyEquivalentBlankStyles(t *testing.T) {
 	styles := compilerBenchmarkStyles()
 	cells := append(textCells("Desktop", 2), textCells("    ", 0)...)
 	cells = append(cells, textCells("Downloads", 2)...)
-	ch := make(chan protocol.Frame, 16)
-	if err := newDisplayCompiler(ch, styles).writeCells(0, 0, cells); err != nil {
+	output := newRenderOutput()
+	if err := newDisplayCompiler(output, styles).writeCells(0, 0, cells); err != nil {
 		t.Fatal(err)
 	}
-	close(ch)
-	writes := 0
-	for frame := range ch {
-		if frame.Type == protocol.MsgWriteText {
-			writes++
-			msg, err := protocol.DecodeWriteText(frame.Payload)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(msg.Text) != "Desktop    Downloads" {
-				t.Fatalf("text=%q", msg.Text)
+	commands := decodePendingCommands(t, output.pending)
+	texts := 0
+	for _, command := range commands {
+		if command.Opcode == protocol.DisplayOpcodeWriteTextUTF8 {
+			texts++
+			if string(command.Text) != "Desktop    Downloads" {
+				t.Fatalf("text=%q", command.Text)
 			}
 		}
 	}
-	if writes != 1 {
-		t.Fatalf("WRITE_TEXT commands=%d, want 1", writes)
+	if texts != 1 {
+		t.Fatalf("text commands=%d, want 1", texts)
 	}
 }
 
-func TestCompilerPreservesVisibleBackgroundBoundary(t *testing.T) {
+func TestDisplayCompilerPreservesVisibleBackgroundBoundary(t *testing.T) {
 	styles := map[uint32]protocol.Style{1: {BG: protocol.Color{Mode: "indexed", Index: 4}}, 2: {BG: protocol.Color{Mode: "indexed", Index: 1}}}
 	cells := append(textCells("blue", 1), textCells("   ", 2)...)
 	cells = append(cells, textCells("panel", 1)...)
-	ch := make(chan protocol.Frame, 16)
-	if err := newDisplayCompiler(ch, styles).writeCells(0, 0, cells); err != nil {
+	output := newRenderOutput()
+	if err := newDisplayCompiler(output, styles).writeCells(0, 0, cells); err != nil {
 		t.Fatal(err)
 	}
-	close(ch)
-	writes := 0
-	fills := 0
-	for frame := range ch {
-		if frame.Type == protocol.MsgWriteText {
-			writes++
-		}
-		if frame.Type == protocol.MsgFill {
-			fills++
+	commands := decodePendingCommands(t, output.pending)
+	if countOpcode(commandOpcodes(commands), protocol.DisplayOpcodeWriteTextUTF8) != 2 || countOpcode(commandOpcodes(commands), protocol.DisplayOpcodeFill) != 1 {
+		t.Fatalf("commands=%#v", commands)
+	}
+}
+
+func TestStyleInstallIsCachedUntilRelayout(t *testing.T) {
+	ctrl := &controller{installedStyles: make(map[int]map[uint32]protocol.Style)}
+	output := newRenderOutput()
+	style := protocol.Style{Bold: true}
+	if err := ctrl.installStyle(0, output, 7, style); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctrl.installStyle(0, output, 7, style); err != nil {
+		t.Fatal(err)
+	}
+	if got := countOpcode(commandOpcodes(decodePendingCommands(t, output.pending)), protocol.DisplayOpcodeStyleInstall); got != 1 {
+		t.Fatalf("style commands=%d", got)
+	}
+	ctrl.resetInstalledStyles(0)
+	if err := ctrl.installStyle(0, output, 7, style); err != nil {
+		t.Fatal(err)
+	}
+	if got := countOpcode(commandOpcodes(decodePendingCommands(t, output.pending)), protocol.DisplayOpcodeStyleInstall); got != 2 {
+		t.Fatalf("style commands after reset=%d", got)
+	}
+}
+
+func TestStyleZeroMustBeCanonicalDefault(t *testing.T) {
+	ctrl := &controller{installedStyles: make(map[int]map[uint32]protocol.Style)}
+	output := newRenderOutput()
+	if err := ctrl.installStyle(0, output, protocol.CanonicalDefaultStyleID, protocol.Style{Bold: true}); err == nil {
+		t.Fatal("accepted noncanonical style 0")
+	}
+	if len(output.pending) != 0 {
+		t.Fatalf("invalid style changed pending bytes: %x", output.pending)
+	}
+}
+
+func TestColoredEraseInstallsReferencedStyle(t *testing.T) {
+	session := NewSession(0)
+	client := session.NewClient(0)
+	client.TerminalCols = 8
+	client.TerminalRows = 3
+	pane := &Pane{ID: session.AddPaneID(), Terminal: terminal.New(8, 3)}
+	session.CreateWindow(pane, 0)
+	output := newRenderOutput()
+	state := &sessionState{session: session, outputFrames: map[int]*renderOutput{0: output}}
+	ctrl := &controller{state: state, outputFrames: map[int]*renderOutput{0: output}}
+	pane.terminalMu.Lock()
+	update := pane.Terminal.Apply([]byte("\x1b[44m\x1b[2K"))
+	pane.terminalMu.Unlock()
+	if err := ctrl.emitTerminalUpdate(pane, update); err != nil {
+		t.Fatal(err)
+	}
+	installed := map[uint32]bool{}
+	for _, command := range decodePendingCommands(t, output.pending) {
+		switch command.Opcode {
+		case protocol.DisplayOpcodeStyleInstall:
+			installed[command.StyleID] = true
+		case protocol.DisplayOpcodeSetWriteStyle:
+			if !installed[command.StyleID] {
+				t.Fatalf("style %d selected before installation", command.StyleID)
+			}
 		}
 	}
-	if writes != 2 || fills != 1 {
-		t.Fatalf("writes=%d fills=%d, want 2/1", writes, fills)
+}
+
+func TestDisplayWireMeasurement(t *testing.T) {
+	rows := compilerBenchmarkRows()
+	output := newRenderOutput()
+	compiler := newDisplayCompiler(output, compilerBenchmarkStyles())
+	for row, cells := range rows {
+		if err := compiler.writeCells(row, 0, cells); err != nil {
+			t.Fatal(err)
+		}
 	}
+	actual := append(append([]byte(nil), output.pending...), byte(protocol.DisplayOpcodePresent))
+	conceptual := conceptualFramedDisplaySize(t, actual)
+	t.Logf("TUI-like batch commands=%d before_framed=%d after_display=%d savings=%d", len(decodePendingCommands(t, output.pending)), conceptual, len(actual), conceptual-len(actual))
+}
+
+func decodePendingCommands(tb testing.TB, data []byte) []protocol.DisplayCommand {
+	tb.Helper()
+	decoder := protocol.NewDisplayDecoder(bytes.NewReader(data))
+	var commands []protocol.DisplayCommand
+	for {
+		command, _, err := decoder.ReadCommand()
+		if err != nil {
+			if err == io.EOF {
+				return commands
+			}
+			tb.Fatal(err)
+		}
+		commands = append(commands, command)
+	}
+}
+
+func commandOpcodes(commands []protocol.DisplayCommand) []protocol.DisplayOpcode {
+	opcodes := make([]protocol.DisplayOpcode, len(commands))
+	for i, command := range commands {
+		opcodes[i] = command.Opcode
+	}
+	return opcodes
+}
+
+func containsOpcode(opcodes []protocol.DisplayOpcode, want protocol.DisplayOpcode) bool {
+	return countOpcode(opcodes, want) > 0
+}
+
+func countOpcode(opcodes []protocol.DisplayOpcode, want protocol.DisplayOpcode) int {
+	count := 0
+	for _, opcode := range opcodes {
+		if opcode == want {
+			count++
+		}
+	}
+	return count
 }
 
 func textCells(text string, styleID uint32) []protocol.Cell {
@@ -100,96 +271,6 @@ func textCells(text string, styleID uint32) []protocol.Cell {
 		cells = append(cells, protocol.Cell{Rune: r, StyleID: styleID, Width: 1})
 	}
 	return cells
-}
-
-func BenchmarkDisplayCompiler(b *testing.B) {
-	rows := compilerBenchmarkRows()
-	baseline := compileDisplayRows(b, rows, false)
-	optimized := compileDisplayRows(b, rows, true)
-	b.Logf("command savings: %d -> %d (%.1f%%); wire savings: %d -> %d bytes (%.1f%%)", len(baseline), len(optimized), savingPercent(len(baseline), len(optimized)), displayFramesSize(baseline), displayFramesSize(optimized), savingPercent(displayFramesSize(baseline), displayFramesSize(optimized)))
-	b.Run("stateless", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			_ = compileDisplayRows(b, rows, false)
-		}
-	})
-	b.Run("stateful", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			_ = compileDisplayRows(b, rows, true)
-		}
-	})
-}
-
-type testingTB interface {
-	Helper()
-	Fatal(...any)
-}
-
-func compileDisplayRows(tb testingTB, rows [][]protocol.Cell, optimized bool) []protocol.Frame {
-	tb.Helper()
-	ch := make(chan protocol.Frame, 2048)
-	if optimized {
-		compiler := newDisplayCompiler(ch, compilerBenchmarkStyles())
-		for row, cells := range rows {
-			if err := compiler.writeCells(row, 0, cells); err != nil {
-				tb.Fatal(err)
-			}
-		}
-	} else {
-		for row, cells := range rows {
-			if err := writeCellsStateless(ch, row, 0, cells); err != nil {
-				tb.Fatal(err)
-			}
-		}
-	}
-	close(ch)
-	frames := make([]protocol.Frame, 0, len(ch))
-	for frame := range ch {
-		frames = append(frames, frame)
-	}
-	return frames
-}
-
-func writeCellsStateless(ch chan<- protocol.Frame, row, column int, cells []protocol.Cell) error {
-	for i := 0; i < len(cells); {
-		cell := cells[i]
-		if cell.Width == 0 {
-			i++
-			continue
-		}
-		if err := sendEncoded(ch, protocol.MsgSetWritePosition, protocol.SetWritePosition{Row: row, Column: column + i}, protocol.EncodeSetWritePosition); err != nil {
-			return err
-		}
-		if err := sendEncoded(ch, protocol.MsgSetWriteStyle, protocol.SetWriteStyle{StyleID: cell.StyleID}, protocol.EncodeSetWriteStyle); err != nil {
-			return err
-		}
-		if cell.Width == 1 {
-			j := i + 1
-			for j < len(cells) && cells[j] == cell {
-				j++
-			}
-			if j-i >= 3 {
-				if err := sendEncoded(ch, protocol.MsgFill, protocol.Fill{Columns: j - i, Rune: normalizedRune(cell.Rune), Width: 1}, protocol.EncodeFill); err != nil {
-					return err
-				}
-				i = j
-				continue
-			}
-		}
-		width, styleID := cell.Width, cell.StyleID
-		text := make([]byte, 0, 64)
-		for i < len(cells) {
-			current := cells[i]
-			if current.Width != width || current.StyleID != styleID || current.Width == 0 {
-				break
-			}
-			text = utf8.AppendRune(text, normalizedRune(current.Rune))
-			i += int(current.Width)
-		}
-		if err := sendEncoded(ch, protocol.MsgWriteText, protocol.WriteText{CellWidth: width, Text: text}, protocol.EncodeWriteText); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func compilerBenchmarkRows() [][]protocol.Cell {
@@ -220,77 +301,32 @@ func compilerBenchmarkStyles() map[uint32]protocol.Style {
 		3: {FG: protocol.Color{Mode: "indexed", Index: 1}, BG: protocol.Color{Mode: "default"}},
 	}
 }
-func displayFramesSize(frames []protocol.Frame) int {
-	size := 0
-	var buf [binary.MaxVarintLen64]byte
-	for _, frame := range frames {
-		size += binary.PutUvarint(buf[:], frame.Type) + binary.PutUvarint(buf[:], uint64(len(frame.Payload))) + len(frame.Payload)
-	}
-	return size
-}
-func savingPercent(before, after int) float64 {
-	if before == 0 {
-		return 0
-	}
-	return float64(before-after) * 100 / float64(before)
-}
 
-func TestColoredEraseInstallsReferencedStyle(t *testing.T) {
-	session := NewSession(0)
-	client := session.NewClient(0)
-	client.TerminalCols = 8
-	client.TerminalRows = 3
-	pane := &Pane{ID: session.AddPaneID(), Terminal: terminal.New(8, 3)}
-	session.CreateWindow(pane, 0)
-	frames := make(chan protocol.Frame, 32)
-	state := &sessionState{session: session, outputFrames: map[int]chan protocol.Frame{0: frames}}
-	ctrl := &controller{state: state, outputFrames: map[int]chan protocol.Frame{0: frames}}
-	pane.terminalMu.Lock()
-	update := pane.Terminal.Apply([]byte("\x1b[44m\x1b[2K"))
-	pane.terminalMu.Unlock()
-	if err := ctrl.emitTerminalUpdate(pane, update); err != nil {
-		t.Fatal(err)
-	}
-	close(frames)
-	installed := map[uint32]bool{}
-	for frame := range frames {
-		switch frame.Type {
-		case protocol.MsgStyleInstall:
-			m, err := protocol.DecodeStyleInstall(frame.Payload)
-			if err != nil {
-				t.Fatal(err)
-			}
-			installed[m.ID] = true
-		case protocol.MsgSetWriteStyle:
-			m, err := protocol.DecodeSetWriteStyle(frame.Payload)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !installed[m.StyleID] {
-				t.Fatalf("style %d selected before installation", m.StyleID)
-			}
+func conceptualFramedDisplaySize(tb testing.TB, stream []byte) int {
+	tb.Helper()
+	decoder := protocol.NewDisplayDecoder(bytes.NewReader(stream))
+	total := 0
+	for {
+		start := decoder.BytesRead()
+		command, _, err := decoder.ReadCommand()
+		if err != nil {
+			return total
 		}
+		payload := int(decoder.BytesRead()-start) - 1
+		var scratch [10]byte
+		typeBytes := putUvarint(scratch[:], uint64(command.Opcode))
+		lengthBytes := putUvarint(scratch[:], uint64(payload))
+		total += typeBytes + lengthBytes + payload
 	}
 }
 
-func TestStyleInstallIsCachedUntilRelayout(t *testing.T) {
-	ctrl := &controller{installedStyles: make(map[int]map[uint32]protocol.Style)}
-	frames := make(chan protocol.Frame, 4)
-	style := protocol.Style{Bold: true}
-	if err := ctrl.installStyle(0, frames, 7, style); err != nil {
-		t.Fatal(err)
+func putUvarint(dst []byte, value uint64) int {
+	count := 0
+	for value >= 0x80 {
+		dst[count] = byte(value) | 0x80
+		value >>= 7
+		count++
 	}
-	if err := ctrl.installStyle(0, frames, 7, style); err != nil {
-		t.Fatal(err)
-	}
-	if len(frames) != 1 {
-		t.Fatalf("style frames=%d, want 1", len(frames))
-	}
-	ctrl.resetInstalledStyles(0)
-	if err := ctrl.installStyle(0, frames, 7, style); err != nil {
-		t.Fatal(err)
-	}
-	if len(frames) != 2 {
-		t.Fatalf("style frames after relayout=%d, want 2", len(frames))
-	}
+	dst[count] = byte(value)
+	return count + 1
 }

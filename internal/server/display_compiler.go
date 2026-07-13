@@ -7,7 +7,7 @@ import (
 )
 
 type displayCompiler struct {
-	output        chan<- protocol.Frame
+	output        *renderOutput
 	positionValid bool
 	row, column   int
 	styleValid    bool
@@ -16,7 +16,7 @@ type displayCompiler struct {
 	styles        map[uint32]protocol.Style
 }
 
-func newDisplayCompiler(output chan<- protocol.Frame, styles map[uint32]protocol.Style) *displayCompiler {
+func newDisplayCompiler(output *renderOutput, styles map[uint32]protocol.Style) *displayCompiler {
 	return &displayCompiler{output: output, styles: styles, textScratch: make([]byte, 0, 64)}
 }
 
@@ -30,9 +30,6 @@ func (d *displayCompiler) writeCells(row, column int, cells []protocol.Cell) err
 		if err := d.moveTo(row, column+i); err != nil {
 			return err
 		}
-		if err := d.selectStyle(cell.StyleID); err != nil {
-			return err
-		}
 		if cell.Width == 1 {
 			j := i + 1
 			for j < len(cells) && cells[j] == cell {
@@ -40,7 +37,10 @@ func (d *displayCompiler) writeCells(row, column int, cells []protocol.Cell) err
 			}
 			if j-i >= 3 {
 				count := j - i
-				if err := sendEncoded(d.output, protocol.MsgFill, protocol.Fill{Columns: count, Rune: normalizedRune(cell.Rune), Width: 1}, protocol.EncodeFill); err != nil {
+				if err := d.selectStyle(cell.StyleID); err != nil {
+					return err
+				}
+				if err := d.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeFill, Fill: protocol.Fill{Columns: count, Rune: normalizedRune(cell.Rune), Width: 1}}); err != nil {
 					return err
 				}
 				d.column += count
@@ -71,8 +71,21 @@ func (d *displayCompiler) writeCells(row, column int, cells []protocol.Cell) err
 			d.textScratch = utf8.AppendRune(d.textScratch, normalizedRune(current.Rune))
 			i += int(current.Width)
 		}
-		if err := sendEncoded(d.output, protocol.MsgWriteText, protocol.WriteText{CellWidth: width, Text: d.textScratch}, protocol.EncodeWriteText); err != nil {
-			return err
+		if width == 1 && styleID == 0 && (!d.styleValid || d.styleID != 0) {
+			if err := d.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: d.textScratch}); err != nil {
+				return err
+			}
+		} else {
+			if err := d.selectStyle(styleID); err != nil {
+				return err
+			}
+			opcode := protocol.DisplayOpcodeWriteText
+			if width == 1 {
+				opcode = protocol.DisplayOpcodeWriteTextUTF8
+			}
+			if err := d.output.append(protocol.DisplayCommand{Opcode: opcode, Width: width, Text: d.textScratch}); err != nil {
+				return err
+			}
 		}
 		d.column += i - start
 	}
@@ -131,7 +144,7 @@ func (d *displayCompiler) moveTo(row, column int) error {
 	if d.positionValid && d.row == row && d.column == column {
 		return nil
 	}
-	if err := sendEncoded(d.output, protocol.MsgSetWritePosition, protocol.SetWritePosition{Row: row, Column: column}, protocol.EncodeSetWritePosition); err != nil {
+	if err := d.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: row, Column: column}); err != nil {
 		return err
 	}
 	d.positionValid = true
@@ -143,7 +156,7 @@ func (d *displayCompiler) selectStyle(styleID uint32) error {
 	if d.styleValid && d.styleID == styleID {
 		return nil
 	}
-	if err := sendEncoded(d.output, protocol.MsgSetWriteStyle, protocol.SetWriteStyle{StyleID: styleID}, protocol.EncodeSetWriteStyle); err != nil {
+	if err := d.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: styleID}); err != nil {
 		return err
 	}
 	d.styleValid = true

@@ -11,7 +11,7 @@ import (
 func TestFrameRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
-	want := Frame{Type: MsgClientHello, Payload: []byte(`{"version":1}`)}
+	want := Frame{Type: MsgSessionAttach, Payload: []byte(`{"version":1,"sessionId":1,"attachToken":"token"}`)}
 	if err := enc.WriteFrame(want); err != nil {
 		t.Fatalf("WriteFrame() error = %v", err)
 	}
@@ -28,7 +28,7 @@ func TestFrameRoundTrip(t *testing.T) {
 func TestFrameOversized(t *testing.T) {
 	var buf bytes.Buffer
 	var header [binary.MaxVarintLen64 * 2]byte
-	n := binary.PutUvarint(header[:], MsgClientHello)
+	n := binary.PutUvarint(header[:], MsgSessionAttach)
 	n += binary.PutUvarint(header[n:], 10)
 	if _, err := buf.Write(header[:n]); err != nil {
 		t.Fatal(err)

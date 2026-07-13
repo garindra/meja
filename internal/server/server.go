@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +13,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"tali/internal/auth"
+	"tali/internal/control"
 	"tali/internal/protocol"
 	"tali/internal/server/terminal"
 )
@@ -29,9 +28,7 @@ const (
 )
 
 type Config struct {
-	ListenAddr       string
-	CertFile         string
-	KeyFile          string
+	ControlPath      string
 	Stdout           io.Writer
 	Stderr           io.Writer
 	TerminalDebugLog io.Writer
@@ -46,70 +43,33 @@ type paneRequest struct {
 }
 
 type sessionState struct {
-	verifier *auth.Verifier
-	session  *Session
+	session        *Session
+	sessionID      uint64
+	attachMu       sync.Mutex
+	attachToken    []byte
+	attachExpires  time.Time
+	attachConsumed bool
+	resumeTokens   map[string]uint64
+	generation     uint64
+	activeConn     quic.Connection
 
 	mu           sync.RWMutex
-	outputFrames map[int]chan protocol.Frame
+	outputFrames map[int]*renderOutput
 	renderMu     sync.Mutex
 }
 
 type controller struct {
 	ctx             context.Context
 	state           *sessionState
-	unixUser        *user.User
 	shell           string
 	mgmtFrames      chan protocol.Frame
-	outputFrames    map[int]chan protocol.Frame
+	outputFrames    map[int]*renderOutput
 	defaultCwd      string
 	defaultArgv     []string
 	installedStyles map[int]map[uint32]protocol.Style
 }
 
-func Run(ctx context.Context, cfg Config) error {
-	terminal.SetDebugLogger(cfg.TerminalDebugLog)
-	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-	if err != nil {
-		return fmt.Errorf("load TLS key pair: %w", err)
-	}
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{protocol.ALPN},
-		MinVersion:   tls.VersionTLS13,
-	}
-	listener, err := quic.ListenAddr(cfg.ListenAddr, tlsConfig, &quic.Config{
-		MaxIdleTimeout:     quicMaxIdleTimeout,
-		KeepAlivePeriod:    quicKeepAlivePeriod,
-		MaxIncomingStreams: int64(protocol.MaxRenderSlots),
-	})
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
-	}
-	defer listener.Close()
-
-	shared := &sessionState{
-		verifier:     auth.NewVerifier(),
-		session:      NewSession(sessionID0),
-		outputFrames: map[int]chan protocol.Frame{},
-	}
-
-	for {
-		conn, err := listener.Accept(ctx)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return fmt.Errorf("accept connection: %w", err)
-		}
-		go func(conn quic.Connection) {
-			if err := handleSession(ctx, shared, conn); err != nil && cfg.Stderr != nil {
-				fmt.Fprintf(cfg.Stderr, "session error: %v\n", err)
-			}
-		}(conn)
-	}
-}
-
-func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) error {
+func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 	defer conn.CloseWithError(0, "")
 
 	var err error
@@ -130,76 +90,97 @@ func handleSession(ctx context.Context, s *sessionState, conn quic.Connection) e
 		return err
 	}
 
-	hello, err := expectDecoded(mgmtDecoder, protocol.MsgClientHello, protocol.DecodeClientHello)
+	first, err := mgmtDecoder.ReadFrame()
 	if err != nil {
-		return fmt.Errorf("read client hello: %w", err)
+		return fmt.Errorf("read session attachment: %w", err)
 	}
-	if hello.Version != 1 {
-		return errors.New("unsupported client protocol version")
+	var s *sessionState
+	var resumeEncoded string
+	var generation uint64
+	responseType := protocol.MsgSessionAttachOK
+	switch first.Type {
+	case protocol.MsgSessionAttach:
+		attach, decodeErr := protocol.DecodeSessionAttach(first.Payload)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		if attach.Version != protocol.ProtocolVersion {
+			return errors.New("unsupported session protocol version")
+		}
+		s, err = d.attach(attach.SessionID, attach.Token)
+		if err == nil {
+			resumeToken, tokenErr := control.NewToken()
+			if tokenErr != nil {
+				return tokenErr
+			}
+			s.attachMu.Lock()
+			s.generation++
+			resumeEncoded = control.EncodeToken(resumeToken)
+			s.resumeTokens = map[string]uint64{resumeEncoded: s.generation}
+			generation = s.generation
+			s.attachMu.Unlock()
+		}
+	case protocol.MsgSessionResume:
+		resume, decodeErr := protocol.DecodeSessionResume(first.Payload)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		if resume.Version != protocol.ProtocolVersion {
+			return errors.New("unsupported session protocol version")
+		}
+		s, resumeEncoded, generation, err = d.resume(resume.SessionID, resume.ResumeToken, resume.Generation)
+		responseType = protocol.MsgSessionResumeOK
+	default:
+		return fmt.Errorf("expected session attachment, got message type %d", first.Type)
 	}
+	if err != nil {
+		_ = sendEncodedDirect(mgmtStream, protocol.MsgSessionAttachFailed, protocol.SessionAttachFailed{Reason: "session attachment rejected"}, protocol.EncodeSessionAttachFailed)
+		return err
+	}
+	d.activate(s, conn)
 
 	mgmtFrames := make(chan protocol.Frame, 64)
 	writerErrs := make(chan error, 4)
 	go writeStream(mgmtStream, mgmtFrames, writerErrs)
 	defer close(mgmtFrames)
 
-	authBegin, err := expectDecoded(mgmtDecoder, protocol.MsgAuthBegin, protocol.DecodeAuthBegin)
-	if err != nil {
-		return fmt.Errorf("read auth begin: %w", err)
-	}
-	beginResult, err := s.verifier.Begin(authBegin.Username, authBegin.PublicKey)
-	if err != nil {
-		_ = sendEncoded(mgmtFrames, protocol.MsgAuthFailed, protocol.AuthFailed{Reason: err.Error()}, protocol.EncodeAuthFailed)
-		return fmt.Errorf("begin auth: %w", err)
-	}
-	unixUser := beginResult.User
-	fingerprint := beginResult.Fingerprint
-	if err := sendEncoded(mgmtFrames, protocol.MsgAuthChallenge, protocol.AuthChallenge{
-		ChallengeID: beginResult.Challenge.ID,
-		Nonce:       beginResult.Challenge.Nonce,
-		ExpiresAt:   beginResult.Challenge.ExpiresAt,
-	}, protocol.EncodeAuthChallenge); err != nil {
+	if responseType == protocol.MsgSessionResumeOK {
+		if err := sendEncoded(mgmtFrames, protocol.MsgSessionResumeOK, protocol.SessionResumeOK{Version: protocol.ProtocolVersion, SessionID: s.sessionID, ResumeToken: resumeEncoded, Generation: generation}, protocol.EncodeSessionResumeOK); err != nil {
+			return err
+		}
+	} else if err := sendEncoded(mgmtFrames, protocol.MsgSessionAttachOK, protocol.SessionAttachOK{Version: protocol.ProtocolVersion, SessionID: s.sessionID, ResumeToken: resumeEncoded, Generation: generation}, protocol.EncodeSessionAttachOK); err != nil {
 		return err
 	}
-	authResponse, err := expectDecoded(mgmtDecoder, protocol.MsgAuthResponse, protocol.DecodeAuthResponse)
+	current, err := user.Current()
 	if err != nil {
-		return fmt.Errorf("read auth response: %w", err)
+		return fmt.Errorf("resolve daemon user: %w", err)
 	}
-	if err := s.verifier.Verify(authBegin.Username, fingerprint, authResponse.ChallengeID, authResponse.Signature); err != nil {
-		_ = sendEncoded(mgmtFrames, protocol.MsgAuthFailed, protocol.AuthFailed{Reason: err.Error()}, protocol.EncodeAuthFailed)
-		return fmt.Errorf("verify auth response: %w", err)
-	}
+	shell := loginShellForUser(current)
 
-	shell := loginShellForUser(unixUser)
-	if err := sendEncoded(mgmtFrames, protocol.MsgAuthOK, protocol.AuthOK{
-		Username: unixUser.Username,
-		HomeDir:  unixUser.HomeDir,
-		Shell:    shell,
-	}, protocol.EncodeAuthOK); err != nil {
-		return err
-	}
-
-	outputFrames := make(map[int]chan protocol.Frame, int(protocol.MaxRenderSlots))
+	outputFrames := make(map[int]*renderOutput, int(protocol.MaxRenderSlots))
 	for slot := 0; slot < int(protocol.MaxRenderSlots); slot++ {
 		outputStream, err := conn.OpenStreamSync(ctx)
 		if err != nil {
 			return fmt.Errorf("open output stream %d: %w", slot, err)
 		}
-		frames := make(chan protocol.Frame, 256)
-		outputFrames[slot] = frames
-		go writeStream(outputStream, frames, writerErrs)
-		defer close(frames)
-		s.setOutputFrames(slot, frames)
-		defer s.clearOutputFrames(slot, frames)
-		if err := sendEncoded(frames, protocol.MsgOpenPaneOutputStream, protocol.StreamOpen{StreamType: protocol.StreamTypePaneOutput, Slot: uint8(slot)}, protocol.EncodeStreamOpen); err != nil {
+		openPayload, err := protocol.EncodeStreamOpen(nil, protocol.StreamOpen{StreamType: protocol.StreamTypePaneOutput, Slot: uint8(slot)})
+		if err != nil {
 			return err
 		}
+		if err := protocol.NewEncoder(outputStream).WriteFrame(protocol.Frame{Type: protocol.MsgOpenPaneOutputStream, Payload: openPayload}); err != nil {
+			return err
+		}
+		frames := newRenderOutput()
+		outputFrames[slot] = frames
+		go writeDisplayStream(outputStream, frames.batches, frames.recycle, writerErrs)
+		defer close(frames.batches)
+		s.setOutputFrames(slot, frames)
+		defer s.clearOutputFrames(slot, frames)
 	}
 
 	ctrl := &controller{
 		ctx:             ctx,
 		state:           s,
-		unixUser:        unixUser,
 		shell:           shell,
 		mgmtFrames:      mgmtFrames,
 		outputFrames:    outputFrames,
@@ -312,7 +293,7 @@ func (c *controller) handlePaneProcessExit(paneID uint64) error {
 
 func (c *controller) createWindow(cwd string, argv []string, cols, rows uint16) (*Pane, *Window, *ClientState, error) {
 	paneID := c.state.session.AddPaneID()
-	pane, err := StartPane(c.unixUser, paneID, paneRequest{
+	pane, err := StartPane(paneID, paneRequest{
 		Cwd:     cwd,
 		Command: argv,
 		Cols:    cols,
@@ -610,7 +591,7 @@ func (c *controller) commandSplit(direction SplitDirection) error {
 	}
 	paneID := c.state.session.AddPaneID()
 	cols, rows := activePane.TerminalSize()
-	newPane, err := StartPane(c.unixUser, paneID, paneRequest{Cols: uint16(cols), Rows: uint16(rows), Shell: c.shell})
+	newPane, err := StartPane(paneID, paneRequest{Cols: uint16(cols), Rows: uint16(rows), Shell: c.shell})
 	if err != nil {
 		return fmt.Errorf("start split pane: %w", err)
 	}
@@ -772,7 +753,7 @@ func (c *controller) emitHistoryMove(pane *Pane, move historyMove) error {
 	pane.terminalMu.Lock()
 	defer pane.terminalMu.Unlock()
 	if move.Delta != 0 {
-		if err := sendEncoded(outputFrames, protocol.MsgScroll, protocol.Scroll{Delta: move.Delta}, protocol.EncodeScroll); err != nil {
+		if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: move.Delta}); err != nil {
 			return err
 		}
 	}
@@ -783,10 +764,10 @@ func (c *controller) emitHistoryMove(pane *Pane, move historyMove) error {
 			return err
 		}
 	}
-	if err := sendEncoded(outputFrames, protocol.MsgCursorUpdate, protocol.CursorUpdate{Cursor: move.Cursor, Visible: true}, protocol.EncodeCursorUpdate); err != nil {
+	if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: move.Cursor, Visible: true}}); err != nil {
 		return err
 	}
-	return sendEncoded(outputFrames, protocol.MsgPresent, protocol.Present{}, protocol.EncodePresent)
+	return outputFrames.present()
 }
 
 type displayCellRun struct {
@@ -1036,11 +1017,11 @@ func (c *controller) emitTerminalUpdate(pane *Pane, update terminal.Update) erro
 		}
 	}
 	if update.CursorChanged || update.VisibleChange {
-		if err := sendEncoded(outputFrames, protocol.MsgCursorUpdate, protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY}, Visible: pane.Terminal.CursorVisible}, protocol.EncodeCursorUpdate); err != nil {
+		if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY}, Visible: pane.Terminal.CursorVisible}}); err != nil {
 			return err
 		}
 	}
-	return sendEncoded(outputFrames, protocol.MsgPresent, protocol.Present{}, protocol.EncodePresent)
+	return outputFrames.present()
 }
 
 func (c *controller) sendFullRender(binding RenderBinding, pane *Pane) error {
@@ -1065,10 +1046,10 @@ func (c *controller) sendFullRender(binding RenderBinding, pane *Pane) error {
 			return err
 		}
 	}
-	if err := sendEncoded(outputFrames, protocol.MsgCursorUpdate, protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY}, Visible: pane.Terminal.CursorVisible}, protocol.EncodeCursorUpdate); err != nil {
+	if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.Terminal.CursorX, Y: pane.Terminal.CursorY}, Visible: pane.Terminal.CursorVisible}}); err != nil {
 		return err
 	}
-	return sendEncoded(outputFrames, protocol.MsgPresent, protocol.Present{}, protocol.EncodePresent)
+	return outputFrames.present()
 }
 
 func (c *controller) sendCurrentViewSnapshot(binding RenderBinding, pane *Pane) error {
@@ -1099,13 +1080,16 @@ func (c *controller) sendHistorySnapshot(binding RenderBinding, pane *Pane, view
 			return err
 		}
 	}
-	if err := sendEncoded(outputFrames, protocol.MsgCursorUpdate, protocol.CursorUpdate{Cursor: protocol.Cursor{X: min(view.CursorCol, snapshot.Cols-1), Y: view.CursorRow - view.ViewTop}, Visible: true}, protocol.EncodeCursorUpdate); err != nil {
+	if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: min(view.CursorCol, snapshot.Cols-1), Y: view.CursorRow - view.ViewTop}, Visible: true}}); err != nil {
 		return err
 	}
-	return sendEncoded(outputFrames, protocol.MsgPresent, protocol.Present{}, protocol.EncodePresent)
+	return outputFrames.present()
 }
 
-func (c *controller) installStyle(slot int, ch chan<- protocol.Frame, id uint32, style protocol.Style) error {
+func (c *controller) installStyle(slot int, output *renderOutput, id uint32, style protocol.Style) error {
+	if id == protocol.CanonicalDefaultStyleID && !protocol.IsCanonicalDefaultStyle(style) {
+		return fmt.Errorf("style %d must be canonical default", id)
+	}
 	if c.installedStyles == nil {
 		c.installedStyles = make(map[int]map[uint32]protocol.Style)
 	}
@@ -1117,7 +1101,7 @@ func (c *controller) installStyle(slot int, ch chan<- protocol.Frame, id uint32,
 	if installed, ok := styles[id]; ok && installed == style {
 		return nil
 	}
-	if err := sendEncoded(ch, protocol.MsgStyleInstall, protocol.StyleInstall{ID: id, Style: style}, protocol.EncodeStyleInstall); err != nil {
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: id, Style: style}); err != nil {
 		return err
 	}
 	styles[id] = style
@@ -1208,10 +1192,13 @@ func (c *controller) publishBindingSnapshotsLocked(bindings []RenderBinding) err
 		if outputFrames == nil {
 			return fmt.Errorf("missing output stream for slot %d", binding.Slot)
 		}
-		if err := sendEncoded(outputFrames, protocol.MsgRelayoutBarrier, protocol.RelayoutBarrier{LayoutRevision: window.LayoutRevision}, protocol.EncodeRelayoutBarrier); err != nil {
+		if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: window.LayoutRevision}); err != nil {
 			return err
 		}
 		c.resetInstalledStyles(binding.Slot)
+		if err := c.installStyle(binding.Slot, outputFrames, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {
+			return err
+		}
 		if err := c.sendCurrentViewSnapshot(binding, pane); err != nil {
 			return err
 		}
@@ -1237,10 +1224,13 @@ func (c *controller) publishVisibleSnapshotsLocked() error {
 		if outputFrames == nil {
 			return fmt.Errorf("missing output stream for slot %d", binding.Slot)
 		}
-		if err := sendEncoded(outputFrames, protocol.MsgRelayoutBarrier, protocol.RelayoutBarrier{LayoutRevision: window.LayoutRevision}, protocol.EncodeRelayoutBarrier); err != nil {
+		if err := outputFrames.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: window.LayoutRevision}); err != nil {
 			return err
 		}
 		c.resetInstalledStyles(binding.Slot)
+		if err := c.installStyle(binding.Slot, outputFrames, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {
+			return err
+		}
 		if err := c.sendCurrentViewSnapshot(binding, pane); err != nil {
 			return err
 		}
@@ -1312,6 +1302,16 @@ func sendEncoded[T any](ch chan<- protocol.Frame, msgType uint64, msg T, encode 
 	return nil
 }
 
+func sendEncodedDirect[T any](w io.Writer, msgType uint64, msg T, encode func([]byte, T) ([]byte, error)) error {
+	// Kept separate from the asynchronous stream writer for pre-attachment
+	// failures, where no session state may be touched.
+	payload, err := encode(nil, msg)
+	if err != nil {
+		return err
+	}
+	return protocol.NewEncoder(w).WriteFrame(protocol.Frame{Type: msgType, Payload: payload})
+}
+
 func writeStream(stream io.Writer, frames <-chan protocol.Frame, errs chan<- error) {
 	enc := protocol.NewEncoder(stream)
 	for frame := range frames {
@@ -1322,13 +1322,84 @@ func writeStream(stream io.Writer, frames <-chan protocol.Frame, errs chan<- err
 	}
 }
 
-func (s *sessionState) setOutputFrames(slot int, outputFrames chan protocol.Frame) {
+type renderOutput struct {
+	batches chan []byte
+	recycle chan []byte
+	pending []byte
+}
+
+func newRenderOutput() *renderOutput {
+	return &renderOutput{batches: make(chan []byte, 256), recycle: make(chan []byte, 2)}
+}
+
+func (o *renderOutput) append(command protocol.DisplayCommand) error {
+	if o.pending == nil {
+		select {
+		case o.pending = <-o.recycle:
+			o.pending = o.pending[:0]
+		default:
+			o.pending = make([]byte, 0, 4096)
+		}
+	}
+	encoder := protocol.NewDisplayEncoder(o.pending)
+	if err := encoder.AppendCommand(command); err != nil {
+		return err
+	}
+	o.pending = encoder.Bytes()
+	return nil
+}
+
+func (o *renderOutput) commit() error {
+	if len(o.pending) == 0 {
+		return nil
+	}
+	data := o.pending
+	o.pending = nil
+	o.batches <- data
+	return nil
+}
+
+func (o *renderOutput) present() error {
+	if err := o.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
+		return err
+	}
+	return o.commit()
+}
+
+func writeDisplayStream(stream io.Writer, batches <-chan []byte, recycle chan<- []byte, errs chan<- error) {
+	for data := range batches {
+		if err := writeAll(stream, data); err != nil {
+			errs <- fmt.Errorf("write display batch: %w", err)
+			return
+		}
+		select {
+		case recycle <- data[:0]:
+		default:
+		}
+	}
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+func (s *sessionState) setOutputFrames(slot int, outputFrames *renderOutput) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.outputFrames[slot] = outputFrames
 }
 
-func (s *sessionState) clearOutputFrames(slot int, outputFrames chan protocol.Frame) {
+func (s *sessionState) clearOutputFrames(slot int, outputFrames *renderOutput) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.outputFrames[slot] == outputFrames {
@@ -1336,7 +1407,7 @@ func (s *sessionState) clearOutputFrames(slot int, outputFrames chan protocol.Fr
 	}
 }
 
-func (s *sessionState) currentOutputFrames(slot int) chan protocol.Frame {
+func (s *sessionState) currentOutputFrames(slot int) *renderOutput {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.outputFrames[slot]

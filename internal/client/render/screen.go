@@ -122,6 +122,9 @@ func (s *ClientState) InstallStyle(slot uint8, msg protocol.StyleInstall) bool {
 	if p == nil {
 		return false
 	}
+	if msg.ID == protocol.CanonicalDefaultStyleID && !protocol.IsCanonicalDefaultStyle(msg.Style) {
+		return false
+	}
 	p.Styles[msg.ID] = msg.Style
 	return true
 }
@@ -146,6 +149,26 @@ func (s *ClientState) SetWriteStyle(slot uint8, msg protocol.SetWriteStyle) bool
 }
 func (s *ClientState) WriteText(slot uint8, msg protocol.WriteText) bool {
 	st, p := s.streamPane(slot)
+	if st == nil || p == nil {
+		return false
+	}
+	return s.writeText(st, p, msg, st.StyleID)
+}
+
+// WriteTextDefault renders with style 0 without changing the stream latch.
+func (s *ClientState) WriteTextDefault(slot uint8, text []byte) bool {
+	st, p := s.streamPane(slot)
+	if st == nil || p == nil {
+		return false
+	}
+	style, ok := p.Styles[protocol.CanonicalDefaultStyleID]
+	if !ok || !protocol.IsCanonicalDefaultStyle(style) {
+		return false
+	}
+	return s.writeText(st, p, protocol.WriteText{CellWidth: 1, Text: text}, 0)
+}
+
+func (s *ClientState) writeText(st *StreamState, p *PaneViewState, msg protocol.WriteText, styleID uint32) bool {
 	if p == nil {
 		return false
 	}
@@ -156,9 +179,9 @@ func (s *ClientState) WriteText(slot uint8, msg protocol.WriteText) bool {
 			return false
 		}
 		idx := st.Row*p.Grid.Cols + st.Column
-		p.Grid.Cells[idx] = protocol.Cell{Rune: r, StyleID: st.StyleID, Width: msg.CellWidth}
+		p.Grid.Cells[idx] = protocol.Cell{Rune: r, StyleID: styleID, Width: msg.CellWidth}
 		for n := 1; n < w; n++ {
-			p.Grid.Cells[idx+n] = protocol.Cell{StyleID: st.StyleID, Width: 0}
+			p.Grid.Cells[idx+n] = protocol.Cell{StyleID: styleID, Width: 0}
 		}
 		st.Column += w
 	}
@@ -274,7 +297,7 @@ func sameLayout(a LayoutDescription, b protocol.WindowLayout) bool {
 	return true
 }
 func defaultStyles() map[uint32]protocol.Style {
-	return map[uint32]protocol.Style{0: {FG: protocol.Color{Mode: "default"}, BG: protocol.Color{Mode: "default"}}}
+	return map[uint32]protocol.Style{protocol.CanonicalDefaultStyleID: protocol.CanonicalDefaultStyle()}
 }
 func blankScreen(cols, rows int) Screen {
 	cells := make([]protocol.Cell, max(0, cols*rows))

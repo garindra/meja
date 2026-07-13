@@ -4,7 +4,21 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"tali/internal/protocol"
 )
+
+func TestCanonicalDefaultStyleOwnsIDZero(t *testing.T) {
+	term := New(4, 1)
+	if term.styleByID[protocol.CanonicalDefaultStyleID] != protocol.CanonicalDefaultStyle() {
+		t.Fatalf("style 0=%#v, want canonical default", term.styleByID[protocol.CanonicalDefaultStyleID])
+	}
+	term.CurrentStyle = Style{Bold: true}
+	term.Apply([]byte("x"))
+	if term.Cells[0].StyleID == protocol.CanonicalDefaultStyleID {
+		t.Fatal("dynamic style reused canonical style ID 0")
+	}
+}
 
 func TestFragmentedCSIAndCursorPositioning(t *testing.T) {
 	term := New(5, 2)

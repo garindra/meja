@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -40,7 +39,11 @@ func (p *Pane) UsesApplicationCursorKeys() bool {
 	return p.Terminal.ApplicationCursorKeys
 }
 
-func StartPane(unixUser *user.User, paneID uint64, request paneRequest) (*Pane, error) {
+func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
+	unixUser, err := user.Current()
+	if err != nil {
+		return nil, fmt.Errorf("resolve daemon user: %w", err)
+	}
 	shell := request.Shell
 	if shell == "" {
 		shell = loginShellForUser(unixUser)
@@ -55,33 +58,7 @@ func StartPane(unixUser *user.User, paneID uint64, request paneRequest) (*Pane, 
 
 	cmd.Env = buildEnv(unixUser, shell)
 
-	uid, err := strconv.ParseUint(unixUser.Uid, 10, 32)
-	if err != nil {
-		return nil, fmt.Errorf("parse uid: %w", err)
-	}
-	gid, err := strconv.ParseUint(unixUser.Gid, 10, 32)
-	if err != nil {
-		return nil, fmt.Errorf("parse gid: %w", err)
-	}
-	groupIDs, err := unixUser.GroupIds()
-	if err != nil {
-		return nil, fmt.Errorf("lookup supplementary groups: %w", err)
-	}
-	groups := make([]uint32, 0, len(groupIDs))
-	for _, raw := range groupIDs {
-		groupID, err := strconv.ParseUint(raw, 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("parse group id %q: %w", raw, err)
-		}
-		groups = append(groups, uint32(groupID))
-	}
-
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{
-			Uid:    uint32(uid),
-			Gid:    uint32(gid),
-			Groups: groups,
-		},
 		Setsid:  true,
 		Setctty: true,
 	}

@@ -2,16 +2,16 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/signal"
-	osuser "os/user"
 	"sort"
 	"strings"
 	"sync"
@@ -21,7 +21,6 @@ import (
 	"github.com/quic-go/quic-go"
 	"golang.org/x/term"
 
-	"tali/internal/auth"
 	"tali/internal/client/render"
 	"tali/internal/protocol"
 	"tali/internal/sshconfig"
@@ -35,6 +34,7 @@ const (
 )
 
 type Target struct {
+	Original        string
 	Username        string
 	Hostname        string
 	HasExplicitUser bool
@@ -44,12 +44,13 @@ type Config struct {
 	Target             Target
 	Port               int
 	PortSet            bool
-	CAFile             string
 	IdentityFile       string
 	DebugRender        bool
 	DebugRenderLogPath string
 	Cwd                string
 	Argv               []string
+	CtrlPath           string
+	SessionID          uint64
 	Stdin              *os.File
 	Stdout             io.Writer
 	Stderr             io.Writer
@@ -68,9 +69,9 @@ type runtimeState struct {
 	incomingBurstTimer      *time.Timer
 	incomingClosed          bool
 	incomingWireBytes       uint64
-	incomingPayloadBytes    uint64
+	incomingTextBytes       uint64
 	incomingCommandCount    uint64
-	incomingMessageTypeHits map[uint64]uint64
+	incomingMessageTypeHits map[protocol.DisplayOpcode]uint64
 	incomingWriteStyleHits  map[renderStyleKey]uint64
 	installedRenderStyles   map[renderStyleKey]protocol.Style
 }
@@ -84,7 +85,7 @@ type renderEvent interface{ renderEvent() }
 type paneBatchEvent struct {
 	slot           uint8
 	layoutRevision uint64
-	commands       []protocol.Frame
+	commands       []protocol.DisplayCommand
 }
 type layoutEvent struct{ layout protocol.WindowLayout }
 type statusEvent struct{ status protocol.StatusBar }
@@ -101,6 +102,7 @@ func ParseTarget(raw string) (Target, error) {
 		return Target{}, fmt.Errorf("invalid target %q: %w", raw, err)
 	}
 	return Target{
+		Original:        parsed.Original,
 		Username:        parsed.Username,
 		Hostname:        parsed.Host,
 		HasExplicitUser: parsed.HasExplicitUser,
@@ -124,7 +126,7 @@ func Run(ctx context.Context, cfg Config) error {
 		renderLog = f
 	}
 
-	localUser, err := currentUsername()
+	bootstrap, err := fetchBootstrap(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -133,26 +135,16 @@ func Run(ctx context.Context, cfg Config) error {
 		Username:        cfg.Target.Username,
 		HasExplicitUser: cfg.Target.HasExplicitUser,
 	}, sshconfig.ResolveOptions{
-		ExplicitIdentityFile: cfg.IdentityFile,
-		ExplicitPort:         cfg.Port,
-		ExplicitPortSet:      cfg.PortSet,
-		LocalUsername:        localUser,
+		LocalUsername: cfg.Target.Username,
 	})
 	if err != nil {
 		return err
 	}
-	identity, err := auth.SelectIdentity(auth.SelectOptions{
-		IdentityFiles:  resolved.IdentityFiles,
-		IdentitiesOnly: resolved.IdentitiesOnly,
-	})
+	tlsConfig, err := loadTLSConfig(bootstrap.CertSPKISHA256)
 	if err != nil {
 		return err
 	}
-	tlsConfig, err := loadTLSConfig(cfg.CAFile, resolved.Hostname)
-	if err != nil {
-		return err
-	}
-	addr := net.JoinHostPort(resolved.Hostname, fmt.Sprintf("%d", resolved.Port))
+	addr := net.JoinHostPort(resolved.Hostname, fmt.Sprintf("%d", bootstrap.Port))
 	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quic.Config{
 		MaxIdleTimeout:     quicMaxIdleTimeout,
 		KeepAlivePeriod:    quicKeepAlivePeriod,
@@ -183,7 +175,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := enqueueEncoded(mgmtFrames, protocol.MsgOpenManagementStream, protocol.StreamOpen{StreamType: protocol.StreamTypeManagement}, protocol.EncodeStreamOpen); err != nil {
 		return err
 	}
-	if err := enqueueEncoded(mgmtFrames, protocol.MsgClientHello, protocol.ClientHello{Version: 1}, protocol.EncodeClientHello); err != nil {
+	if err := enqueueEncoded(mgmtFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, SessionID: bootstrap.SessionID, Token: bootstrap.AttachToken}, protocol.EncodeSessionAttach); err != nil {
 		return err
 	}
 	if err := enqueueEncoded(inputFrames, protocol.MsgOpenInputStream, protocol.StreamOpen{StreamType: protocol.StreamTypeInput}, protocol.EncodeStreamOpen); err != nil {
@@ -203,65 +195,19 @@ func Run(ctx context.Context, cfg Config) error {
 	sessionDone := make(chan error, 2)
 	go acceptOutputStreams(ctx, conn, ui, outputReady, sessionDone)
 
-	if err := enqueueEncoded(mgmtFrames, protocol.MsgAuthBegin, protocol.AuthBegin{
-		Username:  resolved.Username,
-		PublicKey: identity.AuthorizedKey(),
-	}, protocol.EncodeAuthBegin); err != nil {
-		return err
-	}
-
-	challengeFrame, err := mgmtDecoder.ReadFrame()
+	attachResult, err := mgmtDecoder.ReadFrame()
 	if err != nil {
-		return fmt.Errorf("read auth challenge: %w", err)
+		return fmt.Errorf("read session attachment result: %w", err)
 	}
-	if challengeFrame.Type == protocol.MsgAuthFailed {
-		failed, err := protocol.DecodeAuthFailed(challengeFrame.Payload)
-		if err != nil {
+	switch attachResult.Type {
+	case protocol.MsgSessionAttachOK:
+		if _, err := protocol.DecodeSessionAttachOK(attachResult.Payload); err != nil {
 			return err
 		}
-		return fmt.Errorf("authentication failed: %s", failed.Reason)
-	}
-	if challengeFrame.Type != protocol.MsgAuthChallenge {
-		return fmt.Errorf("unexpected auth message type %d", challengeFrame.Type)
-	}
-	challenge, err := protocol.DecodeAuthChallenge(challengeFrame.Payload)
-	if err != nil {
-		return err
-	}
-	signature, err := auth.SignTranscript(identity.Signer, auth.BuildTranscript(
-		resolved.Username,
-		identity.Fingerprint(),
-		challenge.ChallengeID,
-		challenge.Nonce,
-		challenge.ExpiresAt,
-	))
-	if err != nil {
-		return err
-	}
-	if err := enqueueEncoded(mgmtFrames, protocol.MsgAuthResponse, protocol.AuthResponse{
-		ChallengeID: challenge.ChallengeID,
-		Signature:   signature,
-	}, protocol.EncodeAuthResponse); err != nil {
-		return err
-	}
-
-	authResult, err := mgmtDecoder.ReadFrame()
-	if err != nil {
-		return fmt.Errorf("read auth result: %w", err)
-	}
-	switch authResult.Type {
-	case protocol.MsgAuthOK:
-		if _, err := protocol.DecodeAuthOK(authResult.Payload); err != nil {
-			return err
-		}
-	case protocol.MsgAuthFailed:
-		failed, err := protocol.DecodeAuthFailed(authResult.Payload)
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf("authentication failed: %s", failed.Reason)
+	case protocol.MsgSessionAttachFailed:
+		return errors.New("session attachment rejected")
 	default:
-		return fmt.Errorf("unexpected auth result type %d", authResult.Type)
+		return fmt.Errorf("unexpected session attachment result %d", attachResult.Type)
 	}
 
 	cols, rows, err := terminalSize(cfg.Stdin)
@@ -356,25 +302,25 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
-func loadTLSConfig(caFile, serverName string) (*tls.Config, error) {
-	roots, err := x509.SystemCertPool()
-	if err != nil || roots == nil {
-		roots = x509.NewCertPool()
-	}
-	if caFile != "" {
-		pem, err := os.ReadFile(caFile)
-		if err != nil {
-			return nil, fmt.Errorf("read CA file: %w", err)
-		}
-		if !roots.AppendCertsFromPEM(pem) {
-			return nil, errors.New("append CA file: no certificates found")
-		}
+func loadTLSConfig(spkiHash string) (*tls.Config, error) {
+	want, err := hex.DecodeString(spkiHash)
+	if err != nil || len(want) != sha256.Size {
+		return nil, errors.New("invalid pinned certificate SPKI hash")
 	}
 	return &tls.Config{
-		RootCAs:    roots,
-		NextProtos: []string{protocol.ALPN},
-		ServerName: serverName,
-		MinVersion: tls.VersionTLS13,
+		InsecureSkipVerify: true, // VerifyConnection below is the mandatory trust decision.
+		NextProtos:         []string{protocol.ALPN},
+		MinVersion:         tls.VersionTLS13,
+		VerifyConnection: func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return errors.New("server sent no certificate")
+			}
+			got := sha256.Sum256(state.PeerCertificates[0].RawSubjectPublicKeyInfo)
+			if len(want) != len(got) || subtle.ConstantTimeCompare(want, got[:]) != 1 {
+				return errors.New("server certificate SPKI pin mismatch")
+			}
+			return nil
+		},
 	}, nil
 }
 
@@ -385,8 +331,8 @@ func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeS
 			sessionDone <- fmt.Errorf("accept output stream: %w", err)
 			return
 		}
-		decoder := protocol.NewDecoder(stream, protocol.DefaultMaxFrameSize)
-		openFrame, err := decoder.ReadFrame()
+		frameDecoder := protocol.NewDecoder(stream, protocol.DefaultMaxFrameSize)
+		openFrame, err := frameDecoder.ReadFrame()
 		if err != nil {
 			sessionDone <- fmt.Errorf("read output stream open: %w", err)
 			return
@@ -404,105 +350,73 @@ func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeS
 			sessionDone <- fmt.Errorf("unexpected output stream slot %d, want %d", open.Slot, i)
 			return
 		}
-		go readOutputStream(open.Slot, decoder, ui, sessionDone)
+		go readOutputStream(open.Slot, protocol.NewDisplayDecoderFromDecoder(frameDecoder), ui, sessionDone)
 	}
 	outputReady <- struct{}{}
 }
 
-func readOutputStream(slot uint8, decoder *protocol.Decoder, ui *runtimeState, sessionDone chan<- error) {
+func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeState, sessionDone chan<- error) {
 	var layoutRevision uint64
-	var pending []protocol.Frame
+	var pending []protocol.DisplayCommand
 	for {
-		frame, err := decoder.ReadFrame()
+		command, wireBytes, err := decoder.ReadCommand()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return
 			}
-			sessionDone <- fmt.Errorf("read output frame: %w", err)
+			sessionDone <- fmt.Errorf("read display stream on slot %d: %w", slot, err)
 			return
 		}
-		ui.recordIncomingRenderFrame(slot, frame)
-		if frame.Type == protocol.MsgRelayoutBarrier {
-			msg, err := protocol.DecodeRelayoutBarrier(frame.Payload)
-			if err != nil {
-				sessionDone <- fmt.Errorf("decode RELAYOUT_BARRIER on slot %d: %w", slot, err)
+		ui.recordIncomingRenderCommand(slot, command, wireBytes)
+		if command.Opcode == protocol.DisplayOpcodeRelayoutBarrier {
+			pending = pending[:0]
+			layoutRevision = command.LayoutRevision
+			continue
+		}
+		if command.Opcode != protocol.DisplayOpcodePresent {
+			if layoutRevision == 0 {
+				sessionDone <- fmt.Errorf("display command 0x%02x on slot %d before RELAYOUT_BARRIER", byte(command.Opcode), slot)
 				return
 			}
-			pending = pending[:0]
-			layoutRevision = msg.LayoutRevision
+			pending = append(pending, command)
 			continue
-		}
-		if frame.Type != protocol.MsgPresent {
-			pending = append(pending, protocol.Frame{
-				Type:    frame.Type,
-				Payload: append([]byte(nil), frame.Payload...),
-			})
-			continue
-		}
-		if _, err := protocol.DecodePresent(frame.Payload); err != nil {
-			sessionDone <- fmt.Errorf("decode PRESENT on slot %d: %w", slot, err)
-			return
 		}
 		if layoutRevision == 0 {
 			sessionDone <- fmt.Errorf("PRESENT on slot %d before RELAYOUT_BARRIER", slot)
 			return
 		}
-		batch := paneBatchEvent{slot: slot, layoutRevision: layoutRevision, commands: append([]protocol.Frame(nil), pending...)}
+		batch := paneBatchEvent{slot: slot, layoutRevision: layoutRevision, commands: append([]protocol.DisplayCommand(nil), pending...)}
 		pending = pending[:0]
 		ui.emit(batch)
 	}
 }
 
-func applyDisplayCommand(s *render.ClientState, slot uint8, frame protocol.Frame) error {
+func applyDisplayCommand(s *render.ClientState, slot uint8, command protocol.DisplayCommand) error {
 	valid := false
-	switch frame.Type {
-	case protocol.MsgStyleInstall:
-		m, e := protocol.DecodeStyleInstall(frame.Payload)
-		if e != nil {
-			return fmt.Errorf("decode STYLE_INSTALL: %w", e)
-		}
-		valid = s.InstallStyle(slot, m)
-	case protocol.MsgSetWritePosition:
-		m, e := protocol.DecodeSetWritePosition(frame.Payload)
-		if e != nil {
-			return fmt.Errorf("decode SET_WRITE_POSITION: %w", e)
-		}
-		valid = s.SetWritePosition(slot, m)
-	case protocol.MsgSetWriteStyle:
-		m, e := protocol.DecodeSetWriteStyle(frame.Payload)
-		if e != nil {
-			return fmt.Errorf("decode SET_WRITE_STYLE: %w", e)
-		}
-		valid = s.SetWriteStyle(slot, m)
-	case protocol.MsgWriteText:
-		m, e := protocol.DecodeWriteText(frame.Payload)
-		if e != nil {
-			return fmt.Errorf("decode WRITE_TEXT: %w", e)
-		}
-		valid = s.WriteText(slot, m)
-	case protocol.MsgFill:
-		m, e := protocol.DecodeFill(frame.Payload)
-		if e != nil {
-			return fmt.Errorf("decode FILL: %w", e)
-		}
-		valid = s.Fill(slot, m)
-	case protocol.MsgCursorUpdate:
-		m, e := protocol.DecodeCursorUpdate(frame.Payload)
-		if e != nil {
-			return fmt.Errorf("decode CURSOR_UPDATE: %w", e)
-		}
-		valid = s.UpdateCursor(slot, m)
-	case protocol.MsgScroll:
-		m, e := protocol.DecodeScroll(frame.Payload)
-		if e != nil {
-			return fmt.Errorf("decode SCROLL: %w", e)
-		}
-		valid = s.ApplyScroll(slot, m.Delta)
+	switch command.Opcode {
+	case protocol.DisplayOpcodeStyleInstall:
+		valid = s.InstallStyle(slot, protocol.StyleInstall{ID: command.StyleID, Style: command.Style})
+	case protocol.DisplayOpcodeSetWritePosition:
+		valid = s.SetWritePosition(slot, protocol.SetWritePosition{Row: command.Row, Column: command.Column})
+	case protocol.DisplayOpcodeSetWriteStyle:
+		valid = s.SetWriteStyle(slot, protocol.SetWriteStyle{StyleID: command.StyleID})
+	case protocol.DisplayOpcodeWriteText:
+		valid = s.WriteText(slot, protocol.WriteText{CellWidth: command.Width, Text: command.Text})
+	case protocol.DisplayOpcodeWriteTextUTF8:
+		valid = s.WriteText(slot, protocol.WriteText{CellWidth: 1, Text: command.Text})
+	case protocol.DisplayOpcodeWriteTextUTF8Default:
+		valid = s.WriteTextDefault(slot, command.Text)
+	case protocol.DisplayOpcodeFill:
+		valid = s.Fill(slot, command.Fill)
+	case protocol.DisplayOpcodeCursorUpdate:
+		valid = s.UpdateCursor(slot, command.Cursor)
+	case protocol.DisplayOpcodeScroll:
+		valid = s.ApplyScroll(slot, command.Delta)
 	default:
-		return fmt.Errorf("unexpected display command %d", frame.Type)
+		return fmt.Errorf("unexpected display opcode 0x%02x", byte(command.Opcode))
 	}
 	if !valid {
-		return fmt.Errorf("invalid display command %d on slot %d", frame.Type, slot)
+		return fmt.Errorf("invalid display command 0x%02x on slot %d", byte(command.Opcode), slot)
 	}
 	return nil
 }
@@ -655,14 +569,6 @@ func enqueueEncoded[T any](ch chan<- protocol.Frame, msgType uint64, v T, encode
 	return nil
 }
 
-func currentUsername() (string, error) {
-	current, err := osuser.Current()
-	if err != nil {
-		return "", fmt.Errorf("resolve current username: %w", err)
-	}
-	return strings.TrimSpace(current.Username), nil
-}
-
 func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 	state := render.NewClientState()
 	pending := make(map[uint64][]paneBatchEvent)
@@ -773,7 +679,7 @@ func (r *runtimeState) logRenderf(format string, args ...any) {
 	_, _ = fmt.Fprintf(r.stderr, "tali render: "+format+"\n", args...)
 }
 
-func (r *runtimeState) recordIncomingRenderFrame(slot uint8, frame protocol.Frame) {
+func (r *runtimeState) recordIncomingRenderCommand(slot uint8, command protocol.DisplayCommand, wireBytes uint64) {
 	if !r.debugRender || r.stderr == nil {
 		return
 	}
@@ -785,29 +691,25 @@ func (r *runtimeState) recordIncomingRenderFrame(slot uint8, frame protocol.Fram
 	}
 	if r.incomingBurstStarted.IsZero() {
 		r.incomingBurstStarted = time.Now()
-		r.incomingMessageTypeHits = make(map[uint64]uint64)
+		r.incomingMessageTypeHits = make(map[protocol.DisplayOpcode]uint64)
 		r.incomingWriteStyleHits = make(map[renderStyleKey]uint64)
 		r.incomingBurstTimer = time.AfterFunc(incomingBurstWindow, r.flushIncomingRender)
 	}
-	r.incomingWireBytes += uint64(encodedFrameSize(frame))
-	r.incomingPayloadBytes += uint64(len(frame.Payload))
+	r.incomingWireBytes += wireBytes
+	r.incomingTextBytes += uint64(len(command.Text))
 	r.incomingCommandCount++
-	r.incomingMessageTypeHits[frame.Type]++
+	r.incomingMessageTypeHits[command.Opcode]++
 	key := renderStyleKey{slot: slot}
-	if frame.Type == protocol.MsgStyleInstall {
-		if msg, err := protocol.DecodeStyleInstall(frame.Payload); err == nil {
-			key.id = msg.ID
-			if r.installedRenderStyles == nil {
-				r.installedRenderStyles = make(map[renderStyleKey]protocol.Style)
-			}
-			r.installedRenderStyles[key] = msg.Style
+	if command.Opcode == protocol.DisplayOpcodeStyleInstall {
+		key.id = command.StyleID
+		if r.installedRenderStyles == nil {
+			r.installedRenderStyles = make(map[renderStyleKey]protocol.Style)
 		}
+		r.installedRenderStyles[key] = command.Style
 	}
-	if frame.Type == protocol.MsgSetWriteStyle {
-		if msg, err := protocol.DecodeSetWriteStyle(frame.Payload); err == nil {
-			key.id = msg.StyleID
-			r.incomingWriteStyleHits[key]++
-		}
+	if command.Opcode == protocol.DisplayOpcodeSetWriteStyle {
+		key.id = command.StyleID
+		r.incomingWriteStyleHits[key]++
 	}
 	r.incomingMu.Unlock()
 }
@@ -826,19 +728,19 @@ func (r *runtimeState) flushIncomingRender() {
 	types := formatIncomingRenderTypes(r.incomingMessageTypeHits)
 	writeStyles := formatIncomingWriteStyles(r.incomingWriteStyleHits, r.installedRenderStyles)
 	r.logRenderf(
-		"incoming burst at=%s window=%s elapsed=%s wire_bytes=%d payload_bytes=%d commands=%d types=%s write_styles=%s",
+		"incoming burst at=%s window=%s elapsed=%s wire_bytes=%d text_bytes=%d commands=%d types=%s write_styles=%s",
 		time.Now().Format(time.RFC3339Nano),
 		incomingBurstWindow,
 		time.Since(startedAt).Round(time.Millisecond),
 		r.incomingWireBytes,
-		r.incomingPayloadBytes,
+		r.incomingTextBytes,
 		r.incomingCommandCount,
 		types,
 		writeStyles,
 	)
 	r.incomingBurstStarted = time.Time{}
 	r.incomingWireBytes = 0
-	r.incomingPayloadBytes = 0
+	r.incomingTextBytes = 0
 	r.incomingCommandCount = 0
 	r.incomingMessageTypeHits = nil
 	r.incomingWriteStyleHits = nil
@@ -909,52 +811,49 @@ func (r *runtimeState) closeIncomingRenderLog() {
 	r.flushIncomingRender()
 }
 
-func formatIncomingRenderTypes(types map[uint64]uint64) string {
+func formatIncomingRenderTypes(types map[protocol.DisplayOpcode]uint64) string {
 	if len(types) == 0 {
 		return "none"
 	}
-	keys := make([]uint64, 0, len(types))
+	keys := make([]protocol.DisplayOpcode, 0, len(types))
 	for msgType := range types {
 		keys = append(keys, msgType)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	parts := make([]string, 0, len(keys))
 	for _, msgType := range keys {
-		parts = append(parts, fmt.Sprintf("%s:%d", incomingRenderMessageName(msgType), types[msgType]))
+		parts = append(parts, fmt.Sprintf("%s:%d", incomingRenderOpcodeName(msgType), types[msgType]))
 	}
 	return strings.Join(parts, ",")
 }
 
-func incomingRenderMessageName(msgType uint64) string {
-	switch msgType {
-	case protocol.MsgRelayoutBarrier:
+func incomingRenderOpcodeName(opcode protocol.DisplayOpcode) string {
+	switch opcode {
+	case protocol.DisplayOpcodeRelayoutBarrier:
 		return "RelayoutBarrier"
-	case protocol.MsgStyleInstall:
+	case protocol.DisplayOpcodeStyleInstall:
 		return "StyleInstall"
-	case protocol.MsgSetWritePosition:
+	case protocol.DisplayOpcodeSetWritePosition:
 		return "SetWritePosition"
-	case protocol.MsgSetWriteStyle:
+	case protocol.DisplayOpcodeSetWriteStyle:
 		return "SetWriteStyle"
-	case protocol.MsgWriteText:
+	case protocol.DisplayOpcodeWriteText:
 		return "WriteText"
-	case protocol.MsgFill:
+	case protocol.DisplayOpcodeWriteTextUTF8:
+		return "WriteTextUTF8"
+	case protocol.DisplayOpcodeWriteTextUTF8Default:
+		return "WriteTextUTF8Default"
+	case protocol.DisplayOpcodeFill:
 		return "Fill"
-	case protocol.MsgCursorUpdate:
+	case protocol.DisplayOpcodeCursorUpdate:
 		return "CursorUpdate"
-	case protocol.MsgScroll:
+	case protocol.DisplayOpcodeScroll:
 		return "Scroll"
-	case protocol.MsgPresent:
+	case protocol.DisplayOpcodePresent:
 		return "Present"
 	default:
-		return fmt.Sprintf("Message%d", msgType)
+		return fmt.Sprintf("Opcode0x%02x", byte(opcode))
 	}
-}
-
-func encodedFrameSize(frame protocol.Frame) int {
-	var buf [binary.MaxVarintLen64]byte
-	typeBytes := binary.PutUvarint(buf[:], frame.Type)
-	payloadBytes := binary.PutUvarint(buf[:], uint64(len(frame.Payload)))
-	return typeBytes + payloadBytes + len(frame.Payload)
 }
 
 func drawableRows(rows int) uint16 {

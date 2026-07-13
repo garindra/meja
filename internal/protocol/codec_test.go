@@ -1,104 +1,145 @@
 package protocol
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"reflect"
 	"testing"
 )
 
-func TestDisplayCommandRoundTrips(t *testing.T) {
-	tests := []struct {
-		name string
-		run  func() error
-	}{
-		{"barrier", func() error {
-			in := RelayoutBarrier{LayoutRevision: 7}
-			b, e := EncodeRelayoutBarrier(nil, in)
-			if e != nil {
-				return e
-			}
-			out, e := DecodeRelayoutBarrier(b)
-			if out != in {
-				t.Fatalf("barrier=%#v", out)
-			}
-			return e
-		}},
-		{"position", func() error {
-			in := SetWritePosition{Row: 4, Column: 9}
-			b, e := EncodeSetWritePosition(nil, in)
-			if e != nil {
-				return e
-			}
-			out, e := DecodeSetWritePosition(b)
-			if out != in {
-				t.Fatalf("position=%#v", out)
-			}
-			return e
-		}},
-		{"text", func() error {
-			in := WriteText{CellWidth: 2, Text: []byte("日本")}
-			b, e := EncodeWriteText(nil, in)
-			if e != nil {
-				return e
-			}
-			out, e := DecodeWriteText(b)
-			if !reflect.DeepEqual(out, in) {
-				t.Fatalf("text=%#v", out)
-			}
-			return e
-		}},
-		{"fill", func() error {
-			in := Fill{Columns: 80, Rune: ' ', Width: 1}
-			b, e := EncodeFill(nil, in)
-			if e != nil {
-				return e
-			}
-			out, e := DecodeFill(b)
-			if out != in {
-				t.Fatalf("fill=%#v", out)
-			}
-			return e
-		}},
-		{"cursor", func() error {
-			in := CursorUpdate{Cursor: Cursor{X: 2, Y: 3}, Visible: true}
-			b, e := EncodeCursorUpdate(nil, in)
-			if e != nil {
-				return e
-			}
-			out, e := DecodeCursorUpdate(b)
-			if out != in {
-				t.Fatalf("cursor=%#v", out)
-			}
-			return e
-		}},
-		{"scroll", func() error {
-			in := Scroll{Delta: -1}
-			b, e := EncodeScroll(nil, in)
-			if e != nil {
-				return e
-			}
-			out, e := DecodeScroll(b)
-			if out != in {
-				t.Fatalf("scroll=%#v", out)
-			}
-			return e
-		}},
+func TestDisplayWireBytesHaveNoGenericFrameLength(t *testing.T) {
+	encoder := NewDisplayEncoder(nil)
+	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 7}); err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.run(); err != nil {
-				t.Fatal(err)
-			}
-		})
+	if err := encoder.AppendSetWritePosition(SetWritePosition{Row: 4, Column: 9}); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.AppendWriteText(WriteText{CellWidth: 2, Text: []byte("界")}); err != nil {
+		t.Fatal(err)
+	}
+	encoder.AppendPresent()
+	want := []byte{0x01, 0x07, 0x03, 0x04, 0x09, 0x05, 0x02, 0x03, 0xe7, 0x95, 0x8c, 0xff}
+	if !bytes.Equal(encoder.Bytes(), want) {
+		t.Fatalf("wire=% x want % x", encoder.Bytes(), want)
+	}
+	if encoder.Bytes()[1] == byte(len(encoder.Bytes())) {
+		t.Fatal("render stream contains a generic payload length")
 	}
 }
 
-func TestPresentHasEmptyPayload(t *testing.T) {
-	b, err := EncodePresent(nil, Present{})
-	if err != nil || len(b) != 0 {
-		t.Fatalf("present=%v err=%v", b, err)
+func TestDisplayWireBytesCoverAllCommandSchemas(t *testing.T) {
+	encoder := NewDisplayEncoder(nil)
+	_ = encoder.AppendStyleInstall(StyleInstall{ID: 2, Style: Style{Bold: true, FG: Color{Mode: "indexed", Index: 7}, BG: Color{Mode: "default"}}})
+	_ = encoder.AppendSetWritePosition(SetWritePosition{Row: 4, Column: 9})
+	_ = encoder.AppendSetWriteStyle(SetWriteStyle{StyleID: 2})
+	_ = encoder.AppendWriteTextUTF8([]byte("aé"))
+	_ = encoder.AppendWriteTextUTF8Default([]byte(" "))
+	_ = encoder.AppendFill(Fill{Columns: 3, Rune: ' ', Width: 1})
+	_ = encoder.AppendCursorUpdate(CursorUpdate{Cursor: Cursor{X: 2, Y: 3}, Visible: true})
+	_ = encoder.AppendScroll(Scroll{Delta: -1})
+	encoder.AppendPresent()
+	want := []byte{
+		0x02, 0x02, 0x01, 0x01, 0x07, 0x00,
+		0x03, 0x04, 0x09,
+		0x04, 0x02,
+		0x06, 0x03, 'a', 0xc3, 0xa9,
+		0x07, 0x01, ' ',
+		0x08, 0x03, 0x20, 0x01,
+		0x09, 0x02, 0x03, 0x01,
+		0x0a, 0x01,
+		0xff,
 	}
-	if _, err := DecodePresent([]byte{1}); err == nil {
-		t.Fatal("accepted nonempty PRESENT")
+	if !bytes.Equal(encoder.Bytes(), want) {
+		t.Fatalf("wire=% x want % x", encoder.Bytes(), want)
+	}
+}
+
+func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
+	encoder := NewDisplayEncoder(nil)
+	commands := []DisplayCommand{
+		{Opcode: DisplayOpcodeStyleInstall, StyleID: 2, Style: Style{Bold: true, FG: Color{Mode: "indexed", Index: 7}, BG: Color{Mode: "default"}}},
+		{Opcode: DisplayOpcodeSetWritePosition, Row: 4, Column: 9},
+		{Opcode: DisplayOpcodeSetWriteStyle, StyleID: 2},
+		{Opcode: DisplayOpcodeWriteTextUTF8, Width: 1, Text: []byte("aé")},
+		{Opcode: DisplayOpcodeWriteTextUTF8Default, Width: 1, Text: []byte(" ")},
+		{Opcode: DisplayOpcodeFill, Fill: Fill{Columns: 3, Rune: ' ', Width: 1}},
+		{Opcode: DisplayOpcodeCursorUpdate, Cursor: CursorUpdate{Cursor: Cursor{X: 2, Y: 3}, Visible: true}},
+		{Opcode: DisplayOpcodeScroll, Delta: -1},
+	}
+	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 7}); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range commands {
+		if err := encoder.AppendCommand(command); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encoder.AppendPresent()
+	batch, err := NewDisplayDecoder(oneByteReader{Reader: bytes.NewReader(encoder.Bytes())}).ReadBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.LayoutRevision != 7 || !reflect.DeepEqual(batch.Commands, commands) {
+		t.Fatalf("batch=%#v want commands=%#v", batch, commands)
+	}
+}
+
+func TestDisplayEncoderStyleInstallFailurePreservesBytes(t *testing.T) {
+	encoder := NewDisplayEncoder(nil)
+	encoder.AppendPresent()
+	want := append([]byte(nil), encoder.Bytes()...)
+	if err := encoder.AppendStyleInstall(StyleInstall{ID: 4, Style: Style{FG: Color{Mode: "invalid"}}}); err == nil {
+		t.Fatal("accepted invalid style")
+	}
+	if !bytes.Equal(encoder.Bytes(), want) {
+		t.Fatalf("bytes=% x want unchanged % x", encoder.Bytes(), want)
+	}
+}
+
+func TestDisplayDecoderMultipleBatches(t *testing.T) {
+	encoder := NewDisplayEncoder(nil)
+	for _, text := range []string{"one", "two"} {
+		if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 3}); err != nil {
+			t.Fatal(err)
+		}
+		if err := encoder.AppendWriteTextUTF8([]byte(text)); err != nil {
+			t.Fatal(err)
+		}
+		encoder.AppendPresent()
+	}
+	decoder := NewDisplayDecoder(bytes.NewReader(encoder.Bytes()))
+	for _, want := range []string{"one", "two"} {
+		batch, err := decoder.ReadBatch()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(batch.Commands) != 1 || string(batch.Commands[0].Text) != want {
+			t.Fatalf("batch=%#v", batch)
+		}
+	}
+	if _, err := decoder.ReadBatch(); !errors.Is(err, io.EOF) {
+		t.Fatalf("final ReadBatch error=%v", err)
+	}
+}
+
+func TestDisplayDecoderRejectsMalformedCommands(t *testing.T) {
+	for name, data := range map[string][]byte{
+		"unknown opcode":         {0x7f},
+		"truncated position":     {byte(DisplayOpcodeSetWritePosition), 0x01},
+		"invalid width":          {byte(DisplayOpcodeWriteText), 0x03, 0x00},
+		"truncated text":         {byte(DisplayOpcodeWriteTextUTF8), 0x03, 'a'},
+		"invalid utf8":           {byte(DisplayOpcodeWriteTextUTF8), 0x01, 0xff},
+		"present before barrier": {byte(DisplayOpcodePresent)},
+		"command before barrier": {byte(DisplayOpcodeWriteTextUTF8), 0x00},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewDisplayDecoder(bytes.NewReader(data)).ReadBatch()
+			if err == nil {
+				t.Fatal("accepted malformed display stream")
+			}
+		})
 	}
 }
 
@@ -134,4 +175,13 @@ func TestWindowLayoutRoundTripIncludesSlots(t *testing.T) {
 	if !reflect.DeepEqual(out, msg) {
 		t.Fatalf("layout=%#v", out)
 	}
+}
+
+type oneByteReader struct{ *bytes.Reader }
+
+func (r oneByteReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return r.Reader.Read(p[:1])
 }

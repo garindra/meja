@@ -1,19 +1,14 @@
 package protocol
 
-import "time"
-
-const ALPN = "tali/5"
+const (
+	ALPN            = "tali/6"
+	ProtocolVersion = 2
+)
 
 const (
 	MsgOpenManagementStream uint64 = iota + 1
 	MsgOpenInputStream
 	MsgOpenPaneOutputStream
-	MsgClientHello
-	MsgAuthBegin
-	MsgAuthChallenge
-	MsgAuthResponse
-	MsgAuthOK
-	MsgAuthFailed
 	MsgCreatePane
 	MsgPaneCreated
 	MsgInputBytes
@@ -22,15 +17,11 @@ const (
 	MsgPing
 	MsgPong
 	MsgStatusBar
-	MsgRelayoutBarrier
-	MsgStyleInstall
-	MsgSetWritePosition
-	MsgSetWriteStyle
-	MsgWriteText
-	MsgFill
-	MsgCursorUpdate
-	MsgScroll
-	MsgPresent
+	MsgSessionAttach
+	MsgSessionAttachOK
+	MsgSessionAttachFailed
+	MsgSessionResume
+	MsgSessionResumeOK
 )
 
 const (
@@ -45,34 +36,35 @@ type StreamOpen struct {
 	PaneID     uint64
 }
 
-type ClientHello struct {
-	Version int
+type SessionAttach struct {
+	Version   int
+	SessionID uint64
+	Token     string
 }
 
-type AuthBegin struct {
-	Username  string
-	PublicKey string
+type SessionAttachOK struct {
+	Version     int
+	SessionID   uint64
+	ResumeToken string
+	Generation  uint64
 }
 
-type AuthChallenge struct {
-	ChallengeID string
-	Nonce       string
-	ExpiresAt   time.Time
-}
-
-type AuthResponse struct {
-	ChallengeID string
-	Signature   []byte
-}
-
-type AuthOK struct {
-	Username string
-	HomeDir  string
-	Shell    string
-}
-
-type AuthFailed struct {
+type SessionAttachFailed struct {
 	Reason string
+}
+
+type SessionResume struct {
+	Version     int
+	SessionID   uint64
+	ResumeToken string
+	Generation  uint64
+}
+
+type SessionResumeOK struct {
+	Version     int
+	SessionID   uint64
+	ResumeToken string
+	Generation  uint64
 }
 
 type CreatePane struct {
@@ -163,8 +155,6 @@ type Scroll struct {
 	Delta int
 }
 
-type Present struct{}
-
 type Ping struct {
 	Seq           uint64
 	SentUnixMilli int64
@@ -191,6 +181,17 @@ type Style struct {
 	Reverse   bool
 	FG        Color
 	BG        Color
+}
+
+// Every pane/render binding reserves style ID 0 for this exact default style.
+const CanonicalDefaultStyleID uint32 = 0
+
+func CanonicalDefaultStyle() Style {
+	return Style{FG: Color{Mode: "default"}, BG: Color{Mode: "default"}}
+}
+
+func IsCanonicalDefaultStyle(style Style) bool {
+	return style == CanonicalDefaultStyle()
 }
 
 type Cell struct {

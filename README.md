@@ -1,112 +1,88 @@
 # tali
 
-`tali` is a first vertical slice of a QUIC-native remote terminal client and server.
+`tali` is a QUIC remote terminal client. SSH performs remote-user
+authentication, agent/password handling, SSH configuration, and host-key
+verification; Tali does not inspect `authorized_keys` or implement a second SSH
+authentication protocol.
 
-## Architecture
+## Commands
 
-The protocol uses one QUIC connection with ALPN `tali/1` and three application streams:
-
-- one bidirectional management stream
-- one client-to-server input stream
-- one server-to-client pane output stream
-
-Every application stream starts with a framed stream-opening message. Frames use:
-
-```text
-[varint message type][varint payload length][payload]
-```
-
-Payloads in this milestone are JSON encoded.
-
-Authentication is application-level and uses the local `ssh-agent`:
-
-1. the client parses `<user>@<hostname>`
-2. the client sends the requested username and an `ssh-ed25519` public key
-3. the server checks that key against the target account's `~/.ssh/authorized_keys`
-4. the server issues a random challenge
-5. the client signs a deterministic transcript via `ssh-agent`
-6. the server verifies the signature and rejects expired or reused challenges
-
-After authentication, the server allocates a PTY, starts the login shell or requested command as the authenticated Unix account, parses PTY output into a bounded terminal grid, and sends pane snapshots / row updates to the client for ANSI rendering.
-
-## Build
+Build the two supported executables:
 
 ```bash
 go build -o bin/tali ./cmd/tali
-go build -o bin/tali-server ./cmd/tali-server
+go build -o bin/tali-ctrl ./cmd/tali-ctrl
 ```
 
-## Local Certificate Setup
-
-For local testing, create a development CA and server certificate. Example with OpenSSL:
+Connect with:
 
 ```bash
-mkdir -p dev
-openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
-  -keyout dev/ca.key -out dev/ca.crt -subj "/CN=tali-dev-ca"
-
-openssl req -newkey rsa:4096 -nodes \
-  -keyout dev/server.key -out dev/server.csr -subj "/CN=localhost"
-
-openssl x509 -req -in dev/server.csr \
-  -CA dev/ca.crt -CAkey dev/ca.key -CAcreateserial \
-  -out dev/server.crt -days 365 -sha256
+./bin/tali user@host
+./bin/tali user@host -s 12
+./bin/tali --ctrl-path=/opt/tali/bin/tali-ctrl user@host -- /usr/bin/bash -l
 ```
 
-## SSH Agent Requirement
+The local client invokes the installed `ssh` executable to run the quoted
+remote command `tali-ctrl start-session` (or `connect-session <id>` for `-s`).
+SSH prints no protocol data of its own to the client's stdout: the controller emits exactly one
+`TALI_BOOTSTRAP_V1 {json}` record, while diagnostics go to stderr. The JSON
+contains a numeric session ID, UDP port, expiring single-use attach token, and
+the SHA-256 hash of the daemon certificate's SubjectPublicKeyInfo.
 
-The client requires `SSH_AUTH_SOCK` and currently supports only `ssh-ed25519` identities available from the local SSH agent.
+The remote controller supports:
 
-## Server Privilege Warning
-
-`tali-server` must run with sufficient privilege to switch to the authenticated Unix user by real UID, primary GID, and supplementary groups. Running as an unprivileged account will prevent correct user switching.
-
-## Example
-
-Start the server:
-
-```bash
-sudo ./bin/tali-server \
-  -listen :4433 \
-  -cert ./dev/server.crt \
-  -key ./dev/server.key
+```text
+tali-ctrl server
+tali-ctrl start-session
+tali-ctrl connect-session <numeric-session-id>
+tali-ctrl stop-server
 ```
 
-Connect from the client:
+`start-session` starts the per-Unix-user daemon when necessary. To attach to
+an existing session, run `tali user@host -s <numeric-session-id>`; this invokes
+`tali-ctrl connect-session <id>` and never starts a missing daemon. Its protected
+control socket is `$XDG_RUNTIME_DIR/tali/control.sock`, falling back to
+`~/.tali/control.sock`; the socket directory is mode 0700 and the socket is
+mode 0600. `connect-session` only performs an RPC and never starts a daemon.
+`stop-server` only performs an RPC against the existing control socket;
+it gracefully stops the active daemon and reports its PID when available.
+Session IDs increase from 1 for the lifetime of a daemon and sessions end with
+that daemon.
 
-```bash
-./bin/tali -ca ./dev/ca.crt alice@localhost
-./bin/tali -ca ./dev/ca.crt alice@localhost -- /usr/bin/env bash -l
-./bin/tali -i ~/.ssh/id_ed25519 -ca ./dev/ca.crt alice@localhost
-./bin/tali -ca ./dev/ca.crt myserver
-```
+## Security model
 
-## SSH Config Resolution
+The daemon runs under the SSH-authenticated account, so panes naturally have
+that account's UID/GID and environment. No root credential switching is used.
+The daemon generates a self-signed TLS 1.3 certificate and chooses a UDP port
+in 60000–61000. The client uses an internal `InsecureSkipVerify` setting only
+with a mandatory exact SPKI `VerifyConnection` pin from the SSH bootstrap;
+there is no genuinely unverified production TLS mode and no CA/certificate/key
+setup is required.
 
-The client resolves SSH settings from `~/.ssh/config` before dialing. Supported directives:
+The first QUIC management message is the versioned session attachment
+`{sessionId, attachToken}`. The token is random, expiry-bound, listener-bound,
+constant-time compared, and atomically consumed after a successful match.
+After attachment the daemon issues a session-scoped resume credential and
+generation. Replacement connections rotate that credential and fence the old
+generation.
 
-- `Host`
-- `HostName`
-- `User`
-- `IdentityFile`
-- `IdentitiesOnly`
-- `Port`
+## Defaults and SSH options
 
-Resolution precedence:
+`~/.tali/config` is not required. The current implementation uses the defaults
+above. OpenSSH owns SSH config and host verification. `-i` and explicit
+`-port` remain compatibility options and are passed to `ssh`; `--ctrl-path`
+selects the exact remote controller path and is shell-quoted before execution.
 
-- hostname: SSH `HostName`, then original host argument
-- username: explicit `user@host`, then SSH `User`, then local username
-- identity file: explicit `-i`, then SSH `IdentityFile` entries in order, then `~/.ssh/id_ed25519`
-- port: explicit `-port`, then SSH `Port`, then Tali default `4433`
+## Terminal behavior and limitations
 
-Identity selection prefers exact configured identities, uses matching keys from `ssh-agent` when available, and otherwise loads the configured private key from disk. Only Ed25519 identities are currently supported.
+The existing server-owned terminal/render protocol, pane commands, alternate
+screen handling, and layout behavior remain in use. A QUIC disconnect detaches
+the client without immediately killing the session; an explicit detach/remote
+session exit ends the attached client flow.
 
-## Current Limitations
-
-- only one remote pane is implemented
-- only a minimal primary-screen terminal model is implemented
-- no pane layouts or multiplexer commands
-- no alternate screen or scrollback
-- no client certificate authentication
-- only `ssh-ed25519` keys are accepted
-- `authorized_keys` entries with options are rejected
+Resume credential validation and generation fencing are implemented as the
+secure protocol/state foundation. Full automatic client-side reconnect UX
+(orange last-contact overlay, input suppression, authoritative snapshot
+recovery, and automatic fallback after a live connection drops) is not yet
+wired through the existing render loop; the client currently reports a lost
+QUIC connection and exits. Manual reconnection with `-s` is supported.

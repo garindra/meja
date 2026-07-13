@@ -32,24 +32,3 @@ func DecodeStreamOpen(payload []byte) (StreamOpen, error) {
 	}
 	return StreamOpen{StreamType: streamType, Slot: uint8(slot), PaneID: paneID}, nil
 }
-
-func EncodeClientHello(dst []byte, msg ClientHello) ([]byte, error) {
-	if msg.Version < 0 {
-		return nil, fmt.Errorf("encode ClientHello: negative version")
-	}
-	w := PayloadWriter{Buf: dst}
-	w.Uvarint(uint64(msg.Version))
-	return w.Buf, nil
-}
-
-func DecodeClientHello(payload []byte) (ClientHello, error) {
-	r := PayloadReader{Data: payload}
-	version, err := r.Uvarint()
-	if err != nil {
-		return ClientHello{}, fmt.Errorf("decode ClientHello: %w", err)
-	}
-	if err := r.Done(); err != nil {
-		return ClientHello{}, fmt.Errorf("decode ClientHello: %w", err)
-	}
-	return ClientHello{Version: int(version)}, nil
-}

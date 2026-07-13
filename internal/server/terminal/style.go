@@ -5,10 +5,7 @@ import "tali/internal/protocol"
 type Style = protocol.Style
 type Color = protocol.Color
 
-var DefaultStyle = Style{
-	FG: Color{Mode: "default"},
-	BG: Color{Mode: "default"},
-}
+var DefaultStyle = protocol.CanonicalDefaultStyle()
 
 func colorIndexed(idx int) Color {
 	return Color{Mode: "indexed", Index: uint8(idx)}
