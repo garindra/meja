@@ -37,7 +37,7 @@ type daemon struct {
 }
 
 func Run(ctx context.Context, cfg Config) error {
-	serverCtx, stop := context.WithCancel(ctx)
+	serverCtx, stop := context.WithCancel(context.Background())
 	defer stop()
 	terminal.SetDebugLogger(cfg.TerminalDebugLog)
 	cert, hash, err := daemonCertificate()
@@ -58,6 +58,15 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 	d := &daemon{nextID: 1, sessions: make(map[uint64]*sessionState), certHash: hash, port: port, stop: stop}
+	defer d.disconnectActiveClients()
+	go func() {
+		select {
+		case <-ctx.Done():
+			d.disconnectActiveClients()
+			stop()
+		case <-serverCtx.Done():
+		}
+	}()
 	controlErr := make(chan error, 1)
 	go func() { controlErr <- control.Serve(serverCtx, socket, d.handleControl) }()
 	for {
@@ -119,6 +128,17 @@ func daemonCertificate() (tls.Certificate, string, error) {
 
 func (d *daemon) handleControl(operation string, id uint64) (control.Bootstrap, int, error) {
 	d.mu.Lock()
+	if operation == "stop-server" {
+		if d.stop == nil {
+			d.mu.Unlock()
+			return control.Bootstrap{}, 0, errors.New("server stop unavailable")
+		}
+		pid := os.Getpid()
+		d.mu.Unlock()
+		d.disconnectActiveClients()
+		d.stop()
+		return control.Bootstrap{}, pid, nil
+	}
 	defer d.mu.Unlock()
 	var s *sessionState
 	switch operation {
@@ -134,13 +154,6 @@ func (d *daemon) handleControl(operation string, id uint64) (control.Bootstrap, 
 		if s == nil {
 			return control.Bootstrap{}, 0, control.ErrSessionUnavailable
 		}
-	case "stop-server":
-		if d.stop == nil {
-			return control.Bootstrap{}, 0, errors.New("server stop unavailable")
-		}
-		pid := os.Getpid()
-		d.stop()
-		return control.Bootstrap{}, pid, nil
 	default:
 		return control.Bootstrap{}, 0, errors.New("unsupported control operation")
 	}
@@ -154,6 +167,33 @@ func (d *daemon) handleControl(operation string, id uint64) (control.Bootstrap, 
 	s.attachConsumed = false
 	s.attachMu.Unlock()
 	return control.Bootstrap{Version: control.ProtocolVersion, SessionID: s.sessionID, Port: d.port, AttachToken: control.EncodeToken(token), ExpiresAt: time.Now().Add(attachTTL), CertSPKISHA256: d.certHash}, 0, nil
+}
+
+// disconnectActiveClients uses the same clean QUIC close path as an explicit
+// client detach (Ctrl-B, d). The client restores its terminal and does not
+// receive a protocol error or a synthetic input event.
+func (d *daemon) disconnectActiveClients() {
+	d.mu.Lock()
+	sessions := make([]*sessionState, 0, len(d.sessions))
+	for _, session := range d.sessions {
+		sessions = append(sessions, session)
+	}
+	d.mu.Unlock()
+	for _, session := range sessions {
+		session.attachMu.Lock()
+		conn := session.activeConn
+		session.activeConn = nil
+		session.attachMu.Unlock()
+		session.detachMu.Lock()
+		detach := session.detach
+		session.detachMu.Unlock()
+		if detach != nil {
+			_ = detach()
+		}
+		if conn != nil {
+			_ = conn.CloseWithError(0, "")
+		}
+	}
 }
 
 func newSessionState(id uint64) *sessionState {

@@ -52,6 +52,8 @@ type sessionState struct {
 	resumeTokens   map[string]uint64
 	generation     uint64
 	activeConn     quic.Connection
+	detachMu       sync.Mutex
+	detach         func() error
 
 	mu           sync.RWMutex
 	outputFrames map[int]*renderOutput
@@ -137,12 +139,28 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 		_ = sendEncodedDirect(mgmtStream, protocol.MsgSessionAttachFailed, protocol.SessionAttachFailed{Reason: "session attachment rejected"}, protocol.EncodeSessionAttachFailed)
 		return err
 	}
-	d.activate(s, conn)
-
 	mgmtFrames := make(chan protocol.Frame, 64)
 	writerErrs := make(chan error, 4)
-	go writeStream(mgmtStream, mgmtFrames, writerErrs)
+	mgmtWriteMu := &sync.Mutex{}
+	go writeStream(mgmtStream, mgmtFrames, writerErrs, mgmtWriteMu)
 	defer close(mgmtFrames)
+	s.detachMu.Lock()
+	s.detach = func() error {
+		payload, encodeErr := protocol.EncodeSessionDetached(nil, protocol.SessionDetached{Reason: "server stopped"})
+		if encodeErr != nil {
+			return encodeErr
+		}
+		mgmtWriteMu.Lock()
+		defer mgmtWriteMu.Unlock()
+		return protocol.NewEncoder(mgmtStream).WriteFrame(protocol.Frame{Type: protocol.MsgSessionDetached, Payload: payload})
+	}
+	s.detachMu.Unlock()
+	defer func() {
+		s.detachMu.Lock()
+		s.detach = nil
+		s.detachMu.Unlock()
+	}()
+	d.activate(s, conn)
 
 	if responseType == protocol.MsgSessionResumeOK {
 		if err := sendEncoded(mgmtFrames, protocol.MsgSessionResumeOK, protocol.SessionResumeOK{Version: protocol.ProtocolVersion, SessionID: s.sessionID, ResumeToken: resumeEncoded, Generation: generation}, protocol.EncodeSessionResumeOK); err != nil {
@@ -1312,13 +1330,16 @@ func sendEncodedDirect[T any](w io.Writer, msgType uint64, msg T, encode func([]
 	return protocol.NewEncoder(w).WriteFrame(protocol.Frame{Type: msgType, Payload: payload})
 }
 
-func writeStream(stream io.Writer, frames <-chan protocol.Frame, errs chan<- error) {
+func writeStream(stream io.Writer, frames <-chan protocol.Frame, errs chan<- error, writeMu *sync.Mutex) {
 	enc := protocol.NewEncoder(stream)
 	for frame := range frames {
+		writeMu.Lock()
 		if err := enc.WriteFrame(frame); err != nil {
+			writeMu.Unlock()
 			errs <- fmt.Errorf("write frame type %d: %w", frame.Type, err)
 			return
 		}
+		writeMu.Unlock()
 	}
 }
 

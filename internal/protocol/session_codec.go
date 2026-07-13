@@ -143,3 +143,21 @@ func DecodeSessionResumeOK(payload []byte) (SessionResumeOK, error) {
 	}
 	return SessionResumeOK{Version: int(version), SessionID: id, ResumeToken: token, Generation: generation}, nil
 }
+
+func EncodeSessionDetached(dst []byte, msg SessionDetached) ([]byte, error) {
+	w := PayloadWriter{Buf: dst}
+	w.String(msg.Reason)
+	return w.Buf, nil
+}
+
+func DecodeSessionDetached(payload []byte) (SessionDetached, error) {
+	r := PayloadReader{Data: payload}
+	reason, err := r.String(MaxStringLen)
+	if err != nil {
+		return SessionDetached{}, err
+	}
+	if err := r.Done(); err != nil {
+		return SessionDetached{}, err
+	}
+	return SessionDetached{Reason: reason}, nil
+}

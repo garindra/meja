@@ -45,7 +45,9 @@ control socket is `$XDG_RUNTIME_DIR/tali/control.sock`, falling back to
 `~/.tali/control.sock`; the socket directory is mode 0700 and the socket is
 mode 0600. `connect-session` only performs an RPC and never starts a daemon.
 `stop-server` only performs an RPC against the existing control socket;
-it gracefully stops the active daemon and reports its PID when available.
+it cleanly disconnects active clients as if they detached with Ctrl-B, d,
+gracefully stops the active daemon, and reports its PID when available. SIGINT
+and SIGTERM on the daemon use the same client-disconnect behavior.
 Session IDs increase from 1 for the lifetime of a daemon and sessions end with
 that daemon.
 

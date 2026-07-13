@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,7 +24,6 @@ import (
 
 	"tali/internal/client/render"
 	"tali/internal/protocol"
-	"tali/internal/sshconfig"
 )
 
 const (
@@ -74,6 +74,9 @@ type runtimeState struct {
 	incomingMessageTypeHits map[protocol.DisplayOpcode]uint64
 	incomingWriteStyleHits  map[renderStyleKey]uint64
 	installedRenderStyles   map[renderStyleKey]protocol.Style
+	gracefulDetach          atomic.Bool
+	gracefulDetachCh        chan struct{}
+	gracefulDetachOnce      sync.Once
 }
 
 type renderStyleKey struct {
@@ -97,15 +100,23 @@ func (statusEvent) renderEvent()    {}
 func (sizeEvent) renderEvent()      {}
 
 func ParseTarget(raw string) (Target, error) {
-	parsed, err := sshconfig.ParseTarget(raw)
-	if err != nil {
-		return Target{}, fmt.Errorf("invalid target %q: %w", raw, err)
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(raw, "@") || strings.HasSuffix(raw, "@") {
+		return Target{}, fmt.Errorf("invalid target %q", raw)
+	}
+	username, hostname, hasUser := strings.Cut(raw, "@")
+	if !hasUser {
+		username = ""
+		hostname = raw
+	}
+	if hostname == "" || (hasUser && username == "") {
+		return Target{}, fmt.Errorf("invalid target %q", raw)
 	}
 	return Target{
-		Original:        parsed.Original,
-		Username:        parsed.Username,
-		Hostname:        parsed.Host,
-		HasExplicitUser: parsed.HasExplicitUser,
+		Original:        raw,
+		Username:        username,
+		Hostname:        hostname,
+		HasExplicitUser: hasUser,
 	}, nil
 }
 
@@ -130,13 +141,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	resolved, err := sshconfig.Resolve(sshconfig.ParsedTarget{
-		Host:            cfg.Target.Hostname,
-		Username:        cfg.Target.Username,
-		HasExplicitUser: cfg.Target.HasExplicitUser,
-	}, sshconfig.ResolveOptions{
-		LocalUsername: cfg.Target.Username,
-	})
+	hostname, err := resolveSSHHostname(ctx, cfg.Target)
 	if err != nil {
 		return err
 	}
@@ -144,7 +149,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	addr := net.JoinHostPort(resolved.Hostname, fmt.Sprintf("%d", bootstrap.Port))
+	addr := net.JoinHostPort(hostname, fmt.Sprintf("%d", bootstrap.Port))
 	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quic.Config{
 		MaxIdleTimeout:     quicMaxIdleTimeout,
 		KeepAlivePeriod:    quicKeepAlivePeriod,
@@ -184,10 +189,11 @@ func Run(ctx context.Context, cfg Config) error {
 
 	mgmtDecoder := protocol.NewDecoder(mgmtStream, protocol.DefaultMaxFrameSize)
 	ui := &runtimeState{
-		stdout:      cfg.Stdout,
-		stderr:      renderLog,
-		events:      make(chan renderEvent, 256),
-		debugRender: cfg.DebugRender,
+		stdout:           cfg.Stdout,
+		stderr:           renderLog,
+		events:           make(chan renderEvent, 256),
+		gracefulDetachCh: make(chan struct{}),
+		debugRender:      cfg.DebugRender,
 	}
 	defer ui.closeIncomingRenderLog()
 	go ui.renderLoop(ctx, streamErrs)
@@ -350,18 +356,19 @@ func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeS
 			sessionDone <- fmt.Errorf("unexpected output stream slot %d, want %d", open.Slot, i)
 			return
 		}
-		go readOutputStream(open.Slot, protocol.NewDisplayDecoderFromDecoder(frameDecoder), ui, sessionDone)
+		go readOutputStream(open.Slot, protocol.NewDisplayDecoderFromDecoder(frameDecoder), ui, sessionDone, conn.Context())
 	}
 	outputReady <- struct{}{}
 }
 
-func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeState, sessionDone chan<- error) {
+func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeState, sessionDone chan<- error, connectionContexts ...context.Context) {
 	var layoutRevision uint64
 	var pending []protocol.DisplayCommand
 	for {
 		command, wireBytes, err := decoder.ReadCommand()
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			connectionClosed := len(connectionContexts) > 0 && connectionContexts[0].Err() != nil
+			if errors.Is(err, io.EOF) || isCleanQUICClose(err) || ui.gracefulDetach.Load() || (connectionClosed && errors.Is(err, io.ErrUnexpectedEOF)) || ui.waitForGracefulDetach(err) {
 				return
 			}
 			sessionDone <- fmt.Errorf("read display stream on slot %d: %w", slot, err)
@@ -425,7 +432,8 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 	for {
 		frame, err := decoder.ReadFrame()
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) || isCleanQUICClose(err) {
+				ui.markGracefulDetach()
 				done <- nil
 				return
 			}
@@ -452,8 +460,44 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- err
 				done <- err
 				return
 			}
+		case protocol.MsgSessionDetached:
+			if _, err := protocol.DecodeSessionDetached(frame.Payload); err != nil {
+				done <- fmt.Errorf("decode SESSION_DETACHED: %w", err)
+				return
+			}
+			ui.markGracefulDetach()
+			done <- nil
+			return
 		default:
 		}
+	}
+}
+
+func isCleanQUICClose(err error) bool {
+	var applicationErr *quic.ApplicationError
+	return errors.As(err, &applicationErr) && applicationErr.ErrorCode == 0
+}
+
+func (r *runtimeState) markGracefulDetach() {
+	r.gracefulDetach.Store(true)
+	r.gracefulDetachOnce.Do(func() {
+		if r.gracefulDetachCh != nil {
+			close(r.gracefulDetachCh)
+		}
+	})
+}
+
+func (r *runtimeState) waitForGracefulDetach(err error) bool {
+	if !errors.Is(err, io.ErrUnexpectedEOF) || r.gracefulDetachCh == nil {
+		return false
+	}
+	timer := time.NewTimer(200 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-r.gracefulDetachCh:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
