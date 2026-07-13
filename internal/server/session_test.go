@@ -245,6 +245,41 @@ func TestLayoutRevisionsAreUniqueAcrossWindows(t *testing.T) {
 	}
 }
 
+func TestReattachAdvancesActiveWindowLayoutRevision(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	pane := &Pane{ID: s.AddPaneID(), Title: "one"}
+	window, _ := s.CreateWindow(pane, 0)
+	previousRevision := window.LayoutRevision
+
+	reattached, activePane, _, err := s.ReattachClient(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activePane != pane {
+		t.Fatalf("active pane = %#v, want %#v", activePane, pane)
+	}
+	if reattached.LayoutRevision <= previousRevision {
+		t.Fatalf("reattach revision = %d, want greater than %d", reattached.LayoutRevision, previousRevision)
+	}
+}
+
+func TestSelectingWindowAdvancesItsLayoutRevision(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	first, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "one"}, 0)
+	second, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "two"}, 0)
+	firstRevision, secondRevision := first.LayoutRevision, second.LayoutRevision
+
+	selected, _, err := s.SelectWindow(0, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.LayoutRevision <= secondRevision || selected.LayoutRevision <= firstRevision {
+		t.Fatalf("selected revision = %d, prior revisions = %d and %d", selected.LayoutRevision, firstRevision, secondRevision)
+	}
+}
+
 func TestWindowLayoutCarriesRenderSlots(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)

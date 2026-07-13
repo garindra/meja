@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -87,10 +86,4 @@ func controllerCommand(remotePath string, sessionID uint64) (string, error) {
 		return "", err
 	}
 	return control.ShellQuote(remotePath) + " connect-session " + strconv.FormatUint(sessionID, 10), nil
-}
-
-func writeSSHDiagnostic(w io.Writer, message string) {
-	if w != nil {
-		_, _ = fmt.Fprintln(w, message)
-	}
 }

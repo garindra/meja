@@ -4,7 +4,40 @@ import (
 	"strings"
 	"tali/internal/protocol"
 	"testing"
+	"time"
 )
+
+func TestReconnectStatusPreservesExactMessageAndOrangeStyle(t *testing.T) {
+	state := NewClientState()
+	state.SetTerminalSize(80, 24)
+	_ = RenderANSI(state)
+	state.SetReconnecting(true, time.Now().Add(-23*time.Second))
+	output := string(RenderANSI(state))
+	if strings.Contains(output, "\x1b[2J") {
+		t.Fatalf("reconnect status caused a content redraw: %q", output)
+	}
+	if !strings.Contains(output, "tali is reconnecting... [Last contact 23 seconds ago]") {
+		t.Fatalf("reconnect status missing from ANSI output: %q", output)
+	}
+	if !strings.Contains(output, "\x1b[0;38;2;255;165;0;49m") {
+		t.Fatalf("reconnect status is not orange: %q", output)
+	}
+	if !strings.Contains(output, "\x1b[24;1H") {
+		t.Fatalf("reconnect status is not on the status row: %q", output)
+	}
+}
+
+func TestReconnectStatusClearsWithoutContentRedraw(t *testing.T) {
+	state := NewClientState()
+	state.SetTerminalSize(20, 4)
+	state.SetReconnecting(true, time.Now())
+	_ = RenderANSI(state)
+	state.SetReconnecting(false, time.Time{})
+	output := string(RenderANSI(state))
+	if strings.Contains(output, "tali is reconnecting") {
+		t.Fatalf("reconnect status remained after reconnect: %q", output)
+	}
+}
 
 func testRenderState() *ClientState {
 	s := NewClientState()

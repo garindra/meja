@@ -4,7 +4,20 @@ import (
 	"strings"
 	"tali/internal/protocol"
 	"testing"
+	"time"
 )
+
+func TestReconnectStateDoesNotLeakBetweenClientStates(t *testing.T) {
+	first := NewClientState()
+	second := NewClientState()
+	first.SetReconnecting(true, time.Now())
+	if !first.Reconnecting {
+		t.Fatal("first state did not enter reconnecting")
+	}
+	if second.Reconnecting || !second.LastContact.IsZero() {
+		t.Fatal("reconnect state leaked to an independent render state")
+	}
+}
 
 func TestDisplayCommandsApplyAtStreamWriteHead(t *testing.T) {
 	s := NewClientState()

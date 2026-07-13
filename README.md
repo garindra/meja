@@ -82,9 +82,13 @@ screen handling, and layout behavior remain in use. A QUIC disconnect detaches
 the client without immediately killing the session; an explicit detach/remote
 session exit ends the attached client flow.
 
-Resume credential validation and generation fencing are implemented as the
-secure protocol/state foundation. Full automatic client-side reconnect UX
-(orange last-contact overlay, input suppression, authoritative snapshot
-recovery, and automatic fallback after a live connection drops) is not yet
-wired through the existing render loop; the client currently reports a lost
-QUIC connection and exits. Manual reconnection with `-s` is supported.
+After a live QUIC connection drops, the client keeps the last confirmed
+terminal contents, replaces the client-visible status bar with an orange
+reconnecting indicator showing the elapsed time since the last authenticated
+contact, and drops input while it is disconnected. It first retries the pinned
+QUIC resume credential; if that fails, it invokes SSH
+`tali-ctrl connect-session <id>` and retries with the fresh single-use attach
+token. Input resumes only after the server's complete layout, status bar, and
+full visible-pane renders have been applied. If the daemon is intentionally stopped or the user
+presses Ctrl-B, d, the client exits cleanly; an unavailable daemon cannot be
+recreated by `connect-session`.

@@ -38,6 +38,26 @@ func TestServerConsumesPrefixCommandsAndForwardsLiteralBytes(t *testing.T) {
 	}
 }
 
+func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
+	s := NewSession(1)
+	s.NewClient(0)
+	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash", Terminal: terminal.New(80, 24)}, 0)
+	var input bytes.Buffer
+	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: []byte{0x02, 'd', 0x02, 'd'}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	ctrl := &controller{state: &sessionState{session: s}}
+	done := make(chan error, 1)
+	ctrl.handleInput(protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestServerParsesPrefixArrowAndWindowIndex(t *testing.T) {
 	s := NewSession(0)
 	s.NewClient(0)

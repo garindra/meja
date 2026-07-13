@@ -22,7 +22,6 @@ const (
 	MsgSessionAttachFailed
 	MsgSessionResume
 	MsgSessionResumeOK
-	MsgSessionDetached
 )
 
 const (
@@ -66,10 +65,6 @@ type SessionResumeOK struct {
 	SessionID   uint64
 	ResumeToken string
 	Generation  uint64
-}
-
-type SessionDetached struct {
-	Reason string
 }
 
 type CreatePane struct {

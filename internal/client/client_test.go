@@ -7,8 +7,11 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go"
 
 	"tali/internal/client/render"
 	"tali/internal/protocol"
@@ -117,7 +120,7 @@ func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
 	defer reader.Close()
 	defer writer.Close()
 	done := make(chan error, 1)
-	go readOutputStream(0, protocol.NewDisplayDecoder(reader), ui, done)
+	go readOutputStream(0, protocol.NewDisplayDecoder(reader), ui, done, nil, nil)
 	write := func(data []byte) {
 		t.Helper()
 		if _, err := writer.Write(data); err != nil {
@@ -169,7 +172,9 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go forwardInput(ctx, stdinR, inputFrames, errs, done)
+	var input atomic.Pointer[inputDestination]
+	input.Store(&inputDestination{frames: inputFrames, done: ctx.Done()})
+	go forwardInput(ctx, stdinR, &input, errs, done)
 
 	if _, err := stdinW.Write([]byte("abc")); err != nil {
 		t.Fatalf("stdin write = %v", err)
@@ -210,4 +215,198 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 	default:
 	}
 
+}
+
+func TestInputRouterDropsInputWhileDisconnected(t *testing.T) {
+	var input atomic.Pointer[inputDestination]
+	if err := sendCurrentInputEncoded(&input, protocol.MsgInputBytes, protocol.InputBytes{Data: []byte("dropped")}, protocol.EncodeInputBytes); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInputRoutesAfterConnectionDestinationIsInstalled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var input atomic.Pointer[inputDestination]
+	frames := make(chan protocol.Frame, 1)
+	if err := sendCurrentInputEncoded(&input, protocol.MsgInputBytes, protocol.InputBytes{Data: []byte("before")}, protocol.EncodeInputBytes); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-frames:
+		t.Fatal("input routed without a connection destination")
+	default:
+	}
+	input.Store(&inputDestination{frames: frames, done: ctx.Done()})
+	if err := sendCurrentInputEncoded(&input, protocol.MsgInputBytes, protocol.InputBytes{Data: []byte("after")}, protocol.EncodeInputBytes); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-frames:
+	case <-time.After(time.Second):
+		t.Fatal("input was not routed after installing a connection destination")
+	}
+}
+
+func TestPaneBatchBeforeLayoutIsBuffered(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout lockedBuffer
+	ui := &runtimeState{stdout: &stdout, events: make(chan renderEvent, 32)}
+	errs := make(chan error, 1)
+	go ui.renderLoop(ctx, errs)
+	ui.emit(sizeEvent{cols: 80, rows: 24})
+	ui.beginConnection(false, time.Now())
+	ui.emit(paneBatchEvent{slot: 0, layoutRevision: 9, commands: []protocol.DisplayCommand{{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("buffered")}}})
+	time.Sleep(20 * time.Millisecond)
+	stdout.mu.Lock()
+	early := strings.Contains(stdout.String(), "buffered")
+	stdout.mu.Unlock()
+	if early {
+		t.Fatal("pane batch rendered before its layout")
+	}
+	ui.emit(layoutEvent{layout: testSnapshotLayout(9)})
+	waitForBufferText(t, &stdout, "buffered")
+}
+
+func TestStoppedConnectionEventsAreDropped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout lockedBuffer
+	ui := &runtimeState{stdout: &stdout, events: make(chan renderEvent, 64)}
+	errs := make(chan error, 1)
+	go ui.renderLoop(ctx, errs)
+	ui.emit(sizeEvent{cols: 80, rows: 24})
+	ui.beginConnection(true, time.Now())
+	waitForBufferText(t, &stdout, "tali is reconnecting")
+	ui.stopConnection()
+	before := stdout.Len()
+	ui.emit(statusEvent{status: protocol.StatusBar{}})
+	ui.emit(layoutEvent{layout: testSnapshotLayout(11)})
+	ui.emit(paneBatchEvent{slot: 0, layoutRevision: 11})
+	ui.sync(ctx)
+	if stdout.Len() != before {
+		t.Fatal("stopped connection event changed the UI")
+	}
+}
+
+func TestDestroyWaitsForConnectionWorkers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	live := &liveConnection{ctx: ctx, cancel: cancel}
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	live.start(func() {
+		close(started)
+		<-ctx.Done()
+		close(stopped)
+	})
+	<-started
+
+	live.destroy()
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("destroy returned before connection worker stopped")
+	}
+}
+
+func TestConnectedEventClearsReconnectIndicator(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout lockedBuffer
+	ui := &runtimeState{stdout: &stdout, events: make(chan renderEvent, 32)}
+	errs := make(chan error, 1)
+	go ui.renderLoop(ctx, errs)
+	ui.emit(sizeEvent{cols: 80, rows: 24})
+	ui.beginConnection(true, time.Now())
+	waitForBufferText(t, &stdout, "tali is reconnecting")
+	ui.beginConnection(false, time.Time{})
+	time.Sleep(20 * time.Millisecond)
+	stdout.mu.Lock()
+	output := stdout.String()
+	stdout.mu.Unlock()
+	lastReconnect := strings.LastIndex(output, "tali is reconnecting")
+	if lastReconnect < 0 || !strings.Contains(output[lastReconnect:], "\x1b[24;1H") {
+		t.Fatalf("reconnect indicator was not replaced after connection became usable: %q", output)
+	}
+}
+
+type failingReader struct{ err error }
+
+func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestCleanQUICCloseWinsWhenOutputEOFArrivesFirst(t *testing.T) {
+	ui := &runtimeState{events: make(chan renderEvent, 1)}
+	outputErrors := make(chan error, 1)
+	readOutputStream(0, protocol.NewDisplayDecoder(bytes.NewReader(nil)), ui, outputErrors, nil, nil)
+
+	done := make(chan connectionResult, 1)
+	err := &quic.ApplicationError{ErrorCode: 0, ErrorMessage: "server stopped"}
+	managementLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), ui, done, nil)
+	if result := <-done; !result.graceful || result.err != nil {
+		t.Fatalf("terminal result = %#v, want graceful", result)
+	}
+}
+
+func TestReconnectEventsPreserveLastContact(t *testing.T) {
+	ui := &runtimeState{events: make(chan renderEvent, 2)}
+	lastContact := time.Now().Add(-time.Minute)
+	ui.beginConnection(true, lastContact)
+	ui.beginConnection(true, lastContact)
+	for i := 0; i < 2; i++ {
+		reconnect := (<-ui.events).(reconnectEvent)
+		if !reconnect.lastContact.Equal(lastContact) {
+			t.Fatalf("reconnect event = %#v", reconnect)
+		}
+	}
+}
+
+func TestHeartbeatExpiresAfterMissedPongs(t *testing.T) {
+	now := time.Now()
+	if heartbeatExpired(now, now.Add(-clientPingTimeout+time.Millisecond).UnixNano()) {
+		t.Fatal("heartbeat expired before timeout")
+	}
+	if !heartbeatExpired(now, now.Add(-clientPingTimeout).UnixNano()) {
+		t.Fatal("heartbeat remained live at timeout")
+	}
+}
+
+func TestReconnectStateIsLocalToRuntime(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var first, second lockedBuffer
+	ui1 := &runtimeState{stdout: &first, events: make(chan renderEvent, 8)}
+	ui2 := &runtimeState{stdout: &second, events: make(chan renderEvent, 8)}
+	go ui1.renderLoop(ctx, make(chan error, 1))
+	go ui2.renderLoop(ctx, make(chan error, 1))
+	ui1.emit(sizeEvent{cols: 80, rows: 24})
+	ui2.emit(sizeEvent{cols: 80, rows: 24})
+	ui1.beginConnection(true, time.Now())
+	waitForBufferText(t, &first, "tali is reconnecting")
+	time.Sleep(20 * time.Millisecond)
+	second.mu.Lock()
+	leaked := strings.Contains(second.String(), "tali is reconnecting")
+	second.mu.Unlock()
+	if leaked {
+		t.Fatal("reconnect state leaked to an independent runtime")
+	}
+}
+
+func testSnapshotLayout(revision uint64) protocol.WindowLayout {
+	return protocol.WindowLayout{WindowID: 1, FocusedPaneID: 1, LayoutRevision: revision, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 80, Height: 23}}}}
+}
+
+func waitForBufferText(t *testing.T, buffer *lockedBuffer, want string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		buffer.mu.Lock()
+		found := strings.Contains(buffer.String(), want)
+		buffer.mu.Unlock()
+		if found {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("buffer did not contain %q", want)
 }

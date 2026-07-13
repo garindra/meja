@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"tali/internal/protocol"
 )
@@ -32,7 +33,11 @@ func RenderANSI(state *ClientState) []byte {
 	}
 	if tabChanged {
 		writeCursorPosition(&buf, state.TerminalRows, 1)
-		renderStatusBar(&buf, state)
+		if state.Reconnecting {
+			renderReconnectStatusBar(&buf, state, time.Now())
+		} else {
+			renderStatusBar(&buf, state)
+		}
 	}
 	if contentChanged || tabChanged {
 		buf.WriteString(sgrForStyle(defaultStyle()))
@@ -60,6 +65,30 @@ func RenderANSI(state *ClientState) []byte {
 	state.lastCursorVisible = cursorVisible
 	state.hasRenderedCursor = true
 	return buf.Bytes()
+}
+
+func reconnectStatusText(state *ClientState, now time.Time) string {
+	seconds := int(now.Sub(state.LastContact) / time.Second)
+	if seconds < 0 {
+		seconds = 0
+	}
+	return "tali is reconnecting... [Last contact " + strconv.Itoa(seconds) + " seconds ago]"
+}
+
+func renderReconnectStatusBar(buf *bytes.Buffer, state *ClientState, now time.Time) {
+	text := reconnectStatusText(state, now)
+	cells := make([]composedCell, state.TerminalCols)
+	style := protocol.Style{FG: protocol.Color{Mode: "rgb", R: 255, G: 165, B: 0}, BG: protocol.Color{Mode: "default"}}
+	for i := range cells {
+		cells[i] = composedCell{Rune: ' ', Style: style}
+	}
+	for i, r := range []rune(text) {
+		if i >= len(cells) {
+			break
+		}
+		cells[i].Rune = r
+	}
+	renderCellRun(buf, cells)
 }
 
 func renderStatusBar(buf *bytes.Buffer, state *ClientState) {

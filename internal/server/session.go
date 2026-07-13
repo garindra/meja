@@ -226,7 +226,7 @@ func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *Client
 	s.Windows[windowID] = window
 	s.Panes[pane.ID] = pane
 	client := s.ensureClientLocked(activateFor)
-	if client.ActiveWindowID != windowID {
+	if client.ActiveWindowID != window.ID {
 		client.LastWindowID = client.ActiveWindowID
 		client.HasLastWindow = client.LastWindowID != 0
 	}
@@ -253,14 +253,9 @@ func (s *Session) ReattachClient(clientID uint64) (*Window, *Pane, *ClientState,
 	if window == nil {
 		ids := s.windowIDsLocked()
 		window = s.Windows[ids[0]]
-		client.ActiveWindowID = window.ID
-		client.FocusedPaneID = windowPrimaryPaneID(window)
 	}
-	if !windowHasPane(window, client.FocusedPaneID) {
-		client.FocusedPaneID = windowPrimaryPaneID(window)
-	}
+	s.selectWindowLocked(client, window)
 	pane := s.Panes[client.FocusedPaneID]
-	s.rebuildBindingsLocked(client, window)
 	return cloneWindow(window), pane, cloneClientState(client), nil
 }
 
@@ -318,14 +313,19 @@ func (s *Session) SelectWindow(clientID, windowID uint64) (*Window, *ClientState
 	if window == nil {
 		return nil, nil, fmt.Errorf("unknown window %d", windowID)
 	}
-	if client.ActiveWindowID != windowID {
+	s.selectWindowLocked(client, window)
+	return cloneWindow(window), cloneClientState(client), nil
+}
+
+func (s *Session) selectWindowLocked(client *ClientState, window *Window) {
+	if client.ActiveWindowID != window.ID {
 		client.LastWindowID = client.ActiveWindowID
 		client.HasLastWindow = client.LastWindowID != 0
 	}
-	client.ActiveWindowID = windowID
+	client.ActiveWindowID = window.ID
 	client.FocusedPaneID = windowPrimaryPaneID(window)
+	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	s.rebuildBindingsLocked(client, window)
-	return cloneWindow(window), cloneClientState(client), nil
 }
 
 func (s *Session) RenameWindow(windowID uint64, name string) (*Window, error) {

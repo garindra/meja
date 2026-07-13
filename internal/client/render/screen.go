@@ -2,6 +2,7 @@ package render
 
 import (
 	"sort"
+	"time"
 
 	"tali/internal/protocol"
 )
@@ -45,6 +46,8 @@ type ClientState struct {
 	fullContentDirty, tabBarDirty        bool
 	lastCursorX, lastCursorY             int
 	lastCursorVisible, hasRenderedCursor bool
+	Reconnecting                         bool
+	LastContact                          time.Time
 }
 
 func NewClientState() *ClientState {
@@ -66,6 +69,23 @@ func (s *ClientState) SetTerminalSize(cols, rows int) {
 	}
 	s.TerminalCols = cols
 	s.TerminalRows = rows
+}
+
+func (s *ClientState) SetReconnecting(reconnecting bool, lastContact time.Time) {
+	if s.Reconnecting == reconnecting && (reconnecting == false || s.LastContact.Equal(lastContact)) {
+		return
+	}
+	s.Reconnecting = reconnecting
+	if reconnecting {
+		s.LastContact = lastContact
+	}
+	s.tabBarDirty = true
+}
+
+func (s *ClientState) RefreshReconnectStatus() {
+	if s.Reconnecting {
+		s.tabBarDirty = true
+	}
 }
 func (s *ClientState) DrawableRows() int {
 	if s.TerminalRows <= 1 {

@@ -23,13 +23,16 @@ import (
 	"golang.org/x/term"
 
 	"tali/internal/client/render"
+	"tali/internal/control"
 	"tali/internal/protocol"
 )
 
 const (
 	quicMaxIdleTimeout  = 60 * time.Second
 	quicKeepAlivePeriod = 10 * time.Second
-	clientPingPeriod    = 15 * time.Second
+	clientPingPeriod    = 2 * time.Second
+	clientPingTimeout   = 6 * time.Second
+	heartbeatCloseCode  = quic.ApplicationErrorCode(0x54414c48)
 	incomingBurstWindow = 50 * time.Millisecond
 )
 
@@ -74,9 +77,8 @@ type runtimeState struct {
 	incomingMessageTypeHits map[protocol.DisplayOpcode]uint64
 	incomingWriteStyleHits  map[renderStyleKey]uint64
 	installedRenderStyles   map[renderStyleKey]protocol.Style
-	gracefulDetach          atomic.Bool
-	gracefulDetachCh        chan struct{}
-	gracefulDetachOnce      sync.Once
+	renderDone              chan struct{}
+	dropConnectionEvents    atomic.Bool
 }
 
 type renderStyleKey struct {
@@ -93,11 +95,18 @@ type paneBatchEvent struct {
 type layoutEvent struct{ layout protocol.WindowLayout }
 type statusEvent struct{ status protocol.StatusBar }
 type sizeEvent struct{ cols, rows int }
+type reconnectEvent struct {
+	reconnecting bool
+	lastContact  time.Time
+}
+type renderBarrierEvent struct{ done chan struct{} }
 
-func (paneBatchEvent) renderEvent() {}
-func (layoutEvent) renderEvent()    {}
-func (statusEvent) renderEvent()    {}
-func (sizeEvent) renderEvent()      {}
+func (paneBatchEvent) renderEvent()     {}
+func (layoutEvent) renderEvent()        {}
+func (statusEvent) renderEvent()        {}
+func (sizeEvent) renderEvent()          {}
+func (reconnectEvent) renderEvent()     {}
+func (renderBarrierEvent) renderEvent() {}
 
 func ParseTarget(raw string) (Target, error) {
 	raw = strings.TrimSpace(raw)
@@ -127,6 +136,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Stdout == nil {
 		return errors.New("stdout is required")
 	}
+	streamErrs := make(chan error, 32)
 	renderLog := cfg.Stderr
 	if cfg.DebugRenderLogPath != "" {
 		f, err := os.Create(cfg.DebugRenderLogPath)
@@ -137,85 +147,16 @@ func Run(ctx context.Context, cfg Config) error {
 		renderLog = f
 	}
 
-	bootstrap, err := fetchBootstrap(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	hostname, err := resolveSSHHostname(ctx, cfg.Target)
-	if err != nil {
-		return err
-	}
-	tlsConfig, err := loadTLSConfig(bootstrap.CertSPKISHA256)
-	if err != nil {
-		return err
-	}
-	addr := net.JoinHostPort(hostname, fmt.Sprintf("%d", bootstrap.Port))
-	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quic.Config{
-		MaxIdleTimeout:     quicMaxIdleTimeout,
-		KeepAlivePeriod:    quicKeepAlivePeriod,
-		MaxIncomingStreams: int64(protocol.MaxRenderSlots),
-	})
-	if err != nil {
-		return fmt.Errorf("dial %s: %w", addr, err)
-	}
-	defer conn.CloseWithError(0, "")
-
-	mgmtStream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		return fmt.Errorf("open management stream: %w", err)
-	}
-	inputStream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		return fmt.Errorf("open input stream: %w", err)
-	}
-
-	mgmtFrames := make(chan protocol.Frame, 64)
-	inputFrames := make(chan protocol.Frame, 64)
-	streamErrs := make(chan error, 8)
-	go writeFrames(mgmtStream, mgmtFrames, streamErrs)
-	go writeFrames(inputStream, inputFrames, streamErrs)
-	defer close(mgmtFrames)
-	defer close(inputFrames)
-
-	if err := enqueueEncoded(mgmtFrames, protocol.MsgOpenManagementStream, protocol.StreamOpen{StreamType: protocol.StreamTypeManagement}, protocol.EncodeStreamOpen); err != nil {
-		return err
-	}
-	if err := enqueueEncoded(mgmtFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, SessionID: bootstrap.SessionID, Token: bootstrap.AttachToken}, protocol.EncodeSessionAttach); err != nil {
-		return err
-	}
-	if err := enqueueEncoded(inputFrames, protocol.MsgOpenInputStream, protocol.StreamOpen{StreamType: protocol.StreamTypeInput}, protocol.EncodeStreamOpen); err != nil {
-		return err
-	}
-
-	mgmtDecoder := protocol.NewDecoder(mgmtStream, protocol.DefaultMaxFrameSize)
 	ui := &runtimeState{
-		stdout:           cfg.Stdout,
-		stderr:           renderLog,
-		events:           make(chan renderEvent, 256),
-		gracefulDetachCh: make(chan struct{}),
-		debugRender:      cfg.DebugRender,
+		stdout:      cfg.Stdout,
+		stderr:      renderLog,
+		events:      make(chan renderEvent, 256),
+		debugRender: cfg.DebugRender,
+		renderDone:  make(chan struct{}),
 	}
+	ui.dropConnectionEvents.Store(false)
 	defer ui.closeIncomingRenderLog()
 	go ui.renderLoop(ctx, streamErrs)
-	outputReady := make(chan struct{}, 1)
-	sessionDone := make(chan error, 2)
-	go acceptOutputStreams(ctx, conn, ui, outputReady, sessionDone)
-
-	attachResult, err := mgmtDecoder.ReadFrame()
-	if err != nil {
-		return fmt.Errorf("read session attachment result: %w", err)
-	}
-	switch attachResult.Type {
-	case protocol.MsgSessionAttachOK:
-		if _, err := protocol.DecodeSessionAttachOK(attachResult.Payload); err != nil {
-			return err
-		}
-	case protocol.MsgSessionAttachFailed:
-		return errors.New("session attachment rejected")
-	default:
-		return fmt.Errorf("unexpected session attachment result %d", attachResult.Type)
-	}
-
 	cols, rows, err := terminalSize(cfg.Stdin)
 	if err != nil {
 		return err
@@ -250,61 +191,303 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
-	if err := enqueueEncoded(mgmtFrames, protocol.MsgCreatePane, protocol.CreatePane{
-		Cwd:  cfg.Cwd,
-		Argv: cfg.Argv,
-		Cols: cols,
-		Rows: drawableRows(int(rows)),
-	}, protocol.EncodeCreatePane); err != nil {
-		return err
-	}
-
-	createdFrame, err := mgmtDecoder.ReadFrame()
-	if err != nil {
-		return fmt.Errorf("read pane created: %w", err)
-	}
-	if createdFrame.Type != protocol.MsgPaneCreated {
-		return fmt.Errorf("unexpected pane message type %d", createdFrame.Type)
-	}
-	created, err := protocol.DecodePaneCreated(createdFrame.Payload)
-	if err != nil {
-		return fmt.Errorf("decode pane created: %w", err)
-	}
-	_ = created
-
-	select {
-	case <-outputReady:
-	case err := <-sessionDone:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	mgmtDone := make(chan error, 1)
-	go managementLoop(mgmtDecoder, ui, mgmtDone)
-
 	copyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	clientDone := make(chan error, 1)
-	go forwardInput(copyCtx, cfg.Stdin, inputFrames, streamErrs, clientDone)
-	go forwardResize(copyCtx, cfg.Stdin, inputFrames, ui, streamErrs)
-	go sendPeriodicPing(copyCtx, mgmtFrames, streamErrs)
+	var input atomic.Pointer[inputDestination]
+
+	bootstrap, err := fetchBootstrap(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	hostname, err := resolveSSHHostname(ctx, cfg.Target)
+	if err != nil {
+		return err
+	}
+	ui.beginConnection(false, time.Now())
+	live, err := openConnection(ctx, bootstrap, hostname, cols, rows, cfg, "", 0, ui)
+	if err != nil {
+		return err
+	}
+	input.Store(live.inputDestination())
+	go forwardInput(copyCtx, cfg.Stdin, &input, streamErrs, clientDone)
+	go forwardResize(copyCtx, cfg.Stdin, &input, ui, streamErrs)
 
 	for {
 		select {
+		case result := <-live.done:
+			ui.stopConnection()
+			clearInputDestination(&input, live.inputFrames)
+			live.destroy()
+			ui.sync(ctx)
+			if result.graceful {
+				return nil
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			lastContact := live.lastContactTime()
+			ui.markDisconnected(lastContact)
+			resumeToken, generation := live.resumeToken, live.generation
+			backoff := 100 * time.Millisecond
+			for {
+				if err := waitReconnect(ctx, backoff); err != nil {
+					return err
+				}
+				ui.beginConnection(true, lastContact)
+				candidate, reconnectErr := openConnection(ctx, bootstrap, hostname, cols, rows, cfg, resumeToken, generation, ui)
+				if reconnectErr != nil {
+					fallbackCfg := cfg
+					fallbackCfg.SessionID = bootstrap.SessionID
+					fallbackCfg.Stderr = io.Discard
+					fallback, fallbackErr := fetchBootstrap(ctx, fallbackCfg)
+					if fallbackErr == nil {
+						fallbackHost, hostErr := resolveSSHHostname(ctx, cfg.Target)
+						if hostErr == nil {
+							ui.beginConnection(true, lastContact)
+							candidate, reconnectErr = openConnection(ctx, fallback, fallbackHost, cols, rows, cfg, "", 0, ui)
+							if reconnectErr == nil {
+								bootstrap, hostname = fallback, fallbackHost
+							}
+						}
+					}
+				}
+				if reconnectErr == nil {
+					live = candidate
+					ui.beginConnection(false, lastContact)
+					input.Store(live.inputDestination())
+					break
+				}
+				if backoff < 2*time.Second {
+					backoff *= 2
+				}
+			}
+		case err := <-clientDone:
+			clearInputDestination(&input, live.inputFrames)
+			live.destroy()
+			return err
 		case err := <-streamErrs:
 			if err != nil {
+				clearInputDestination(&input, live.inputFrames)
+				live.destroy()
 				return err
 			}
-		case err := <-sessionDone:
-			return err
-		case err := <-mgmtDone:
-			return err
-		case err := <-clientDone:
-			return err
 		case <-ctx.Done():
+			clearInputDestination(&input, live.inputFrames)
+			live.destroy()
 			return ctx.Err()
 		}
+	}
+}
+
+type inputDestination struct {
+	frames chan<- protocol.Frame
+	done   <-chan struct{}
+}
+
+func clearInputDestination(current *atomic.Pointer[inputDestination], frames chan<- protocol.Frame) {
+	for {
+		destination := current.Load()
+		if destination == nil || destination.frames != frames || current.CompareAndSwap(destination, nil) {
+			return
+		}
+	}
+}
+
+func sendCurrentInput(current *atomic.Pointer[inputDestination], frame protocol.Frame) error {
+	destination := current.Load()
+	if destination == nil {
+		return nil // disconnected input is deliberately dropped
+	}
+	select {
+	case destination.frames <- frame:
+		return nil
+	case <-destination.done:
+		return nil
+	}
+}
+
+func sendCurrentInputEncoded[T any](current *atomic.Pointer[inputDestination], msgType uint64, value T, encode func([]byte, T) ([]byte, error)) error {
+	payload, err := encode(nil, value)
+	if err != nil {
+		return err
+	}
+	return sendCurrentInput(current, protocol.Frame{Type: msgType, Payload: payload})
+}
+
+type connectionResult struct {
+	err      error
+	graceful bool
+}
+
+type liveConnection struct {
+	conn        quic.Connection
+	mgmtFrames  chan protocol.Frame
+	inputFrames chan protocol.Frame
+	cancel      context.CancelFunc
+	ctx         context.Context
+	done        chan connectionResult
+	resumeToken string
+	generation  uint64
+	lastContact atomic.Int64
+	workers     sync.WaitGroup
+}
+
+func (c *liveConnection) inputDestination() *inputDestination {
+	return &inputDestination{frames: c.inputFrames, done: c.ctx.Done()}
+}
+
+func (c *liveConnection) noteContact() { c.lastContact.Store(time.Now().UnixNano()) }
+
+func (c *liveConnection) lastContactTime() time.Time {
+	return time.Unix(0, c.lastContact.Load())
+}
+
+func (c *liveConnection) start(worker func()) {
+	c.workers.Add(1)
+	go func() {
+		defer c.workers.Done()
+		worker()
+	}()
+}
+
+func (c *liveConnection) destroy() {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.conn != nil {
+		_ = c.conn.CloseWithError(0, "")
+	}
+	c.workers.Wait()
+}
+
+func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname string, cols, rows uint16, cfg Config, resumeToken string, generation uint64, ui *runtimeState) (*liveConnection, error) {
+	tlsConfig, err := loadTLSConfig(bootstrap.CertSPKISHA256)
+	if err != nil {
+		return nil, err
+	}
+	addr := net.JoinHostPort(hostname, fmt.Sprintf("%d", bootstrap.Port))
+	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quic.Config{
+		MaxIdleTimeout:     quicMaxIdleTimeout,
+		KeepAlivePeriod:    quicKeepAlivePeriod,
+		MaxIncomingStreams: int64(protocol.MaxRenderSlots),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	connCtx, cancel := context.WithCancel(ctx)
+	live := &liveConnection{
+		conn:        conn,
+		mgmtFrames:  make(chan protocol.Frame, 64),
+		inputFrames: make(chan protocol.Frame, 64),
+		cancel:      cancel,
+		ctx:         connCtx,
+		done:        make(chan connectionResult, 1),
+	}
+	fail := func(err error) (*liveConnection, error) {
+		ui.stopConnection()
+		live.destroy()
+		ui.sync(ctx)
+		return nil, err
+	}
+	live.noteContact()
+	mgmtStream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return fail(fmt.Errorf("open management stream: %w", err))
+	}
+	inputStream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return fail(fmt.Errorf("open input stream: %w", err))
+	}
+	errs := make(chan error, 8)
+	live.start(func() { writeFrames(connCtx, mgmtStream, live.mgmtFrames, errs) })
+	live.start(func() { writeFrames(connCtx, inputStream, live.inputFrames, errs) })
+	if err := enqueueEncoded(live.mgmtFrames, protocol.MsgOpenManagementStream, protocol.StreamOpen{StreamType: protocol.StreamTypeManagement}, protocol.EncodeStreamOpen); err != nil {
+		return fail(err)
+	}
+	if resumeToken == "" {
+		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, SessionID: bootstrap.SessionID, Token: bootstrap.AttachToken}, protocol.EncodeSessionAttach)
+	} else {
+		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionResume, protocol.SessionResume{Version: protocol.ProtocolVersion, SessionID: bootstrap.SessionID, ResumeToken: resumeToken, Generation: generation}, protocol.EncodeSessionResume)
+	}
+	if err != nil {
+		return fail(err)
+	}
+	if err := enqueueEncoded(live.inputFrames, protocol.MsgOpenInputStream, protocol.StreamOpen{StreamType: protocol.StreamTypeInput}, protocol.EncodeStreamOpen); err != nil {
+		return fail(err)
+	}
+	mgmtDecoder := protocol.NewDecoder(mgmtStream, protocol.DefaultMaxFrameSize)
+	attachResult, err := mgmtDecoder.ReadFrame()
+	if err != nil {
+		return fail(fmt.Errorf("read session attachment result: %w", err))
+	}
+	switch attachResult.Type {
+	case protocol.MsgSessionAttachOK:
+		msg, decodeErr := protocol.DecodeSessionAttachOK(attachResult.Payload)
+		if decodeErr != nil {
+			return fail(decodeErr)
+		}
+		live.resumeToken, live.generation = msg.ResumeToken, msg.Generation
+	case protocol.MsgSessionResumeOK:
+		msg, decodeErr := protocol.DecodeSessionResumeOK(attachResult.Payload)
+		if decodeErr != nil {
+			return fail(decodeErr)
+		}
+		live.resumeToken, live.generation = msg.ResumeToken, msg.Generation
+	case protocol.MsgSessionAttachFailed:
+		return fail(errors.New("session attachment rejected"))
+	default:
+		return fail(fmt.Errorf("unexpected session attachment result %d", attachResult.Type))
+	}
+	outputReady := make(chan struct{})
+	live.start(func() { acceptOutputStreams(connCtx, conn, ui, outputReady, errs, live.start, &live.lastContact) })
+	select {
+	case <-outputReady:
+	case streamErr := <-errs:
+		return fail(streamErr)
+	case <-ctx.Done():
+		return fail(ctx.Err())
+	}
+	if err := enqueueEncoded(live.mgmtFrames, protocol.MsgCreatePane, protocol.CreatePane{Cwd: cfg.Cwd, Argv: cfg.Argv, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeCreatePane); err != nil {
+		return fail(err)
+	}
+	createdFrame, err := mgmtDecoder.ReadFrame()
+	if err != nil {
+		return fail(fmt.Errorf("read pane created: %w", err))
+	}
+	if createdFrame.Type != protocol.MsgPaneCreated {
+		return fail(fmt.Errorf("unexpected pane message type %d", createdFrame.Type))
+	}
+	if _, err := protocol.DecodePaneCreated(createdFrame.Payload); err != nil {
+		return fail(fmt.Errorf("decode pane created: %w", err))
+	}
+	live.start(func() { managementLoop(mgmtDecoder, ui, live.done, &live.lastContact) })
+	live.start(func() {
+		sendPeriodicPing(connCtx, live.mgmtFrames, errs, &live.lastContact, func() {
+			_ = conn.CloseWithError(heartbeatCloseCode, "heartbeat timeout")
+		})
+	})
+	live.start(func() {
+		for {
+			select {
+			case <-errs:
+				// The management stream is the authoritative lifecycle signal.
+			case <-connCtx.Done():
+				return
+			}
+		}
+	})
+	return live, nil
+}
+
+func waitReconnect(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -330,49 +513,61 @@ func loadTLSConfig(spkiHash string) (*tls.Config, error) {
 	}, nil
 }
 
-func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeState, outputReady chan<- struct{}, sessionDone chan<- error) {
+func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeState, outputReady chan<- struct{}, sessionDone chan<- error, start func(func()), lastContact *atomic.Int64) {
 	for i := 0; i < int(protocol.MaxRenderSlots); i++ {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
-			sessionDone <- fmt.Errorf("accept output stream: %w", err)
+			sendConnectionError(ctx, sessionDone, fmt.Errorf("accept output stream: %w", err))
 			return
 		}
 		frameDecoder := protocol.NewDecoder(stream, protocol.DefaultMaxFrameSize)
 		openFrame, err := frameDecoder.ReadFrame()
 		if err != nil {
-			sessionDone <- fmt.Errorf("read output stream open: %w", err)
+			sendConnectionError(ctx, sessionDone, fmt.Errorf("read output stream open: %w", err))
 			return
 		}
 		if openFrame.Type != protocol.MsgOpenPaneOutputStream {
-			sessionDone <- fmt.Errorf("unexpected output stream opener %d", openFrame.Type)
+			sendConnectionError(ctx, sessionDone, fmt.Errorf("unexpected output stream opener %d", openFrame.Type))
 			return
 		}
 		open, err := protocol.DecodeStreamOpen(openFrame.Payload)
 		if err != nil {
-			sessionDone <- err
+			sendConnectionError(ctx, sessionDone, err)
 			return
 		}
 		if int(open.Slot) != i {
-			sessionDone <- fmt.Errorf("unexpected output stream slot %d, want %d", open.Slot, i)
+			sendConnectionError(ctx, sessionDone, fmt.Errorf("unexpected output stream slot %d, want %d", open.Slot, i))
 			return
 		}
-		go readOutputStream(open.Slot, protocol.NewDisplayDecoderFromDecoder(frameDecoder), ui, sessionDone, conn.Context())
+		slot := open.Slot
+		start(func() {
+			readOutputStream(slot, protocol.NewDisplayDecoderFromDecoder(frameDecoder), ui, sessionDone, conn.Context(), lastContact)
+		})
 	}
-	outputReady <- struct{}{}
+	select {
+	case outputReady <- struct{}{}:
+	case <-ctx.Done():
+	}
 }
 
-func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeState, sessionDone chan<- error, connectionContexts ...context.Context) {
+func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeState, sessionDone chan<- error, connectionContext context.Context, lastContact *atomic.Int64) {
 	var layoutRevision uint64
 	var pending []protocol.DisplayCommand
 	for {
 		command, wireBytes, err := decoder.ReadCommand()
 		if err != nil {
-			connectionClosed := len(connectionContexts) > 0 && connectionContexts[0].Err() != nil
-			if errors.Is(err, io.EOF) || isCleanQUICClose(err) || ui.gracefulDetach.Load() || (connectionClosed && errors.Is(err, io.ErrUnexpectedEOF)) || ui.waitForGracefulDetach(err) {
+			connectionClosed := connectionContext != nil && connectionContext.Err() != nil
+			if errors.Is(err, io.EOF) || isCleanQUICClose(err) {
 				return
 			}
-			sessionDone <- fmt.Errorf("read display stream on slot %d: %w", slot, err)
+			if connectionClosed && errors.Is(err, io.ErrUnexpectedEOF) {
+				return
+			}
+			sendConnectionError(connectionContext, sessionDone, fmt.Errorf("read display stream on slot %d: %w", slot, err))
 			return
+		}
+		if lastContact != nil {
+			lastContact.Store(time.Now().UnixNano())
 		}
 		ui.recordIncomingRenderCommand(slot, command, wireBytes)
 		if command.Opcode == protocol.DisplayOpcodeRelayoutBarrier {
@@ -382,14 +577,14 @@ func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeS
 		}
 		if command.Opcode != protocol.DisplayOpcodePresent {
 			if layoutRevision == 0 {
-				sessionDone <- fmt.Errorf("display command 0x%02x on slot %d before RELAYOUT_BARRIER", byte(command.Opcode), slot)
+				sendConnectionError(connectionContext, sessionDone, fmt.Errorf("display command 0x%02x on slot %d before RELAYOUT_BARRIER", byte(command.Opcode), slot))
 				return
 			}
 			pending = append(pending, command)
 			continue
 		}
 		if layoutRevision == 0 {
-			sessionDone <- fmt.Errorf("PRESENT on slot %d before RELAYOUT_BARRIER", slot)
+			sendConnectionError(connectionContext, sessionDone, fmt.Errorf("PRESENT on slot %d before RELAYOUT_BARRIER", slot))
 			return
 		}
 		batch := paneBatchEvent{slot: slot, layoutRevision: layoutRevision, commands: append([]protocol.DisplayCommand(nil), pending...)}
@@ -428,46 +623,44 @@ func applyDisplayCommand(s *render.ClientState, slot uint8, command protocol.Dis
 	return nil
 }
 
-func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- error) {
+func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- connectionResult, lastContact *atomic.Int64) {
 	for {
 		frame, err := decoder.ReadFrame()
 		if err != nil {
-			if errors.Is(err, io.EOF) || isCleanQUICClose(err) {
-				ui.markGracefulDetach()
-				done <- nil
+			if isCleanQUICClose(err) {
+				done <- connectionResult{graceful: true}
 				return
 			}
-			done <- fmt.Errorf("read management frame: %w", err)
+			if errors.Is(err, io.EOF) {
+				done <- connectionResult{}
+				return
+			}
+			done <- connectionResult{err: fmt.Errorf("read management frame: %w", err)}
 			return
+		}
+		if lastContact != nil {
+			lastContact.Store(time.Now().UnixNano())
 		}
 		switch frame.Type {
 		case protocol.MsgWindowLayout:
 			msg, err := protocol.DecodeWindowLayout(frame.Payload)
 			if err != nil {
-				done <- fmt.Errorf("decode WINDOW_LAYOUT: %w", err)
+				done <- connectionResult{err: fmt.Errorf("decode WINDOW_LAYOUT: %w", err)}
 				return
 			}
 			ui.emit(layoutEvent{layout: msg})
 		case protocol.MsgStatusBar:
 			msg, err := protocol.DecodeStatusBar(frame.Payload)
 			if err != nil {
-				done <- fmt.Errorf("decode STATUS_BAR: %w", err)
+				done <- connectionResult{err: fmt.Errorf("decode STATUS_BAR: %w", err)}
 				return
 			}
 			ui.emit(statusEvent{status: msg})
 		case protocol.MsgPong:
 			if _, err := protocol.DecodePong(frame.Payload); err != nil {
-				done <- err
+				done <- connectionResult{err: err}
 				return
 			}
-		case protocol.MsgSessionDetached:
-			if _, err := protocol.DecodeSessionDetached(frame.Payload); err != nil {
-				done <- fmt.Errorf("decode SESSION_DETACHED: %w", err)
-				return
-			}
-			ui.markGracefulDetach()
-			done <- nil
-			return
 		default:
 		}
 	}
@@ -478,35 +671,12 @@ func isCleanQUICClose(err error) bool {
 	return errors.As(err, &applicationErr) && applicationErr.ErrorCode == 0
 }
 
-func (r *runtimeState) markGracefulDetach() {
-	r.gracefulDetach.Store(true)
-	r.gracefulDetachOnce.Do(func() {
-		if r.gracefulDetachCh != nil {
-			close(r.gracefulDetachCh)
-		}
-	})
-}
-
-func (r *runtimeState) waitForGracefulDetach(err error) bool {
-	if !errors.Is(err, io.ErrUnexpectedEOF) || r.gracefulDetachCh == nil {
-		return false
-	}
-	timer := time.NewTimer(200 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case <-r.gracefulDetachCh:
-		return true
-	case <-timer.C:
-		return false
-	}
-}
-
-func forwardInput(ctx context.Context, stdin *os.File, inputFrames chan<- protocol.Frame, errs chan<- error, done chan<- error) {
+func forwardInput(ctx context.Context, stdin *os.File, input *atomic.Pointer[inputDestination], errs chan<- error, done chan<- error) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := stdin.Read(buf)
 		if n > 0 {
-			if sendErr := sendInputBytes(inputFrames, append([]byte(nil), buf[:n]...)); sendErr != nil {
+			if sendErr := sendCurrentInputEncoded(input, protocol.MsgInputBytes, protocol.InputBytes{Data: append([]byte(nil), buf[:n]...)}, protocol.EncodeInputBytes); sendErr != nil {
 				if ctx.Err() != nil {
 					return
 				}
@@ -524,7 +694,7 @@ func forwardInput(ctx context.Context, stdin *os.File, inputFrames chan<- protoc
 	}
 }
 
-func forwardResize(ctx context.Context, tty *os.File, inputFrames chan<- protocol.Frame, ui *runtimeState, errs chan<- error) {
+func forwardResize(ctx context.Context, tty *os.File, input *atomic.Pointer[inputDestination], ui *runtimeState, errs chan<- error) {
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, syscall.SIGWINCH)
 	defer signal.Stop(sigch)
@@ -539,7 +709,7 @@ func forwardResize(ctx context.Context, tty *os.File, inputFrames chan<- protoco
 				return
 			}
 			ui.emit(sizeEvent{cols: int(cols), rows: int(rows)})
-			if sendErr := enqueueEncoded(inputFrames, protocol.MsgResizePane, protocol.ResizePane{
+			if sendErr := sendCurrentInputEncoded(input, protocol.MsgResizePane, protocol.ResizePane{
 				Cols: cols,
 				Rows: drawableRows(int(rows)),
 			}, protocol.EncodeResizePane); sendErr != nil {
@@ -550,7 +720,7 @@ func forwardResize(ctx context.Context, tty *os.File, inputFrames chan<- protoco
 	}
 }
 
-func sendPeriodicPing(ctx context.Context, mgmtFrames chan<- protocol.Frame, errs chan<- error) {
+func sendPeriodicPing(ctx context.Context, mgmtFrames chan<- protocol.Frame, errs chan<- error, lastContact *atomic.Int64, closeConnection func()) {
 	ticker := time.NewTicker(clientPingPeriod)
 	defer ticker.Stop()
 
@@ -559,20 +729,34 @@ func sendPeriodicPing(ctx context.Context, mgmtFrames chan<- protocol.Frame, err
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case now := <-ticker.C:
+			if heartbeatExpired(now, lastContact.Load()) {
+				closeConnection()
+				return
+			}
 			seq++
-			if err := enqueueEncoded(mgmtFrames, protocol.MsgPing, protocol.Ping{
+			payload, err := protocol.EncodePing(nil, protocol.Ping{
 				Seq:           seq,
 				SentUnixMilli: time.Now().UnixMilli(),
-			}, protocol.EncodePing); err != nil {
+			})
+			if err != nil {
 				if ctx.Err() != nil {
 					return
 				}
 				errs <- err
 				return
 			}
+			select {
+			case mgmtFrames <- protocol.Frame{Type: protocol.MsgPing, Payload: payload}:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
+}
+
+func heartbeatExpired(now time.Time, lastContactUnixNano int64) bool {
+	return !now.Before(time.Unix(0, lastContactUnixNano).Add(clientPingTimeout))
 }
 
 func terminalSize(f *os.File) (uint16, uint16, error) {
@@ -583,13 +767,29 @@ func terminalSize(f *os.File) (uint16, uint16, error) {
 	return uint16(cols), uint16(rows), nil
 }
 
-func writeFrames(stream io.Writer, frames <-chan protocol.Frame, errs chan<- error) {
+func writeFrames(ctx context.Context, stream io.Writer, frames <-chan protocol.Frame, errs chan<- error) {
 	enc := protocol.NewEncoder(stream)
-	for frame := range frames {
-		if err := enc.WriteFrame(frame); err != nil {
-			errs <- fmt.Errorf("write frame type %d: %w", frame.Type, err)
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case frame := <-frames:
+			if err := enc.WriteFrame(frame); err != nil {
+				sendConnectionError(ctx, errs, fmt.Errorf("write frame type %d: %w", frame.Type, err))
+				return
+			}
 		}
+	}
+}
+
+func sendConnectionError(ctx context.Context, errs chan<- error, err error) {
+	if ctx == nil {
+		errs <- err
+		return
+	}
+	select {
+	case errs <- err:
+	case <-ctx.Done():
 	}
 }
 
@@ -613,7 +813,23 @@ func enqueueEncoded[T any](ch chan<- protocol.Frame, msgType uint64, v T, encode
 	return nil
 }
 
+func (r *runtimeState) beginConnection(reconnecting bool, lastContact time.Time) {
+	r.dropConnectionEvents.Store(false)
+	r.emit(reconnectEvent{reconnecting: reconnecting, lastContact: lastContact})
+}
+
+func (r *runtimeState) stopConnection() {
+	r.dropConnectionEvents.Store(true)
+}
+
+func (r *runtimeState) markDisconnected(lastContact time.Time) {
+	r.emit(reconnectEvent{reconnecting: true, lastContact: lastContact})
+}
+
 func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
+	if r.renderDone != nil {
+		defer close(r.renderDone)
+	}
 	state := render.NewClientState()
 	pending := make(map[uint64][]paneBatchEvent)
 	slotRevision := make(map[uint8]uint64)
@@ -645,13 +861,27 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 		reason := ""
 		var err error
 		switch e := event.(type) {
+		case reconnectEvent:
+			if e.reconnecting {
+				pending = make(map[uint64][]paneBatchEvent)
+				slotRevision = make(map[uint8]uint64)
+			}
+			state.SetReconnecting(e.reconnecting, e.lastContact)
+			needsPresent = true
+			reason = "reconnect state"
 		case sizeEvent:
 			state.SetTerminalSize(e.cols, e.rows)
 		case statusEvent:
+			if r.dropConnectionEvents.Load() {
+				return false, "", nil
+			}
 			state.ApplyStatusBar(e.status)
 			needsPresent = true
 			reason = "status-bar"
 		case layoutEvent:
+			if r.dropConnectionEvents.Load() {
+				return false, "", nil
+			}
 			if state.ApplyWindowLayout(e.layout) {
 				needsPresent = true
 				reason = "window-layout"
@@ -670,6 +900,9 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 			}
 			delete(pending, e.layout.LayoutRevision)
 		case paneBatchEvent:
+			if r.dropConnectionEvents.Load() {
+				return false, "", nil
+			}
 			current := state.Layout.LayoutRevision
 			if e.layoutRevision > current {
 				pending[e.layoutRevision] = append(pending[e.layoutRevision], e)
@@ -678,13 +911,27 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 				needsPresent = err == nil
 				reason = fmt.Sprintf("present slot=%d", e.slot)
 			}
+		case renderBarrierEvent:
+			close(e.done)
 		}
 		return needsPresent, reason, err
 	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			if state.Reconnecting {
+				state.RefreshReconnectStatus()
+				if err := present("reconnect timer"); err != nil {
+					if ctx.Err() == nil {
+						errs <- err
+					}
+					return
+				}
+			}
 		case event := <-r.events:
 			needsPresent, reason, err := handleEvent(event)
 			draining := true
@@ -715,6 +962,22 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 }
 
 func (r *runtimeState) emit(event renderEvent) { r.events <- event }
+
+func (r *runtimeState) sync(ctx context.Context) {
+	done := make(chan struct{})
+	select {
+	case r.events <- renderBarrierEvent{done: done}:
+	case <-r.renderDone:
+		return
+	case <-ctx.Done():
+		return
+	}
+	select {
+	case <-done:
+	case <-r.renderDone:
+	case <-ctx.Done():
+	}
+}
 
 func (r *runtimeState) logRenderf(format string, args ...any) {
 	if !r.debugRender || r.stderr == nil {

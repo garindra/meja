@@ -184,12 +184,6 @@ func (d *daemon) disconnectActiveClients() {
 		conn := session.activeConn
 		session.activeConn = nil
 		session.attachMu.Unlock()
-		session.detachMu.Lock()
-		detach := session.detach
-		session.detachMu.Unlock()
-		if detach != nil {
-			_ = detach()
-		}
 		if conn != nil {
 			_ = conn.CloseWithError(0, "")
 		}

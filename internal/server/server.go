@@ -8,6 +8,7 @@ import (
 	"os/user"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -52,12 +53,11 @@ type sessionState struct {
 	resumeTokens   map[string]uint64
 	generation     uint64
 	activeConn     quic.Connection
-	detachMu       sync.Mutex
-	detach         func() error
 
-	mu           sync.RWMutex
-	outputFrames map[int]*renderOutput
-	renderMu     sync.Mutex
+	mu                sync.RWMutex
+	outputFrames      map[int]*renderOutput
+	renderMu          sync.Mutex
+	currentConnection atomic.Pointer[controller]
 }
 
 type controller struct {
@@ -144,22 +144,6 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 	mgmtWriteMu := &sync.Mutex{}
 	go writeStream(mgmtStream, mgmtFrames, writerErrs, mgmtWriteMu)
 	defer close(mgmtFrames)
-	s.detachMu.Lock()
-	s.detach = func() error {
-		payload, encodeErr := protocol.EncodeSessionDetached(nil, protocol.SessionDetached{Reason: "server stopped"})
-		if encodeErr != nil {
-			return encodeErr
-		}
-		mgmtWriteMu.Lock()
-		defer mgmtWriteMu.Unlock()
-		return protocol.NewEncoder(mgmtStream).WriteFrame(protocol.Frame{Type: protocol.MsgSessionDetached, Payload: payload})
-	}
-	s.detachMu.Unlock()
-	defer func() {
-		s.detachMu.Lock()
-		s.detach = nil
-		s.detachMu.Unlock()
-	}()
 	d.activate(s, conn)
 
 	if responseType == protocol.MsgSessionResumeOK {
@@ -204,6 +188,7 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 		outputFrames:    outputFrames,
 		installedStyles: make(map[int]map[uint32]protocol.Style),
 	}
+	s.currentConnection.Store(ctrl)
 	s.session.EnsureClient(clientID0)
 
 	createPane, err := expectDecoded(mgmtDecoder, protocol.MsgCreatePane, protocol.DecodeCreatePane)
@@ -275,7 +260,9 @@ func (c *controller) startPane(pane *Pane) {
 	go func() {
 		_ = pane.Process.Wait()
 		_ = pane.PTY.Close()
-		_ = c.handlePaneProcessExit(pane.ID)
+		if connection := c.state.currentConnection.Load(); connection != nil {
+			_ = connection.handlePaneProcessExit(pane.ID)
+		}
 	}()
 }
 
@@ -888,7 +875,8 @@ func (c *controller) publishTerminalUpdates(pane *Pane, updates <-chan terminal.
 		current := aggregate
 		aggregate = terminal.Update{}
 		pending = false
-		return c.emitTerminalUpdate(pane, current) == nil
+		connection := c.state.currentConnection.Load()
+		return connection == nil || connection.emitTerminalUpdate(pane, current) == nil
 	}
 	for {
 		select {
