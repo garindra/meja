@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"tali/internal/control"
 )
 
 func TestCommandAfterTarget(t *testing.T) {
@@ -66,5 +68,20 @@ func TestUnrecognizedFirstWordRoutesToRemoteConnect(t *testing.T) {
 func TestCommandAfterTargetRequiresSeparator(t *testing.T) {
 	if _, err := commandAfterTarget([]string{"uname"}); err == nil {
 		t.Fatal("command without -- was accepted")
+	}
+}
+
+func TestWriteSessionListShowsNamesAndAttachmentState(t *testing.T) {
+	var output bytes.Buffer
+	err := writeSessionList(&output, []control.SessionInfo{
+		{ID: 1},
+		{ID: 2, Name: "work", Attached: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Active Sessions\nID  NAME       STATUS\n1   <unnamed>  detached\n2   work       attached\n"
+	if got := output.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
 	}
 }

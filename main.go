@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"text/tabwriter"
 
 	"tali/internal/client"
 	"tali/internal/control"
@@ -38,9 +39,9 @@ func (e usageError) Error() string { return e.text }
 const usage = `usage:
   tali [-L profile | -S socket-path]
   tali [-L profile | -S socket-path] <host> [-- command args...]
-  tali [-L profile | -S socket-path] attach|a -t <session-id> [host]
+  tali [-L profile | -S socket-path] new [-s session-name] [options] [host] [-- command args...]
+  tali [-L profile | -S socket-path] attach|a -t <session-id-or-name> [host]
   tali [-L profile | -S socket-path] ls [host]
-  tali [-L profile | -S socket-path] connect|c [options] <host> [-- command args...]
   tali [-L profile | -S socket-path] server run|stop`
 
 func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.Writer) error {
@@ -56,8 +57,8 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 		return client.Run(ctx, client.Config{Local: true, SocketSelector: selector, Stdin: stdin, Stdout: stdout, Stderr: stderr})
 	}
 	switch args[0] {
-	case "connect", "c":
-		return runConnect(ctx, selector, args[1:], stdin, stdout, stderr)
+	case "new":
+		return runNew(ctx, selector, args[1:], stdin, stdout, stderr)
 	case "attach", "a":
 		return runAttach(ctx, selector, args[1:], stdin, stdout, stderr)
 	case "ls":
@@ -70,7 +71,7 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 		fmt.Fprintln(stdout, usage)
 		return nil
 	default:
-		return runConnect(ctx, selector, args, stdin, stdout, stderr)
+		return runNew(ctx, selector, args, stdin, stdout, stderr)
 	}
 }
 
@@ -124,17 +125,26 @@ func (f connectionFlags) config(selector control.SocketSelector, stdin *os.File,
 	}
 }
 
-func runConnect(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
+func runNew(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("new", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var flags connectionFlags
 	flags.register(fs)
+	sessionName := fs.String("s", "", "session name")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
 	remaining := fs.Args()
+	if *sessionName != "" {
+		if err := control.ValidateSessionName(*sessionName); err != nil {
+			return err
+		}
+	}
+	cfg := flags.config(selector, stdin, stdout, stderr)
+	cfg.SessionName = *sessionName
 	if len(remaining) == 0 {
-		return usageError{"connect requires a host"}
+		cfg.Local = true
+		return client.Run(ctx, cfg)
 	}
 	target, err := client.ParseTarget(remaining[0])
 	if err != nil {
@@ -144,7 +154,6 @@ func runConnect(ctx context.Context, selector control.SocketSelector, args []str
 	if err != nil {
 		return err
 	}
-	cfg := flags.config(selector, stdin, stdout, stderr)
 	cfg.Target = target
 	cfg.Argv = command
 	return client.Run(ctx, cfg)
@@ -155,14 +164,14 @@ func runAttach(ctx context.Context, selector control.SocketSelector, args []stri
 	fs.SetOutput(io.Discard)
 	var flags connectionFlags
 	flags.register(fs)
-	sessionRaw := fs.String("t", "", "session ID")
+	sessionRaw := fs.String("t", "", "session ID or name")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
 	if *sessionRaw == "" {
-		return usageError{"attach requires -t <session-id>"}
+		return usageError{"attach requires -t <session-id-or-name>"}
 	}
-	sessionID, err := control.ParseSessionID(*sessionRaw)
+	_, err := control.ParseSessionTarget(*sessionRaw)
 	if err != nil {
 		return err
 	}
@@ -171,7 +180,7 @@ func runAttach(ctx context.Context, selector control.SocketSelector, args []stri
 		return usageError{"attach accepts at most one host"}
 	}
 	cfg := flags.config(selector, stdin, stdout, stderr)
-	cfg.SessionID = sessionID
+	cfg.SessionTarget = *sessionRaw
 	if len(remaining) == 0 {
 		cfg.Local = true
 	} else {
@@ -205,14 +214,35 @@ func runList(ctx context.Context, selector control.SocketSelector, args []string
 			return err
 		}
 	}
-	ids, err := client.ListSessions(ctx, cfg)
+	sessions, err := client.ListSessions(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	for _, id := range ids {
-		fmt.Fprintln(stdout, id)
+	return writeSessionList(stdout, sessions)
+}
+
+func writeSessionList(w io.Writer, sessions []control.SessionInfo) error {
+	if _, err := fmt.Fprintln(w, "Active Sessions"); err != nil {
+		return err
 	}
-	return nil
+	table := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(table, "ID\tNAME\tSTATUS"); err != nil {
+		return err
+	}
+	for _, session := range sessions {
+		name := session.Name
+		if name == "" {
+			name = "<unnamed>"
+		}
+		status := "detached"
+		if session.Attached {
+			status = "attached"
+		}
+		if _, err := fmt.Fprintf(table, "%d\t%s\t%s\n", session.ID, name, status); err != nil {
+			return err
+		}
+	}
+	return table.Flush()
 }
 
 func runServer(ctx context.Context, selector control.SocketSelector, args []string, stdout, stderr io.Writer) error {
@@ -252,31 +282,31 @@ func runControl(ctx context.Context, selector control.SocketSelector, args []str
 	}
 	switch args[0] {
 	case "start-session":
-		if len(args) != 1 {
-			return usageError{"__control-v1 start-session accepts no arguments"}
+		if len(args) > 2 {
+			return usageError{"__control-v1 start-session accepts at most one session name"}
+		}
+		name := ""
+		if len(args) == 2 {
+			name = args[1]
 		}
 		executable, err := control.CurrentExecutable()
 		if err != nil {
 			return err
 		}
-		bootstrap, err := control.StartSession(ctx, executable, selector)
+		bootstrap, err := control.StartSession(ctx, executable, selector, name)
 		if err != nil {
 			return err
 		}
 		return control.WriteBootstrap(stdout, bootstrap)
 	case "connect-session":
 		if len(args) != 2 {
-			return usageError{"__control-v1 connect-session requires a session ID"}
-		}
-		id, err := control.ParseSessionID(args[1])
-		if err != nil {
-			return err
+			return usageError{"__control-v1 connect-session requires a session ID or name"}
 		}
 		socket, err := selector.Resolve()
 		if err != nil {
 			return err
 		}
-		bootstrap, err := control.Call(ctx, socket, "connect-session", id)
+		bootstrap, err := control.ConnectSession(ctx, socket, args[1])
 		if err != nil {
 			return err
 		}
@@ -289,11 +319,11 @@ func runControl(ctx context.Context, selector control.SocketSelector, args []str
 		if err != nil {
 			return err
 		}
-		ids, err := control.ListSessions(ctx, socket)
+		sessions, err := control.ListSessions(ctx, socket)
 		if err != nil {
 			return err
 		}
-		return control.WriteSessionList(stdout, ids)
+		return control.WriteSessionList(stdout, sessions)
 	default:
 		return usageError{"unsupported __control-v1 operation"}
 	}

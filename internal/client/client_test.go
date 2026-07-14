@@ -61,24 +61,36 @@ func TestParseTargetInvalid(t *testing.T) {
 
 func TestControllerCommandSelectsStartOrConnect(t *testing.T) {
 	selector := control.SocketSelector{Profile: "dev"}
-	start, err := controllerCommand("/opt/tali", selector, 0)
+	start, err := controllerCommand("/opt/tali", selector, "", "")
 	if err != nil || start != "'/opt/tali' '-L' 'dev' __control-v1 start-session" {
 		t.Fatalf("start command = %q, %v", start, err)
 	}
-	connect, err := controllerCommand("/opt/tali", selector, 42)
-	if err != nil || connect != "'/opt/tali' '-L' 'dev' __control-v1 connect-session 42" {
+	connect, err := controllerCommand("/opt/tali", selector, "42", "")
+	if err != nil || connect != "'/opt/tali' '-L' 'dev' __control-v1 connect-session '42'" {
 		t.Fatalf("connect command = %q, %v", connect, err)
 	}
 }
 
 func TestControllerCommandQuotesExactSocketPath(t *testing.T) {
-	command, err := controllerCommand("/opt/tali", control.SocketSelector{Path: "/tmp/tali user's/dev.sock"}, 0)
+	command, err := controllerCommand("/opt/tali", control.SocketSelector{Path: "/tmp/tali user's/dev.sock"}, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := "'/opt/tali' '-S' '/tmp/tali user'\\''s/dev.sock' __control-v1 start-session"
 	if command != want {
 		t.Fatalf("command = %q, want %q", command, want)
+	}
+}
+
+func TestControllerCommandQuotesSessionNames(t *testing.T) {
+	selector := control.SocketSelector{Profile: "default"}
+	start, err := controllerCommand("tali", selector, "", "my work")
+	if err != nil || !strings.HasSuffix(start, "start-session 'my work'") {
+		t.Fatalf("named start command = %q, %v", start, err)
+	}
+	attach, err := controllerCommand("tali", selector, "my work", "")
+	if err != nil || !strings.HasSuffix(attach, "connect-session 'my work'") {
+		t.Fatalf("named attach command = %q, %v", attach, err)
 	}
 }
 

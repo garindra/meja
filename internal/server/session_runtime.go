@@ -30,7 +30,11 @@ func (s *sessionState) publishStatusBar() error {
 		text = prompt.Label + string(prompt.Text)
 	} else {
 		list := s.session.WindowStatuses(clientID0)
-		text = fmt.Sprintf("[%d] ", s.session.ID)
+		if name := s.session.SessionName(); name != "" {
+			text = fmt.Sprintf("[%s] ", name)
+		} else {
+			text = fmt.Sprintf("[%d] ", s.session.ID)
+		}
 		for _, window := range list {
 			marker := ' '
 			if window.Active {

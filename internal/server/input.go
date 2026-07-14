@@ -31,7 +31,8 @@ const (
 	serverCommandEnterHistory
 	serverCommandSelectIndex
 	serverCommandFocusDirection
-	serverCommandBeginPrompt
+	serverCommandBeginWindowPrompt
+	serverCommandBeginSessionPrompt
 	serverCommandPrompt
 )
 
@@ -89,7 +90,9 @@ func consumeInputByteLocked(client *ClientState, b byte) serverInputEvent {
 		case '[':
 			return serverInputEvent{Command: serverCommandEnterHistory}
 		case ',':
-			return serverInputEvent{Command: serverCommandBeginPrompt}
+			return serverInputEvent{Command: serverCommandBeginWindowPrompt}
+		case '$':
+			return serverInputEvent{Command: serverCommandBeginSessionPrompt}
 		default:
 			if b >= '0' && b <= '9' {
 				return serverInputEvent{Command: serverCommandSelectIndex, Index: int(b - '0')}

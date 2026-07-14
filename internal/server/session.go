@@ -25,6 +25,9 @@ type sessionState struct {
 	mgmtFrames     chan protocol.Frame
 	outputStreams  map[int]io.Writer
 	operations     chan sessionOperation
+	operationsDone chan struct{}
+	stopOnce       sync.Once
+	ended          bool
 }
 
 type sessionOperation struct {
@@ -37,14 +40,32 @@ func (s *sessionState) coordinate(run func() error) error {
 		return run()
 	}
 	done := make(chan error, 1)
-	s.operations <- sessionOperation{run: run, done: done}
-	return <-done
+	select {
+	case s.operations <- sessionOperation{run: run, done: done}:
+	case <-s.operationsDone:
+		return nil
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-s.operationsDone:
+		return nil
+	}
 }
 
 func (s *sessionState) runOperations() {
-	for operation := range s.operations {
-		operation.done <- operation.run()
+	for {
+		select {
+		case operation := <-s.operations:
+			operation.done <- operation.run()
+		case <-s.operationsDone:
+			return
+		}
 	}
+}
+
+func (s *sessionState) stopOperations() {
+	s.stopOnce.Do(func() { close(s.operationsDone) })
 }
 
 func (s *sessionState) attachConnection(mgmtFrames chan protocol.Frame, outputStreams map[int]io.Writer) {
@@ -75,8 +96,15 @@ func (s *sessionState) currentOutputStream(slot int) io.Writer {
 	return s.outputStreams[slot]
 }
 
+func (s *sessionState) isAttached() bool {
+	s.attachMu.Lock()
+	defer s.attachMu.Unlock()
+	return s.activeConn != nil
+}
+
 type Session struct {
 	ID      uint64
+	Name    string
 	Windows map[uint64]*Window
 	Panes   map[uint64]*Pane
 	Clients map[uint64]*ClientState
@@ -101,6 +129,7 @@ type PromptKind uint8
 
 const (
 	PromptKindRenameWindow PromptKind = iota + 1
+	PromptKindRenameSession
 )
 
 type PromptAction uint8
@@ -232,6 +261,36 @@ func (s *Session) BeginRenameWindowPrompt(clientID uint64) (*PromptState, error)
 		Cursor:         len(text),
 	}
 	return clonePromptState(client.Prompt), nil
+}
+
+func (s *Session) BeginRenameSessionPrompt(clientID uint64) (*PromptState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client := s.Clients[clientID]
+	if client == nil {
+		return nil, fmt.Errorf("unknown client %d", clientID)
+	}
+	text := []rune(s.Name)
+	client.InputState = serverInputNormal
+	client.Prompt = &PromptState{
+		Kind:   PromptKindRenameSession,
+		Label:  "(rename-session) ",
+		Text:   text,
+		Cursor: len(text),
+	}
+	return clonePromptState(client.Prompt), nil
+}
+
+func (s *Session) SessionName() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Name
+}
+
+func (s *Session) setSessionName(name string) {
+	s.mu.Lock()
+	s.Name = name
+	s.mu.Unlock()
 }
 
 func (s *Session) ActivePrompt(clientID uint64) *PromptState {

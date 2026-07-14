@@ -38,6 +38,15 @@ func TestServerConsumesPrefixCommandsAndForwardsLiteralBytes(t *testing.T) {
 	}
 }
 
+func TestServerRecognizesRenameSessionPrefix(t *testing.T) {
+	s := NewSession(1)
+	s.NewClient(0)
+	s.ConsumeInputByte(0, 0x02)
+	if event := s.ConsumeInputByte(0, '$'); event.Command != serverCommandBeginSessionPrompt {
+		t.Fatalf("rename-session event = %#v", event)
+	}
+}
+
 func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	s := NewSession(1)
 	s.NewClient(0)
@@ -80,7 +89,7 @@ func TestServerPromptEditsAndCancelsAuthoritatively(t *testing.T) {
 	window, _ := s.CreateWindow(pane, 0)
 
 	s.ConsumeInputByte(0, 0x02)
-	if event := s.ConsumeInputByte(0, ','); event.Command != serverCommandBeginPrompt {
+	if event := s.ConsumeInputByte(0, ','); event.Command != serverCommandBeginWindowPrompt {
 		t.Fatalf("rename prompt event = %#v", event)
 	}
 	if _, err := s.BeginRenameWindowPrompt(0); err != nil {

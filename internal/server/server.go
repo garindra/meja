@@ -42,6 +42,7 @@ type paneRequest struct {
 
 type connectionHandler struct {
 	state       *sessionState
+	daemon      *daemon
 	shell       string
 	mgmtFrames  chan protocol.Frame
 	defaultCwd  string
@@ -160,6 +161,7 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 
 	handler := &connectionHandler{
 		state:      s,
+		daemon:     d,
 		shell:      shell,
 		mgmtFrames: mgmtFrames,
 	}
@@ -168,6 +170,7 @@ func handleSession(ctx context.Context, d *daemon, conn quic.Connection) error {
 		_ = conn.CloseWithError(0, "")
 		_ = handler.state.detachStreams(outputStreams)
 		s.detachConnection(mgmtFrames)
+		d.deactivate(s, conn)
 	}()
 	s.session.EnsureClient(clientID0)
 
@@ -324,7 +327,11 @@ func (p *Pane) sendRenderCommand(command paneCommand) error {
 func (c *connectionHandler) handlePaneProcessExit(paneID uint64) error {
 	// Pane lifetime is session-owned and can outlive the connection that
 	// started it, so process exit is intentionally not connection-gated.
-	return c.state.coordinate(func() error { return c.handlePaneProcessExitNow(paneID) })
+	err := c.state.coordinate(func() error { return c.handlePaneProcessExitNow(paneID) })
+	if err == nil && c.state.ended && c.daemon != nil {
+		c.daemon.destroySession(c.state)
+	}
+	return err
 }
 
 func (c *connectionHandler) handlePaneProcessExitNow(paneID uint64) error {
@@ -337,16 +344,8 @@ func (c *connectionHandler) handlePaneProcessExitNow(paneID uint64) error {
 		return err
 	}
 	if finalPane {
-		cols, rows := uint16(80), uint16(24)
-		if clientState != nil && clientState.TerminalCols > 0 && clientState.TerminalRows > 0 {
-			cols, rows = clientState.TerminalCols, clientState.TerminalRows
-		}
-		newPane, replacement, nextClient, createErr := c.createWindow(c.defaultCwd, c.defaultArgv, cols, rows)
-		if createErr != nil {
-			return createErr
-		}
-		c.startPane(newPane)
-		window, clientState = replacement, nextClient
+		c.state.ended = true
+		return nil
 	}
 	if err := c.state.publishStatusBar(); err != nil {
 		return err
@@ -596,8 +595,10 @@ func (c *connectionHandler) handleServerInputEvent(event serverInputEvent) (bool
 			}
 			return c.state.publishWindowLayout()
 		})
-	case serverCommandBeginPrompt:
+	case serverCommandBeginWindowPrompt:
 		return false, c.commandBeginRenameWindowPrompt()
+	case serverCommandBeginSessionPrompt:
+		return false, c.commandBeginRenameSessionPrompt()
 	case serverCommandPrompt:
 		return false, c.handlePromptEvent(event)
 	}
@@ -606,6 +607,13 @@ func (c *connectionHandler) handleServerInputEvent(event serverInputEvent) (bool
 
 func (c *connectionHandler) commandBeginRenameWindowPrompt() error {
 	if _, err := c.state.session.BeginRenameWindowPrompt(clientID0); err != nil {
+		return err
+	}
+	return c.state.publishStatusBar()
+}
+
+func (c *connectionHandler) commandBeginRenameSessionPrompt() error {
+	if _, err := c.state.session.BeginRenameSessionPrompt(clientID0); err != nil {
 		return err
 	}
 	return c.state.publishStatusBar()
@@ -620,6 +628,13 @@ func (c *connectionHandler) handlePromptEvent(event serverInputEvent) error {
 		case PromptKindRenameWindow:
 			if _, err := c.state.session.RenameWindow(event.PromptWindowID, event.PromptText); err != nil {
 				return err
+			}
+		case PromptKindRenameSession:
+			if c.daemon == nil {
+				c.state.session.setSessionName(event.PromptText)
+			} else if err := c.daemon.renameSession(c.state, event.PromptText); err != nil {
+				_, _ = c.state.session.BeginRenameSessionPrompt(clientID0)
+				return c.state.publishStatusBar()
 			}
 		default:
 			return fmt.Errorf("unsupported prompt kind %d", event.PromptKind)
@@ -735,27 +750,23 @@ func (c *connectionHandler) commandEnterHistoryNow() error {
 }
 
 func (c *connectionHandler) commandClosePane() error {
-	return c.coordinate(c.commandClosePaneNow)
+	err := c.coordinate(c.commandClosePaneNow)
+	if err == nil && c.state.ended && c.daemon != nil {
+		c.daemon.destroySession(c.state)
+	}
+	return err
 }
 
 func (c *connectionHandler) commandClosePaneNow() error {
 	handoff := c.state.beginOutputHandoff()
-	closedPane, window, clientState, windowClosed, _, autoCreate, err := c.state.session.CloseFocusedPane(clientID0)
+	closedPane, window, clientState, _, _, finalPane, err := c.state.session.CloseFocusedPane(clientID0)
 	if err != nil {
 		return err
 	}
 	_ = terminatePane(closedPane)
-	if windowClosed && autoCreate {
-		cols, rows := uint16(80), uint16(24)
-		if clientState != nil && clientState.TerminalCols > 0 && clientState.TerminalRows > 0 {
-			cols, rows = clientState.TerminalCols, clientState.TerminalRows
-		}
-		pane, replacement, nextClient, err := c.createWindow(c.defaultCwd, c.defaultArgv, cols, rows)
-		if err != nil {
-			return err
-		}
-		c.startPane(pane)
-		window, clientState = replacement, nextClient
+	if finalPane {
+		c.state.ended = true
+		return nil
 	}
 	if err := c.state.publishStatusBar(); err != nil {
 		return err

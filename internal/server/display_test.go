@@ -347,6 +347,26 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 	}
 }
 
+func TestExitedOnlyPaneDestroysSession(t *testing.T) {
+	state := newSessionState(1, "work")
+	d := &daemon{sessions: map[uint64]*sessionState{1: state}}
+	handler := &connectionHandler{state: state, daemon: d}
+	state.session.NewClient(clientID0)
+	pane, updates := startTestPaneRenderer(handler, state.session.AddPaneID(), 16, 4)
+	defer close(updates)
+	state.session.CreateWindow(pane, clientID0)
+
+	if err := handler.handlePaneProcessExit(pane.ID); err != nil {
+		t.Fatal(err)
+	}
+	if d.session(1) != nil {
+		t.Fatal("session remained registered after its only pane exited")
+	}
+	if !state.ended || state.session.HasWindows() {
+		t.Fatalf("ended=%v windows=%v", state.ended, state.session.HasWindows())
+	}
+}
+
 func startTestPaneRenderer(handler *connectionHandler, id uint64, cols, rows int) (*Pane, chan []byte) {
 	pane := &Pane{ID: id, terminal: terminal.New(cols, rows)}
 	return pane, startTestPaneLoop(handler.state, pane)

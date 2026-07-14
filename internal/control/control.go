@@ -18,12 +18,14 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
-	ProtocolVersion   = 1
-	BootstrapPrefix   = "TALI_BOOTSTRAP_V1 "
-	SessionListPrefix = "TALI_SESSION_LIST_V1 "
+	ProtocolVersion   = 2
+	BootstrapPrefix   = "TALI_BOOTSTRAP_V2 "
+	SessionListPrefix = "TALI_SESSION_LIST_V2 "
 	DefaultUDPMin     = 60000
 	DefaultUDPMax     = 61000
 	controlTimeout    = 2 * time.Second
@@ -113,8 +115,19 @@ type Bootstrap struct {
 }
 
 type SessionList struct {
-	Version    int      `json:"version"`
-	SessionIDs []uint64 `json:"sessionIds"`
+	Version  int           `json:"version"`
+	Sessions []SessionInfo `json:"sessions"`
+}
+
+type SessionInfo struct {
+	ID       uint64 `json:"id"`
+	Name     string `json:"name,omitempty"`
+	Attached bool   `json:"attached"`
+}
+
+type SessionTarget struct {
+	ID   uint64
+	Name string
 }
 
 func (b Bootstrap) Validate(now time.Time) error {
@@ -165,21 +178,22 @@ func ControlPath() (string, error) {
 }
 
 type request struct {
-	Version   int    `json:"version"`
-	Operation string `json:"operation"`
-	SessionID uint64 `json:"sessionId,omitempty"`
+	Version     int    `json:"version"`
+	Operation   string `json:"operation"`
+	SessionID   uint64 `json:"sessionId,omitempty"`
+	SessionName string `json:"sessionName,omitempty"`
 }
 
 type response struct {
-	Version    int        `json:"version"`
-	OK         bool       `json:"ok"`
-	Error      string     `json:"error,omitempty"`
-	Bootstrap  *Bootstrap `json:"bootstrap,omitempty"`
-	PID        int        `json:"pid,omitempty"`
-	SessionIDs []uint64   `json:"sessionIds,omitempty"`
+	Version   int           `json:"version"`
+	OK        bool          `json:"ok"`
+	Error     string        `json:"error,omitempty"`
+	Bootstrap *Bootstrap    `json:"bootstrap,omitempty"`
+	PID       int           `json:"pid,omitempty"`
+	Sessions  []SessionInfo `json:"sessions,omitempty"`
 }
 
-type Handler func(operation string, sessionID uint64) (Bootstrap, []uint64, int, error)
+type Handler func(operation string, target SessionTarget) (Bootstrap, []SessionInfo, int, error)
 
 // Serve accepts the small control RPC. The caller owns listener shutdown via
 // ctx; malformed requests are answered without exposing token material.
@@ -224,24 +238,38 @@ func serveConn(conn net.Conn, handler Handler) {
 	if err := decoder.Decode(&req); err != nil || req.Version != ProtocolVersion {
 		reply.Error = "invalid control request"
 	} else {
-		b, sessionIDs, pid, err := handler(req.Operation, req.SessionID)
+		b, sessions, pid, err := handler(req.Operation, SessionTarget{ID: req.SessionID, Name: req.SessionName})
 		if err != nil {
 			reply.Error = err.Error()
 		} else {
 			reply.OK = true
 			reply.Bootstrap = &b
-			reply.SessionIDs = sessionIDs
+			reply.Sessions = sessions
 			reply.PID = pid
 		}
 	}
 	_ = json.NewEncoder(conn).Encode(reply)
 }
 
-func Call(ctx context.Context, socket, operation string, sessionID uint64) (Bootstrap, error) {
-	if operation != "create-session" && operation != "connect-session" {
-		return Bootstrap{}, errors.New("unsupported control operation")
+func CreateSession(ctx context.Context, socket, name string) (Bootstrap, error) {
+	if name != "" {
+		if err := ValidateSessionName(name); err != nil {
+			return Bootstrap{}, err
+		}
 	}
-	reply, err := call(ctx, socket, operation, sessionID)
+	return callBootstrap(ctx, socket, "create-session", SessionTarget{Name: name})
+}
+
+func ConnectSession(ctx context.Context, socket, rawTarget string) (Bootstrap, error) {
+	target, err := ParseSessionTarget(rawTarget)
+	if err != nil {
+		return Bootstrap{}, err
+	}
+	return callBootstrap(ctx, socket, "connect-session", target)
+}
+
+func callBootstrap(ctx context.Context, socket, operation string, target SessionTarget) (Bootstrap, error) {
+	reply, err := call(ctx, socket, operation, target)
 	if err != nil {
 		return Bootstrap{}, err
 	}
@@ -254,23 +282,23 @@ func Call(ctx context.Context, socket, operation string, sessionID uint64) (Boot
 	return *reply.Bootstrap, nil
 }
 
-func ListSessions(ctx context.Context, socket string) ([]uint64, error) {
-	reply, err := call(ctx, socket, "list-sessions", 0)
+func ListSessions(ctx context.Context, socket string) ([]SessionInfo, error) {
+	reply, err := call(ctx, socket, "list-sessions", SessionTarget{})
 	if err != nil {
 		return nil, err
 	}
-	return append([]uint64(nil), reply.SessionIDs...), nil
+	return append([]SessionInfo(nil), reply.Sessions...), nil
 }
 
 func StopServer(ctx context.Context, socket string) (int, error) {
-	reply, err := call(ctx, socket, "stop-server", 0)
+	reply, err := call(ctx, socket, "stop-server", SessionTarget{})
 	if err != nil {
 		return 0, err
 	}
 	return reply.PID, nil
 }
 
-func call(ctx context.Context, socket, operation string, sessionID uint64) (response, error) {
+func call(ctx context.Context, socket, operation string, target SessionTarget) (response, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, controlTimeout)
 	defer cancel()
 	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", socket)
@@ -279,7 +307,7 @@ func call(ctx context.Context, socket, operation string, sessionID uint64) (resp
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(controlTimeout))
-	if err := json.NewEncoder(conn).Encode(request{Version: ProtocolVersion, Operation: operation, SessionID: sessionID}); err != nil {
+	if err := json.NewEncoder(conn).Encode(request{Version: ProtocolVersion, Operation: operation, SessionID: target.ID, SessionName: target.Name}); err != nil {
 		return response{}, fmt.Errorf("control request: %w", err)
 	}
 	var reply response
@@ -310,8 +338,8 @@ func WriteBootstrap(w io.Writer, b Bootstrap) error {
 	return err
 }
 
-func WriteSessionList(w io.Writer, ids []uint64) error {
-	payload, err := json.Marshal(SessionList{Version: ProtocolVersion, SessionIDs: ids})
+func WriteSessionList(w io.Writer, sessions []SessionInfo) error {
+	payload, err := json.Marshal(SessionList{Version: ProtocolVersion, Sessions: sessions})
 	if err != nil {
 		return err
 	}
@@ -319,7 +347,7 @@ func WriteSessionList(w io.Writer, ids []uint64) error {
 	return err
 }
 
-func ParseSessionListOutput(output []byte) ([]uint64, error) {
+func ParseSessionListOutput(output []byte) ([]SessionInfo, error) {
 	var found []byte
 	for _, line := range strings.Split(string(output), "\n") {
 		line = strings.TrimSpace(line)
@@ -340,7 +368,7 @@ func ParseSessionListOutput(output []byte) ([]uint64, error) {
 	if list.Version != ProtocolVersion {
 		return nil, fmt.Errorf("unsupported session-list version %d", list.Version)
 	}
-	return list.SessionIDs, nil
+	return list.Sessions, nil
 }
 
 func ParseBootstrapOutput(output []byte) (Bootstrap, error) {
@@ -367,12 +395,12 @@ func ParseBootstrapOutput(output []byte) (Bootstrap, error) {
 	return b, nil
 }
 
-func StartSession(ctx context.Context, executable string, selector SocketSelector) (Bootstrap, error) {
+func StartSession(ctx context.Context, executable string, selector SocketSelector, name string) (Bootstrap, error) {
 	socket, err := selector.Resolve()
 	if err != nil {
 		return Bootstrap{}, err
 	}
-	if b, callErr := Call(ctx, socket, "create-session", 0); callErr == nil {
+	if b, callErr := CreateSession(ctx, socket, name); callErr == nil {
 		return b, nil
 	} else if !isUnavailable(callErr) {
 		return Bootstrap{}, callErr
@@ -385,7 +413,7 @@ func StartSession(ctx context.Context, executable string, selector SocketSelecto
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		b, callErr := Call(ctx, socket, "create-session", 0)
+		b, callErr := CreateSession(ctx, socket, name)
 		if callErr == nil {
 			return b, nil
 		}
@@ -522,6 +550,53 @@ func ParseSessionID(raw string) (uint64, error) {
 		return 0, errors.New("session ID must be a numeric uint64")
 	}
 	return id, nil
+}
+
+func ParseSessionTarget(raw string) (SessionTarget, error) {
+	if raw == "" {
+		return SessionTarget{}, errors.New("session target must not be empty")
+	}
+	if isDecimal(raw) {
+		id, err := ParseSessionID(raw)
+		if err != nil {
+			return SessionTarget{}, err
+		}
+		return SessionTarget{ID: id}, nil
+	}
+	if err := ValidateSessionName(raw); err != nil {
+		return SessionTarget{}, err
+	}
+	return SessionTarget{Name: raw}, nil
+}
+
+func ValidateSessionName(name string) error {
+	if name == "" {
+		return errors.New("session name must not be empty")
+	}
+	if len(name) > 128 || !utf8.ValidString(name) {
+		return errors.New("session name must be valid UTF-8 and at most 128 bytes")
+	}
+	if isDecimal(name) {
+		return errors.New("session name must not be entirely numeric")
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return errors.New("session name must not contain control characters")
+		}
+	}
+	return nil
+}
+
+func isDecimal(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	for _, r := range raw {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ShellQuote is used only for the remote command string passed to OpenSSH.

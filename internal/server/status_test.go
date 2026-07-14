@@ -107,6 +107,44 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	assertStatusText(t, status, "[0] 0:zsh* ")
 }
 
+func TestRenameSessionPromptUpdatesStatusName(t *testing.T) {
+	s := NewSession(7)
+	s.setSessionName("work")
+	client := s.NewClient(clientID0)
+	client.TerminalCols, client.TerminalRows = 80, 23
+	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, clientID0)
+	frames := make(chan protocol.Frame, 32)
+	state := &sessionState{sessionID: 7, session: s}
+	d := &daemon{sessions: map[uint64]*sessionState{7: state}}
+	handler := &connectionHandler{state: state, daemon: d, mgmtFrames: frames}
+	state.attachConnection(frames, nil)
+
+	s.ConsumeInputByte(clientID0, 0x02)
+	if err := runStatusEvent(t, handler, s.ConsumeInputByte(clientID0, '$')); err != nil {
+		t.Fatal(err)
+	}
+	assertStatusText(t, readStatusBar(t, frames), "(rename-session) work")
+	for range "work" {
+		if err := runStatusEvent(t, handler, s.ConsumeInputByte(clientID0, 0x7f)); err != nil {
+			t.Fatal(err)
+		}
+		readStatusBar(t, frames)
+	}
+	for _, b := range []byte("dev") {
+		if err := runStatusEvent(t, handler, s.ConsumeInputByte(clientID0, b)); err != nil {
+			t.Fatal(err)
+		}
+		readStatusBar(t, frames)
+	}
+	if err := runStatusEvent(t, handler, s.ConsumeInputByte(clientID0, '\r')); err != nil {
+		t.Fatal(err)
+	}
+	assertStatusText(t, readStatusBar(t, frames), "[dev] 0:bash* ")
+	if got := s.SessionName(); got != "dev" {
+		t.Fatalf("session name = %q", got)
+	}
+}
+
 func runStatusEvent(t *testing.T, handler *connectionHandler, event serverInputEvent) error {
 	t.Helper()
 	_, err := handler.handleServerInputEvent(event)

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-	"strconv"
 	"strings"
 
 	"tali/internal/control"
@@ -17,14 +16,14 @@ func fetchBootstrap(ctx context.Context, cfg Config) (control.Bootstrap, error) 
 		if err != nil {
 			return control.Bootstrap{}, err
 		}
-		if cfg.SessionID != 0 {
-			return control.Call(ctx, socket, "connect-session", cfg.SessionID)
+		if target := configSessionTarget(cfg); target != "" {
+			return control.ConnectSession(ctx, socket, target)
 		}
 		executable, err := control.CurrentExecutable()
 		if err != nil {
 			return control.Bootstrap{}, err
 		}
-		return control.StartSession(ctx, executable, cfg.SocketSelector)
+		return control.StartSession(ctx, executable, cfg.SocketSelector, cfg.SessionName)
 	}
 	return fetchRemoteBootstrap(ctx, cfg)
 }
@@ -34,7 +33,7 @@ func fetchRemoteBootstrap(ctx context.Context, cfg Config) (control.Bootstrap, e
 	if remotePath == "" {
 		remotePath = "tali"
 	}
-	command, err := controllerCommand(remotePath, cfg.SocketSelector, cfg.SessionID)
+	command, err := controllerCommand(remotePath, cfg.SocketSelector, configSessionTarget(cfg), cfg.SessionName)
 	if err != nil {
 		return control.Bootstrap{}, err
 	}
@@ -103,18 +102,35 @@ func resolveSSHHostname(ctx context.Context, target Target) (string, error) {
 	return target.Hostname, nil
 }
 
-func controllerCommand(remotePath string, selector control.SocketSelector, sessionID uint64) (string, error) {
+func controllerCommand(remotePath string, selector control.SocketSelector, sessionTarget, sessionName string) (string, error) {
 	command, err := controllerCommandPrefix(remotePath, selector)
 	if err != nil {
 		return "", err
 	}
-	if sessionID == 0 {
-		return command + " __control-v1 start-session", nil
+	if sessionTarget == "" {
+		command += " __control-v1 start-session"
+		if sessionName != "" {
+			if err := control.ValidateSessionName(sessionName); err != nil {
+				return "", err
+			}
+			command += " " + control.ShellQuote(sessionName)
+		}
+		return command, nil
 	}
-	if _, err := control.ParseSessionID(strconv.FormatUint(sessionID, 10)); err != nil {
+	if _, err := control.ParseSessionTarget(sessionTarget); err != nil {
 		return "", err
 	}
-	return command + " __control-v1 connect-session " + strconv.FormatUint(sessionID, 10), nil
+	return command + " __control-v1 connect-session " + control.ShellQuote(sessionTarget), nil
+}
+
+func configSessionTarget(cfg Config) string {
+	if cfg.SessionTarget != "" {
+		return cfg.SessionTarget
+	}
+	if cfg.SessionID != 0 {
+		return fmt.Sprintf("%d", cfg.SessionID)
+	}
+	return ""
 }
 
 func controllerCommandPrefix(remotePath string, selector control.SocketSelector) (string, error) {
@@ -132,7 +148,7 @@ func controllerCommandPrefix(remotePath string, selector control.SocketSelector)
 	return command, nil
 }
 
-func ListSessions(ctx context.Context, cfg Config) ([]uint64, error) {
+func ListSessions(ctx context.Context, cfg Config) ([]control.SessionInfo, error) {
 	if cfg.Local {
 		socket, err := cfg.SocketSelector.Resolve()
 		if err != nil {

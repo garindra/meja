@@ -160,7 +160,7 @@ func daemonCertificate() (tls.Certificate, string, error) {
 	return cert, hex.EncodeToString(hash[:]), nil
 }
 
-func (d *daemon) handleControl(operation string, id uint64) (control.Bootstrap, []uint64, int, error) {
+func (d *daemon) handleControl(operation string, target control.SessionTarget) (control.Bootstrap, []control.SessionInfo, int, error) {
 	d.mu.Lock()
 	if operation == "stop-server" {
 		if d.stop == nil {
@@ -175,24 +175,40 @@ func (d *daemon) handleControl(operation string, id uint64) (control.Bootstrap, 
 	}
 	defer d.mu.Unlock()
 	if operation == "list-sessions" {
-		ids := make([]uint64, 0, len(d.sessions))
-		for sessionID := range d.sessions {
-			ids = append(ids, sessionID)
+		sessions := make([]control.SessionInfo, 0, len(d.sessions))
+		for sessionID, state := range d.sessions {
+			name := ""
+			if state != nil && state.session != nil {
+				name = state.session.SessionName()
+			}
+			sessions = append(sessions, control.SessionInfo{ID: sessionID, Name: name, Attached: state != nil && state.isAttached()})
 		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		return control.Bootstrap{}, ids, 0, nil
+		sort.Slice(sessions, func(i, j int) bool { return sessions[i].ID < sessions[j].ID })
+		return control.Bootstrap{}, sessions, 0, nil
 	}
 	var s *sessionState
 	switch operation {
 	case "create-session":
+		if target.Name != "" {
+			if err := control.ValidateSessionName(target.Name); err != nil {
+				return control.Bootstrap{}, nil, 0, err
+			}
+			if d.sessionByNameLocked(target.Name) != nil {
+				return control.Bootstrap{}, nil, 0, fmt.Errorf("session %q already exists", target.Name)
+			}
+		}
 		if d.nextID == 0 {
 			return control.Bootstrap{}, nil, 0, errors.New("session ID exhausted")
 		}
-		s = newSessionState(d.nextID)
+		s = newSessionState(d.nextID, target.Name)
 		d.sessions[d.nextID] = s
 		d.nextID++
 	case "connect-session":
-		s = d.sessions[id]
+		if target.Name != "" {
+			s = d.sessionByNameLocked(target.Name)
+		} else {
+			s = d.sessions[target.ID]
+		}
 		if s == nil {
 			return control.Bootstrap{}, nil, 0, control.ErrSessionUnavailable
 		}
@@ -232,15 +248,60 @@ func (d *daemon) disconnectActiveClients() {
 	}
 }
 
-func newSessionState(id uint64) *sessionState {
+func newSessionState(id uint64, name string) *sessionState {
 	state := &sessionState{
-		sessionID:    id,
-		session:      NewSession(id),
-		resumeTokens: map[string]uint64{},
-		operations:   make(chan sessionOperation),
+		sessionID:      id,
+		session:        NewSession(id),
+		resumeTokens:   map[string]uint64{},
+		operations:     make(chan sessionOperation),
+		operationsDone: make(chan struct{}),
 	}
+	state.session.setSessionName(name)
 	go state.runOperations()
 	return state
+}
+
+func (d *daemon) sessionByNameLocked(name string) *sessionState {
+	for _, state := range d.sessions {
+		if state != nil && state.session != nil && state.session.SessionName() == name {
+			return state
+		}
+	}
+	return nil
+}
+
+func (d *daemon) renameSession(state *sessionState, name string) error {
+	if err := control.ValidateSessionName(name); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.sessions[state.sessionID] != state {
+		return control.ErrSessionUnavailable
+	}
+	if existing := d.sessionByNameLocked(name); existing != nil && existing != state {
+		return fmt.Errorf("session %q already exists", name)
+	}
+	state.session.setSessionName(name)
+	return nil
+}
+
+func (d *daemon) destroySession(state *sessionState) {
+	d.mu.Lock()
+	if d.sessions[state.sessionID] != state {
+		d.mu.Unlock()
+		return
+	}
+	delete(d.sessions, state.sessionID)
+	d.mu.Unlock()
+	state.attachMu.Lock()
+	conn := state.activeConn
+	state.activeConn = nil
+	state.attachMu.Unlock()
+	if conn != nil {
+		_ = conn.CloseWithError(0, "")
+	}
+	state.stopOperations()
 }
 
 func (d *daemon) session(id uint64) *sessionState {
@@ -291,4 +352,12 @@ func (d *daemon) activate(s *sessionState, conn quic.Connection) {
 	if old != nil && old != conn {
 		_ = old.CloseWithError(0x54414c49, "session resumed")
 	}
+}
+
+func (d *daemon) deactivate(s *sessionState, conn quic.Connection) {
+	s.attachMu.Lock()
+	if s.activeConn == conn {
+		s.activeConn = nil
+	}
+	s.attachMu.Unlock()
 }

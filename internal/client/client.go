@@ -56,6 +56,8 @@ type Config struct {
 	RemotePath         string
 	SocketSelector     control.SocketSelector
 	SessionID          uint64
+	SessionTarget      string
+	SessionName        string
 	Stdin              *os.File
 	Stdout             io.Writer
 	Stderr             io.Writer
@@ -246,6 +248,7 @@ func Run(ctx context.Context, cfg Config) error {
 				if reconnectErr != nil {
 					fallbackCfg := cfg
 					fallbackCfg.SessionID = bootstrap.SessionID
+					fallbackCfg.SessionTarget = fmt.Sprintf("%d", bootstrap.SessionID)
 					fallbackCfg.Stderr = io.Discard
 					fallback, fallbackErr := fetchBootstrap(ctx, fallbackCfg)
 					if fallbackErr == nil {

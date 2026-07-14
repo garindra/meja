@@ -24,6 +24,8 @@ Start a new local session:
 
 ```bash
 tali
+tali new
+tali new -s work
 tali -L dev
 ```
 
@@ -33,30 +35,31 @@ config alias:
 ```bash
 tali prod
 tali prod -- /usr/bin/bash -l
-tali connect user@host
-tali c prod
-tali -L dev c prod
-tali c --cwd /srv/app prod -- /usr/bin/bash -l
+tali new user@host
+tali new -s work prod
+tali -L dev new prod
+tali new --cwd /srv/app prod -- /usr/bin/bash -l
 ```
 
 An unrecognized first word is treated as a remote target, making `tali prod`
-the shorthand for `tali c prod`. The words `attach`, `a`, `ls`, `connect`, `c`,
+the shorthand for `tali new prod`. The words `new`, `attach`, `a`, `ls`,
 `server`, and `help` are reserved commands. Use the explicit form for an SSH
 host alias with one of those names, or whenever connection-specific flags are
 needed:
 
 ```bash
-tali c server
-tali c -i ~/.ssh/prod_ed25519 prod
+tali new server
+tali new -i ~/.ssh/prod_ed25519 prod
 ```
 
-Attach to an existing numeric session ID. Omitting the host selects the local
-server:
+Attach to an existing session by numeric ID or name. Omitting the host selects
+the local server:
 
 ```bash
 tali attach -t 12
+tali attach -t work
 tali a -t 12 prod
-tali -L dev a -t 12 prod
+tali -L dev a -t work prod
 ```
 
 List local or remote sessions:
@@ -66,6 +69,9 @@ tali ls
 tali ls prod
 tali -L dev ls prod
 ```
+
+The list is headed `Active Sessions` and shows each session's numeric ID,
+name (or `<unnamed>`), and whether a client is currently attached.
 
 Run or stop the local per-user server explicitly:
 
@@ -86,7 +92,7 @@ exclusive options and must appear before the command:
 ```bash
 tali -L work
 tali -L work attach -t 3
-tali -L work c prod
+tali -L work new -s work prod
 tali -L work server stop
 
 tali -S /home/alice/run/tali.sock
@@ -123,14 +129,15 @@ executable with one of these private, versioned remote commands:
 
 ```text
 tali __control-v1 start-session
-tali __control-v1 connect-session <numeric-session-id>
+tali __control-v1 start-session <session-name>
+tali __control-v1 connect-session <session-id-or-name>
 tali __control-v1 list-sessions
 tali -L <profile> __control-v1 <operation>
 tali -S <socket-path> __control-v1 <operation>
 ```
 
-The start/connect operations emit exactly one `TALI_BOOTSTRAP_V1 {json}`
-record. The list operation emits exactly one `TALI_SESSION_LIST_V1 {json}`
+The start/connect operations emit exactly one `TALI_BOOTSTRAP_V2 {json}`
+record. The list operation emits exactly one `TALI_SESSION_LIST_V2 {json}`
 record. Diagnostics go to stderr. These commands are a machine interface, not
 the user-facing session-management interface.
 
@@ -146,7 +153,8 @@ from the protected Unix control socket and connect to the QUIC server through
 `connect-session` only performs an RPC and never starts a missing daemon. The
 protected control socket is selected by `-L` or `-S`; the socket directory is
 mode 0700 and the socket is mode 0600. Session IDs increase from 1 for the
-lifetime of a daemon and sessions end with that daemon.
+lifetime of a daemon. Session names are unique within one server/socket. A
+session is destroyed when its last pane exits.
 
 `tali server stop` cleanly disconnects active clients as if they detached,
 gracefully stops the active daemon, and reports its PID when available. SIGINT
@@ -174,6 +182,9 @@ generation.
 The server owns terminal emulation, pane state, layout, and rendering. A QUIC
 disconnect detaches the client without immediately killing the session; an
 explicit detach or remote session exit ends the attached client flow.
+
+Press `Ctrl+B`, then `$` to rename the current session using the status-bar
+prompt. Press `Ctrl+B`, then `,` to rename the current window.
 
 After a live QUIC connection drops, the client keeps the last confirmed
 terminal contents, replaces the client-visible status bar with an orange

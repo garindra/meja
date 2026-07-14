@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -196,15 +197,15 @@ func TestControlRPCUsesPrivateSocketAndDoesNotStartOnConnect(t *testing.T) {
 	ready := make(chan struct{})
 	go func() {
 		close(ready)
-		_ = Serve(ctx, socket, func(operation string, id uint64) (Bootstrap, []uint64, int, error) {
+		_ = Serve(ctx, socket, func(operation string, target SessionTarget) (Bootstrap, []SessionInfo, int, error) {
 			if operation == "stop-server" {
 				return Bootstrap{}, nil, 1234, nil
 			}
 			if operation == "list-sessions" {
-				return Bootstrap{}, []uint64{3, 7}, 0, nil
+				return Bootstrap{}, []SessionInfo{{ID: 3}, {ID: 7, Name: "work", Attached: true}}, 0, nil
 			}
-			if operation != "connect-session" || id != want.SessionID {
-				t.Errorf("handler received %q %d", operation, id)
+			if operation != "connect-session" || target.ID != want.SessionID {
+				t.Errorf("handler received %q %#v", operation, target)
 			}
 			return want, nil, 0, nil
 		})
@@ -220,7 +221,7 @@ func TestControlRPCUsesPrivateSocketAndDoesNotStartOnConnect(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	got, err := Call(ctx, socket, "connect-session", want.SessionID)
+	got, err := ConnectSession(ctx, socket, strconv.FormatUint(want.SessionID, 10))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +229,7 @@ func TestControlRPCUsesPrivateSocketAndDoesNotStartOnConnect(t *testing.T) {
 		t.Fatalf("session ID = %d", got.SessionID)
 	}
 	ids, err := ListSessions(ctx, socket)
-	if err != nil || len(ids) != 2 || ids[0] != 3 || ids[1] != 7 {
+	if err != nil || len(ids) != 2 || ids[0].ID != 3 || ids[1].ID != 7 || ids[1].Name != "work" || !ids[1].Attached {
 		t.Fatalf("ListSessions() = %v, %v", ids, err)
 	}
 	info, err := os.Stat(socket)
