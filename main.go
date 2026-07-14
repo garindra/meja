@@ -1,0 +1,326 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+
+	"tali/internal/client"
+	"tali/internal/control"
+	"tali/internal/server"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
+		if usageErr, ok := err.(usageError); ok {
+			if usageErr.text != "" {
+				fmt.Fprintf(os.Stderr, "tali: %s\n", usageErr.text)
+			}
+			fmt.Fprintln(os.Stderr, usage)
+			os.Exit(2)
+		}
+		fmt.Fprintf(os.Stderr, "tali: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+type usageError struct{ text string }
+
+func (e usageError) Error() string { return e.text }
+
+const usage = `usage:
+  tali [-L profile | -S socket-path]
+  tali [-L profile | -S socket-path] attach|a -t <session-id> [host]
+  tali [-L profile | -S socket-path] ls [host]
+  tali [-L profile | -S socket-path] connect|c [options] <host> [-- command args...]
+  tali [-L profile | -S socket-path] server run|stop`
+
+func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.Writer) error {
+	selector, args, err := parseGlobalOptions(args)
+	if err != nil {
+		if err == flag.ErrHelp {
+			fmt.Fprintln(stdout, usage)
+			return nil
+		}
+		return usageError{err.Error()}
+	}
+	if len(args) == 0 {
+		return client.Run(ctx, client.Config{Local: true, SocketSelector: selector, Stdin: stdin, Stdout: stdout, Stderr: stderr})
+	}
+	switch args[0] {
+	case "connect", "c":
+		return runConnect(ctx, selector, args[1:], stdin, stdout, stderr)
+	case "attach", "a":
+		return runAttach(ctx, selector, args[1:], stdin, stdout, stderr)
+	case "ls":
+		return runList(ctx, selector, args[1:], stdin, stdout, stderr)
+	case "server":
+		return runServer(ctx, selector, args[1:], stdout, stderr)
+	case "__control-v1":
+		return runControl(ctx, selector, args[1:], stdout)
+	case "help", "-h", "--help":
+		fmt.Fprintln(stdout, usage)
+		return nil
+	default:
+		return usageError{fmt.Sprintf("unknown command %q", args[0])}
+	}
+}
+
+func parseGlobalOptions(args []string) (control.SocketSelector, []string, error) {
+	fs := flag.NewFlagSet("tali", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	profile := fs.String("L", "", "server profile")
+	socket := fs.String("S", "", "exact server socket path")
+	if err := fs.Parse(args); err != nil {
+		return control.SocketSelector{}, nil, err
+	}
+	selector, err := (control.SocketSelector{Profile: *profile, Path: *socket}).Normalize()
+	if err != nil {
+		return control.SocketSelector{}, nil, err
+	}
+	return selector, fs.Args(), nil
+}
+
+type connectionFlags struct {
+	cwd            string
+	identity       string
+	remotePath     string
+	port           intFlagValue
+	debugRender    bool
+	debugRenderLog string
+}
+
+func (f *connectionFlags) register(fs *flag.FlagSet) {
+	fs.StringVar(&f.cwd, "cwd", "", "remote working directory")
+	fs.StringVar(&f.identity, "i", "", "path to SSH identity file")
+	fs.StringVar(&f.remotePath, "remote-path", "tali", "remote tali executable path")
+	f.port.value = 4433
+	fs.Var(&f.port, "port", "SSH port")
+	fs.BoolVar(&f.debugRender, "debug-render", false, "enable client redraw logging")
+	fs.StringVar(&f.debugRenderLog, "debug-render-log", "", "write client redraw logs to this file")
+}
+
+func (f connectionFlags) config(selector control.SocketSelector, stdin *os.File, stdout, stderr io.Writer) client.Config {
+	return client.Config{
+		Port:               f.port.value,
+		PortSet:            f.port.set,
+		IdentityFile:       f.identity,
+		RemotePath:         f.remotePath,
+		SocketSelector:     selector,
+		DebugRender:        f.debugRender,
+		DebugRenderLogPath: f.debugRenderLog,
+		Cwd:                f.cwd,
+		Stdin:              stdin,
+		Stdout:             stdout,
+		Stderr:             stderr,
+	}
+}
+
+func runConnect(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var flags connectionFlags
+	flags.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return usageError{err.Error()}
+	}
+	remaining := fs.Args()
+	if len(remaining) == 0 {
+		return usageError{"connect requires a host"}
+	}
+	target, err := client.ParseTarget(remaining[0])
+	if err != nil {
+		return err
+	}
+	command, err := commandAfterTarget(remaining[1:])
+	if err != nil {
+		return err
+	}
+	cfg := flags.config(selector, stdin, stdout, stderr)
+	cfg.Target = target
+	cfg.Argv = command
+	return client.Run(ctx, cfg)
+}
+
+func runAttach(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("attach", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var flags connectionFlags
+	flags.register(fs)
+	sessionRaw := fs.String("t", "", "session ID")
+	if err := fs.Parse(args); err != nil {
+		return usageError{err.Error()}
+	}
+	if *sessionRaw == "" {
+		return usageError{"attach requires -t <session-id>"}
+	}
+	sessionID, err := control.ParseSessionID(*sessionRaw)
+	if err != nil {
+		return err
+	}
+	remaining := fs.Args()
+	if len(remaining) > 1 {
+		return usageError{"attach accepts at most one host"}
+	}
+	cfg := flags.config(selector, stdin, stdout, stderr)
+	cfg.SessionID = sessionID
+	if len(remaining) == 0 {
+		cfg.Local = true
+	} else {
+		cfg.Target, err = client.ParseTarget(remaining[0])
+		if err != nil {
+			return err
+		}
+	}
+	return client.Run(ctx, cfg)
+}
+
+func runList(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("ls", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var flags connectionFlags
+	flags.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return usageError{err.Error()}
+	}
+	remaining := fs.Args()
+	if len(remaining) > 1 {
+		return usageError{"ls accepts at most one host"}
+	}
+	cfg := flags.config(selector, stdin, stdout, stderr)
+	var err error
+	if len(remaining) == 0 {
+		cfg.Local = true
+	} else {
+		cfg.Target, err = client.ParseTarget(remaining[0])
+		if err != nil {
+			return err
+		}
+	}
+	ids, err := client.ListSessions(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		fmt.Fprintln(stdout, id)
+	}
+	return nil
+}
+
+func runServer(ctx context.Context, selector control.SocketSelector, args []string, stdout, stderr io.Writer) error {
+	if len(args) != 1 {
+		return usageError{"server requires run or stop"}
+	}
+	switch args[0] {
+	case "run":
+		socket, err := selector.Resolve()
+		if err != nil {
+			return err
+		}
+		return server.Run(ctx, server.Config{ControlPath: socket, Stdout: stdout, Stderr: stderr})
+	case "stop":
+		socket, err := selector.Resolve()
+		if err != nil {
+			return err
+		}
+		pid, err := control.StopServer(ctx, socket)
+		if err != nil {
+			return err
+		}
+		if pid > 0 {
+			fmt.Fprintf(stdout, "stopped server PID %d\n", pid)
+		} else {
+			fmt.Fprintln(stdout, "stopped server (PID unavailable)")
+		}
+		return nil
+	default:
+		return usageError{"server requires run or stop"}
+	}
+}
+
+func runControl(ctx context.Context, selector control.SocketSelector, args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return usageError{"__control-v1 requires an operation"}
+	}
+	switch args[0] {
+	case "start-session":
+		if len(args) != 1 {
+			return usageError{"__control-v1 start-session accepts no arguments"}
+		}
+		executable, err := control.CurrentExecutable()
+		if err != nil {
+			return err
+		}
+		bootstrap, err := control.StartSession(ctx, executable, selector)
+		if err != nil {
+			return err
+		}
+		return control.WriteBootstrap(stdout, bootstrap)
+	case "connect-session":
+		if len(args) != 2 {
+			return usageError{"__control-v1 connect-session requires a session ID"}
+		}
+		id, err := control.ParseSessionID(args[1])
+		if err != nil {
+			return err
+		}
+		socket, err := selector.Resolve()
+		if err != nil {
+			return err
+		}
+		bootstrap, err := control.Call(ctx, socket, "connect-session", id)
+		if err != nil {
+			return err
+		}
+		return control.WriteBootstrap(stdout, bootstrap)
+	case "list-sessions":
+		if len(args) != 1 {
+			return usageError{"__control-v1 list-sessions accepts no arguments"}
+		}
+		socket, err := selector.Resolve()
+		if err != nil {
+			return err
+		}
+		ids, err := control.ListSessions(ctx, socket)
+		if err != nil {
+			return err
+		}
+		return control.WriteSessionList(stdout, ids)
+	default:
+		return usageError{"unsupported __control-v1 operation"}
+	}
+}
+
+func commandAfterTarget(args []string) ([]string, error) {
+	if len(args) == 0 {
+		return nil, nil
+	}
+	if args[0] != "--" {
+		return nil, usageError{"remote command must follow --"}
+	}
+	return append([]string(nil), args[1:]...), nil
+}
+
+type intFlagValue struct {
+	value int
+	set   bool
+}
+
+func (f *intFlagValue) String() string { return strconv.Itoa(f.value) }
+
+func (f *intFlagValue) Set(raw string) error {
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return err
+	}
+	f.value = value
+	f.set = true
+	return nil
+}

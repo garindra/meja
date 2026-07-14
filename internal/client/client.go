@@ -44,6 +44,7 @@ type Target struct {
 }
 
 type Config struct {
+	Local              bool
 	Target             Target
 	Port               int
 	PortSet            bool
@@ -52,7 +53,8 @@ type Config struct {
 	DebugRenderLogPath string
 	Cwd                string
 	Argv               []string
-	CtrlPath           string
+	RemotePath         string
+	SocketSelector     control.SocketSelector
 	SessionID          uint64
 	Stdin              *os.File
 	Stdout             io.Writer
@@ -200,7 +202,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	hostname, err := resolveSSHHostname(ctx, cfg.Target)
+	hostname, err := resolveConnectionHostname(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -242,7 +244,7 @@ func Run(ctx context.Context, cfg Config) error {
 					fallbackCfg.Stderr = io.Discard
 					fallback, fallbackErr := fetchBootstrap(ctx, fallbackCfg)
 					if fallbackErr == nil {
-						fallbackHost, hostErr := resolveSSHHostname(ctx, cfg.Target)
+						fallbackHost, hostErr := resolveConnectionHostname(ctx, cfg)
 						if hostErr == nil {
 							ui.beginConnection(true, lastContact)
 							candidate, reconnectErr = openConnection(ctx, fallback, fallbackHost, cols, rows, cfg, "", 0, ui)

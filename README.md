@@ -1,55 +1,143 @@
 # tali
 
-`tali` is a QUIC remote terminal client. SSH performs remote-user
-authentication, agent/password handling, SSH configuration, and host-key
-verification; Tali does not inspect `authorized_keys` or implement a second SSH
-authentication protocol.
+`tali` is a local and remote terminal multiplexer transported over QUIC. A
+single executable contains the interactive client, per-user server, and the
+small SSH control interface.
+
+SSH performs remote-user authentication, agent/password handling, SSH
+configuration, and host-key verification. Tali does not inspect
+`authorized_keys` or implement a second SSH authentication protocol.
+
+## Build
+
+Build the single supported executable:
+
+```bash
+go build -o bin/tali .
+```
+
+Install the appropriate build as `tali` locally and on each remote host.
 
 ## Commands
 
-Build the two supported executables:
+Start a new local session:
 
 ```bash
-go build -o bin/tali ./cmd/tali
-go build -o bin/tali-ctrl ./cmd/tali-ctrl
+tali
+tali -L dev
 ```
 
-Connect with:
+Connect to a new remote session using a hostname, `user@host`, or an OpenSSH
+config alias:
 
 ```bash
-./bin/tali user@host
-./bin/tali user@host -s 12
-./bin/tali --ctrl-path=/opt/tali/bin/tali-ctrl user@host -- /usr/bin/bash -l
+tali connect user@host
+tali c prod
+tali -L dev c prod
+tali c --cwd /srv/app prod -- /usr/bin/bash -l
 ```
 
-The local client invokes the installed `ssh` executable to run the quoted
-remote command `tali-ctrl start-session` (or `connect-session <id>` for `-s`).
-SSH prints no protocol data of its own to the client's stdout: the controller emits exactly one
-`TALI_BOOTSTRAP_V1 {json}` record, while diagnostics go to stderr. The JSON
-contains a numeric session ID, UDP port, expiring single-use attach token, and
-the SHA-256 hash of the daemon certificate's SubjectPublicKeyInfo.
+Attach to an existing numeric session ID. Omitting the host selects the local
+server:
 
-The remote controller supports:
+```bash
+tali attach -t 12
+tali a -t 12 prod
+tali -L dev a -t 12 prod
+```
+
+List local or remote sessions:
+
+```bash
+tali ls
+tali ls prod
+tali -L dev ls prod
+```
+
+Run or stop the local per-user server explicitly:
+
+```bash
+tali server run
+tali server stop
+tali -L dev server run
+tali -L dev server stop
+```
+
+## Servers and sockets
+
+Each socket identifies an isolated Tali server process with its own sessions,
+session-ID sequence, QUIC listener, and certificate. `-L` selects a named
+profile and `-S` selects an exact socket path. They are global, mutually
+exclusive options and must appear before the command:
+
+```bash
+tali -L work
+tali -L work attach -t 3
+tali -L work c prod
+tali -L work server stop
+
+tali -S /home/alice/run/tali.sock
+tali -S /home/alice/run/tali.sock server stop
+```
+
+With no selector, Tali uses the `default` profile. Named profiles resolve to
+`~/.tali/<profile>/tali.sock`, so the default socket is
+`~/.tali/default/tali.sock`. Profile names may use letters, digits, `.`, `_`,
+and `-`. Exact `-S` paths must be absolute. For a remote command the profile or
+path is resolved on the remote host.
+
+Socket directories created by Tali have mode 0700 and sockets have mode 0600.
+Tali never changes the permissions of an existing socket parent. An existing
+parent must already be owned by the current user with mode 0700, so a socket
+cannot be placed directly in a shared directory such as `/tmp`.
+
+Commands that create a session start the selected server if its socket is
+missing or stale. `attach`, `ls`, and `server stop` never start a missing
+server. A foreground `server run` and an automatically detached server use the
+same profile selector. A per-socket lifetime lock prevents two server processes
+from owning the same profile. A foreground server logs
+`tali server: session <id> attached` for each successful client attachment,
+including reconnects and reattachments.
+
+Connection flags belong before the host. `-i` selects an SSH identity,
+`--port` selects the SSH port, and `--remote-path` selects the exact remote
+`tali` executable. The default remote path is `tali`.
+
+## SSH bootstrap
+
+For a remote connection, the local client invokes the installed `ssh`
+executable with one of these private, versioned remote commands:
 
 ```text
-tali-ctrl server
-tali-ctrl start-session
-tali-ctrl connect-session <numeric-session-id>
-tali-ctrl stop-server
+tali __control-v1 start-session
+tali __control-v1 connect-session <numeric-session-id>
+tali __control-v1 list-sessions
+tali -L <profile> __control-v1 <operation>
+tali -S <socket-path> __control-v1 <operation>
 ```
 
-`start-session` starts the per-Unix-user daemon when necessary. To attach to
-an existing session, run `tali user@host -s <numeric-session-id>`; this invokes
-`tali-ctrl connect-session <id>` and never starts a missing daemon. Its protected
-control socket is `$XDG_RUNTIME_DIR/tali/control.sock`, falling back to
-`~/.tali/control.sock`; the socket directory is mode 0700 and the socket is
-mode 0600. `connect-session` only performs an RPC and never starts a daemon.
-`stop-server` only performs an RPC against the existing control socket;
-it cleanly disconnects active clients as if they detached with Ctrl-B, d,
+The start/connect operations emit exactly one `TALI_BOOTSTRAP_V1 {json}`
+record. The list operation emits exactly one `TALI_SESSION_LIST_V1 {json}`
+record. Diagnostics go to stderr. These commands are a machine interface, not
+the user-facing session-management interface.
+
+The bootstrap JSON contains a numeric session ID, UDP port, expiring
+single-use attach token, and the SHA-256 hash of the daemon certificate's
+SubjectPublicKeyInfo.
+
+Local connections skip SSH entirely. They obtain the same bootstrap directly
+from the protected Unix control socket and connect to the QUIC server through
+`127.0.0.1`. Local reconnects also use the control socket directly.
+
+`start-session` starts the per-Unix-user daemon when necessary.
+`connect-session` only performs an RPC and never starts a missing daemon. The
+protected control socket is selected by `-L` or `-S`; the socket directory is
+mode 0700 and the socket is mode 0600. Session IDs increase from 1 for the
+lifetime of a daemon and sessions end with that daemon.
+
+`tali server stop` cleanly disconnects active clients as if they detached,
 gracefully stops the active daemon, and reports its PID when available. SIGINT
-and SIGTERM on the daemon use the same client-disconnect behavior.
-Session IDs increase from 1 for the lifetime of a daemon and sessions end with
-that daemon.
+and SIGTERM on a foreground daemon use the same client-disconnect behavior.
 
 ## Security model
 
@@ -57,9 +145,9 @@ The daemon runs under the SSH-authenticated account, so panes naturally have
 that account's UID/GID and environment. No root credential switching is used.
 The daemon generates a self-signed TLS 1.3 certificate and chooses a UDP port
 in 60000–61000. The client uses an internal `InsecureSkipVerify` setting only
-with a mandatory exact SPKI `VerifyConnection` pin from the SSH bootstrap;
-there is no genuinely unverified production TLS mode and no CA/certificate/key
-setup is required.
+with a mandatory exact SPKI `VerifyConnection` pin from the bootstrap; there
+is no genuinely unverified production TLS mode and no CA/certificate/key setup
+is required.
 
 The first QUIC management message is the versioned session attachment
 `{sessionId, attachToken}`. The token is random, expiry-bound, listener-bound,
@@ -68,27 +156,16 @@ After attachment the daemon issues a session-scoped resume credential and
 generation. Replacement connections rotate that credential and fence the old
 generation.
 
-## Defaults and SSH options
+## Terminal behavior
 
-`~/.tali/config` is not required. The current implementation uses the defaults
-above. OpenSSH owns SSH config and host verification. `-i` and explicit
-`-port` remain compatibility options and are passed to `ssh`; `--ctrl-path`
-selects the exact remote controller path and is shell-quoted before execution.
-
-## Terminal behavior and limitations
-
-The existing server-owned terminal/render protocol, pane commands, alternate
-screen handling, and layout behavior remain in use. A QUIC disconnect detaches
-the client without immediately killing the session; an explicit detach/remote
-session exit ends the attached client flow.
+The server owns terminal emulation, pane state, layout, and rendering. A QUIC
+disconnect detaches the client without immediately killing the session; an
+explicit detach or remote session exit ends the attached client flow.
 
 After a live QUIC connection drops, the client keeps the last confirmed
 terminal contents, replaces the client-visible status bar with an orange
-reconnecting indicator showing the elapsed time since the last authenticated
-contact, and drops input while it is disconnected. It first retries the pinned
-QUIC resume credential; if that fails, it invokes SSH
-`tali-ctrl connect-session <id>` and retries with the fresh single-use attach
-token. Input resumes only after the server's complete layout, status bar, and
-full visible-pane renders have been applied. If the daemon is intentionally stopped or the user
-presses Ctrl-B, d, the client exits cleanly; an unavailable daemon cannot be
-recreated by `connect-session`.
+reconnecting indicator, and drops input while disconnected. It first retries
+the pinned QUIC resume credential. If that fails, it obtains a fresh
+single-use attach token through the local control socket or the versioned SSH
+control command, as appropriate. Input resumes only after the server's layout,
+status bar, and full visible-pane renders have been applied.

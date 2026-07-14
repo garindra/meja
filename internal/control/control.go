@@ -21,20 +21,88 @@ import (
 )
 
 const (
-	ProtocolVersion = 1
-	BootstrapPrefix = "TALI_BOOTSTRAP_V1 "
-	DefaultUDPMin   = 60000
-	DefaultUDPMax   = 61000
-	controlTimeout  = 2 * time.Second
+	ProtocolVersion   = 1
+	BootstrapPrefix   = "TALI_BOOTSTRAP_V1 "
+	SessionListPrefix = "TALI_SESSION_LIST_V1 "
+	DefaultUDPMin     = 60000
+	DefaultUDPMax     = 61000
+	controlTimeout    = 2 * time.Second
 )
 
 var (
 	ErrDaemonUnavailable  = errors.New("tali daemon unavailable")
 	ErrSessionUnavailable = errors.New("tali session unavailable")
+	ErrServerRunning      = errors.New("tali server already running")
 )
 
-// Bootstrap is the only data printed to stdout by tali-ctrl start-session and
-// connect-session. Tokens are intentionally never included in error strings.
+const DefaultProfile = "default"
+
+type SocketSelector struct {
+	Profile string
+	Path    string
+}
+
+func (s SocketSelector) Normalize() (SocketSelector, error) {
+	if s.Profile != "" && s.Path != "" {
+		return SocketSelector{}, errors.New("-L and -S are mutually exclusive")
+	}
+	if s.Path != "" {
+		if !filepath.IsAbs(s.Path) {
+			return SocketSelector{}, errors.New("-S requires an absolute socket path")
+		}
+		return SocketSelector{Path: filepath.Clean(s.Path)}, nil
+	}
+	profile := s.Profile
+	if profile == "" {
+		profile = DefaultProfile
+	}
+	if err := validateProfile(profile); err != nil {
+		return SocketSelector{}, err
+	}
+	return SocketSelector{Profile: profile}, nil
+}
+
+func (s SocketSelector) Resolve() (string, error) {
+	normalized, err := s.Normalize()
+	if err != nil {
+		return "", err
+	}
+	if normalized.Path != "" {
+		return normalized.Path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(home, ".tali", normalized.Profile, "tali.sock"), nil
+}
+
+func (s SocketSelector) Args() ([]string, error) {
+	normalized, err := s.Normalize()
+	if err != nil {
+		return nil, err
+	}
+	if normalized.Path != "" {
+		return []string{"-S", normalized.Path}, nil
+	}
+	return []string{"-L", normalized.Profile}, nil
+}
+
+func validateProfile(profile string) error {
+	if profile == "" || profile == "." || profile == ".." {
+		return errors.New("profile must be a non-empty name")
+	}
+	for _, r := range profile {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return fmt.Errorf("invalid profile %q: use only letters, digits, '.', '_' or '-'", profile)
+	}
+	return nil
+}
+
+// Bootstrap is the only data printed to stdout by the versioned control
+// start/connect operations. Tokens are intentionally never included in errors.
 type Bootstrap struct {
 	Version        int       `json:"version"`
 	SessionID      uint64    `json:"sessionId"`
@@ -42,6 +110,11 @@ type Bootstrap struct {
 	AttachToken    string    `json:"attachToken"`
 	ExpiresAt      time.Time `json:"expiresAt"`
 	CertSPKISHA256 string    `json:"certSpkiSha256"`
+}
+
+type SessionList struct {
+	Version    int      `json:"version"`
+	SessionIDs []uint64 `json:"sessionIds"`
 }
 
 func (b Bootstrap) Validate(now time.Time) error {
@@ -88,16 +161,7 @@ func EqualToken(encoded string, token []byte) bool {
 }
 
 func ControlPath() (string, error) {
-	if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
-		if filepath.IsAbs(runtimeDir) {
-			return filepath.Join(runtimeDir, "tali", "control.sock"), nil
-		}
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home directory: %w", err)
-	}
-	return filepath.Join(home, ".tali", "control.sock"), nil
+	return (SocketSelector{}).Resolve()
 }
 
 type request struct {
@@ -107,14 +171,15 @@ type request struct {
 }
 
 type response struct {
-	Version   int        `json:"version"`
-	OK        bool       `json:"ok"`
-	Error     string     `json:"error,omitempty"`
-	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
-	PID       int        `json:"pid,omitempty"`
+	Version    int        `json:"version"`
+	OK         bool       `json:"ok"`
+	Error      string     `json:"error,omitempty"`
+	Bootstrap  *Bootstrap `json:"bootstrap,omitempty"`
+	PID        int        `json:"pid,omitempty"`
+	SessionIDs []uint64   `json:"sessionIds,omitempty"`
 }
 
-type Handler func(operation string, sessionID uint64) (Bootstrap, int, error)
+type Handler func(operation string, sessionID uint64) (Bootstrap, []uint64, int, error)
 
 // Serve accepts the small control RPC. The caller owns listener shutdown via
 // ctx; malformed requests are answered without exposing token material.
@@ -159,12 +224,13 @@ func serveConn(conn net.Conn, handler Handler) {
 	if err := decoder.Decode(&req); err != nil || req.Version != ProtocolVersion {
 		reply.Error = "invalid control request"
 	} else {
-		b, pid, err := handler(req.Operation, req.SessionID)
+		b, sessionIDs, pid, err := handler(req.Operation, req.SessionID)
 		if err != nil {
 			reply.Error = err.Error()
 		} else {
 			reply.OK = true
 			reply.Bootstrap = &b
+			reply.SessionIDs = sessionIDs
 			reply.PID = pid
 		}
 	}
@@ -188,6 +254,14 @@ func Call(ctx context.Context, socket, operation string, sessionID uint64) (Boot
 	return *reply.Bootstrap, nil
 }
 
+func ListSessions(ctx context.Context, socket string) ([]uint64, error) {
+	reply, err := call(ctx, socket, "list-sessions", 0)
+	if err != nil {
+		return nil, err
+	}
+	return append([]uint64(nil), reply.SessionIDs...), nil
+}
+
 func StopServer(ctx context.Context, socket string) (int, error) {
 	reply, err := call(ctx, socket, "stop-server", 0)
 	if err != nil {
@@ -201,7 +275,7 @@ func call(ctx context.Context, socket, operation string, sessionID uint64) (resp
 	defer cancel()
 	conn, err := (&net.Dialer{}).DialContext(dialCtx, "unix", socket)
 	if err != nil {
-		return response{}, fmt.Errorf("%w: connect control socket", ErrDaemonUnavailable)
+		return response{}, fmt.Errorf("%w: connect control socket %s", ErrDaemonUnavailable, socket)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(controlTimeout))
@@ -236,6 +310,39 @@ func WriteBootstrap(w io.Writer, b Bootstrap) error {
 	return err
 }
 
+func WriteSessionList(w io.Writer, ids []uint64) error {
+	payload, err := json.Marshal(SessionList{Version: ProtocolVersion, SessionIDs: ids})
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "%s%s\n", SessionListPrefix, payload)
+	return err
+}
+
+func ParseSessionListOutput(output []byte) ([]uint64, error) {
+	var found []byte
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, SessionListPrefix) {
+			if found != nil {
+				return nil, errors.New("multiple session-list records")
+			}
+			found = []byte(strings.TrimSpace(strings.TrimPrefix(line, SessionListPrefix)))
+		}
+	}
+	if len(found) == 0 {
+		return nil, errors.New("SSH command did not return a Tali session list")
+	}
+	var list SessionList
+	if err := json.Unmarshal(found, &list); err != nil {
+		return nil, fmt.Errorf("parse session list: %w", err)
+	}
+	if list.Version != ProtocolVersion {
+		return nil, fmt.Errorf("unsupported session-list version %d", list.Version)
+	}
+	return list.SessionIDs, nil
+}
+
 func ParseBootstrapOutput(output []byte) (Bootstrap, error) {
 	var found []byte
 	for _, line := range strings.Split(string(output), "\n") {
@@ -260,8 +367,8 @@ func ParseBootstrapOutput(output []byte) (Bootstrap, error) {
 	return b, nil
 }
 
-func StartSession(ctx context.Context, executable string) (Bootstrap, error) {
-	socket, err := ControlPath()
+func StartSession(ctx context.Context, executable string, selector SocketSelector) (Bootstrap, error) {
+	socket, err := selector.Resolve()
 	if err != nil {
 		return Bootstrap{}, err
 	}
@@ -270,10 +377,10 @@ func StartSession(ctx context.Context, executable string) (Bootstrap, error) {
 	} else if !isUnavailable(callErr) {
 		return Bootstrap{}, callErr
 	}
-	if err := removeStaleSocket(socket); err != nil {
+	if err := EnsureSocketDir(socket); err != nil {
 		return Bootstrap{}, err
 	}
-	if err := startDetachedServer(executable); err != nil {
+	if err := startDetachedServer(executable, selector); err != nil {
 		return Bootstrap{}, err
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -284,16 +391,21 @@ func StartSession(ctx context.Context, executable string) (Bootstrap, error) {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	return Bootstrap{}, ErrDaemonUnavailable
+	return Bootstrap{}, fmt.Errorf("%w at %s", ErrDaemonUnavailable, socket)
 }
 
 func isUnavailable(err error) bool { return errors.Is(err, ErrDaemonUnavailable) }
 
-func startDetachedServer(executable string) error {
+func startDetachedServer(executable string, selector SocketSelector) error {
 	if executable == "" || !filepath.IsAbs(executable) {
 		return errors.New("controller executable path is not absolute")
 	}
-	cmd := exec.Command(executable, "server")
+	args, err := selector.Args()
+	if err != nil {
+		return err
+	}
+	args = append(args, "server", "run")
+	cmd := exec.Command(executable, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
@@ -330,6 +442,14 @@ func removeStaleSocket(socket string) error {
 	if !parentInfo.IsDir() || parentInfo.Mode().Perm() != 0o700 || !ownedByCurrentUID(parentInfo) {
 		return errors.New("control socket directory is not a private directory")
 	}
+	conn, dialErr := net.DialTimeout("unix", socket, 100*time.Millisecond)
+	if dialErr == nil {
+		_ = conn.Close()
+		return fmt.Errorf("control socket %s is already accepting connections", socket)
+	}
+	if !errors.Is(dialErr, syscall.ECONNREFUSED) && !os.IsNotExist(dialErr) {
+		return fmt.Errorf("inspect existing control socket %s: %w", socket, dialErr)
+	}
 	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove stale control socket: %w", err)
 	}
@@ -346,14 +466,51 @@ func EnsureSocketDir(socket string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create control directory: %w", err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return fmt.Errorf("protect control directory: %w", err)
-	}
 	info, err := os.Stat(dir)
 	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 || !ownedByCurrentUID(info) {
-		return errors.New("control directory is not private")
+		return fmt.Errorf("control directory %q must be owned by the current user with mode 0700", dir)
 	}
 	return nil
+}
+
+type ServerLock struct {
+	file *os.File
+}
+
+func AcquireServerLock(socket string) (*ServerLock, error) {
+	if err := EnsureSocketDir(socket); err != nil {
+		return nil, err
+	}
+	path := socket + ".lock"
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open server lock: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("protect server lock: %w", err)
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, fmt.Errorf("%w for socket %s", ErrServerRunning, socket)
+		}
+		return nil, fmt.Errorf("lock server socket: %w", err)
+	}
+	return &ServerLock{file: file}, nil
+}
+
+func (l *ServerLock) Close() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	err := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	closeErr := l.file.Close()
+	l.file = nil
+	if err != nil {
+		return err
+	}
+	return closeErr
 }
 
 func ParseSessionID(raw string) (uint64, error) {

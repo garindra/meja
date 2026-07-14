@@ -1,3 +1,4 @@
-GOOS=darwin GOARCH=arm64 go build -buildvcs=false -o bin/tali-darwin-arm64 ./cmd/tali
+mkdir -p bin/linux-amd64 bin/darwin-arm64
 
-go build -buildvcs=false -o bin/tali-ctrl ./cmd/tali-ctrl
+GOOS=linux GOARCH=amd64 go build -buildvcs=false -o bin/linux-amd64/tali .
+GOOS=darwin GOARCH=arm64 go build -buildvcs=false -o bin/darwin-arm64/tali .

@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -57,6 +58,135 @@ func TestTokenComparisonIsEncodingStrict(t *testing.T) {
 	}
 }
 
+func TestSocketSelectorResolvesProfilesAndExactPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path, err := (SocketSelector{Profile: "dev.test_1"}).Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".tali", "dev.test_1", "tali.sock")
+	if path != want {
+		t.Fatalf("profile path = %q, want %q", path, want)
+	}
+	defaultPath, err := (SocketSelector{}).Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultPath != filepath.Join(home, ".tali", DefaultProfile, "tali.sock") {
+		t.Fatalf("default path = %q", defaultPath)
+	}
+	exact := filepath.Join(home, "exact.sock")
+	if got, err := (SocketSelector{Path: exact}).Resolve(); err != nil || got != exact {
+		t.Fatalf("exact path = %q, %v", got, err)
+	}
+}
+
+func TestSocketSelectorRejectsInvalidCombinations(t *testing.T) {
+	for _, selector := range []SocketSelector{
+		{Profile: "dev", Path: "/tmp/dev.sock"},
+		{Profile: "../dev"},
+		{Profile: "dev/work"},
+		{Path: "relative.sock"},
+	} {
+		if _, err := selector.Normalize(); err == nil {
+			t.Errorf("Normalize(%#v) accepted", selector)
+		}
+	}
+}
+
+func TestSocketSelectorArgsPreserveProfileOrExactPath(t *testing.T) {
+	args, err := (SocketSelector{Profile: "dev"}).Args()
+	if err != nil || len(args) != 2 || args[0] != "-L" || args[1] != "dev" {
+		t.Fatalf("profile args = %v, %v", args, err)
+	}
+	args, err = (SocketSelector{Path: "/private/tali.sock"}).Args()
+	if err != nil || len(args) != 2 || args[0] != "-S" || args[1] != "/private/tali.sock" {
+		t.Fatalf("socket args = %v, %v", args, err)
+	}
+}
+
+func TestEnsureSocketDirDoesNotChmodExistingParent(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureSocketDir(filepath.Join(parent, "tali.sock")); err == nil {
+		t.Fatal("shared parent was accepted")
+	}
+	info, err := os.Stat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("parent mode changed to %o", info.Mode().Perm())
+	}
+}
+
+func TestServerLockIsExclusivePerSocket(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "profile", "tali.sock")
+	first, err := AcquireServerLock(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := AcquireServerLock(socket); !errors.Is(err, ErrServerRunning) {
+		t.Fatalf("second lock error = %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := AcquireServerLock(socket)
+	if err != nil {
+		t.Fatalf("lock after release = %v", err)
+	}
+	_ = second.Close()
+}
+
+func TestRemoveStaleSocketDoesNotDeleteActiveSocket(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "profile")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "tali.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := removeStaleSocket(socket); err == nil {
+		t.Fatal("active socket was treated as stale")
+	}
+	if _, err := os.Lstat(socket); err != nil {
+		t.Fatalf("active socket was removed: %v", err)
+	}
+}
+
+func TestRemoveStaleSocketDeletesUnboundSocket(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "profile")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(dir, "tali.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeStaleSocket(socket); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(socket); !os.IsNotExist(err) {
+		t.Fatalf("stale socket still exists: %v", err)
+	}
+}
+
 func TestControlRPCUsesPrivateSocketAndDoesNotStartOnConnect(t *testing.T) {
 	dir := t.TempDir()
 	socket := filepath.Join(dir, "tali", "control.sock")
@@ -66,14 +196,17 @@ func TestControlRPCUsesPrivateSocketAndDoesNotStartOnConnect(t *testing.T) {
 	ready := make(chan struct{})
 	go func() {
 		close(ready)
-		_ = Serve(ctx, socket, func(operation string, id uint64) (Bootstrap, int, error) {
+		_ = Serve(ctx, socket, func(operation string, id uint64) (Bootstrap, []uint64, int, error) {
 			if operation == "stop-server" {
-				return Bootstrap{}, 1234, nil
+				return Bootstrap{}, nil, 1234, nil
+			}
+			if operation == "list-sessions" {
+				return Bootstrap{}, []uint64{3, 7}, 0, nil
 			}
 			if operation != "connect-session" || id != want.SessionID {
 				t.Errorf("handler received %q %d", operation, id)
 			}
-			return want, 0, nil
+			return want, nil, 0, nil
 		})
 	}()
 	<-ready
@@ -93,6 +226,10 @@ func TestControlRPCUsesPrivateSocketAndDoesNotStartOnConnect(t *testing.T) {
 	}
 	if got.SessionID != want.SessionID {
 		t.Fatalf("session ID = %d", got.SessionID)
+	}
+	ids, err := ListSessions(ctx, socket)
+	if err != nil || len(ids) != 2 || ids[0] != 3 || ids[1] != 7 {
+		t.Fatalf("ListSessions() = %v, %v", ids, err)
 	}
 	info, err := os.Stat(socket)
 	if err != nil {

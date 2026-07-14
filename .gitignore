@@ -1,12 +1,7 @@
 # Build outputs
 /bin/
 
-# Local TLS / dev certificate material
-/dev/*.crt
-/dev/*.csr
-/dev/*.key
-/dev/*.srl
-/dev/*.cnf
+/dev/*
 
 # macOS / editor noise
 .DS_Store
