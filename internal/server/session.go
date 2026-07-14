@@ -112,6 +112,11 @@ func (s *Session) attachConnection(connection *Connection) {
 	_ = s.coordinate(func() error {
 		previous := s.connection
 		s.connection = connection
+		if connection != nil && connection.StatusOutput != nil {
+			if err := s.attachStatusOutput(connection, connection.StatusOutput); err != nil {
+				return err
+			}
+		}
 		if previous != nil && previous != connection && previous.QUIC != nil {
 			_ = previous.QUIC.CloseWithError(0x54414c49, "session resumed")
 		}
@@ -122,6 +127,9 @@ func (s *Session) attachConnection(connection *Connection) {
 func (s *Session) detachConnection(connection *Connection) {
 	_ = s.coordinate(func() error {
 		if s.connection == connection {
+			if err := s.detachStatusOutput(connection); err != nil {
+				return err
+			}
 			s.connection = nil
 		}
 		return nil
@@ -245,6 +253,7 @@ type Session struct {
 	defaultCwd     string
 	operations     chan sessionOperation
 	operationsDone chan struct{}
+	statusCommands chan statusCommand
 	stopOnce       sync.Once
 	stopping       bool
 	ended          bool
@@ -324,8 +333,10 @@ func NewSession(id uint64) *Session {
 		resumeTokens:   map[string]uint64{},
 		operations:     make(chan sessionOperation, 64),
 		operationsDone: make(chan struct{}),
+		statusCommands: make(chan statusCommand, 64),
 	}
 	go session.runOperations()
+	go session.runStatusOutput()
 	return session
 }
 

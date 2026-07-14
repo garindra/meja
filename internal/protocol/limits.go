@@ -13,9 +13,22 @@ const (
 	MaxArgvCount          uint64 = 256
 	MaxVisiblePanes       uint64 = 8
 	MaxRenderSlots        uint64 = 8
-	MaxStyles             uint64 = 4096
+	OutputStreamCount     uint64 = MaxRenderSlots + 1
+	StatusRenderSlot      uint8  = uint8(MaxRenderSlots)
 	MaxGridCols           uint64 = 1024
 	MaxGridRows           uint64 = 1024
-	MaxCells              uint64 = MaxGridCols * MaxGridRows
-	MaxCellRun            uint64 = MaxGridCols
 )
+
+// OutputIndexFromStreamID maps server-initiated unidirectional QUIC stream IDs
+// (3, 7, 11, ...) to Tali's connection-local display output indices. Index 0
+// is the status surface; indices 1..8 correspond to pane slots 0..7.
+func OutputIndexFromStreamID(id uint64) (uint8, bool) {
+	if id&3 != 3 {
+		return 0, false
+	}
+	index := (id - 3) / 4
+	if index >= OutputStreamCount {
+		return 0, false
+	}
+	return uint8(index), true
+}

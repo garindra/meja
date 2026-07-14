@@ -2,9 +2,134 @@ package server
 
 import (
 	"fmt"
+	"io"
 
 	"tali/internal/protocol"
 )
+
+const (
+	statusNormalStyleID uint32 = 1
+	statusPromptStyleID uint32 = 2
+)
+
+type statusModel struct {
+	width   int
+	text    string
+	styleID uint32
+}
+
+type statusCommand struct {
+	attach     io.Writer
+	detach     bool
+	connection *Connection
+	model      *statusModel
+	done       chan error
+}
+
+func (s *Session) sendStatusCommand(command statusCommand) error {
+	if s.statusCommands == nil {
+		return nil
+	}
+	command.done = make(chan error, 1)
+	select {
+	case s.statusCommands <- command:
+	case <-s.operationsDone:
+		return nil
+	}
+	select {
+	case err := <-command.done:
+		return err
+	case <-s.operationsDone:
+		return nil
+	}
+}
+
+func (s *Session) attachStatusOutput(connection *Connection, stream io.Writer) error {
+	return s.sendStatusCommand(statusCommand{attach: stream, connection: connection})
+}
+
+func (s *Session) detachStatusOutput(connection *Connection) error {
+	return s.sendStatusCommand(statusCommand{detach: true, connection: connection})
+}
+
+func (s *Session) runStatusOutput() {
+	var connection *Connection
+	var output *renderOutput
+	initialized := false
+	var latest statusModel
+	var hasLatest bool
+	for {
+		select {
+		case command := <-s.statusCommands:
+			var err error
+			switch {
+			case command.attach != nil:
+				connection = command.connection
+				output = newRenderOutput(command.attach)
+				initialized = false
+				if hasLatest {
+					err = renderStatusModel(output, latest, true)
+					initialized = err == nil
+				}
+			case command.detach:
+				if connection == command.connection {
+					connection = nil
+					output = nil
+					initialized = false
+				}
+			case command.model != nil:
+				latest = *command.model
+				hasLatest = true
+				if output != nil {
+					err = renderStatusModel(output, latest, !initialized)
+					initialized = err == nil
+				}
+			}
+			if err != nil {
+				output = nil
+				initialized = false
+			}
+			command.done <- err
+		case <-s.operationsDone:
+			return
+		}
+	}
+}
+
+func renderStatusModel(output *renderOutput, model statusModel, full bool) error {
+	normal := protocol.Style{FG: protocol.Color{Mode: "default"}, BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}}
+	prompt := protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 0}, BG: protocol.Color{Mode: "indexed", Index: 3}}
+	if full {
+		if err := installStyle(output, statusNormalStyleID, normal); err != nil {
+			return err
+		}
+		if err := installStyle(output, statusPromptStyleID, prompt); err != nil {
+			return err
+		}
+	}
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0}); err != nil {
+		return err
+	}
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: model.styleID}); err != nil {
+		return err
+	}
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeFill, Fill: protocol.Fill{Columns: model.width, Rune: ' ', Width: 1}}); err != nil {
+		return err
+	}
+	runes := []rune(model.text)
+	if len(runes) > model.width {
+		runes = runes[:model.width]
+	}
+	if len(runes) > 0 {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0}); err != nil {
+			return err
+		}
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte(string(runes))}); err != nil {
+			return err
+		}
+	}
+	return output.present()
+}
 
 func (s *Session) publishStatusBar() error {
 	client := s.SnapshotClient(clientID0)
@@ -12,20 +137,10 @@ func (s *Session) publishStatusBar() error {
 		return nil
 	}
 	width := int(client.TerminalCols)
-	cells := make([]protocol.Cell, width)
-	for i := range cells {
-		cells[i] = protocol.Cell{Rune: ' ', StyleID: 0, Width: 1}
-	}
-	style := protocol.Style{
-		FG: protocol.Color{Mode: "default"},
-		BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158},
-	}
+	styleID := statusNormalStyleID
 	text := ""
 	if prompt := s.ActivePrompt(clientID0); prompt != nil {
-		style = protocol.Style{
-			FG: protocol.Color{Mode: "indexed", Index: 0},
-			BG: protocol.Color{Mode: "indexed", Index: 3},
-		}
+		styleID = statusPromptStyleID
 		text = prompt.Label + string(prompt.Text)
 	} else {
 		list := s.WindowStatuses(clientID0)
@@ -42,23 +157,7 @@ func (s *Session) publishStatusBar() error {
 			text += fmt.Sprintf("%d:%s%c ", window.Index, window.Title, marker)
 		}
 	}
-	column := 0
-	for _, r := range text {
-		if column >= len(cells) {
-			break
-		}
-		cells[column].Rune = r
-		column++
-	}
-	mgmtFrames := s.currentManagementFrames()
-	if mgmtFrames == nil {
-		return nil
-	}
-	return sendEncoded(mgmtFrames, protocol.MsgStatusBar, protocol.StatusBar{
-		Cols:   width,
-		Cells:  cells,
-		Styles: []protocol.StyleDefinition{{ID: 0, Style: style}},
-	}, protocol.EncodeStatusBar)
+	return s.sendStatusCommand(statusCommand{model: &statusModel{width: width, text: text, styleID: styleID}})
 }
 
 func (s *Session) publishWindowLayout() error {

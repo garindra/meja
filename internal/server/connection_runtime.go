@@ -91,18 +91,27 @@ func serveConnection(ctx context.Context, d *Daemon, conn quic.Connection) error
 	d.logSessionAttached(s.ID)
 	shell := defaultShell()
 
+	statusOutput, err := conn.OpenUniStreamSync(ctx)
+	if err != nil {
+		return fmt.Errorf("open status output stream: %w", err)
+	}
+	if index, ok := protocol.OutputIndexFromStreamID(uint64(statusOutput.StreamID())); !ok || index != 0 {
+		return fmt.Errorf("status output stream ID %d has index %d", statusOutput.StreamID(), index)
+	}
+	if _, err := statusOutput.Write([]byte{byte(protocol.DisplayOpcodeNoop)}); err != nil {
+		return fmt.Errorf("materialize status output stream: %w", err)
+	}
 	outputLeases := make(map[int]*OutputLease, int(protocol.MaxRenderSlots))
 	for slot := 0; slot < int(protocol.MaxRenderSlots); slot++ {
-		outputStream, err := conn.OpenStreamSync(ctx)
+		outputStream, err := conn.OpenUniStreamSync(ctx)
 		if err != nil {
 			return fmt.Errorf("open output stream %d: %w", slot, err)
 		}
-		openPayload, err := protocol.EncodeStreamOpen(nil, protocol.StreamOpen{StreamType: protocol.StreamTypePaneOutput, Slot: uint8(slot)})
-		if err != nil {
-			return err
+		if index, ok := protocol.OutputIndexFromStreamID(uint64(outputStream.StreamID())); !ok || int(index) != slot+1 {
+			return fmt.Errorf("pane output stream ID %d has index %d, want %d", outputStream.StreamID(), index, slot+1)
 		}
-		if err := protocol.NewEncoder(outputStream).WriteFrame(protocol.Frame{Type: protocol.MsgOpenPaneOutputStream, Payload: openPayload}); err != nil {
-			return err
+		if _, err := outputStream.Write([]byte{byte(protocol.DisplayOpcodeNoop)}); err != nil {
+			return fmt.Errorf("materialize pane output stream %d: %w", slot, err)
 		}
 		outputLeases[slot] = &OutputLease{Slot: slot, Stream: outputStream}
 	}
@@ -113,6 +122,7 @@ func serveConnection(ctx context.Context, d *Daemon, conn quic.Connection) error
 		Daemon:        d,
 		Management:    mgmtStream,
 		Input:         inputStream,
+		StatusOutput:  statusOutput,
 		shell:         shell,
 		managementOut: mgmtFrames,
 	}

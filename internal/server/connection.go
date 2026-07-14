@@ -16,16 +16,17 @@ type OutputLease struct {
 	Stream io.Writer
 }
 
-// Connection owns one live QUIC connection, its protocol streams, and its
-// eight enduring output leases. It borrows a Session; sessions and panes can
-// outlive any particular Connection.
+// Connection owns one live QUIC connection, its protocol streams, eight
+// transferable pane output leases, and one enduring status output stream.
+// It borrows a Session; sessions and panes can outlive any connection.
 type Connection struct {
-	QUIC       quic.Connection
-	Session    *Session
-	Daemon     *Daemon
-	Management quic.Stream
-	Input      quic.Stream
-	Output     [protocol.MaxRenderSlots]*OutputLease
+	QUIC         quic.Connection
+	Session      *Session
+	Daemon       *Daemon
+	Management   quic.Stream
+	Input        quic.Stream
+	Output       [protocol.MaxRenderSlots]*OutputLease
+	StatusOutput io.Writer
 
 	managementOut chan protocol.Frame
 	shell         string

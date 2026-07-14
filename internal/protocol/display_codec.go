@@ -20,6 +20,7 @@ import (
 type DisplayOpcode byte
 
 const (
+	DisplayOpcodeNoop                 DisplayOpcode = 0x00
 	DisplayOpcodeRelayoutBarrier      DisplayOpcode = 0x01
 	DisplayOpcodeStyleInstall         DisplayOpcode = 0x02
 	DisplayOpcodeSetWritePosition     DisplayOpcode = 0x03
@@ -64,6 +65,9 @@ func (e *DisplayEncoder) Reset(dst []byte)         { e.buf = dst }
 
 func (e *DisplayEncoder) AppendCommand(cmd DisplayCommand) error {
 	switch cmd.Opcode {
+	case DisplayOpcodeNoop:
+		e.opcode(DisplayOpcodeNoop)
+		return nil
 	case DisplayOpcodeRelayoutBarrier:
 		return e.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: cmd.LayoutRevision})
 	case DisplayOpcodeStyleInstall:
@@ -248,6 +252,7 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 	}
 	cmd := DisplayCommand{Opcode: DisplayOpcode(op)}
 	switch cmd.Opcode {
+	case DisplayOpcodeNoop:
 	case DisplayOpcodeRelayoutBarrier:
 		cmd.LayoutRevision, err = d.readUvarint()
 	case DisplayOpcodeStyleInstall:
@@ -346,6 +351,8 @@ func (d *DisplayDecoder) ReadBatch() (DisplayBatch, error) {
 			return DisplayBatch{}, err
 		}
 		switch cmd.Opcode {
+		case DisplayOpcodeNoop:
+			continue
 		case DisplayOpcodeRelayoutBarrier:
 			d.pending = d.pending[:0]
 			d.layoutRevision = cmd.LayoutRevision

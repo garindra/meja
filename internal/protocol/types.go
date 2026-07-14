@@ -1,14 +1,13 @@
 package protocol
 
 const (
-	ALPN            = "tali/6"
-	ProtocolVersion = 2
+	ALPN            = "tali/7"
+	ProtocolVersion = 3
 )
 
 const (
 	MsgOpenManagementStream uint64 = iota + 1
 	MsgOpenInputStream
-	MsgOpenPaneOutputStream
 	MsgCreatePane
 	MsgPaneCreated
 	MsgInputBytes
@@ -16,7 +15,6 @@ const (
 	MsgWindowLayout
 	MsgPing
 	MsgPong
-	MsgStatusBar
 	MsgSessionAttach
 	MsgSessionAttachOK
 	MsgSessionAttachFailed
@@ -27,13 +25,10 @@ const (
 const (
 	StreamTypeManagement = "management"
 	StreamTypeInput      = "input"
-	StreamTypePaneOutput = "pane-output"
 )
 
 type StreamOpen struct {
 	StreamType string
-	Slot       uint8
-	PaneID     uint64
 }
 
 type SessionAttach struct {
@@ -109,12 +104,6 @@ type WindowLayout struct {
 	FocusedPaneID  uint64
 	LayoutRevision uint64
 	Panes          []PanePlacement
-}
-
-type StatusBar struct {
-	Cols   int
-	Cells  []Cell
-	Styles []StyleDefinition
 }
 
 type RelayoutBarrier struct {

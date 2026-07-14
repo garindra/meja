@@ -170,25 +170,6 @@ func TestDisplayDecoderRejectsMalformedCommands(t *testing.T) {
 	}
 }
 
-func TestStatusBarRoundTrip(t *testing.T) {
-	cells := make([]Cell, 80)
-	for i := range cells {
-		cells[i] = Cell{Rune: ' ', Width: 1}
-	}
-	msg := StatusBar{Cols: 80, Cells: cells, Styles: []StyleDefinition{{ID: 0, Style: Style{BG: Color{Mode: "rgb", R: 42, G: 99, B: 158}}}}}
-	payload, err := EncodeStatusBar(nil, msg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := DecodeStatusBar(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.Cols != msg.Cols || !reflect.DeepEqual(out.Cells, msg.Cells) || len(out.Styles) != 1 || out.Styles[0].Style.BG != msg.Styles[0].Style.BG {
-		t.Fatalf("status round trip mismatch: %#v", out)
-	}
-}
-
 func TestWindowLayoutRoundTripIncludesSlots(t *testing.T) {
 	msg := WindowLayout{WindowID: 2, FocusedPaneID: 8, LayoutRevision: 11, Panes: []PanePlacement{{PaneID: 7, Slot: 0, Rect: Rect{Width: 40, Height: 20}}, {PaneID: 8, Slot: 1, Rect: Rect{X: 41, Width: 39, Height: 20}}}}
 	payload, err := EncodeWindowLayout(nil, msg)
@@ -201,6 +182,21 @@ func TestWindowLayoutRoundTripIncludesSlots(t *testing.T) {
 	}
 	if !reflect.DeepEqual(out, msg) {
 		t.Fatalf("layout=%#v", out)
+	}
+}
+
+func TestOutputIndexFromServerUnidirectionalStreamID(t *testing.T) {
+	for index := uint8(0); index < uint8(OutputStreamCount); index++ {
+		id := uint64(3 + 4*index)
+		got, ok := OutputIndexFromStreamID(id)
+		if !ok || got != index {
+			t.Fatalf("stream ID %d mapped to (%d, %v), want (%d, true)", id, got, ok, index)
+		}
+	}
+	for _, id := range []uint64{0, 1, 2, 36, 39} {
+		if got, ok := OutputIndexFromStreamID(id); ok {
+			t.Fatalf("invalid stream ID %d mapped to index %d", id, got)
+		}
 	}
 }
 

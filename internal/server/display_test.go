@@ -65,8 +65,11 @@ func testOutputLease(slot int, stream io.Writer) *OutputLease {
 	return &OutputLease{Slot: slot, Stream: stream}
 }
 
-func testConnection(frames chan protocol.Frame, leases map[int]*OutputLease) *Connection {
+func testConnection(frames chan protocol.Frame, leases map[int]*OutputLease, status ...io.Writer) *Connection {
 	connection := &Connection{managementOut: frames}
+	if len(status) > 0 {
+		connection.StatusOutput = status[0]
+	}
 	for slot, lease := range leases {
 		connection.Output[slot] = lease
 	}

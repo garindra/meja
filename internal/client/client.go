@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,7 +24,6 @@ import (
 	"github.com/quic-go/quic-go"
 	"golang.org/x/term"
 
-	"tali/internal/client/render"
 	"tali/internal/control"
 	"tali/internal/protocol"
 )
@@ -91,13 +92,12 @@ type renderStyleKey struct {
 }
 
 type renderEvent interface{ renderEvent() }
-type paneBatchEvent struct {
+type displayBatchEvent struct {
 	slot           uint8
 	layoutRevision uint64
 	commands       []protocol.DisplayCommand
 }
 type layoutEvent struct{ layout protocol.WindowLayout }
-type statusEvent struct{ status protocol.StatusBar }
 type sizeEvent struct{ cols, rows int }
 type reconnectEvent struct {
 	reconnecting bool
@@ -105,9 +105,8 @@ type reconnectEvent struct {
 }
 type renderBarrierEvent struct{ done chan struct{} }
 
-func (paneBatchEvent) renderEvent()     {}
+func (displayBatchEvent) renderEvent()  {}
 func (layoutEvent) renderEvent()        {}
-func (statusEvent) renderEvent()        {}
 func (sizeEvent) renderEvent()          {}
 func (reconnectEvent) renderEvent()     {}
 func (renderBarrierEvent) renderEvent() {}
@@ -378,10 +377,10 @@ func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname s
 	}
 	addr := net.JoinHostPort(hostname, fmt.Sprintf("%d", bootstrap.Port))
 	conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quic.Config{
-		MaxIdleTimeout:     quicMaxIdleTimeout,
-		KeepAlivePeriod:    quicKeepAlivePeriod,
-		MaxIncomingStreams: int64(protocol.MaxRenderSlots),
-		InitialPacketSize:  protocol.QUICInitialPacketSize,
+		MaxIdleTimeout:        quicMaxIdleTimeout,
+		KeepAlivePeriod:       quicKeepAlivePeriod,
+		MaxIncomingUniStreams: int64(protocol.OutputStreamCount),
+		InitialPacketSize:     protocol.QUICInitialPacketSize,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
@@ -525,34 +524,29 @@ func loadTLSConfig(spkiHash string) (*tls.Config, error) {
 }
 
 func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeState, outputReady chan<- struct{}, sessionDone chan<- error, start func(func()), lastContact *atomic.Int64) {
-	for i := 0; i < int(protocol.MaxRenderSlots); i++ {
-		stream, err := conn.AcceptStream(ctx)
+	seen := make(map[uint8]struct{}, int(protocol.OutputStreamCount))
+	for i := 0; i < int(protocol.OutputStreamCount); i++ {
+		stream, err := conn.AcceptUniStream(ctx)
 		if err != nil {
 			sendConnectionError(ctx, sessionDone, fmt.Errorf("accept output stream: %w", err))
 			return
 		}
-		frameDecoder := protocol.NewDecoder(stream, protocol.DefaultMaxFrameSize)
-		openFrame, err := frameDecoder.ReadFrame()
-		if err != nil {
-			sendConnectionError(ctx, sessionDone, fmt.Errorf("read output stream open: %w", err))
+		index, ok := protocol.OutputIndexFromStreamID(uint64(stream.StreamID()))
+		if !ok {
+			sendConnectionError(ctx, sessionDone, fmt.Errorf("unexpected output stream ID %d", stream.StreamID()))
 			return
 		}
-		if openFrame.Type != protocol.MsgOpenPaneOutputStream {
-			sendConnectionError(ctx, sessionDone, fmt.Errorf("unexpected output stream opener %d", openFrame.Type))
+		if _, duplicate := seen[index]; duplicate {
+			sendConnectionError(ctx, sessionDone, fmt.Errorf("duplicate output stream index %d", index))
 			return
 		}
-		open, err := protocol.DecodeStreamOpen(openFrame.Payload)
-		if err != nil {
-			sendConnectionError(ctx, sessionDone, err)
-			return
+		seen[index] = struct{}{}
+		slot := protocol.StatusRenderSlot
+		if index > 0 {
+			slot = index - 1
 		}
-		if int(open.Slot) != i {
-			sendConnectionError(ctx, sessionDone, fmt.Errorf("unexpected output stream slot %d, want %d", open.Slot, i))
-			return
-		}
-		slot := open.Slot
 		start(func() {
-			readOutputStream(slot, protocol.NewDisplayDecoderFromDecoder(frameDecoder), ui, sessionDone, conn.Context(), lastContact)
+			readOutputStream(slot, protocol.NewDisplayDecoder(stream), ui, sessionDone, conn.Context(), lastContact)
 		})
 	}
 	select {
@@ -581,30 +575,37 @@ func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeS
 			lastContact.Store(time.Now().UnixNano())
 		}
 		ui.recordIncomingRenderCommand(slot, command, wireBytes)
+		if command.Opcode == protocol.DisplayOpcodeNoop {
+			continue
+		}
 		if command.Opcode == protocol.DisplayOpcodeRelayoutBarrier {
+			if slot == protocol.StatusRenderSlot {
+				sendConnectionError(connectionContext, sessionDone, errors.New("RELAYOUT_BARRIER on status output"))
+				return
+			}
 			pending = pending[:0]
 			layoutRevision = command.LayoutRevision
 			continue
 		}
 		if command.Opcode != protocol.DisplayOpcodePresent {
-			if layoutRevision == 0 {
+			if layoutRevision == 0 && slot != protocol.StatusRenderSlot {
 				sendConnectionError(connectionContext, sessionDone, fmt.Errorf("display command 0x%02x on slot %d before RELAYOUT_BARRIER", byte(command.Opcode), slot))
 				return
 			}
 			pending = append(pending, command)
 			continue
 		}
-		if layoutRevision == 0 {
+		if layoutRevision == 0 && slot != protocol.StatusRenderSlot {
 			sendConnectionError(connectionContext, sessionDone, fmt.Errorf("PRESENT on slot %d before RELAYOUT_BARRIER", slot))
 			return
 		}
-		batch := paneBatchEvent{slot: slot, layoutRevision: layoutRevision, commands: append([]protocol.DisplayCommand(nil), pending...)}
+		batch := displayBatchEvent{slot: slot, layoutRevision: layoutRevision, commands: append([]protocol.DisplayCommand(nil), pending...)}
 		pending = pending[:0]
 		ui.emit(batch)
 	}
 }
 
-func applyDisplayCommand(s *render.ClientState, slot uint8, command protocol.DisplayCommand) error {
+func applyDisplayCommand(s *ClientState, slot uint8, command protocol.DisplayCommand) error {
 	valid := false
 	switch command.Opcode {
 	case protocol.DisplayOpcodeStyleInstall:
@@ -660,13 +661,6 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- con
 				return
 			}
 			ui.emit(layoutEvent{layout: msg})
-		case protocol.MsgStatusBar:
-			msg, err := protocol.DecodeStatusBar(frame.Payload)
-			if err != nil {
-				done <- connectionResult{err: fmt.Errorf("decode STATUS_BAR: %w", err)}
-				return
-			}
-			ui.emit(statusEvent{status: msg})
 		case protocol.MsgPong:
 			if _, err := protocol.DecodePong(frame.Payload); err != nil {
 				done <- connectionResult{err: err}
@@ -841,19 +835,19 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 	if r.renderDone != nil {
 		defer close(r.renderDone)
 	}
-	state := render.NewClientState()
-	pending := make(map[uint64][]paneBatchEvent)
+	state := NewClientState()
+	pending := make(map[uint64][]displayBatchEvent)
 	slotRevision := make(map[uint8]uint64)
 	present := func(reason string) error {
 		r.redrawRequests++
 		r.logRenderf("redraw request #%d: %s", r.redrawRequests, reason)
-		buf := render.RenderANSI(state)
+		buf := RenderANSI(state)
 		r.redrawWrites++
 		r.logRenderf("redraw write #%d bytes=%d", r.redrawWrites, len(buf))
 		_, err := r.stdout.Write(buf)
 		return err
 	}
-	applyBatch := func(batch paneBatchEvent) error {
+	applyBatch := func(batch displayBatchEvent) error {
 		if slotRevision[batch.slot] != batch.layoutRevision {
 			if !state.ResetStream(batch.slot) {
 				return fmt.Errorf("barrier for unbound output slot %d", batch.slot)
@@ -874,21 +868,17 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 		switch e := event.(type) {
 		case reconnectEvent:
 			if e.reconnecting {
-				pending = make(map[uint64][]paneBatchEvent)
+				pending = make(map[uint64][]displayBatchEvent)
 				slotRevision = make(map[uint8]uint64)
 			}
 			state.SetReconnecting(e.reconnecting, e.lastContact)
+			if e.reconnecting {
+				state.RefreshReconnectStatus(time.Now())
+			}
 			needsPresent = true
 			reason = "reconnect state"
 		case sizeEvent:
 			state.SetTerminalSize(e.cols, e.rows)
-		case statusEvent:
-			if r.dropConnectionEvents.Load() {
-				return false, "", nil
-			}
-			state.ApplyStatusBar(e.status)
-			needsPresent = true
-			reason = "status-bar"
 		case layoutEvent:
 			if r.dropConnectionEvents.Load() {
 				return false, "", nil
@@ -910,12 +900,16 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 				reason = "layout batches"
 			}
 			delete(pending, e.layout.LayoutRevision)
-		case paneBatchEvent:
+		case displayBatchEvent:
 			if r.dropConnectionEvents.Load() {
 				return false, "", nil
 			}
 			current := state.Layout.LayoutRevision
-			if e.layoutRevision > current {
+			if e.slot == protocol.StatusRenderSlot {
+				err = applyBatch(e)
+				needsPresent = err == nil
+				reason = "present status"
+			} else if e.layoutRevision > current {
 				pending[e.layoutRevision] = append(pending[e.layoutRevision], e)
 			} else if e.layoutRevision == current {
 				err = applyBatch(e)
@@ -935,7 +929,7 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 			return
 		case <-ticker.C:
 			if state.Reconnecting {
-				state.RefreshReconnectStatus()
+				state.RefreshReconnectStatus(time.Now())
 				if err := present("reconnect timer"); err != nil {
 					if ctx.Err() == nil {
 						errs <- err
@@ -1153,6 +1147,8 @@ func formatIncomingRenderTypes(types map[protocol.DisplayOpcode]uint64) string {
 
 func incomingRenderOpcodeName(opcode protocol.DisplayOpcode) string {
 	switch opcode {
+	case protocol.DisplayOpcodeNoop:
+		return "Noop"
 	case protocol.DisplayOpcodeRelayoutBarrier:
 		return "RelayoutBarrier"
 	case protocol.DisplayOpcodeStyleInstall:
@@ -1185,4 +1181,653 @@ func drawableRows(rows int) uint16 {
 		return 1
 	}
 	return uint16(rows - 1)
+}
+
+const statusSurfaceID = ^uint64(0)
+const reconnectStyleID uint32 = 3
+
+type Screen struct {
+	Cols, Rows int
+	Cells      []protocol.Cell
+}
+type LayoutDescription struct {
+	WindowID, LayoutRevision uint64
+	Panes                    []protocol.PanePlacement
+}
+type PaneViewState struct {
+	PaneID        uint64
+	Rect          protocol.Rect
+	Grid          Screen
+	Cursor        protocol.Cursor
+	CursorVisible bool
+	Slot          uint8
+	Styles        map[uint32]protocol.Style
+}
+type StreamState struct {
+	Row, Column int
+	StyleID     uint32
+}
+
+type ClientState struct {
+	ActiveWindowID                       uint64
+	HasActiveWindow                      bool
+	FocusedPaneID                        uint64
+	Layout                               LayoutDescription
+	Panes                                map[uint64]*PaneViewState
+	RenderSlots                          map[uint8]uint64
+	Streams                              map[uint8]*StreamState
+	TerminalCols, TerminalRows           int
+	LastRendered                         Screen
+	composedCells                        []composedCell
+	pendingDamageRects                   []protocol.Rect
+	fullContentDirty                     bool
+	lastCursorX, lastCursorY             int
+	lastCursorVisible, hasRenderedCursor bool
+	Reconnecting                         bool
+	LastContact                          time.Time
+}
+
+func NewClientState() *ClientState {
+	s := &ClientState{Panes: map[uint64]*PaneViewState{}, RenderSlots: map[uint8]uint64{}, Streams: map[uint8]*StreamState{}, fullContentDirty: true}
+	s.Panes[statusSurfaceID] = &PaneViewState{PaneID: statusSurfaceID, Slot: protocol.StatusRenderSlot, Styles: defaultStyles()}
+	s.RenderSlots[protocol.StatusRenderSlot] = statusSurfaceID
+	s.Streams[protocol.StatusRenderSlot] = &StreamState{}
+	return s
+}
+func (s *ClientState) SetTerminalSize(cols, rows int) {
+	if s.TerminalCols != cols || s.TerminalRows != rows {
+		s.fullContentDirty = true
+		s.pendingDamageRects = nil
+	}
+	s.TerminalCols = cols
+	s.TerminalRows = rows
+	status := s.ensurePane(statusSurfaceID)
+	status.Rect = protocol.Rect{X: 0, Y: max(0, rows-1), Width: max(0, cols), Height: 1}
+	status.Slot = protocol.StatusRenderSlot
+	if status.Grid.Cols != cols || status.Grid.Rows != 1 {
+		status.Grid = blankScreen(cols, 1)
+	}
+	s.RenderSlots[protocol.StatusRenderSlot] = statusSurfaceID
+}
+
+func (s *ClientState) SetReconnecting(reconnecting bool, lastContact time.Time) {
+	if s.Reconnecting == reconnecting && (reconnecting == false || s.LastContact.Equal(lastContact)) {
+		return
+	}
+	s.Reconnecting = reconnecting
+	if reconnecting {
+		s.LastContact = lastContact
+	}
+}
+
+func (s *ClientState) RefreshReconnectStatus(now time.Time) bool {
+	if !s.Reconnecting || s.TerminalCols <= 0 {
+		return false
+	}
+	style := protocol.Style{FG: protocol.Color{Mode: "rgb", R: 255, G: 165, B: 0}, BG: protocol.Color{Mode: "default"}}
+	if !s.InstallStyle(protocol.StatusRenderSlot, protocol.StyleInstall{ID: reconnectStyleID, Style: style}) ||
+		!s.SetWritePosition(protocol.StatusRenderSlot, protocol.SetWritePosition{}) ||
+		!s.SetWriteStyle(protocol.StatusRenderSlot, protocol.SetWriteStyle{StyleID: reconnectStyleID}) ||
+		!s.Fill(protocol.StatusRenderSlot, protocol.Fill{Columns: s.TerminalCols, Rune: ' ', Width: 1}) ||
+		!s.SetWritePosition(protocol.StatusRenderSlot, protocol.SetWritePosition{}) {
+		return false
+	}
+	seconds := int(now.Sub(s.LastContact) / time.Second)
+	if seconds < 0 {
+		seconds = 0
+	}
+	text := []rune("tali is reconnecting... [Last contact " + strconv.Itoa(seconds) + " seconds ago]")
+	if len(text) > s.TerminalCols {
+		text = text[:s.TerminalCols]
+	}
+	return s.WriteText(protocol.StatusRenderSlot, protocol.WriteText{CellWidth: 1, Text: []byte(string(text))})
+}
+
+func (s *ClientState) ApplyWindowLayout(msg protocol.WindowLayout) bool {
+	windowChanged := s.HasActiveWindow && s.ActiveWindowID != msg.WindowID
+	focusChanged := s.HasActiveWindow && !windowChanged && s.FocusedPaneID != msg.FocusedPaneID
+	s.ActiveWindowID = msg.WindowID
+	s.HasActiveWindow = true
+	s.FocusedPaneID = msg.FocusedPaneID
+	layoutChanged := !sameLayout(s.Layout, msg)
+	s.Layout = LayoutDescription{WindowID: msg.WindowID, LayoutRevision: msg.LayoutRevision, Panes: append([]protocol.PanePlacement(nil), msg.Panes...)}
+	visible := map[uint64]struct{}{statusSurfaceID: {}}
+	nextSlots := map[uint8]uint64{protocol.StatusRenderSlot: statusSurfaceID}
+	for _, p := range msg.Panes {
+		visible[p.PaneID] = struct{}{}
+		nextSlots[p.Slot] = p.PaneID
+		pane := s.ensurePane(p.PaneID)
+		if pane.Grid.Cols != p.Rect.Width || pane.Grid.Rows != p.Rect.Height {
+			pane.Grid = blankScreen(p.Rect.Width, p.Rect.Height)
+		}
+		pane.Rect = p.Rect
+		pane.Slot = p.Slot
+		if s.Streams[p.Slot] == nil {
+			s.Streams[p.Slot] = &StreamState{}
+		}
+	}
+	for id := range s.Panes {
+		if _, ok := visible[id]; !ok {
+			delete(s.Panes, id)
+		}
+	}
+	s.RenderSlots = nextSlots
+	if layoutChanged || windowChanged {
+		s.fullContentDirty = true
+		s.pendingDamageRects = nil
+	}
+	return focusChanged && !layoutChanged
+}
+
+func (s *ClientState) ResetStream(slot uint8) bool {
+	if s.slotPane(slot) == nil {
+		return false
+	}
+	s.Streams[slot] = &StreamState{}
+	return true
+}
+func (s *ClientState) InstallStyle(slot uint8, msg protocol.StyleInstall) bool {
+	p := s.slotPane(slot)
+	if p == nil {
+		return false
+	}
+	if msg.ID == protocol.CanonicalDefaultStyleID && !protocol.IsCanonicalDefaultStyle(msg.Style) {
+		return false
+	}
+	p.Styles[msg.ID] = msg.Style
+	return true
+}
+func (s *ClientState) SetWritePosition(slot uint8, msg protocol.SetWritePosition) bool {
+	st, p := s.streamPane(slot)
+	if p == nil || msg.Row < 0 || msg.Row >= p.Grid.Rows || msg.Column < 0 || msg.Column >= p.Grid.Cols {
+		return false
+	}
+	st.Row, st.Column = msg.Row, msg.Column
+	return true
+}
+func (s *ClientState) SetWriteStyle(slot uint8, msg protocol.SetWriteStyle) bool {
+	st, p := s.streamPane(slot)
+	if p == nil {
+		return false
+	}
+	if _, ok := p.Styles[msg.StyleID]; !ok {
+		return false
+	}
+	st.StyleID = msg.StyleID
+	return true
+}
+func (s *ClientState) WriteText(slot uint8, msg protocol.WriteText) bool {
+	st, p := s.streamPane(slot)
+	if st == nil || p == nil {
+		return false
+	}
+	return s.writeText(st, p, msg, st.StyleID)
+}
+
+// WriteTextDefault renders with style 0 without changing the stream latch.
+func (s *ClientState) WriteTextDefault(slot uint8, text []byte) bool {
+	st, p := s.streamPane(slot)
+	if st == nil || p == nil {
+		return false
+	}
+	style, ok := p.Styles[protocol.CanonicalDefaultStyleID]
+	if !ok || !protocol.IsCanonicalDefaultStyle(style) {
+		return false
+	}
+	return s.writeText(st, p, protocol.WriteText{CellWidth: 1, Text: text}, 0)
+}
+
+func (s *ClientState) writeText(st *StreamState, p *PaneViewState, msg protocol.WriteText, styleID uint32) bool {
+	if p == nil {
+		return false
+	}
+	start := st.Column
+	for _, r := range string(msg.Text) {
+		w := int(msg.CellWidth)
+		if st.Column+w > p.Grid.Cols {
+			return false
+		}
+		idx := st.Row*p.Grid.Cols + st.Column
+		p.Grid.Cells[idx] = protocol.Cell{Rune: r, StyleID: styleID, Width: msg.CellWidth}
+		for n := 1; n < w; n++ {
+			p.Grid.Cells[idx+n] = protocol.Cell{StyleID: styleID, Width: 0}
+		}
+		st.Column += w
+	}
+	s.markDamageRect(protocol.Rect{X: p.Rect.X + start, Y: p.Rect.Y + st.Row, Width: st.Column - start, Height: 1})
+	return true
+}
+func (s *ClientState) Fill(slot uint8, msg protocol.Fill) bool {
+	st, p := s.streamPane(slot)
+	if p == nil || st.Column+msg.Columns > p.Grid.Cols {
+		return false
+	}
+	start := st.Column
+	end := start + msg.Columns
+	for st.Column < end {
+		w := int(msg.Width)
+		if st.Column+w > end {
+			return false
+		}
+		idx := st.Row*p.Grid.Cols + st.Column
+		p.Grid.Cells[idx] = protocol.Cell{Rune: msg.Rune, StyleID: st.StyleID, Width: msg.Width}
+		for n := 1; n < w; n++ {
+			p.Grid.Cells[idx+n] = protocol.Cell{StyleID: st.StyleID, Width: 0}
+		}
+		st.Column += w
+	}
+	s.markDamageRect(protocol.Rect{X: p.Rect.X + start, Y: p.Rect.Y + st.Row, Width: msg.Columns, Height: 1})
+	return true
+}
+func (s *ClientState) UpdateCursor(slot uint8, msg protocol.CursorUpdate) bool {
+	p := s.slotPane(slot)
+	if p == nil || msg.Cursor.X < 0 || msg.Cursor.X >= p.Grid.Cols || msg.Cursor.Y < 0 || msg.Cursor.Y >= p.Grid.Rows {
+		return false
+	}
+	p.Cursor = msg.Cursor
+	p.CursorVisible = msg.Visible
+	return true
+}
+func (s *ClientState) ApplyScroll(slot uint8, delta int) bool {
+	p := s.slotPane(slot)
+	if p == nil || delta == 0 {
+		return p != nil
+	}
+	rows := p.Grid.Rows
+	if delta >= rows || delta <= -rows {
+		p.Grid = blankScreen(p.Grid.Cols, p.Grid.Rows)
+	} else if delta > 0 {
+		shift := delta * p.Grid.Cols
+		copy(p.Grid.Cells[shift:], p.Grid.Cells[:len(p.Grid.Cells)-shift])
+		fillBlank(p.Grid.Cells[:shift])
+	} else {
+		shift := -delta * p.Grid.Cols
+		copy(p.Grid.Cells, p.Grid.Cells[shift:])
+		fillBlank(p.Grid.Cells[len(p.Grid.Cells)-shift:])
+	}
+	s.markDamageRect(p.Rect)
+	return true
+}
+
+func (s *ClientState) slotPane(slot uint8) *PaneViewState {
+	id, ok := s.RenderSlots[slot]
+	if !ok {
+		return nil
+	}
+	return s.Panes[id]
+}
+func (s *ClientState) streamPane(slot uint8) (*StreamState, *PaneViewState) {
+	p := s.slotPane(slot)
+	if p == nil {
+		return nil, nil
+	}
+	st := s.Streams[slot]
+	if st == nil {
+		st = &StreamState{}
+		s.Streams[slot] = st
+	}
+	return st, p
+}
+func (s *ClientState) markDamageRect(r protocol.Rect) {
+	if r.Width > 0 && r.Height > 0 {
+		s.pendingDamageRects = append(s.pendingDamageRects, r)
+	}
+}
+func (s *ClientState) ensurePane(id uint64) *PaneViewState {
+	if p := s.Panes[id]; p != nil {
+		return p
+	}
+	p := &PaneViewState{PaneID: id, CursorVisible: true, Styles: defaultStyles()}
+	s.Panes[id] = p
+	return p
+}
+func (s *ClientState) orderedLayoutPanes() []protocol.PanePlacement {
+	out := append([]protocol.PanePlacement(nil), s.Layout.Panes...)
+	if status := s.Panes[statusSurfaceID]; status != nil && status.Rect.Width > 0 {
+		out = append(out, protocol.PanePlacement{PaneID: statusSurfaceID, Slot: protocol.StatusRenderSlot, Rect: status.Rect})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].PaneID == statusSurfaceID || out[j].PaneID == statusSurfaceID {
+			return out[i].PaneID == statusSurfaceID && out[j].PaneID != statusSurfaceID
+		}
+		if out[i].Rect.Y != out[j].Rect.Y {
+			return out[i].Rect.Y < out[j].Rect.Y
+		}
+		if out[i].Rect.X == out[j].Rect.X {
+			return out[i].PaneID < out[j].PaneID
+		}
+		return out[i].Rect.X < out[j].Rect.X
+	})
+	return out
+}
+func sameLayout(a LayoutDescription, b protocol.WindowLayout) bool {
+	if a.WindowID != b.WindowID || a.LayoutRevision != b.LayoutRevision || len(a.Panes) != len(b.Panes) {
+		return false
+	}
+	for i := range a.Panes {
+		if a.Panes[i] != b.Panes[i] {
+			return false
+		}
+	}
+	return true
+}
+func defaultStyles() map[uint32]protocol.Style {
+	return map[uint32]protocol.Style{protocol.CanonicalDefaultStyleID: protocol.CanonicalDefaultStyle()}
+}
+func blankScreen(cols, rows int) Screen {
+	cells := make([]protocol.Cell, max(0, cols*rows))
+	fillBlank(cells)
+	return Screen{Cols: cols, Rows: rows, Cells: cells}
+}
+func fillBlank(cells []protocol.Cell) {
+	for i := range cells {
+		cells[i] = protocol.Cell{Rune: ' ', Width: 1}
+	}
+}
+
+func RenderANSI(state *ClientState) []byte {
+	contentRows := state.TerminalRows
+	cursorX, cursorY, cursorVisible := physicalCursor(state)
+	fullRedraw := state.fullContentDirty || state.LastRendered.Cols != state.TerminalCols ||
+		state.LastRendered.Rows != contentRows
+	cursorChanged := !state.hasRenderedCursor || cursorX != state.lastCursorX ||
+		cursorY != state.lastCursorY || cursorVisible != state.lastCursorVisible
+
+	var buf bytes.Buffer
+	contentChanged := fullRedraw || len(state.pendingDamageRects) > 0
+	if contentChanged {
+		buf.WriteString("\x1b[?25l")
+	}
+	if fullRedraw {
+		buf.WriteString("\x1b[H\x1b[2J")
+		composed := composeContent(state)
+		renderFullContent(&buf, composed, state.TerminalCols, contentRows)
+	} else if contentChanged {
+		renderDamagedContent(&buf, state, state.pendingDamageRects, state.TerminalCols, contentRows)
+	}
+	if contentChanged {
+		buf.WriteString(sgrForStyle(defaultStyle()))
+		writeCursorPosition(&buf, cursorY+1, cursorX+1)
+		if cursorVisible {
+			buf.WriteString("\x1b[?25h")
+		} else {
+			buf.WriteString("\x1b[?25l")
+		}
+	} else if cursorChanged {
+		writeCursorPosition(&buf, cursorY+1, cursorX+1)
+		if cursorVisible {
+			buf.WriteString("\x1b[?25h")
+		} else {
+			buf.WriteString("\x1b[?25l")
+		}
+	}
+
+	state.LastRendered = Screen{Cols: state.TerminalCols, Rows: contentRows}
+	state.pendingDamageRects = state.pendingDamageRects[:0]
+	state.fullContentDirty = false
+	state.lastCursorX = cursorX
+	state.lastCursorY = cursorY
+	state.lastCursorVisible = cursorVisible
+	state.hasRenderedCursor = true
+	return buf.Bytes()
+}
+
+func renderFullContent(buf *bytes.Buffer, cells []composedCell, cols, rows int) {
+	for row := 0; row < rows; row++ {
+		writeCursorPosition(buf, row+1, 1)
+		renderCellRun(buf, cells[row*cols:(row+1)*cols])
+	}
+}
+
+type columnSpan struct {
+	start int
+	end   int
+}
+
+func renderDamagedContent(buf *bytes.Buffer, state *ClientState, rects []protocol.Rect, cols, rows int) {
+	spans := make(map[int][]columnSpan)
+	for _, rect := range rects {
+		startX := max(rect.X, 0)
+		endX := min(rect.X+rect.Width, cols)
+		startY := max(rect.Y, 0)
+		endY := min(rect.Y+rect.Height, rows)
+		if startX >= endX || startY >= endY {
+			continue
+		}
+		for row := startY; row < endY; row++ {
+			spans[row] = append(spans[row], columnSpan{start: startX, end: endX})
+		}
+	}
+	orderedRows := make([]int, 0, len(spans))
+	for row := range spans {
+		orderedRows = append(orderedRows, row)
+	}
+	sort.Ints(orderedRows)
+	placements := state.orderedLayoutPanes()
+	var scratch []composedCell
+	for _, row := range orderedRows {
+		rowSpans := spans[row]
+		sort.Slice(rowSpans, func(i, j int) bool { return rowSpans[i].start < rowSpans[j].start })
+		merged := rowSpans[:0]
+		for _, span := range rowSpans {
+			if len(merged) == 0 || span.start > merged[len(merged)-1].end {
+				merged = append(merged, span)
+				continue
+			}
+			merged[len(merged)-1].end = max(merged[len(merged)-1].end, span.end)
+		}
+		for _, span := range merged {
+			width := span.end - span.start
+			if cap(scratch) < width {
+				scratch = make([]composedCell, width)
+			} else {
+				scratch = scratch[:width]
+			}
+			composeRowSpan(scratch, state, placements, row, span.start)
+			writeCursorPosition(buf, row+1, span.start+1)
+			renderCellRun(buf, scratch)
+		}
+	}
+}
+
+func renderCellRun(buf *bytes.Buffer, cells []composedCell) {
+	var currentStyle protocol.Style
+	hasStyle := false
+	for _, cell := range cells {
+		if cell.Width == 0 {
+			continue
+		}
+		if !hasStyle || cell.Style != currentStyle {
+			buf.WriteString(sgrForStyle(cell.Style))
+			currentStyle = cell.Style
+			hasStyle = true
+		}
+		buf.WriteRune(cell.Rune)
+	}
+}
+
+func writeCursorPosition(buf *bytes.Buffer, row, col int) {
+	buf.WriteString("\x1b[")
+	buf.WriteString(strconv.Itoa(row))
+	buf.WriteByte(';')
+	buf.WriteString(strconv.Itoa(col))
+	buf.WriteByte('H')
+}
+
+type composedCell struct {
+	Rune  rune
+	Width uint8
+	Style protocol.Style
+}
+
+func composeContent(state *ClientState) []composedCell {
+	contentRows := state.TerminalRows
+	if state.TerminalCols <= 0 || contentRows <= 0 {
+		return nil
+	}
+	cellCount := state.TerminalCols * contentRows
+	if cap(state.composedCells) < cellCount {
+		state.composedCells = make([]composedCell, cellCount)
+	} else {
+		state.composedCells = state.composedCells[:cellCount]
+	}
+	cells := state.composedCells
+	placements := state.orderedLayoutPanes()
+	for row := 0; row < contentRows; row++ {
+		composeRowSpan(cells[row*state.TerminalCols:(row+1)*state.TerminalCols], state, placements, row, 0)
+	}
+	return cells
+}
+
+func composeRowSpan(dst []composedCell, state *ClientState, placements []protocol.PanePlacement, row, startColumn int) {
+	defaultCell := composedCell{Rune: ' ', Width: 1, Style: defaultStyle()}
+	for i := range dst {
+		column := startColumn + i
+		cell := defaultCell
+		insidePane := false
+		for _, placement := range placements {
+			if column < placement.Rect.X || column >= placement.Rect.X+placement.Rect.Width ||
+				row < placement.Rect.Y || row >= placement.Rect.Y+placement.Rect.Height {
+				continue
+			}
+			insidePane = true
+			pane := state.Panes[placement.PaneID]
+			if pane == nil {
+				break
+			}
+			localColumn := column - placement.Rect.X
+			localRow := row - placement.Rect.Y
+			if localColumn < pane.Grid.Cols && localRow < pane.Grid.Rows {
+				src := pane.Grid.Cells[localRow*pane.Grid.Cols+localColumn]
+				style := defaultCell.Style
+				if found, ok := pane.Styles[src.StyleID]; ok {
+					style = found
+				}
+				r := src.Rune
+				if r == 0 {
+					r = ' '
+				}
+				cell = composedCell{Rune: r, Width: src.Width, Style: style}
+			}
+			break
+		}
+		if !insidePane {
+			if border := paneBorderRune(placements, column, row); border != 0 {
+				cell = composedCell{Rune: border, Width: 1, Style: defaultCell.Style}
+			}
+		}
+		dst[i] = cell
+	}
+}
+
+func paneBorderRune(placements []protocol.PanePlacement, column, row int) rune {
+	var left, right, above, below bool
+	for _, placement := range placements {
+		rect := placement.Rect
+		if row >= rect.Y && row < rect.Y+rect.Height {
+			left = left || rect.X+rect.Width == column
+			right = right || rect.X == column+1
+		}
+		if column >= rect.X && column < rect.X+rect.Width {
+			above = above || rect.Y+rect.Height == row
+			below = below || rect.Y == row+1
+		}
+	}
+	vertical := left && right
+	horizontal := above && below
+	switch {
+	case vertical && horizontal:
+		return '┼'
+	case vertical:
+		return '│'
+	case horizontal:
+		return '─'
+	default:
+		return 0
+	}
+}
+
+func physicalCursor(state *ClientState) (int, int, bool) {
+	pane := state.Panes[state.FocusedPaneID]
+	if pane == nil {
+		return 0, 0, false
+	}
+	x := pane.Rect.X + pane.Cursor.X
+	y := pane.Rect.Y + pane.Cursor.Y
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+	return x, y, pane.CursorVisible
+}
+
+func defaultStyle() protocol.Style {
+	return protocol.Style{
+		FG: protocol.Color{Mode: "default"},
+		BG: protocol.Color{Mode: "default"},
+	}
+}
+
+func sgrForStyle(style protocol.Style) string {
+	codes := []string{"0"}
+	if style.Bold {
+		codes = append(codes, "1")
+	}
+	if style.Dim {
+		codes = append(codes, "2")
+	}
+	if style.Blink {
+		codes = append(codes, "5")
+	}
+	if style.Italic {
+		codes = append(codes, "3")
+	}
+	if style.Underline {
+		codes = append(codes, "4")
+	}
+	if style.Reverse {
+		codes = append(codes, "7")
+	}
+	if style.Invisible {
+		codes = append(codes, "8")
+	}
+	codes = append(codes, colorCodes(style.FG, true)...)
+	codes = append(codes, colorCodes(style.BG, false)...)
+	return "\x1b[" + strings.Join(codes, ";") + "m"
+}
+
+func colorCodes(c protocol.Color, fg bool) []string {
+	switch c.Mode {
+	case "indexed":
+		if c.Index < 8 {
+			if fg {
+				return []string{strconv.Itoa(30 + int(c.Index))}
+			}
+			return []string{strconv.Itoa(40 + int(c.Index))}
+		}
+		if c.Index < 16 {
+			if fg {
+				return []string{strconv.Itoa(90 + int(c.Index-8))}
+			}
+			return []string{strconv.Itoa(100 + int(c.Index-8))}
+		}
+		prefix := "48"
+		if fg {
+			prefix = "38"
+		}
+		return []string{prefix, "5", strconv.Itoa(int(c.Index))}
+	case "rgb":
+		prefix := "48"
+		if fg {
+			prefix = "38"
+		}
+		return []string{prefix, "2", strconv.Itoa(int(c.R)), strconv.Itoa(int(c.G)), strconv.Itoa(int(c.B))}
+	default:
+		if fg {
+			return []string{"39"}
+		}
+		return []string{"49"}
+	}
 }

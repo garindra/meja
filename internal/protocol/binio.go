@@ -203,48 +203,6 @@ func decodeArgv(r *PayloadReader) ([]string, error) {
 	return out, nil
 }
 
-func encodeCell(w *PayloadWriter, cell Cell) error {
-	if !validRune(cell.Rune) {
-		return ErrInvalidRune
-	}
-	if !validCellWidth(cell.Width) {
-		return ErrInvalidCellWidth
-	}
-	w.Uvarint(uint64(cell.Rune))
-	w.Uvarint(uint64(cell.StyleID))
-	w.Byte(cell.Width)
-	return nil
-}
-
-func decodeCell(r *PayloadReader) (Cell, error) {
-	rawRune, err := r.Uvarint()
-	if err != nil {
-		return Cell{}, err
-	}
-	if rawRune > math.MaxInt32 {
-		return Cell{}, ErrInvalidRune
-	}
-	rawStyle, err := r.Uvarint()
-	if err != nil {
-		return Cell{}, err
-	}
-	if rawStyle > math.MaxUint32 {
-		return Cell{}, fmt.Errorf("style id %d exceeds uint32", rawStyle)
-	}
-	width, err := r.Byte()
-	if err != nil {
-		return Cell{}, err
-	}
-	cell := Cell{Rune: rune(rawRune), StyleID: uint32(rawStyle), Width: width}
-	if !validRune(cell.Rune) {
-		return Cell{}, ErrInvalidRune
-	}
-	if !validCellWidth(cell.Width) {
-		return Cell{}, ErrInvalidCellWidth
-	}
-	return cell, nil
-}
-
 func validRune(r rune) bool {
 	return r >= 0 && r <= utf8.MaxRune && !(r >= 0xD800 && r <= 0xDFFF)
 }
