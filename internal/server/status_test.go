@@ -13,12 +13,12 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	client.TerminalCols, client.TerminalRows = 80, 23
 	window, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, 0)
 	frames := make(chan protocol.Frame, 32)
-	state := &sessionState{session: s}
-	handler := &connectionHandler{
-		state:      state,
-		mgmtFrames: frames,
+	state := s
+	handler := &Connection{
+		Session:       state,
+		managementOut: frames,
 	}
-	state.attachConnection(frames, nil)
+	state.attachConnection(testConnection(frames, nil))
 
 	s.ConsumeInputByte(0, 0x02)
 	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, ',')); err != nil {
@@ -114,10 +114,10 @@ func TestRenameSessionPromptUpdatesStatusName(t *testing.T) {
 	client.TerminalCols, client.TerminalRows = 80, 23
 	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, clientID0)
 	frames := make(chan protocol.Frame, 32)
-	state := &sessionState{sessionID: 7, session: s}
-	d := &daemon{sessions: map[uint64]*sessionState{7: state}}
-	handler := &connectionHandler{state: state, daemon: d, mgmtFrames: frames}
-	state.attachConnection(frames, nil)
+	state := s
+	d := &Daemon{sessions: map[uint64]*Session{7: state}}
+	handler := &Connection{Session: state, Daemon: d, managementOut: frames}
+	state.attachConnection(testConnection(frames, nil))
 
 	s.ConsumeInputByte(clientID0, 0x02)
 	if err := runStatusEvent(t, handler, s.ConsumeInputByte(clientID0, '$')); err != nil {
@@ -145,9 +145,9 @@ func TestRenameSessionPromptUpdatesStatusName(t *testing.T) {
 	}
 }
 
-func runStatusEvent(t *testing.T, handler *connectionHandler, event serverInputEvent) error {
+func runStatusEvent(t *testing.T, handler *Connection, event serverInputEvent) error {
 	t.Helper()
-	_, err := handler.handleServerInputEvent(event)
+	_, err := handler.Session.handleServerInputEvent(handler, event)
 	return err
 }
 

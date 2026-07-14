@@ -8,7 +8,7 @@ import (
 )
 
 func TestSessionCoordinatorSerializesOperations(t *testing.T) {
-	state := &sessionState{operations: make(chan sessionOperation)}
+	state := &Session{operations: make(chan sessionOperation)}
 	go state.runOperations()
 
 	firstStarted := make(chan struct{})
@@ -54,14 +54,14 @@ func TestSessionCoordinatorSerializesOperations(t *testing.T) {
 func TestStaleControllerCannotRunSessionOperation(t *testing.T) {
 	current := make(chan protocol.Frame)
 	stale := make(chan protocol.Frame)
-	state := &sessionState{
-		mgmtFrames: current,
+	state := &Session{
 		operations: make(chan sessionOperation),
 	}
+	state.connection = &Connection{managementOut: current}
 	go state.runOperations()
-	connectionHandler := &connectionHandler{state: state, mgmtFrames: stale}
+	Connection := &Connection{Session: state, managementOut: stale}
 	run := false
-	if err := connectionHandler.coordinate(func() error {
+	if err := state.coordinateConnection(Connection, func() error {
 		run = true
 		return nil
 	}); err != nil {

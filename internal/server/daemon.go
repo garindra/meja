@@ -29,15 +29,63 @@ import (
 
 const attachTTL = 2 * time.Minute
 
-type daemon struct {
-	mu       sync.Mutex
+type Config struct {
+	ControlPath      string
+	Stdout           io.Writer
+	Stderr           io.Writer
+	TerminalDebugLog io.Writer
+}
+
+// Daemon owns the server-wide session registry and name reservations. All
+// registry access is serialized by requests; control handlers query it and
+// then query Sessions separately, so neither actor waits on the other.
+type Daemon struct {
 	logMu    sync.Mutex
+	requests chan daemonRequest
 	nextID   uint64
-	sessions map[uint64]*sessionState
+	sessions map[uint64]*Session
+	names    map[string]*Session
 	certHash string
 	port     uint16
 	stop     context.CancelFunc
 	stderr   io.Writer
+}
+
+type daemonRequest struct {
+	run  func()
+	done chan struct{}
+}
+
+func (d *Daemon) runRequests(ctx context.Context) {
+	for {
+		select {
+		case request := <-d.requests:
+			request.run()
+			if request.done != nil {
+				close(request.done)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (d *Daemon) call(run func()) {
+	if d.requests == nil {
+		run()
+		return
+	}
+	done := make(chan struct{})
+	d.requests <- daemonRequest{run: run, done: done}
+	<-done
+}
+
+func (d *Daemon) post(run func()) {
+	if d.requests == nil {
+		run()
+		return
+	}
+	d.requests <- daemonRequest{run: run}
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -67,8 +115,13 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer listener.Close()
-	d := &daemon{nextID: 1, sessions: make(map[uint64]*sessionState), certHash: hash, port: port, stop: stop, stderr: cfg.Stderr}
-	defer d.disconnectActiveClients()
+	d := &Daemon{requests: make(chan daemonRequest, 64), nextID: 1, sessions: make(map[uint64]*Session), names: make(map[string]*Session), certHash: hash, port: port, stop: stop, stderr: cfg.Stderr}
+	actorCtx, stopActor := context.WithCancel(context.Background())
+	go d.runRequests(actorCtx)
+	defer func() {
+		d.disconnectActiveClients()
+		stopActor()
+	}()
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -99,7 +152,7 @@ func Run(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("accept QUIC connection: %w", acceptErr)
 		}
 		go func() {
-			if err := handleSession(serverCtx, d, conn); err != nil {
+			if err := serveConnection(serverCtx, d, conn); err != nil {
 				d.logf("tali session: %v\n", err)
 			}
 		}()
@@ -113,11 +166,11 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
-func (d *daemon) logSessionAttached(sessionID uint64) {
+func (d *Daemon) logSessionAttached(sessionID uint64) {
 	d.logf("tali server: session %d attached\n", sessionID)
 }
 
-func (d *daemon) logf(format string, args ...any) {
+func (d *Daemon) logf(format string, args ...any) {
 	if d.stderr == nil {
 		return
 	}
@@ -165,204 +218,232 @@ func daemonCertificate() (tls.Certificate, string, error) {
 	return cert, hex.EncodeToString(hash[:]), nil
 }
 
-func (d *daemon) handleControl(operation string, target control.SessionTarget) (control.Bootstrap, []control.SessionInfo, int, error) {
-	d.mu.Lock()
+func (d *Daemon) handleControl(operation string, target control.SessionTarget) (control.Bootstrap, []control.SessionInfo, int, error) {
 	if operation == "stop-server" {
-		if d.stop == nil {
-			d.mu.Unlock()
+		var stop context.CancelFunc
+		d.call(func() { stop = d.stop })
+		if stop == nil {
 			return control.Bootstrap{}, nil, 0, errors.New("server stop unavailable")
 		}
 		pid := os.Getpid()
-		d.mu.Unlock()
 		d.disconnectActiveClients()
-		d.stop()
+		stop()
 		return control.Bootstrap{}, nil, pid, nil
 	}
-	defer d.mu.Unlock()
 	if operation == "list-sessions" {
-		sessions := make([]control.SessionInfo, 0, len(d.sessions))
-		for sessionID, state := range d.sessions {
-			name := ""
-			if state != nil && state.session != nil {
-				name = state.session.SessionName()
+		type listedSession struct {
+			id    uint64
+			state *Session
+		}
+		var states []listedSession
+		d.call(func() {
+			states = make([]listedSession, 0, len(d.sessions))
+			for id, state := range d.sessions {
+				states = append(states, listedSession{id: id, state: state})
 			}
-			sessions = append(sessions, control.SessionInfo{ID: sessionID, Name: name, Attached: state != nil && state.isAttached()})
+		})
+
+		sessions := make([]control.SessionInfo, 0, len(states))
+		for _, listed := range states {
+			if listed.state != nil {
+				name, attached := listed.state.info()
+				sessions = append(sessions, control.SessionInfo{ID: listed.id, Name: name, Attached: attached})
+			}
 		}
 		sort.Slice(sessions, func(i, j int) bool { return sessions[i].ID < sessions[j].ID })
 		return control.Bootstrap{}, sessions, 0, nil
 	}
-	var s *sessionState
-	switch operation {
-	case "create-session":
-		if target.Name != "" {
-			if err := control.ValidateSessionName(target.Name); err != nil {
-				return control.Bootstrap{}, nil, 0, err
+	var s *Session
+	var operationErr error
+	d.call(func() {
+		switch operation {
+		case "create-session":
+			if target.Name != "" {
+				if err := control.ValidateSessionName(target.Name); err != nil {
+					operationErr = err
+					return
+				}
+				if d.sessionByName(target.Name) != nil {
+					operationErr = fmt.Errorf("session %q already exists", target.Name)
+					return
+				}
 			}
-			if d.sessionByNameLocked(target.Name) != nil {
-				return control.Bootstrap{}, nil, 0, fmt.Errorf("session %q already exists", target.Name)
+			if d.nextID == 0 {
+				operationErr = errors.New("session ID exhausted")
+				return
 			}
+			s = newSession(d.nextID, target.Name)
+			s.daemon = d
+			d.sessions[d.nextID] = s
+			d.reserveSessionName(s, target.Name)
+			d.nextID++
+		case "connect-session":
+			if target.Name != "" {
+				s = d.sessionByName(target.Name)
+			} else {
+				s = d.sessions[target.ID]
+			}
+			if s == nil {
+				operationErr = control.ErrSessionUnavailable
+			}
+		default:
+			operationErr = errors.New("unsupported control operation")
 		}
-		if d.nextID == 0 {
-			return control.Bootstrap{}, nil, 0, errors.New("session ID exhausted")
-		}
-		s = newSessionState(d.nextID, target.Name)
-		d.sessions[d.nextID] = s
-		d.nextID++
-	case "connect-session":
-		if target.Name != "" {
-			s = d.sessionByNameLocked(target.Name)
-		} else {
-			s = d.sessions[target.ID]
-		}
-		if s == nil {
-			return control.Bootstrap{}, nil, 0, control.ErrSessionUnavailable
-		}
-	default:
-		return control.Bootstrap{}, nil, 0, errors.New("unsupported control operation")
+	})
+	if operationErr != nil {
+		return control.Bootstrap{}, nil, 0, operationErr
 	}
-	token, err := control.NewToken()
+
+	encodedToken, expires, err := s.issueAttachToken()
 	if err != nil {
 		return control.Bootstrap{}, nil, 0, err
 	}
-	s.attachMu.Lock()
-	s.attachToken = token
-	s.attachExpires = time.Now().Add(attachTTL)
-	s.attachConsumed = false
-	s.attachMu.Unlock()
-	return control.Bootstrap{Version: control.ProtocolVersion, SessionID: s.sessionID, Port: d.port, AttachToken: control.EncodeToken(token), ExpiresAt: time.Now().Add(attachTTL), CertSPKISHA256: d.certHash}, nil, 0, nil
+	return control.Bootstrap{Version: control.ProtocolVersion, SessionID: s.ID, Port: d.port, AttachToken: encodedToken, ExpiresAt: expires, CertSPKISHA256: d.certHash}, nil, 0, nil
 }
 
 // disconnectActiveClients uses the same clean QUIC close path as an explicit
 // client detach (Ctrl-B, d). The client restores its terminal and does not
 // receive a protocol error or a synthetic input event.
-func (d *daemon) disconnectActiveClients() {
-	d.mu.Lock()
-	sessions := make([]*sessionState, 0, len(d.sessions))
-	for _, session := range d.sessions {
-		sessions = append(sessions, session)
-	}
-	d.mu.Unlock()
-	for _, session := range sessions {
-		session.attachMu.Lock()
-		conn := session.activeConn
-		session.activeConn = nil
-		session.attachMu.Unlock()
-		if conn != nil {
-			_ = conn.CloseWithError(0, "")
+func (d *Daemon) disconnectActiveClients() {
+	var sessions []*Session
+	d.call(func() {
+		sessions = make([]*Session, 0, len(d.sessions))
+		for _, session := range d.sessions {
+			sessions = append(sessions, session)
 		}
+	})
+	for _, session := range sessions {
+		_ = session.shutdown()
 	}
 }
 
-func newSessionState(id uint64, name string) *sessionState {
-	state := &sessionState{
-		sessionID:      id,
-		session:        NewSession(id),
-		resumeTokens:   map[string]uint64{},
-		operations:     make(chan sessionOperation),
-		operationsDone: make(chan struct{}),
-	}
-	state.session.setSessionName(name)
-	go state.runOperations()
-	return state
+func newSession(id uint64, name string) *Session {
+	session := NewSession(id)
+	session.setSessionName(name)
+	return session
 }
 
-func (d *daemon) sessionByNameLocked(name string) *sessionState {
+// sessionByName runs only on the daemon actor.
+func (d *Daemon) sessionByName(name string) *Session {
+	if state := d.names[name]; state != nil {
+		return state
+	}
 	for _, state := range d.sessions {
-		if state != nil && state.session != nil && state.session.SessionName() == name {
+		if state != nil && state.SessionName() == name {
 			return state
 		}
 	}
 	return nil
 }
 
-func (d *daemon) renameSession(state *sessionState, name string) error {
+func (d *Daemon) renameSession(state *Session, name string) error {
+	var renameErr error
+	d.call(func() {
+		renameErr = d.validateSessionRename(state, name)
+		if renameErr == nil {
+			d.reserveSessionName(state, name)
+		}
+	})
+	if renameErr == nil {
+		state.setSessionName(name)
+	}
+	return renameErr
+}
+
+func (d *Daemon) validateSessionRename(state *Session, name string) error {
 	if err := control.ValidateSessionName(name); err != nil {
 		return err
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.sessions[state.sessionID] != state {
+	if d.sessions[state.ID] != state {
 		return control.ErrSessionUnavailable
 	}
-	if existing := d.sessionByNameLocked(name); existing != nil && existing != state {
+	if existing := d.sessionByName(name); existing != nil && existing != state {
 		return fmt.Errorf("session %q already exists", name)
 	}
-	state.session.setSessionName(name)
 	return nil
 }
 
-func (d *daemon) destroySession(state *sessionState) {
-	d.mu.Lock()
-	if d.sessions[state.sessionID] != state {
-		d.mu.Unlock()
+// requestSessionRename is deliberately one-way. The Session actor never waits
+// on the Daemon actor; the Daemon posts the accepted/rejected result back.
+func (d *Daemon) requestSessionRename(state *Session, name string) {
+	if d.requests == nil {
+		err := d.validateSessionRename(state, name)
+		if err == nil {
+			d.reserveSessionName(state, name)
+		}
+		_ = state.finishSessionRename(name, err == nil)
 		return
 	}
-	delete(d.sessions, state.sessionID)
-	d.mu.Unlock()
-	state.attachMu.Lock()
-	conn := state.activeConn
-	state.activeConn = nil
-	state.attachMu.Unlock()
-	if conn != nil {
-		_ = conn.CloseWithError(0, "")
+	d.post(func() {
+		err := d.validateSessionRename(state, name)
+		if err == nil {
+			d.reserveSessionName(state, name)
+		}
+		state.post(func() error { return state.finishSessionRename(name, err == nil) })
+	})
+}
+
+func (d *Daemon) reserveSessionName(state *Session, name string) {
+	if d.names == nil {
+		d.names = make(map[string]*Session)
 	}
-	state.stopOperations()
+	for existingName, existing := range d.names {
+		if existing == state {
+			delete(d.names, existingName)
+		}
+	}
+	if name != "" {
+		d.names[name] = state
+	}
 }
 
-func (d *daemon) session(id uint64) *sessionState {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.sessions[id]
+// sessionExited is a one-way death notification. The Session has already
+// released its Connection; the Daemon only removes matching registry refs.
+func (d *Daemon) sessionExited(state *Session) {
+	remove := func() {
+		if d.sessions[state.ID] != state {
+			return
+		}
+		delete(d.sessions, state.ID)
+		d.reserveSessionName(state, "")
+	}
+	if d.requests == nil {
+		remove()
+		return
+	}
+	d.post(remove)
 }
 
-func (d *daemon) attach(id uint64, encoded string) (*sessionState, error) {
+func (d *Daemon) session(id uint64) *Session {
+	var session *Session
+	d.call(func() { session = d.sessions[id] })
+	return session
+}
+
+func (d *Daemon) attach(id uint64, encoded string) (*Session, error) {
 	s := d.session(id)
 	if s == nil {
 		return nil, control.ErrSessionUnavailable
 	}
-	s.attachMu.Lock()
-	defer s.attachMu.Unlock()
-	if s.attachConsumed || time.Now().After(s.attachExpires) || !control.EqualToken(encoded, s.attachToken) {
-		return nil, errors.New("session attachment rejected")
+	if err := s.consumeAttachToken(encoded); err != nil {
+		return nil, err
 	}
-	s.attachConsumed = true
 	return s, nil
 }
 
-func (d *daemon) resume(id uint64, encoded string, generation uint64) (*sessionState, string, uint64, error) {
+func (d *Daemon) resume(id uint64, encoded string, generation uint64) (*Session, string, uint64, error) {
 	s := d.session(id)
 	if s == nil {
 		return nil, "", 0, control.ErrSessionUnavailable
 	}
-	s.attachMu.Lock()
-	defer s.attachMu.Unlock()
-	if current, ok := s.resumeTokens[encoded]; !ok || current != generation || generation != s.generation {
-		return nil, "", 0, errors.New("session resume rejected")
-	}
-	token, err := control.NewToken()
-	if err != nil {
-		return nil, "", 0, err
-	}
-	s.generation++
-	encodedToken := control.EncodeToken(token)
-	s.resumeTokens = map[string]uint64{encodedToken: s.generation}
-	return s, encodedToken, s.generation, nil
+	encodedToken, nextGeneration, err := s.resumeAttachment(encoded, generation)
+	return s, encodedToken, nextGeneration, err
 }
 
-func (d *daemon) activate(s *sessionState, conn quic.Connection) {
-	s.attachMu.Lock()
-	old := s.activeConn
-	s.activeConn = conn
-	s.attachMu.Unlock()
-	if old != nil && old != conn {
-		_ = old.CloseWithError(0x54414c49, "session resumed")
-	}
+func (d *Daemon) activate(s *Session, connection *Connection) {
+	s.attachConnection(connection)
 }
 
-func (d *daemon) deactivate(s *sessionState, conn quic.Connection) {
-	s.attachMu.Lock()
-	if s.activeConn == conn {
-		s.activeConn = nil
-	}
-	s.attachMu.Unlock()
+func (d *Daemon) deactivate(s *Session, connection *Connection) {
+	s.detachConnection(connection)
 }

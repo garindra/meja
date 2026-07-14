@@ -157,8 +157,6 @@ func trimHistoryBlanks(cells []protocol.Cell) []protocol.Cell {
 }
 
 func (s *Session) InstallHistoryView(clientID, paneID uint64, snapshot *HistorySnapshot) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil || client.FocusedPaneID != paneID {
 		return fmt.Errorf("pane %d is not focused", paneID)
@@ -179,8 +177,6 @@ func (s *Session) InstallHistoryView(clientID, paneID uint64, snapshot *HistoryS
 }
 
 func (s *Session) HistoryView(clientID, paneID uint64) *HistoryView {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil || client.HistoryViews[paneID] == nil {
 		return nil
@@ -190,23 +186,17 @@ func (s *Session) HistoryView(clientID, paneID uint64) *HistoryView {
 }
 
 func (s *Session) IsHistoryPane(clientID, paneID uint64) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	return client != nil && client.HistoryViews[paneID] != nil
 }
 
 func (s *Session) ClearHistoryViews() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, client := range s.Clients {
 		client.HistoryViews = map[uint64]*HistoryView{}
 	}
 }
 
 func (s *Session) moveHistory(clientID, paneID uint64, direction int) (historyMove, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil || client.FocusedPaneID != paneID {
 		return historyMove{}, false
@@ -247,8 +237,6 @@ func (s *Session) moveHistory(clientID, paneID uint64, direction int) (historyMo
 }
 
 func (s *Session) jumpHistory(clientID, paneID uint64, oldest bool) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil || client.FocusedPaneID != paneID {
 		return false
@@ -270,8 +258,6 @@ func (s *Session) jumpHistory(clientID, paneID uint64, oldest bool) bool {
 }
 
 func (s *Session) exitHistoryAndRebuild(clientID, paneID uint64) ([]RenderBinding, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil || client.HistoryViews[paneID] == nil {
 		return nil, false

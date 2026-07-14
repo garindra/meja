@@ -15,6 +15,89 @@ import (
 
 var ptyReadBuffers = sync.Pool{New: func() any { return make([]byte, 32*1024) }}
 
+const (
+	renderIdleFlush   = time.Millisecond
+	renderMaxBatchAge = 10 * time.Millisecond
+)
+
+func (p *Pane) attachOutput(lease *OutputLease, refresh func(*renderOutput) error) error {
+	return p.attachOutputMode(lease, true, refresh)
+}
+
+func (p *Pane) attachOutputMode(lease *OutputLease, live bool, refresh func(*renderOutput) error) error {
+	if p.commands == nil {
+		if refresh == nil {
+			return nil
+		}
+		return refresh(newRenderOutput(lease.Stream))
+	}
+	select {
+	case p.commands <- paneCommand{attach: lease, live: live, refresh: refresh}:
+		return nil
+	case <-p.mainDone:
+		return nil
+	case <-p.done:
+		return nil
+	}
+}
+
+func (p *Pane) detachOutput(stream io.Writer) error {
+	if p.commands == nil {
+		return nil
+	}
+	return p.sendRenderCommand(paneCommand{detach: stream})
+}
+
+func (p *Pane) releaseOutput(done chan<- *OutputLease) {
+	if p.commands == nil {
+		done <- p.outputLease
+		p.outputLease = nil
+		return
+	}
+	release := &paneOutputRelease{done: done, acked: make(chan struct{})}
+	select {
+	case p.commands <- paneCommand{release: release}:
+		go func() {
+			select {
+			case <-p.mainDone:
+				release.acknowledge()
+			case <-release.acked:
+			}
+		}()
+	case <-p.mainDone:
+		release.acknowledge()
+	case <-p.done:
+		release.acknowledge()
+	}
+}
+
+func (p *Pane) applyRender(render func(*renderOutput) error) error {
+	if p.commands == nil {
+		return nil
+	}
+	return p.sendRenderCommand(paneCommand{apply: render})
+}
+
+func (p *Pane) sendRenderCommand(command paneCommand) error {
+	done := make(chan error, 1)
+	command.done = done
+	select {
+	case p.commands <- command:
+	case <-p.mainDone:
+		return nil
+	case <-p.done:
+		return nil
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-p.mainDone:
+		return nil
+	case <-p.done:
+		return nil
+	}
+}
+
 func relayPTYOutput(pane *Pane) {
 	defer close(pane.ptyOutput)
 	for {
@@ -51,9 +134,10 @@ func runPTYWriter(pane *Pane, failed func(error)) {
 	}
 }
 
-func (s *sessionState) runPane(pane *Pane) {
+func (pane *Pane) run() {
 	defer close(pane.mainDone)
 	var output *renderOutput
+	liveOutput := false
 	var aggregate terminal.Update
 	var idle, maxAge *time.Timer
 	var idleC, maxC <-chan time.Time
@@ -76,10 +160,10 @@ func (s *sessionState) runPane(pane *Pane) {
 		current := aggregate
 		aggregate = terminal.Update{}
 		pending = false
-		if output != nil {
-			if err := s.emitTerminalUpdate(output, pane, current); err != nil {
+		if output != nil && liveOutput {
+			if err := emitTerminalUpdate(output, pane, current); err != nil {
 				output = nil
-				pane.outputStream = nil
+				pane.outputLease = nil
 			}
 		}
 	}
@@ -92,26 +176,31 @@ func (s *sessionState) runPane(pane *Pane) {
 			aggregate = terminal.Update{}
 			pending = false
 			if command.release != nil {
-				pane.outputStream = nil
+				lease := pane.outputLease
+				pane.outputLease = nil
 				output = nil
-				command.release.acknowledge()
+				liveOutput = false
+				command.release.returnLease(lease)
 				continue
 			}
 			if command.detach != nil {
-				if pane.outputStream == command.detach {
-					pane.outputStream = nil
+				if pane.outputLease != nil && pane.outputLease.Stream == command.detach {
+					pane.outputLease = nil
 					output = nil
+					liveOutput = false
 				}
 				command.done <- nil
 				continue
 			}
 			if command.attach != nil {
-				pane.outputStream = command.attach
-				output = newRenderOutput(command.attach)
+				pane.outputLease = command.attach
+				output = newRenderOutput(command.attach.Stream)
+				liveOutput = command.live
 				if command.refresh != nil {
 					if err := command.refresh(output); err != nil {
-						pane.outputStream = nil
+						pane.outputLease = nil
 						output = nil
+						liveOutput = false
 					}
 				}
 				continue
@@ -119,8 +208,9 @@ func (s *sessionState) runPane(pane *Pane) {
 			if command.apply != nil && output != nil {
 				err := command.apply(output)
 				if err != nil {
-					pane.outputStream = nil
+					pane.outputLease = nil
 					output = nil
+					liveOutput = false
 				}
 				command.done <- err
 			} else if command.resize != nil {
@@ -170,8 +260,8 @@ func (s *sessionState) runPane(pane *Pane) {
 	}
 }
 
-func (s *sessionState) emitHistoryMove(pane *Pane, move historyMove) error {
-	view := s.session.HistoryView(clientID0, pane.ID)
+func (s *Session) emitHistoryMove(pane *Pane, move historyMove) error {
+	view := s.HistoryView(clientID0, pane.ID)
 	if view == nil {
 		return nil
 	}
@@ -241,12 +331,9 @@ func styleDefinitionsMap(defs []protocol.StyleDefinition) map[uint32]protocol.St
 	return styles
 }
 
-func (s *sessionState) emitTerminalUpdate(output *renderOutput, pane *Pane, update terminal.Update) error {
-	if s.session.IsHistoryPane(clientID0, pane.ID) || s.windowForPane(pane.ID) == nil {
-		return nil
-	}
+func emitTerminalUpdate(output *renderOutput, pane *Pane, update terminal.Update) error {
 	if update.FullRedraw {
-		return s.sendFullRender(output, pane)
+		return sendFullRender(output, pane)
 	}
 	rows := make([]int, 0, len(update.DirtySpans))
 	for row := range update.DirtySpans {
@@ -316,7 +403,7 @@ func (s *sessionState) emitTerminalUpdate(output *renderOutput, pane *Pane, upda
 	return output.present()
 }
 
-func (s *sessionState) sendFullRender(output *renderOutput, pane *Pane) error {
+func sendFullRender(output *renderOutput, pane *Pane) error {
 	styleDefs := pane.terminal.SnapshotStyles()
 	styleByID := make(map[uint32]protocol.Style, len(styleDefs))
 	for _, def := range styleDefs {
@@ -338,14 +425,14 @@ func (s *sessionState) sendFullRender(output *renderOutput, pane *Pane) error {
 	return output.present()
 }
 
-func (s *sessionState) sendCurrentViewSnapshot(output *renderOutput, pane *Pane) error {
-	if view := s.session.HistoryView(clientID0, pane.ID); view != nil {
-		return s.sendHistorySnapshot(output, pane, view)
+func sendCurrentViewSnapshot(output *renderOutput, pane *Pane, view *HistoryView) error {
+	if view != nil {
+		return sendHistorySnapshot(output, pane, view)
 	}
-	return s.sendFullRender(output, pane)
+	return sendFullRender(output, pane)
 }
 
-func (s *sessionState) sendHistorySnapshot(output *renderOutput, pane *Pane, view *HistoryView) error {
+func sendHistorySnapshot(output *renderOutput, pane *Pane, view *HistoryView) error {
 	snapshot := view.Snapshot
 	for _, def := range snapshot.Styles {
 		if err := installStyle(output, def.ID, def.Style); err != nil {
@@ -366,9 +453,9 @@ func (s *sessionState) sendHistorySnapshot(output *renderOutput, pane *Pane, vie
 	return output.present()
 }
 
-func (s *sessionState) sendHistorySnapshotSerialized(pane *Pane, view *HistoryView) error {
+func (s *Session) sendHistorySnapshotSerialized(pane *Pane, view *HistoryView) error {
 	return pane.applyRender(func(output *renderOutput) error {
-		return s.sendHistorySnapshot(output, pane, view)
+		return sendHistorySnapshot(output, pane, view)
 	})
 }
 
@@ -383,18 +470,6 @@ func installStyle(output *renderOutput, id uint32, style protocol.Style) error {
 		return err
 	}
 	output.installedStyles[id] = style
-	return nil
-}
-
-func (s *sessionState) windowForPane(paneID uint64) *Window {
-	s.session.mu.RLock()
-	defer s.session.mu.RUnlock()
-	for _, window := range s.session.Windows {
-		if windowHasPane(window, paneID) {
-			cp := *window
-			return &cp
-		}
-	}
 	return nil
 }
 

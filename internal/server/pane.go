@@ -16,6 +16,8 @@ import (
 	"tali/internal/server/terminal"
 )
 
+// Pane owns a child process, PTY, terminal emulator, and its four enduring
+// goroutines: PTY reader, PTY writer, process waiter, and terminal actor.
 type Pane struct {
 	ID      uint64
 	PTY     *os.File
@@ -33,13 +35,22 @@ type Pane struct {
 	done       chan struct{}
 	stopping   atomic.Bool
 
-	// Owned exclusively by the pane main goroutine. Production attaches
-	// the actual QUIC stream; tests can provide the narrower write capability.
-	outputStream io.Writer
+	// Held exclusively by the pane main goroutine. A lease contains the actual
+	// QUIC stream and is physically returned before another pane receives it.
+	outputLease *OutputLease
+}
+
+type paneRequest struct {
+	Cwd     string
+	Command []string
+	Cols    uint16
+	Rows    uint16
+	Shell   string
 }
 
 type paneCommand struct {
-	attach  io.Writer
+	attach  *OutputLease
+	live    bool
 	detach  io.Writer
 	release *paneOutputRelease
 	refresh func(*renderOutput) error
@@ -61,15 +72,21 @@ type paneTerminalMetadata struct {
 }
 
 type paneOutputRelease struct {
-	slot  int
-	done  chan<- int
+	done  chan<- *OutputLease
 	acked chan struct{}
 	once  sync.Once
 }
 
 func (r *paneOutputRelease) acknowledge() {
 	r.once.Do(func() {
-		r.done <- r.slot
+		r.done <- nil
+		close(r.acked)
+	})
+}
+
+func (r *paneOutputRelease) returnLease(lease *OutputLease) {
+	r.once.Do(func() {
+		r.done <- lease
 		close(r.acked)
 	})
 }

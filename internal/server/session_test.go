@@ -313,8 +313,8 @@ func TestCreateWindowSizePrefersClientDimensionsOverSplitPane(t *testing.T) {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
 
-	handler := &connectionHandler{state: &sessionState{session: s}}
-	cols, rows, err := handler.createWindowSize()
+	handler := &Connection{Session: s}
+	cols, rows, err := handler.Session.createWindowSize()
 	if err != nil {
 		t.Fatalf("createWindowSize() error = %v", err)
 	}

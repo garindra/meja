@@ -59,9 +59,9 @@ func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	handler := &connectionHandler{state: &sessionState{session: s}}
+	handler := &Connection{Session: s}
 	done := make(chan error, 1)
-	handler.handleInput(protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
+	handler.Session.readInputFrames(handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -190,11 +190,11 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	state := &sessionState{session: s}
-	handler := &connectionHandler{state: state, mgmtFrames: make(chan protocol.Frame, 8)}
-	state.attachConnection(handler.mgmtFrames, nil)
+	state := s
+	handler := &Connection{Session: state, managementOut: make(chan protocol.Frame, 8)}
+	state.attachConnection(handler)
 	done := make(chan error, 1)
-	handler.handleInput(protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
+	state.readInputFrames(handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -234,11 +234,11 @@ func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
 	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	state := &sessionState{session: s}
-	handler := &connectionHandler{state: state, mgmtFrames: make(chan protocol.Frame, 1)}
-	state.attachConnection(handler.mgmtFrames, nil)
+	state := s
+	handler := &Connection{Session: state, managementOut: make(chan protocol.Frame, 1)}
+	state.attachConnection(handler)
 	done := make(chan error, 1)
-	handler.handleInput(protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
+	state.readInputFrames(handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}

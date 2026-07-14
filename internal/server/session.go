@@ -2,40 +2,25 @@ package server
 
 import (
 	"fmt"
-	"io"
 	"sort"
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
-
+	"tali/internal/control"
 	"tali/internal/protocol"
 )
 
-type sessionState struct {
-	session        *Session
-	sessionID      uint64
-	attachMu       sync.Mutex
-	attachToken    []byte
-	attachExpires  time.Time
-	attachConsumed bool
-	resumeTokens   map[string]uint64
-	generation     uint64
-	activeConn     quic.Connection
-	mgmtFrames     chan protocol.Frame
-	outputStreams  map[int]io.Writer
-	operations     chan sessionOperation
-	operationsDone chan struct{}
-	stopOnce       sync.Once
-	ended          bool
-}
+const (
+	sessionID0 = 0
+	clientID0  = 0
+)
 
 type sessionOperation struct {
 	run  func() error
 	done chan error
 }
 
-func (s *sessionState) coordinate(run func() error) error {
+func (s *Session) coordinate(run func() error) error {
 	if s.operations == nil {
 		return run()
 	}
@@ -53,55 +38,191 @@ func (s *sessionState) coordinate(run func() error) error {
 	}
 }
 
-func (s *sessionState) runOperations() {
+func (s *Session) coordinateConnection(connection *Connection, run func() error) error {
+	return s.coordinate(func() error {
+		if s.connection != connection {
+			return nil
+		}
+		return run()
+	})
+}
+
+func (s *Session) runOperations() {
 	for {
 		select {
 		case operation := <-s.operations:
-			operation.done <- operation.run()
+			err := operation.run()
+			if operation.done != nil {
+				operation.done <- err
+			}
+			if s.stopping {
+				s.stopOperations()
+				return
+			}
 		case <-s.operationsDone:
 			return
 		}
 	}
 }
 
-func (s *sessionState) stopOperations() {
+func (s *Session) post(run func() error) {
+	if s.operations == nil {
+		_ = run()
+		return
+	}
+	select {
+	case s.operations <- sessionOperation{run: run}:
+	case <-s.operationsDone:
+	}
+}
+
+func (s *Session) stopOperations() {
 	s.stopOnce.Do(func() { close(s.operationsDone) })
 }
 
-func (s *sessionState) attachConnection(mgmtFrames chan protocol.Frame, outputStreams map[int]io.Writer) {
-	s.attachMu.Lock()
-	s.mgmtFrames = mgmtFrames
-	s.outputStreams = outputStreams
-	s.attachMu.Unlock()
-}
-
-func (s *sessionState) detachConnection(mgmtFrames chan protocol.Frame) {
-	s.attachMu.Lock()
-	if s.mgmtFrames == mgmtFrames {
-		s.mgmtFrames = nil
-		s.outputStreams = nil
+// shutdownNow runs only on the session actor. The Session releases its own
+// live resources, tells the Daemon to forget it, and lets runOperations exit
+// after replying to the operation that caused the shutdown.
+func (s *Session) shutdownNow() {
+	if s.stopping {
+		return
 	}
-	s.attachMu.Unlock()
+	s.stopping = true
+	s.ended = true
+	s.attachToken = nil
+	s.resumeTokens = nil
+	connection := s.connection
+	s.connection = nil
+	if connection != nil && connection.QUIC != nil {
+		_ = connection.QUIC.CloseWithError(0, "")
+	}
+	if s.daemon != nil {
+		s.daemon.sessionExited(s)
+	}
 }
 
-func (s *sessionState) currentManagementFrames() chan protocol.Frame {
-	s.attachMu.Lock()
-	defer s.attachMu.Unlock()
-	return s.mgmtFrames
+func (s *Session) shutdown() error {
+	return s.coordinate(func() error {
+		s.shutdownNow()
+		return nil
+	})
 }
 
-func (s *sessionState) currentOutputStream(slot int) io.Writer {
-	s.attachMu.Lock()
-	defer s.attachMu.Unlock()
-	return s.outputStreams[slot]
+func (s *Session) attachConnection(connection *Connection) {
+	_ = s.coordinate(func() error {
+		previous := s.connection
+		s.connection = connection
+		if previous != nil && previous != connection && previous.QUIC != nil {
+			_ = previous.QUIC.CloseWithError(0x54414c49, "session resumed")
+		}
+		return nil
+	})
 }
 
-func (s *sessionState) isAttached() bool {
-	s.attachMu.Lock()
-	defer s.attachMu.Unlock()
-	return s.activeConn != nil
+func (s *Session) detachConnection(connection *Connection) {
+	_ = s.coordinate(func() error {
+		if s.connection == connection {
+			s.connection = nil
+		}
+		return nil
+	})
 }
 
+func (s *Session) currentManagementFrames() chan protocol.Frame {
+	if s.connection == nil {
+		return nil
+	}
+	return s.connection.managementOut
+}
+
+func (s *Session) currentOutputLease(slot int) *OutputLease {
+	if s.connection == nil || slot < 0 || slot >= len(s.connection.Output) {
+		return nil
+	}
+	return s.connection.Output[slot]
+}
+
+func (s *Session) isAttached() bool {
+	attached := false
+	_ = s.coordinate(func() error {
+		attached = s.connection != nil
+		return nil
+	})
+	return attached
+}
+
+func (s *Session) info() (name string, attached bool) {
+	_ = s.coordinate(func() error {
+		name = s.Name
+		attached = s.connection != nil
+		return nil
+	})
+	return name, attached
+}
+
+func (s *Session) issueAttachToken() (string, time.Time, error) {
+	token, err := control.NewToken()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	expires := time.Now().Add(attachTTL)
+	err = s.coordinate(func() error {
+		s.attachToken = token
+		s.attachExpires = expires
+		s.attachConsumed = false
+		return nil
+	})
+	return control.EncodeToken(token), expires, err
+}
+
+func (s *Session) consumeAttachToken(encoded string) error {
+	return s.coordinate(func() error {
+		if s.attachConsumed || time.Now().After(s.attachExpires) || !control.EqualToken(encoded, s.attachToken) {
+			return fmt.Errorf("session attachment rejected")
+		}
+		s.attachConsumed = true
+		return nil
+	})
+}
+
+func (s *Session) beginAttachment() (string, uint64, error) {
+	token, err := control.NewToken()
+	if err != nil {
+		return "", 0, err
+	}
+	encoded := control.EncodeToken(token)
+	var generation uint64
+	err = s.coordinate(func() error {
+		s.generation++
+		generation = s.generation
+		s.resumeTokens = map[string]uint64{encoded: generation}
+		return nil
+	})
+	return encoded, generation, err
+}
+
+func (s *Session) resumeAttachment(encoded string, generation uint64) (string, uint64, error) {
+	token, err := control.NewToken()
+	if err != nil {
+		return "", 0, err
+	}
+	nextToken := control.EncodeToken(token)
+	var nextGeneration uint64
+	err = s.coordinate(func() error {
+		if current, ok := s.resumeTokens[encoded]; !ok || current != generation || generation != s.generation {
+			return fmt.Errorf("session resume rejected")
+		}
+		s.generation++
+		nextGeneration = s.generation
+		s.resumeTokens = map[string]uint64{nextToken: nextGeneration}
+		return nil
+	})
+	return nextToken, nextGeneration, err
+}
+
+// Session is the authority for one persistent terminal workspace. Its actor
+// owns attachment credentials, the live Connection, clients, windows, and
+// pane membership. Panes remain alive across Connection replacement.
 type Session struct {
 	ID      uint64
 	Name    string
@@ -114,7 +235,18 @@ type Session struct {
 	NextPaneID         uint64
 	NextLayoutRevision uint64
 
-	mu sync.RWMutex
+	attachToken    []byte
+	attachExpires  time.Time
+	attachConsumed bool
+	resumeTokens   map[string]uint64
+	generation     uint64
+	daemon         *Daemon
+	connection     *Connection
+	operations     chan sessionOperation
+	operationsDone chan struct{}
+	stopOnce       sync.Once
+	stopping       bool
+	ended          bool
 }
 
 type Window struct {
@@ -174,13 +306,18 @@ type ClientState struct {
 }
 
 func NewSession(id uint64) *Session {
-	return &Session{
-		ID:           id,
-		Windows:      map[uint64]*Window{},
-		Panes:        map[uint64]*Pane{},
-		Clients:      map[uint64]*ClientState{},
-		NextWindowID: 1,
+	session := &Session{
+		ID:             id,
+		Windows:        map[uint64]*Window{},
+		Panes:          map[uint64]*Pane{},
+		Clients:        map[uint64]*ClientState{},
+		NextWindowID:   1,
+		resumeTokens:   map[string]uint64{},
+		operations:     make(chan sessionOperation, 64),
+		operationsDone: make(chan struct{}),
 	}
+	go session.runOperations()
+	return session
 }
 
 func (s *Session) nextLayoutRevisionLocked() uint64 {
@@ -189,16 +326,12 @@ func (s *Session) nextLayoutRevisionLocked() uint64 {
 }
 
 func (s *Session) NewClient(id uint64) *ClientState {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := &ClientState{ID: id, SessionID: s.ID, HistoryViews: map[uint64]*HistoryView{}}
 	s.Clients[id] = client
 	return client
 }
 
 func (s *Session) EnsureClient(id uint64) *ClientState {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.ensureClientLocked(id)
 	return cloneClientState(client)
 }
@@ -218,8 +351,6 @@ func (s *Session) ensureClientLocked(id uint64) *ClientState {
 }
 
 func (s *Session) BeginPrompt(clientID uint64, kind PromptKind, label, initial string) (*PromptState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, fmt.Errorf("unknown client %d", clientID)
@@ -241,8 +372,6 @@ func (s *Session) BeginPrompt(clientID uint64, kind PromptKind, label, initial s
 }
 
 func (s *Session) BeginRenameWindowPrompt(clientID uint64) (*PromptState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, fmt.Errorf("unknown client %d", clientID)
@@ -264,8 +393,6 @@ func (s *Session) BeginRenameWindowPrompt(clientID uint64) (*PromptState, error)
 }
 
 func (s *Session) BeginRenameSessionPrompt(clientID uint64) (*PromptState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, fmt.Errorf("unknown client %d", clientID)
@@ -281,21 +408,28 @@ func (s *Session) BeginRenameSessionPrompt(clientID uint64) (*PromptState, error
 	return clonePromptState(client.Prompt), nil
 }
 
+func (s *Session) finishSessionRename(name string, accepted bool) error {
+	client := s.Clients[clientID0]
+	if accepted {
+		s.Name = name
+		if client != nil && client.Prompt != nil && client.Prompt.Kind == PromptKindRenameSession {
+			client.Prompt = nil
+		}
+	} else if client != nil && client.Prompt != nil && client.Prompt.Kind == PromptKindRenameSession {
+		client.Prompt.Action = PromptActionNone
+	}
+	return s.publishStatusBar()
+}
+
 func (s *Session) SessionName() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	return s.Name
 }
 
 func (s *Session) setSessionName(name string) {
-	s.mu.Lock()
 	s.Name = name
-	s.mu.Unlock()
 }
 
 func (s *Session) ActivePrompt(clientID uint64) *PromptState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil
@@ -319,8 +453,6 @@ func (s *Session) ensureClientFocusLocked(client *ClientState) {
 }
 
 func (s *Session) SetClientSize(clientID uint64, cols, rows uint16) *ClientState {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.ensureClientLocked(clientID)
 	if client.TerminalCols != cols || client.TerminalRows != rows {
 		for _, window := range s.Windows {
@@ -333,8 +465,6 @@ func (s *Session) SetClientSize(clientID uint64, cols, rows uint16) *ClientState
 }
 
 func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *ClientState) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.NextWindowID == 0 {
 		s.NextWindowID = 1
 	}
@@ -363,14 +493,10 @@ func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *Client
 }
 
 func (s *Session) HasWindows() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	return len(s.Windows) > 0
 }
 
 func (s *Session) PanesSnapshot() []*Pane {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	panes := make([]*Pane, 0, len(s.Panes))
 	for _, pane := range s.Panes {
 		panes = append(panes, pane)
@@ -379,14 +505,10 @@ func (s *Session) PanesSnapshot() []*Pane {
 }
 
 func (s *Session) Pane(id uint64) *Pane {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	return s.Panes[id]
 }
 
 func (s *Session) ReattachClient(clientID uint64) (*Window, *Pane, *ClientState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.ensureClientLocked(clientID)
 	if len(s.Windows) == 0 {
 		return nil, nil, nil, fmt.Errorf("session has no windows")
@@ -402,16 +524,12 @@ func (s *Session) ReattachClient(clientID uint64) (*Window, *Pane, *ClientState,
 }
 
 func (s *Session) AddPaneID() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	id := s.NextPaneID
 	s.NextPaneID++
 	return id
 }
 
 func (s *Session) ActivePane(clientID uint64) (*Pane, *ClientState) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, nil
@@ -420,8 +538,6 @@ func (s *Session) ActivePane(clientID uint64) (*Pane, *ClientState) {
 }
 
 func (s *Session) ActiveWindow(clientID uint64) (*Window, *ClientState) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, nil
@@ -431,8 +547,6 @@ func (s *Session) ActiveWindow(clientID uint64) (*Window, *ClientState) {
 }
 
 func (s *Session) ResolveInputTarget(clientID, requestedPaneID uint64) (*Pane, *ClientState, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, nil, false
@@ -445,8 +559,6 @@ func (s *Session) ResolveInputTarget(clientID, requestedPaneID uint64) (*Pane, *
 }
 
 func (s *Session) SelectWindow(clientID, windowID uint64) (*Window, *ClientState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, nil, fmt.Errorf("unknown client %d", clientID)
@@ -471,8 +583,6 @@ func (s *Session) selectWindowLocked(client *ClientState, window *Window) {
 }
 
 func (s *Session) RenameWindow(windowID uint64, name string) (*Window, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	window := s.Windows[windowID]
 	if window == nil {
 		return nil, fmt.Errorf("unknown window %d", windowID)
@@ -483,8 +593,6 @@ func (s *Session) RenameWindow(windowID uint64, name string) (*Window, error) {
 }
 
 func (s *Session) FocusPane(clientID, paneID uint64) (*Window, *ClientState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, nil, fmt.Errorf("unknown client %d", clientID)
@@ -501,8 +609,6 @@ func (s *Session) FocusPane(clientID, paneID uint64) (*Window, *ClientState, err
 }
 
 func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitDirection) (*Window, *ClientState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, nil, fmt.Errorf("unknown client %d", clientID)
@@ -533,8 +639,6 @@ func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitD
 }
 
 func (s *Session) CanSplitFocusedPane(clientID uint64) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return fmt.Errorf("unknown client %d", clientID)
@@ -553,8 +657,6 @@ func (s *Session) CanSplitFocusedPane(clientID uint64) error {
 }
 
 func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *Window, client *ClientState, windowClosed bool, closedWindowID uint64, autoCreate bool, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	c := s.Clients[clientID]
 	if c == nil {
 		return nil, nil, nil, false, 0, false, fmt.Errorf("unknown client %d", clientID)
@@ -599,8 +701,6 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 // RemovePane applies process exit to authoritative session state. It is a no-op
 // when an explicit close already removed the pane before Process.Wait returned.
 func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *ClientState, finalPane, removed bool, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	c := s.Clients[clientID]
 	if c == nil {
 		return nil, nil, false, false, fmt.Errorf("unknown client %d", clientID)
@@ -649,8 +749,6 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 }
 
 func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedPanes []*Pane, replacement *Window, pane *Pane, client *ClientState, autoCreated bool, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	c := s.Clients[clientID]
 	if c == nil {
 		return 0, nil, nil, nil, nil, false, fmt.Errorf("unknown client %d", clientID)
@@ -696,8 +794,6 @@ type WindowStatus struct {
 }
 
 func (s *Session) WindowStatuses(clientID uint64) []WindowStatus {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	active := uint64(0)
 	if client != nil {
@@ -717,8 +813,6 @@ func (s *Session) WindowStatuses(clientID uint64) []WindowStatus {
 }
 
 func (s *Session) WindowLayout(clientID uint64) (protocol.WindowLayout, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return protocol.WindowLayout{}, fmt.Errorf("unknown client %d", clientID)
@@ -758,8 +852,6 @@ func (s *Session) WindowLayout(clientID uint64) (protocol.WindowLayout, error) {
 }
 
 func (s *Session) VisiblePlacements(clientID uint64) ([]PanePlacement, *Window, *ClientState, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, nil, nil, fmt.Errorf("unknown client %d", clientID)
@@ -773,8 +865,6 @@ func (s *Session) VisiblePlacements(clientID uint64) ([]PanePlacement, *Window, 
 }
 
 func (s *Session) BindingForPane(clientID, paneID uint64) (RenderBinding, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return RenderBinding{}, false
@@ -788,8 +878,6 @@ func (s *Session) BindingForPane(clientID, paneID uint64) (RenderBinding, bool) 
 }
 
 func (s *Session) RenderBindings(clientID uint64) ([]RenderBinding, *ClientState) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, nil
@@ -799,8 +887,6 @@ func (s *Session) RenderBindings(clientID uint64) ([]RenderBinding, *ClientState
 }
 
 func (s *Session) RebuildRenderBindings(clientID uint64) ([]RenderBinding, *Window, *ClientState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, nil, nil, fmt.Errorf("unknown client %d", clientID)
@@ -835,8 +921,6 @@ func (s *Session) rebuildBindingsLocked(client *ClientState, window *Window) {
 }
 
 func (s *Session) UpdatePaneTitle(paneID uint64, title string) *Window {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, window := range s.Windows {
 		if windowHasPane(window, paneID) {
 			window.Name = title
@@ -847,20 +931,15 @@ func (s *Session) UpdatePaneTitle(paneID uint64, title string) *Window {
 }
 
 func (s *Session) IsFocusedPane(clientID, paneID uint64) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	return client != nil && client.FocusedPaneID == paneID
 }
 
 func (s *Session) SnapshotClient(clientID uint64) *ClientState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	return cloneClientState(s.Clients[clientID])
 }
 
 func (s *Session) ResizeAll(cols, rows uint16) {
-	s.mu.Lock()
 	type resizeTarget struct {
 		pane *Pane
 		rect Rect
@@ -881,7 +960,6 @@ func (s *Session) ResizeAll(cols, rows uint16) {
 			targets = append(targets, resizeTarget{pane: pane, rect: placement.Rect})
 		}
 	}
-	s.mu.Unlock()
 	for _, target := range targets {
 		_ = target.pane.resize(uint16(target.rect.Width), uint16(target.rect.Height))
 	}

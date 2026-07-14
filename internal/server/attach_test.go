@@ -9,7 +9,7 @@ import (
 )
 
 func TestDaemonAllocatesMonotonicSessionIDsAndSingleUseAttach(t *testing.T) {
-	d := &daemon{nextID: 1, sessions: map[uint64]*sessionState{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	d := &Daemon{nextID: 1, sessions: map[uint64]*Session{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	b1, _, _, err := d.handleControl("create-session", control.SessionTarget{})
 	if err != nil {
 		t.Fatal(err)
@@ -31,7 +31,7 @@ func TestDaemonAllocatesMonotonicSessionIDsAndSingleUseAttach(t *testing.T) {
 
 func TestSessionAttachedLogIsEmittedForEveryAttach(t *testing.T) {
 	var log bytes.Buffer
-	d := &daemon{stderr: &log}
+	d := &Daemon{stderr: &log}
 	d.logSessionAttached(7)
 	d.logSessionAttached(7)
 	if got, want := log.String(), "tali server: session 7 attached\ntali server: session 7 attached\n"; got != want {
@@ -40,7 +40,7 @@ func TestSessionAttachedLogIsEmittedForEveryAttach(t *testing.T) {
 }
 
 func TestDaemonConnectSessionDoesNotCreateMissingSession(t *testing.T) {
-	d := &daemon{nextID: 1, sessions: map[uint64]*sessionState{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	d := &Daemon{nextID: 1, sessions: map[uint64]*Session{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	if _, _, _, err := d.handleControl("connect-session", control.SessionTarget{ID: 99}); err == nil {
 		t.Fatal("connect-session created missing session")
 	}
@@ -57,22 +57,25 @@ func TestDaemonConnectSessionDoesNotCreateMissingSession(t *testing.T) {
 }
 
 func TestDaemonRejectsExpiredAttachToken(t *testing.T) {
-	d := &daemon{nextID: 1, sessions: map[uint64]*sessionState{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	d := &Daemon{nextID: 1, sessions: map[uint64]*Session{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	b, _, _, err := d.handleControl("create-session", control.SessionTarget{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := d.sessions[b.SessionID]
-	s.attachMu.Lock()
-	s.attachExpires = time.Now().Add(-time.Second)
-	s.attachMu.Unlock()
+	if err := s.coordinate(func() error {
+		s.attachExpires = time.Now().Add(-time.Second)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := d.attach(b.SessionID, b.AttachToken); err == nil {
 		t.Fatal("expired attach token accepted")
 	}
 }
 
 func TestDaemonListsSessionIDsInOrder(t *testing.T) {
-	d := &daemon{sessions: map[uint64]*sessionState{9: {}, 2: {}, 4: {}}}
+	d := &Daemon{sessions: map[uint64]*Session{9: {}, 2: {}, 4: {}}}
 	_, ids, _, err := d.handleControl("list-sessions", control.SessionTarget{})
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +89,7 @@ func TestDaemonListsSessionIDsInOrder(t *testing.T) {
 }
 
 func TestDaemonCreatesListsAndConnectsNamedSession(t *testing.T) {
-	d := &daemon{nextID: 1, sessions: map[uint64]*sessionState{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	d := &Daemon{nextID: 1, sessions: map[uint64]*Session{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	created, _, _, err := d.handleControl("create-session", control.SessionTarget{Name: "work"})
 	if err != nil {
 		t.Fatal(err)
@@ -105,14 +108,14 @@ func TestDaemonCreatesListsAndConnectsNamedSession(t *testing.T) {
 }
 
 func TestDaemonRenamesSessionUniquely(t *testing.T) {
-	d := &daemon{nextID: 1, sessions: map[uint64]*sessionState{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	d := &Daemon{nextID: 1, sessions: map[uint64]*Session{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	first, _, _, _ := d.handleControl("create-session", control.SessionTarget{Name: "one"})
 	_, _, _, _ = d.handleControl("create-session", control.SessionTarget{Name: "two"})
 	state := d.sessions[first.SessionID]
 	if err := d.renameSession(state, "renamed"); err != nil {
 		t.Fatal(err)
 	}
-	if got := state.session.SessionName(); got != "renamed" {
+	if got := state.SessionName(); got != "renamed" {
 		t.Fatalf("session name = %q", got)
 	}
 	if err := d.renameSession(state, "two"); err == nil {

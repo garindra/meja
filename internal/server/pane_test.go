@@ -21,8 +21,7 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 
 	pane := &Pane{ID: 1, PTY: writer, terminal: terminal.New(8, 3)}
 	pane.initializeRuntime()
-	state := &sessionState{session: NewSession(0)}
-	go state.runPane(pane)
+	go pane.run()
 	writeFailed := make(chan error, 1)
 	go runPTYWriter(pane, func(err error) { writeFailed <- err })
 
@@ -90,8 +89,7 @@ func TestDefaultShellUsesEnvironmentWithSafeFallback(t *testing.T) {
 func TestPaneResizeRunsOnPaneMainLoop(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
 	pane.initializeRuntime()
-	state := &sessionState{session: NewSession(0)}
-	go state.runPane(pane)
+	go pane.run()
 	defer func() {
 		close(pane.ptyOutput)
 		<-pane.mainDone

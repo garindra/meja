@@ -48,8 +48,6 @@ type serverInputEvent struct {
 }
 
 func (s *Session) ConsumeInputByte(clientID uint64, b byte) serverInputEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return serverInputEvent{}
@@ -140,7 +138,9 @@ func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
 		prompt.pendingUTF8 = nil
 		event.PromptAction = PromptActionSubmit
 		event.PromptText = string(prompt.Text)
-		client.Prompt = nil
+		if prompt.Kind != PromptKindRenameSession {
+			client.Prompt = nil
+		}
 	case 0x03, 0x1b:
 		prompt.Action = PromptActionCancel
 		prompt.PendingEscape = nil
@@ -218,8 +218,6 @@ func promptEventLocked(prompt *PromptState, action PromptAction, text string) se
 // is resolved as cancel only once its next byte proves it is not CSI Delete.
 // Any submit/cancel terminates ownership of the current input payload.
 func (s *Session) ConsumePromptInput(clientID uint64, data []byte) (int, []serverInputEvent, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil || client.Prompt == nil {
 		return 0, nil, false
@@ -234,6 +232,7 @@ func (s *Session) ConsumePromptInput(clientID uint64, data []byte) (int, []serve
 			events = append(events, event)
 			if event.PromptAction == PromptActionSubmit || event.PromptAction == PromptActionCancel {
 				terminated = true
+				break
 			}
 		}
 	}
@@ -241,8 +240,6 @@ func (s *Session) ConsumePromptInput(clientID uint64, data []byte) (int, []serve
 }
 
 func (s *Session) InputIsNormal(clientID uint64) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	return client != nil && client.Prompt == nil && client.InputState == serverInputNormal
 }
@@ -255,8 +252,6 @@ func translateApplicationCursor(data []byte, enabled bool) ([]byte, int, bool) {
 }
 
 func (s *Session) RelativeWindowID(clientID uint64, delta int) (uint64, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil || len(s.Windows) == 0 {
 		return 0, false
@@ -271,8 +266,6 @@ func (s *Session) RelativeWindowID(clientID uint64, delta int) (uint64, bool) {
 }
 
 func (s *Session) LastWindowID(clientID uint64) (uint64, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	client := s.Clients[clientID]
 	if client == nil || !client.HasLastWindow || s.Windows[client.LastWindowID] == nil {
 		return 0, false
@@ -281,8 +274,6 @@ func (s *Session) LastWindowID(clientID uint64) (uint64, bool) {
 }
 
 func (s *Session) WindowIDByIndex(index int) (uint64, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if index < 0 {
 		return 0, false
 	}
@@ -343,8 +334,6 @@ func deletePromptRune(prompt *PromptState) {
 }
 
 func (s *Session) FocusPaneDirection(clientID uint64, direction byte) (*Window, *ClientState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	client := s.Clients[clientID]
 	if client == nil {
 		return nil, nil, fmt.Errorf("unknown client %d", clientID)
