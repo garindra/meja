@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"testing"
 
+	"tali/internal/client"
 	"tali/internal/control"
 )
 
@@ -18,6 +19,28 @@ func TestCommandAfterTarget(t *testing.T) {
 	}
 	if !reflect.DeepEqual(command, []string{"/bin/sh", "-l"}) {
 		t.Fatalf("command = %#v", command)
+	}
+}
+
+func TestDefaultLocalCwdUsesInvokerDirectoryUnlessExplicit(t *testing.T) {
+	want, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := client.Config{}
+	if err := setDefaultLocalCwd(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cwd != want {
+		t.Fatalf("default local cwd = %q, want %q", cfg.Cwd, want)
+	}
+
+	cfg.Cwd = "~/explicit"
+	if err := setDefaultLocalCwd(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cwd != "~/explicit" {
+		t.Fatalf("explicit cwd was replaced with %q", cfg.Cwd)
 	}
 }
 

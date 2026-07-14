@@ -54,7 +54,11 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 		return usageError{err.Error()}
 	}
 	if len(args) == 0 {
-		return client.Run(ctx, client.Config{Local: true, SocketSelector: selector, Stdin: stdin, Stdout: stdout, Stderr: stderr})
+		cfg := client.Config{Local: true, SocketSelector: selector, Stdin: stdin, Stdout: stdout, Stderr: stderr}
+		if err := setDefaultLocalCwd(&cfg); err != nil {
+			return err
+		}
+		return client.Run(ctx, cfg)
 	}
 	switch args[0] {
 	case "new":
@@ -145,6 +149,9 @@ func runNew(ctx context.Context, selector control.SocketSelector, args []string,
 	cfg.Cwd = cwd
 	if len(remaining) == 0 {
 		cfg.Local = true
+		if err := setDefaultLocalCwd(&cfg); err != nil {
+			return err
+		}
 		return client.Run(ctx, cfg)
 	}
 	target, err := client.ParseTarget(remaining[0])
@@ -158,6 +165,18 @@ func runNew(ctx context.Context, selector control.SocketSelector, args []string,
 	cfg.Target = target
 	cfg.Argv = command
 	return client.Run(ctx, cfg)
+}
+
+func setDefaultLocalCwd(cfg *client.Config) error {
+	if cfg.Cwd != "" {
+		return nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("resolve current working directory: %w", err)
+	}
+	cfg.Cwd = cwd
+	return nil
 }
 
 func runAttach(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {

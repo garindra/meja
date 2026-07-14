@@ -133,6 +133,8 @@ tali new -c '~/projects/app' prod
 
 The command following `--` applies only to the initial pane. Later panes start
 the target user's shell in the session's starting directory.
+When `-c` is omitted, a local session inherits the invoking process's current
+directory; a remote session starts in the remote user's home directory.
 
 ## SSH bootstrap
 
@@ -208,6 +210,11 @@ Persist those values through the system's sysctl configuration if desired.
 The server owns terminal emulation, pane state, layout, and rendering. A QUIC
 disconnect detaches the client without immediately killing the session; an
 explicit detach or remote session exit ends the attached client flow.
+
+Each connection has nine server-to-client unidirectional display streams. The
+first server stream is permanently bound to the one-row status surface; the
+remaining eight are movable pane render slots. Stream roles come from their
+QUIC stream ordinals, and every surface uses the same display-command codec.
 
 Press `Ctrl+B`, then `$` to rename the current session using the status-bar
 prompt. Press `Ctrl+B`, then `,` to rename the current window.
