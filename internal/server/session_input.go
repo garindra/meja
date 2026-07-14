@@ -2,7 +2,6 @@ package server
 
 import (
 	"fmt"
-	"sort"
 	"unicode/utf8"
 )
 
@@ -353,55 +352,101 @@ func (s *Session) FocusPaneDirection(clientID uint64, direction byte) (*Window, 
 	if current == nil {
 		return cloneWindow(window), cloneClientState(client), nil
 	}
-	cx, cy := current.Rect.X*2+current.Rect.Width, current.Rect.Y*2+current.Rect.Height
-	type candidate struct {
-		paneID uint64
-		score  int
+	if !client.HasFocusPoint {
+		client.FocusX2 = rectCenterX2(current.Rect)
+		client.FocusY2 = rectCenterY2(current.Rect)
+		client.HasFocusPoint = true
+	} else {
+		client.FocusX2 = clampToRectAxis(client.FocusX2, current.Rect.X, current.Rect.Width)
+		client.FocusY2 = clampToRectAxis(client.FocusY2, current.Rect.Y, current.Rect.Height)
 	}
-	var candidates []candidate
+	type candidate struct {
+		placement    PanePlacement
+		primaryGap   int
+		secondaryGap int
+	}
+	var best *candidate
 	for _, placement := range placements {
 		if placement.PaneID == current.PaneID {
 			continue
 		}
-		x, y := placement.Rect.X*2+placement.Rect.Width, placement.Rect.Y*2+placement.Rect.Height
-		dx, dy := x-cx, y-cy
-		primary, secondary := 0, 0
+		candidate := candidate{placement: placement}
+		candidateRight := placement.Rect.X + placement.Rect.Width
+		candidateBottom := placement.Rect.Y + placement.Rect.Height
+		currentRight := current.Rect.X + current.Rect.Width
+		currentBottom := current.Rect.Y + current.Rect.Height
 		switch direction {
 		case 'A':
-			if dy >= 0 {
+			if candidateBottom > current.Rect.Y {
 				continue
 			}
-			primary, secondary = -dy, serverAbs(dx)
+			candidate.primaryGap = current.Rect.Y - candidateBottom
+			candidate.secondaryGap = distanceToRectAxis(client.FocusX2, placement.Rect.X, placement.Rect.Width)
 		case 'B':
-			if dy <= 0 {
+			if placement.Rect.Y < currentBottom {
 				continue
 			}
-			primary, secondary = dy, serverAbs(dx)
+			candidate.primaryGap = placement.Rect.Y - currentBottom
+			candidate.secondaryGap = distanceToRectAxis(client.FocusX2, placement.Rect.X, placement.Rect.Width)
 		case 'C':
-			if dx <= 0 {
+			if placement.Rect.X < currentRight {
 				continue
 			}
-			primary, secondary = dx, serverAbs(dy)
+			candidate.primaryGap = placement.Rect.X - currentRight
+			candidate.secondaryGap = distanceToRectAxis(client.FocusY2, placement.Rect.Y, placement.Rect.Height)
 		case 'D':
-			if dx >= 0 {
+			if candidateRight > current.Rect.X {
 				continue
 			}
-			primary, secondary = -dx, serverAbs(dy)
+			candidate.primaryGap = current.Rect.X - candidateRight
+			candidate.secondaryGap = distanceToRectAxis(client.FocusY2, placement.Rect.Y, placement.Rect.Height)
 		default:
 			continue
 		}
-		candidates = append(candidates, candidate{placement.PaneID, primary*10000 + secondary})
+		if best == nil || candidate.secondaryGap < best.secondaryGap ||
+			(candidate.secondaryGap == best.secondaryGap && candidate.primaryGap < best.primaryGap) ||
+			(candidate.secondaryGap == best.secondaryGap && candidate.primaryGap == best.primaryGap && candidate.placement.PaneID < best.placement.PaneID) {
+			copy := candidate
+			best = &copy
+		}
 	}
-	if len(candidates) > 0 {
-		sort.Slice(candidates, func(i, j int) bool { return candidates[i].score < candidates[j].score })
-		client.FocusedPaneID = candidates[0].paneID
+	if best != nil {
+		client.FocusedPaneID = best.placement.PaneID
+		if direction == 'A' || direction == 'B' {
+			client.FocusX2 = clampToRectAxis(client.FocusX2, best.placement.Rect.X, best.placement.Rect.Width)
+			client.FocusY2 = rectCenterY2(best.placement.Rect)
+		} else {
+			client.FocusX2 = rectCenterX2(best.placement.Rect)
+			client.FocusY2 = clampToRectAxis(client.FocusY2, best.placement.Rect.Y, best.placement.Rect.Height)
+		}
 	}
 	return cloneWindow(window), cloneClientState(client), nil
 }
 
-func serverAbs(value int) int {
-	if value < 0 {
-		return -value
+func rectCenterX2(rect Rect) int {
+	return rect.X*2 + rect.Width
+}
+
+func rectCenterY2(rect Rect) int {
+	return rect.Y*2 + rect.Height
+}
+
+func clampToRectAxis(point, start, size int) int {
+	minimum := start * 2
+	maximum := (start+size)*2 - 1
+	if point < minimum {
+		return minimum
 	}
-	return value
+	if point > maximum {
+		return maximum
+	}
+	return point
+}
+
+func distanceToRectAxis(point, start, size int) int {
+	clamped := clampToRectAxis(point, start, size)
+	if point < clamped {
+		return clamped - point
+	}
+	return point - clamped
 }

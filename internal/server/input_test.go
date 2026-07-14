@@ -311,3 +311,37 @@ func TestServerGeometricFocusHandlesPaneZero(t *testing.T) {
 		t.Fatalf("FocusPaneDirection(up) = state %#v err=%v; want pane %d", state, err, top.ID)
 	}
 }
+
+func TestDirectionalFocusRemembersPositionAcrossUnevenPanes(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 24
+	left := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 24)}
+	s.CreateWindow(left, 0)
+	topRight := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 24)}
+	if _, _, err := s.SplitFocusedPane(0, topRight, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	bottomRight := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 24)}
+	if _, _, err := s.SplitFocusedPane(0, bottomRight, SplitHorizontal); err != nil {
+		t.Fatal(err)
+	}
+
+	move := func(direction byte, want uint64) {
+		t.Helper()
+		_, state, err := s.FocusPaneDirection(0, direction)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.FocusedPaneID != want {
+			t.Fatalf("direction %q focused pane %d, want %d", direction, state.FocusedPaneID, want)
+		}
+	}
+
+	move('A', topRight.ID)
+	move('D', left.ID)
+	move('C', topRight.ID)
+	move('B', bottomRight.ID)
+	move('D', left.ID)
+	move('C', bottomRight.ID)
+}

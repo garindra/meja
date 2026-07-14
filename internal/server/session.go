@@ -295,6 +295,9 @@ type ClientState struct {
 	SessionID      uint64
 	ActiveWindowID uint64
 	FocusedPaneID  uint64
+	FocusX2        int
+	FocusY2        int
+	HasFocusPoint  bool
 	TerminalCols   uint16
 	TerminalRows   uint16
 
@@ -304,6 +307,11 @@ type ClientState struct {
 	Prompt         *PromptState
 	LastWindowID   uint64
 	HasLastWindow  bool
+}
+
+func (c *ClientState) setFocusedPane(paneID uint64) {
+	c.FocusedPaneID = paneID
+	c.HasFocusPoint = false
 }
 
 func NewSession(id uint64) *Session {
@@ -449,7 +457,7 @@ func (s *Session) ensureClientFocusLocked(client *ClientState) {
 		client.ActiveWindowID = window.ID
 	}
 	if !windowHasPane(window, client.FocusedPaneID) {
-		client.FocusedPaneID = windowPrimaryPaneID(window)
+		client.setFocusedPane(windowPrimaryPaneID(window))
 	}
 }
 
@@ -488,7 +496,7 @@ func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *Client
 		client.HasLastWindow = client.LastWindowID != 0
 	}
 	client.ActiveWindowID = windowID
-	client.FocusedPaneID = pane.ID
+	client.setFocusedPane(pane.ID)
 	s.rebuildBindingsLocked(client, window)
 	return window, cloneClientState(client)
 }
@@ -578,7 +586,7 @@ func (s *Session) selectWindowLocked(client *ClientState, window *Window) {
 		client.HasLastWindow = client.LastWindowID != 0
 	}
 	client.ActiveWindowID = window.ID
-	client.FocusedPaneID = windowPrimaryPaneID(window)
+	client.setFocusedPane(windowPrimaryPaneID(window))
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	s.rebuildBindingsLocked(client, window)
 }
@@ -605,7 +613,7 @@ func (s *Session) FocusPane(clientID, paneID uint64) (*Window, *ClientState, err
 	if !windowHasPane(window, paneID) {
 		return nil, nil, fmt.Errorf("pane %d not visible in window %d", paneID, window.ID)
 	}
-	client.FocusedPaneID = paneID
+	client.setFocusedPane(paneID)
 	return cloneWindow(window), cloneClientState(client), nil
 }
 
@@ -634,7 +642,7 @@ func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitD
 	s.Panes[pane.ID] = pane
 	window.Layout = updated
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
-	client.FocusedPaneID = pane.ID
+	client.setFocusedPane(pane.ID)
 	s.rebuildBindingsLocked(client, window)
 	return cloneWindow(window), cloneClientState(client), nil
 }
@@ -682,7 +690,7 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 		ids := s.windowIDsLocked()
 		nextWindow := s.Windows[ids[0]]
 		c.ActiveWindowID = nextWindow.ID
-		c.FocusedPaneID = windowPrimaryPaneID(nextWindow)
+		c.setFocusedPane(windowPrimaryPaneID(nextWindow))
 		s.rebuildBindingsLocked(c, nextWindow)
 		return closedPane, cloneWindow(nextWindow), cloneClientState(c), true, closedWindowID, false, nil
 	}
@@ -694,7 +702,7 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 	delete(s.Panes, c.FocusedPaneID)
 	window.Layout = updated
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
-	c.FocusedPaneID = nextFocusedPaneID
+	c.setFocusedPane(nextFocusedPaneID)
 	s.rebuildBindingsLocked(c, window)
 	return closedPane, cloneWindow(window), cloneClientState(c), false, 0, false, nil
 }
@@ -728,7 +736,7 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 		owner.Layout = updated
 		owner.LayoutRevision = s.nextLayoutRevisionLocked()
 		if c.ActiveWindowID == owner.ID && c.FocusedPaneID == paneID {
-			c.FocusedPaneID = nextFocusedPaneID
+			c.setFocusedPane(nextFocusedPaneID)
 		}
 	} else {
 		delete(s.Windows, owner.ID)
@@ -738,7 +746,7 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 		if c.ActiveWindowID == owner.ID {
 			ids := s.windowIDsLocked()
 			c.ActiveWindowID = ids[0]
-			c.FocusedPaneID = windowPrimaryPaneID(s.Windows[ids[0]])
+			c.setFocusedPane(windowPrimaryPaneID(s.Windows[ids[0]]))
 		}
 	}
 	active := s.Windows[c.ActiveWindowID]
@@ -781,7 +789,7 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	ids := s.windowIDsLocked()
 	nextWindow := s.Windows[ids[0]]
 	c.ActiveWindowID = nextWindow.ID
-	c.FocusedPaneID = windowPrimaryPaneID(nextWindow)
+	c.setFocusedPane(windowPrimaryPaneID(nextWindow))
 	s.rebuildBindingsLocked(c, nextWindow)
 	pane = s.Panes[c.FocusedPaneID]
 	return closed, closedPanes, cloneWindow(nextWindow), pane, cloneClientState(c), false, nil
