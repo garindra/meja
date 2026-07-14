@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -146,9 +147,9 @@ func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
 
 	cmdPath, argv := resolveCommand(shell, request.Command)
 	cmd := exec.Command(cmdPath, argv...)
-	cmd.Dir = request.Cwd
-	if cmd.Dir == "" {
-		cmd.Dir = unixUser.HomeDir
+	cmd.Dir, err = resolveStartingDirectoryForUser(request.Cwd, unixUser)
+	if err != nil {
+		return nil, err
 	}
 
 	cmd.Env = buildEnv(unixUser, shell)
@@ -174,6 +175,37 @@ func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
 		terminal: terminal.New(int(request.Cols), int(request.Rows)),
 		Title:    paneTitle(shell, request.Command),
 	}, nil
+}
+
+func resolveStartingDirectory(raw string) (string, error) {
+	unixUser, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("resolve daemon user: %w", err)
+	}
+	return resolveStartingDirectoryForUser(raw, unixUser)
+}
+
+func resolveStartingDirectoryForUser(raw string, unixUser *user.User) (string, error) {
+	path := raw
+	if path == "" || path == "~" {
+		path = unixUser.HomeDir
+	} else if strings.HasPrefix(path, "~/") {
+		path = filepath.Join(unixUser.HomeDir, strings.TrimPrefix(path, "~/"))
+	} else if strings.HasPrefix(path, "~") {
+		return "", fmt.Errorf("starting directory %q: only ~ and ~/... home expansion are supported", raw)
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("starting directory %q must be absolute or start with ~/", raw)
+	}
+	path = filepath.Clean(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("starting directory %q: %w", raw, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("starting directory %q is not a directory", raw)
+	}
+	return path, nil
 }
 
 func (p *Pane) resize(cols, rows uint16) error {

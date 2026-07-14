@@ -242,6 +242,7 @@ type Session struct {
 	generation     uint64
 	daemon         *Daemon
 	connection     *Connection
+	defaultCwd     string
 	operations     chan sessionOperation
 	operationsDone chan struct{}
 	stopOnce       sync.Once

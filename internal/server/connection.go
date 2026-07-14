@@ -29,6 +29,4 @@ type Connection struct {
 
 	managementOut chan protocol.Frame
 	shell         string
-	defaultCwd    string
-	defaultArgv   []string
 }

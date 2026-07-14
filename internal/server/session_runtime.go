@@ -320,7 +320,7 @@ func (s *Session) commandCreateWindow(c *Connection) error {
 	if err != nil {
 		return err
 	}
-	pane, _, _, err := s.createWindow(c, c.defaultCwd, c.defaultArgv, cols, rows)
+	pane, _, _, err := s.createWindow(c, s.defaultCwd, nil, cols, rows)
 	if err != nil {
 		return err
 	}
@@ -362,7 +362,7 @@ func (s *Session) commandSplit(c *Connection, direction SplitDirection) error {
 	}
 	paneID := s.AddPaneID()
 	cols, rows := activePane.TerminalSize()
-	newPane, err := StartPane(paneID, paneRequest{Cols: uint16(cols), Rows: uint16(rows), Shell: c.shell})
+	newPane, err := StartPane(paneID, paneRequest{Cwd: s.defaultCwd, Cols: uint16(cols), Rows: uint16(rows), Shell: c.shell})
 	if err != nil {
 		return fmt.Errorf("start split pane: %w", err)
 	}

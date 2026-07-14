@@ -130,14 +130,19 @@ func serveConnection(ctx context.Context, d *Daemon, conn quic.Connection) error
 	if err != nil {
 		return fmt.Errorf("read create pane: %w", err)
 	}
-	handler.defaultCwd = createPane.Cwd
-	handler.defaultArgv = append([]string(nil), createPane.Argv...)
 	if err := s.coordinate(func() error {
 		s.EnsureClient(clientID0)
 		s.SetClientSize(clientID0, createPane.Cols, createPane.Rows)
 		if !s.HasWindows() {
-			initialPane, _, _, err := s.createWindow(handler, createPane.Cwd, createPane.Argv, createPane.Cols, createPane.Rows)
+			cwd, err := resolveStartingDirectory(createPane.Cwd)
 			if err != nil {
+				s.shutdownNow()
+				return err
+			}
+			s.defaultCwd = cwd
+			initialPane, _, _, err := s.createWindow(handler, s.defaultCwd, createPane.Argv, createPane.Cols, createPane.Rows)
+			if err != nil {
+				s.shutdownNow()
 				return err
 			}
 			if err := sendEncoded(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: initialPane.ID}, protocol.EncodePaneCreated); err != nil {

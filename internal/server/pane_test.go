@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"os/user"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -83,6 +84,43 @@ func TestDefaultShellUsesEnvironmentWithSafeFallback(t *testing.T) {
 	t.Setenv("SHELL", "relative-shell")
 	if got := defaultShell(); got != "/bin/sh" {
 		t.Fatalf("relative shell fallback = %q, want /bin/sh", got)
+	}
+}
+
+func TestResolveStartingDirectoryExpandsTargetUserHome(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, "projects", "tali")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	unixUser := &user.User{HomeDir: home, Username: "test"}
+	for raw, want := range map[string]string{
+		"":                home,
+		"~":               home,
+		"~/projects/tali": project,
+		project:           project,
+	} {
+		got, err := resolveStartingDirectoryForUser(raw, unixUser)
+		if err != nil {
+			t.Fatalf("resolve %q: %v", raw, err)
+		}
+		if got != want {
+			t.Fatalf("resolve %q = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestResolveStartingDirectoryRejectsAmbiguousOrInvalidPaths(t *testing.T) {
+	home := t.TempDir()
+	unixUser := &user.User{HomeDir: home, Username: "test"}
+	file := filepath.Join(home, "file")
+	if err := os.WriteFile(file, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"relative/path", "~other/path", file, filepath.Join(home, "missing")} {
+		if _, err := resolveStartingDirectoryForUser(raw, unixUser); err == nil {
+			t.Fatalf("resolve %q unexpectedly succeeded", raw)
+		}
 	}
 }
 

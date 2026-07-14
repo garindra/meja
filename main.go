@@ -39,7 +39,7 @@ func (e usageError) Error() string { return e.text }
 const usage = `usage:
   tali [-L profile | -S socket-path]
   tali [-L profile | -S socket-path] <host> [-- command args...]
-  tali [-L profile | -S socket-path] new [-s session-name] [options] [host] [-- command args...]
+  tali [-L profile | -S socket-path] new [-s session-name] [-c directory] [options] [host] [-- command args...]
   tali [-L profile | -S socket-path] attach|a -t <session-id-or-name> [host]
   tali [-L profile | -S socket-path] ls [host]
   tali [-L profile | -S socket-path] server run|stop`
@@ -91,7 +91,6 @@ func parseGlobalOptions(args []string) (control.SocketSelector, []string, error)
 }
 
 type connectionFlags struct {
-	cwd            string
 	identity       string
 	remotePath     string
 	port           intFlagValue
@@ -100,7 +99,6 @@ type connectionFlags struct {
 }
 
 func (f *connectionFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&f.cwd, "cwd", "", "remote working directory")
 	fs.StringVar(&f.identity, "i", "", "path to SSH identity file")
 	fs.StringVar(&f.remotePath, "remote-path", "tali", "remote tali executable path")
 	f.port.value = 4433
@@ -118,7 +116,6 @@ func (f connectionFlags) config(selector control.SocketSelector, stdin *os.File,
 		SocketSelector:     selector,
 		DebugRender:        f.debugRender,
 		DebugRenderLogPath: f.debugRenderLog,
-		Cwd:                f.cwd,
 		Stdin:              stdin,
 		Stdout:             stdout,
 		Stderr:             stderr,
@@ -131,6 +128,9 @@ func runNew(ctx context.Context, selector control.SocketSelector, args []string,
 	var flags connectionFlags
 	flags.register(fs)
 	sessionName := fs.String("s", "", "session name")
+	var cwd string
+	fs.StringVar(&cwd, "c", "", "starting directory for new panes")
+	fs.StringVar(&cwd, "cwd", "", "starting directory for new panes")
 	if err := fs.Parse(args); err != nil {
 		return usageError{err.Error()}
 	}
@@ -142,6 +142,7 @@ func runNew(ctx context.Context, selector control.SocketSelector, args []string,
 	}
 	cfg := flags.config(selector, stdin, stdout, stderr)
 	cfg.SessionName = *sessionName
+	cfg.Cwd = cwd
 	if len(remaining) == 0 {
 		cfg.Local = true
 		return client.Run(ctx, cfg)

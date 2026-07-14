@@ -38,7 +38,7 @@ tali prod -- /usr/bin/bash -l
 tali new user@host
 tali new -s work prod
 tali -L dev new prod
-tali new --cwd /srv/app prod -- /usr/bin/bash -l
+tali new -c /srv/app prod -- /usr/bin/bash -l
 ```
 
 An unrecognized first word is treated as a remote target, making `tali prod`
@@ -121,6 +121,18 @@ including reconnects and reattachments.
 Connection flags belong before the host. `-i` selects an SSH identity,
 `--port` selects the SSH port, and `--remote-path` selects the exact remote
 `tali` executable. The default remote path is `tali`.
+
+`tali new -c <directory>` (or `--cwd`) sets the session's starting directory
+for its initial pane and all later windows and splits. The directory is
+resolved on the target machine and must be absolute or begin with `~/`.
+Quote a remote home-relative path so the local shell does not expand it first:
+
+```bash
+tali new -c '~/projects/app' prod
+```
+
+The command following `--` applies only to the initial pane. Later panes start
+the target user's shell in the session's starting directory.
 
 ## SSH bootstrap
 
