@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -44,6 +47,19 @@ func TestParseGlobalOptionsAcceptsProfileAndSocket(t *testing.T) {
 func TestParseGlobalOptionsRejectsProfileAndSocketTogether(t *testing.T) {
 	if _, _, err := parseGlobalOptions([]string{"-L", "dev", "-S", "/tmp/dev.sock"}); err == nil {
 		t.Fatal("-L with -S was accepted")
+	}
+}
+
+func TestUnrecognizedFirstWordRoutesToRemoteConnect(t *testing.T) {
+	stdin, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	var stdout, stderr bytes.Buffer
+	err = run(context.Background(), []string{"prod"}, stdin, &stdout, &stderr)
+	if _, isUsageError := err.(usageError); isUsageError {
+		t.Fatalf("shorthand was treated as a command error: %v", err)
 	}
 }
 

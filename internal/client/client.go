@@ -138,6 +138,23 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Stdout == nil {
 		return errors.New("stdout is required")
 	}
+	cols, rows, err := terminalSize(cfg.Stdin)
+	if err != nil {
+		return err
+	}
+
+	// Keep the user's normal terminal active for initial SSH diagnostics,
+	// authentication prompts, and host-key handling. Reconnect bootstrap occurs
+	// later inside the already-active Tali display.
+	bootstrap, err := fetchBootstrap(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	hostname, err := resolveConnectionHostname(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
 	streamErrs := make(chan error, 32)
 	renderLog := cfg.Stderr
 	if cfg.DebugRenderLogPath != "" {
@@ -159,10 +176,6 @@ func Run(ctx context.Context, cfg Config) error {
 	ui.dropConnectionEvents.Store(false)
 	defer ui.closeIncomingRenderLog()
 	go ui.renderLoop(ctx, streamErrs)
-	cols, rows, err := terminalSize(cfg.Stdin)
-	if err != nil {
-		return err
-	}
 	ui.emit(sizeEvent{cols: int(cols), rows: int(rows)})
 
 	rawState, err := term.MakeRaw(int(cfg.Stdin.Fd()))
@@ -198,14 +211,6 @@ func Run(ctx context.Context, cfg Config) error {
 	clientDone := make(chan error, 1)
 	var input atomic.Pointer[inputDestination]
 
-	bootstrap, err := fetchBootstrap(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	hostname, err := resolveConnectionHostname(ctx, cfg)
-	if err != nil {
-		return err
-	}
 	ui.beginConnection(false, time.Now())
 	live, err := openConnection(ctx, bootstrap, hostname, cols, rows, cfg, "", 0, ui)
 	if err != nil {

@@ -31,10 +31,23 @@ Connect to a new remote session using a hostname, `user@host`, or an OpenSSH
 config alias:
 
 ```bash
+tali prod
+tali prod -- /usr/bin/bash -l
 tali connect user@host
 tali c prod
 tali -L dev c prod
 tali c --cwd /srv/app prod -- /usr/bin/bash -l
+```
+
+An unrecognized first word is treated as a remote target, making `tali prod`
+the shorthand for `tali c prod`. The words `attach`, `a`, `ls`, `connect`, `c`,
+`server`, and `help` are reserved commands. Use the explicit form for an SSH
+host alias with one of those names, or whenever connection-specific flags are
+needed:
+
+```bash
+tali c server
+tali c -i ~/.ssh/prod_ed25519 prod
 ```
 
 Attach to an existing numeric session ID. Omitting the host selects the local

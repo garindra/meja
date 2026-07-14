@@ -37,6 +37,7 @@ func (e usageError) Error() string { return e.text }
 
 const usage = `usage:
   tali [-L profile | -S socket-path]
+  tali [-L profile | -S socket-path] <host> [-- command args...]
   tali [-L profile | -S socket-path] attach|a -t <session-id> [host]
   tali [-L profile | -S socket-path] ls [host]
   tali [-L profile | -S socket-path] connect|c [options] <host> [-- command args...]
@@ -69,7 +70,7 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 		fmt.Fprintln(stdout, usage)
 		return nil
 	default:
-		return usageError{fmt.Sprintf("unknown command %q", args[0])}
+		return runConnect(ctx, selector, args, stdin, stdout, stderr)
 	}
 }
 
