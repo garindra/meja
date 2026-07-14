@@ -128,7 +128,12 @@ func (d *daemon) logf(format string, args ...any) {
 
 func listenQUICInRange(tlsConfig *tls.Config) (*quic.Listener, uint16, error) {
 	for port := control.DefaultUDPMin; port <= control.DefaultUDPMax; port++ {
-		listener, err := quic.ListenAddr(net.JoinHostPort("0.0.0.0", strconv.Itoa(port)), tlsConfig, &quic.Config{MaxIdleTimeout: quicMaxIdleTimeout, KeepAlivePeriod: quicKeepAlivePeriod, MaxIncomingStreams: int64(protocol.MaxRenderSlots)})
+		listener, err := quic.ListenAddr(net.JoinHostPort("0.0.0.0", strconv.Itoa(port)), tlsConfig, &quic.Config{
+			MaxIdleTimeout:     quicMaxIdleTimeout,
+			KeepAlivePeriod:    quicKeepAlivePeriod,
+			MaxIncomingStreams: int64(protocol.MaxRenderSlots),
+			InitialPacketSize:  protocol.QUICInitialPacketSize,
+		})
 		if err == nil {
 			return listener, uint16(port), nil
 		}

@@ -381,6 +381,7 @@ func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname s
 		MaxIdleTimeout:     quicMaxIdleTimeout,
 		KeepAlivePeriod:    quicKeepAlivePeriod,
 		MaxIncomingStreams: int64(protocol.MaxRenderSlots),
+		InitialPacketSize:  protocol.QUICInitialPacketSize,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)

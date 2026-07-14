@@ -177,6 +177,20 @@ After attachment the daemon issues a session-scoped resume credential and
 generation. Replacement connections rotate that credential and fence the old
 generation.
 
+Tali uses 1200-byte initial QUIC packets so the handshake fits paths with a
+1280-byte IP MTU without depending on fragmentation.
+
+On Linux, quic-go may warn when the kernel limits its UDP socket buffers below
+the preferred size. This does not prevent Tali from running, but it can limit
+throughput on fast connections. An administrator can raise the live limits:
+
+```bash
+sudo sysctl -w net.core.rmem_max=7500000
+sudo sysctl -w net.core.wmem_max=7500000
+```
+
+Persist those values through the system's sysctl configuration if desired.
+
 ## Terminal behavior
 
 The server owns terminal emulation, pane state, layout, and rendering. A QUIC

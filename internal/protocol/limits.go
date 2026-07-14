@@ -1,6 +1,10 @@
 package protocol
 
 const (
+	// QUICInitialPacketSize is the RFC 9000 minimum. Keeping the UDP payload at
+	// 1200 bytes leaves room for IP and UDP headers on 1280-byte paths instead
+	// of relying on IP fragmentation during the handshake.
+	QUICInitialPacketSize        = 1200
 	DefaultMaxFrameSize          = 4 << 20
 	MaxRetainedPayloadCap        = 8 << 20
 	MaxRetainedANSIOutput        = 8 << 20
