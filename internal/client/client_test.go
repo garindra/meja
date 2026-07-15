@@ -186,31 +186,6 @@ func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
 	}
 }
 
-func TestStatusSurfaceOccupiesLastTerminalRow(t *testing.T) {
-	ui := NewClientState()
-	ui.SetTerminalSize(80, 24)
-	status := ui.Panes[^uint64(0)]
-	if status == nil || status.Rect != (protocol.Rect{X: 0, Y: 23, Width: 80, Height: 1}) {
-		t.Fatalf("status surface = %#v", status)
-	}
-}
-
-func TestSingleRowTerminalComposesStatusAbovePane(t *testing.T) {
-	state := NewClientState()
-	state.SetTerminalSize(6, 1)
-	state.ApplyWindowLayout(protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 6, Height: 1}}}})
-	state.SetWritePosition(0, protocol.SetWritePosition{})
-	state.WriteText(0, protocol.WriteText{CellWidth: 1, Text: []byte("pane")})
-	state.InstallStyle(protocol.StatusRenderSlot, protocol.StyleInstall{ID: 1, Style: protocol.Style{Bold: true}})
-	state.SetWritePosition(protocol.StatusRenderSlot, protocol.SetWritePosition{})
-	state.SetWriteStyle(protocol.StatusRenderSlot, protocol.SetWriteStyle{StyleID: 1})
-	state.WriteText(protocol.StatusRenderSlot, protocol.WriteText{CellWidth: 1, Text: []byte("status")})
-	output := string(RenderANSI(state))
-	if !strings.Contains(output, "status") || strings.Contains(output, "pane") {
-		t.Fatalf("single-row output = %q", output)
-	}
-}
-
 func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
@@ -309,7 +284,7 @@ func TestPaneBatchBeforeLayoutIsBuffered(t *testing.T) {
 	go ui.renderLoop(ctx, errs)
 	ui.emit(sizeEvent{cols: 80, rows: 24})
 	ui.beginConnection(false, time.Now())
-	ui.emit(displayBatchEvent{slot: 0, layoutRevision: 9, commands: []protocol.DisplayCommand{{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("buffered")}}})
+	ui.emit(paneFrameEvent{slot: 0, frame: renderFrame{layoutRevision: 9, spans: []paintSpan{{kind: paintText, styleID: 0, cellWidth: 1, text: []byte("buffered")}}}})
 	time.Sleep(20 * time.Millisecond)
 	stdout.mu.Lock()
 	early := strings.Contains(stdout.String(), "buffered")
@@ -334,7 +309,7 @@ func TestStoppedConnectionEventsAreDropped(t *testing.T) {
 	ui.stopConnection()
 	before := stdout.Len()
 	ui.emit(layoutEvent{layout: testSnapshotLayout(11)})
-	ui.emit(displayBatchEvent{slot: 0, layoutRevision: 11})
+	ui.emit(paneFrameEvent{slot: 0, frame: renderFrame{layoutRevision: 11}})
 	ui.sync(ctx)
 	if stdout.Len() != before {
 		t.Fatal("stopped connection event changed the UI")
@@ -371,13 +346,12 @@ func TestStatusFullRefreshClearsReconnectIndicator(t *testing.T) {
 	ui.emit(sizeEvent{cols: 80, rows: 24})
 	ui.beginConnection(true, time.Now())
 	waitForBufferText(t, &stdout, "tali is reconnecting")
-	ui.emit(displayBatchEvent{slot: protocol.StatusRenderSlot, commands: []protocol.DisplayCommand{
-		{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}}},
-		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0},
-		{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: 1},
-		{Opcode: protocol.DisplayOpcodeFill, Fill: protocol.Fill{Columns: 80, Rune: ' ', Width: 1}},
-		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0},
-		{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("ready")},
+	ui.emit(paneFrameEvent{slot: protocol.StatusRenderSlot, frame: renderFrame{
+		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}}}},
+		spans: []paintSpan{
+			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: ' ', fillColumns: 80},
+			{kind: paintText, styleID: 1, cellWidth: 1, text: []byte("ready")},
+		},
 	}})
 	ui.beginConnection(false, time.Time{})
 	waitForBufferText(t, &stdout, "ready")
@@ -387,6 +361,34 @@ func TestStatusFullRefreshClearsReconnectIndicator(t *testing.T) {
 	lastReconnect := strings.LastIndex(output, "tali is reconnecting")
 	if lastReconnect < 0 || !strings.Contains(output[lastReconnect:], "ready") {
 		t.Fatalf("reconnect indicator was not replaced after connection became usable: %q", output)
+	}
+}
+
+func TestLayoutActivationPreservesStatusRow(t *testing.T) {
+	s := newScanoutState(true)
+	s.cols, s.rows = 12, 4
+	status := renderFrame{
+		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}}}},
+		spans: []paintSpan{
+			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: ' ', fillColumns: 12},
+			{kind: paintText, styleID: 1, cellWidth: 1, text: []byte("1:shell*")},
+		},
+	}
+	if _, err := s.acceptFrame(protocol.StatusRenderSlot, status); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.takeANSI()
+	layout := protocol.WindowLayout{WindowID: 1, LayoutRevision: 2, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 12, Height: 3}}}}
+	_, _ = s.acceptLayout(layout)
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 2}); err != nil {
+		t.Fatal(err)
+	}
+	out := string(s.takeANSI())
+	if strings.Contains(out, "\x1b[2J") {
+		t.Fatalf("layout activation cleared status row: %q", out)
+	}
+	if !strings.Contains(out, "\x1b[1;1H\x1b[2K") || strings.Contains(out, "\x1b[4;1H\x1b[2K") {
+		t.Fatalf("layout activation did not clear only content rows: %q", out)
 	}
 }
 
@@ -469,93 +471,6 @@ func waitForBufferText(t *testing.T, buffer *lockedBuffer, want string) {
 	}
 	t.Fatalf("buffer did not contain %q", want)
 }
-func TestReconnectStateDoesNotLeakBetweenClientStates(t *testing.T) {
-	first := NewClientState()
-	second := NewClientState()
-	first.SetReconnecting(true, time.Now())
-	if !first.Reconnecting {
-		t.Fatal("first state did not enter reconnecting")
-	}
-	if second.Reconnecting || !second.LastContact.IsZero() {
-		t.Fatal("reconnect state leaked to an independent render state")
-	}
-}
-
-func TestDisplayCommandsApplyAtStreamWriteHead(t *testing.T) {
-	s := NewClientState()
-	s.SetTerminalSize(10, 4)
-	s.ApplyWindowLayout(protocol.WindowLayout{WindowID: 1, LayoutRevision: 2, FocusedPaneID: 5, Panes: []protocol.PanePlacement{{PaneID: 5, Slot: 0, Rect: protocol.Rect{Width: 10, Height: 3}}}})
-	if !s.ResetStream(0) || !s.SetWritePosition(0, protocol.SetWritePosition{Row: 1, Column: 2}) || !s.SetWriteStyle(0, protocol.SetWriteStyle{StyleID: 0}) || !s.WriteText(0, protocol.WriteText{CellWidth: 1, Text: []byte("ls")}) || !s.UpdateCursor(0, protocol.CursorUpdate{Cursor: protocol.Cursor{X: 4, Y: 1}, Visible: true}) {
-		t.Fatal("display command rejected")
-	}
-	p := s.Panes[5]
-	if got := string([]rune{p.Grid.Cells[12].Rune, p.Grid.Cells[13].Rune}); got != "ls" {
-		t.Fatalf("text=%q", got)
-	}
-	out := string(RenderANSI(s))
-	if !strings.Contains(out, "ls") {
-		t.Fatalf("ANSI output=%q", out)
-	}
-}
-
-func TestWideTextCreatesContinuationCell(t *testing.T) {
-	s := NewClientState()
-	s.ApplyWindowLayout(protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 4, Height: 1}}}})
-	s.SetWritePosition(0, protocol.SetWritePosition{})
-	if !s.WriteText(0, protocol.WriteText{CellWidth: 2, Text: []byte("界")}) {
-		t.Fatal("wide text rejected")
-	}
-	cells := s.Panes[1].Grid.Cells
-	if cells[0].Rune != '界' || cells[0].Width != 2 || cells[1].Width != 0 {
-		t.Fatalf("cells=%#v", cells)
-	}
-}
-
-func TestDefaultTextOverrideDoesNotChangeLatchedStyle(t *testing.T) {
-	s := NewClientState()
-	s.ApplyWindowLayout(protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 6, Height: 1}}}})
-	if !s.InstallStyle(0, protocol.StyleInstall{ID: 2, Style: protocol.Style{Bold: true}}) || !s.SetWriteStyle(0, protocol.SetWriteStyle{StyleID: 2}) {
-		t.Fatal("failed to install/select nondefault style")
-	}
-	if !s.WriteTextDefault(0, []byte("d")) || !s.WriteText(0, protocol.WriteText{CellWidth: 1, Text: []byte("c")}) {
-		t.Fatal("text commands rejected")
-	}
-	p := s.Panes[1]
-	if p.Grid.Cells[0].StyleID != 0 || p.Grid.Cells[1].StyleID != 2 {
-		t.Fatalf("styles=%d,%d", p.Grid.Cells[0].StyleID, p.Grid.Cells[1].StyleID)
-	}
-	if got := s.Streams[0].StyleID; got != 2 {
-		t.Fatalf("latched style=%d, want 2", got)
-	}
-}
-
-func TestDefaultTextOverrideRejectsMissingCanonicalStyle(t *testing.T) {
-	s := NewClientState()
-	s.ApplyWindowLayout(protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 4, Height: 1}}}})
-	delete(s.Panes[1].Styles, protocol.CanonicalDefaultStyleID)
-	if s.WriteTextDefault(0, []byte("x")) {
-		t.Fatal("accepted default text without canonical style 0")
-	}
-	if got := s.Streams[0].StyleID; got != 0 {
-		t.Fatalf("stream style changed to %d", got)
-	}
-}
-
-func TestRenderCellRunSkipsWideContinuationCell(t *testing.T) {
-	var output bytes.Buffer
-	renderCellRun(&output, []composedCell{
-		{Rune: '界', Width: 2, Style: defaultStyle()},
-		{Width: 0, Style: defaultStyle()},
-		{Rune: 'x', Width: 1, Style: defaultStyle()},
-	})
-	if !bytes.Contains(output.Bytes(), []byte("界x")) {
-		t.Fatalf("ANSI output=%q, want adjacent wide rune and x", output.Bytes())
-	}
-	if bytes.Contains(output.Bytes(), []byte("界 x")) {
-		t.Fatalf("ANSI output rendered continuation as a space: %q", output.Bytes())
-	}
-}
-
 func TestSGRForStyleRendersAdvertisedAttributes(t *testing.T) {
 	got := sgrForStyle(protocol.Style{
 		Bold: true, Dim: true, Blink: true, Italic: true, Underline: true, Reverse: true, Invisible: true,
@@ -563,92 +478,6 @@ func TestSGRForStyleRendersAdvertisedAttributes(t *testing.T) {
 	})
 	if got != "\x1b[0;1;2;5;3;4;7;8;39;49m" {
 		t.Fatalf("attribute SGR=%q", got)
-	}
-}
-
-func TestReconnectStatusPreservesExactMessageAndOrangeStyle(t *testing.T) {
-	state := NewClientState()
-	state.SetTerminalSize(80, 24)
-	_ = RenderANSI(state)
-	state.SetReconnecting(true, time.Now().Add(-23*time.Second))
-	state.RefreshReconnectStatus(time.Now())
-	output := string(RenderANSI(state))
-	if strings.Contains(output, "\x1b[2J") {
-		t.Fatalf("reconnect status caused a content redraw: %q", output)
-	}
-	if !strings.Contains(output, "tali is reconnecting... [Last contact 23 seconds ago]") {
-		t.Fatalf("reconnect status missing from ANSI output: %q", output)
-	}
-	if !strings.Contains(output, "\x1b[0;38;2;255;165;0;49m") {
-		t.Fatalf("reconnect status is not orange: %q", output)
-	}
-	if !strings.Contains(output, "\x1b[24;1H") {
-		t.Fatalf("reconnect status is not on the status row: %q", output)
-	}
-}
-
-func TestReconnectStatusClearsWithoutContentRedraw(t *testing.T) {
-	state := NewClientState()
-	state.SetTerminalSize(20, 4)
-	state.SetReconnecting(true, time.Now())
-	state.RefreshReconnectStatus(time.Now())
-	_ = RenderANSI(state)
-	state.SetReconnecting(false, time.Time{})
-	output := string(RenderANSI(state))
-	if strings.Contains(output, "tali is reconnecting") {
-		t.Fatalf("reconnect status remained after reconnect: %q", output)
-	}
-}
-
-func testRenderState() *ClientState {
-	s := NewClientState()
-	s.SetTerminalSize(8, 4)
-	s.ApplyWindowLayout(protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 8, Height: 3}}}})
-	return s
-}
-
-func TestSteadyStateANSIUsesDamageOnly(t *testing.T) {
-	s := testRenderState()
-	s.SetWritePosition(0, protocol.SetWritePosition{Row: 1, Column: 2})
-	s.WriteText(0, protocol.WriteText{CellWidth: 1, Text: []byte("x")})
-	_ = RenderANSI(s)
-	s.SetWritePosition(0, protocol.SetWritePosition{Row: 1, Column: 3})
-	s.WriteText(0, protocol.WriteText{CellWidth: 1, Text: []byte("y")})
-	out := string(RenderANSI(s))
-	if strings.Contains(out, "\x1b[2J") || !strings.Contains(out, "y") {
-		t.Fatalf("damage output=%q", out)
-	}
-}
-func TestUnchangedANSIEmitsNothing(t *testing.T) {
-	s := testRenderState()
-	_ = RenderANSI(s)
-	if out := RenderANSI(s); len(out) != 0 {
-		t.Fatalf("unchanged output=%q", out)
-	}
-}
-func TestFillMarksOnlyRequestedColumns(t *testing.T) {
-	s := testRenderState()
-	_ = RenderANSI(s)
-	s.SetWritePosition(0, protocol.SetWritePosition{Row: 0, Column: 2})
-	if !s.Fill(0, protocol.Fill{Columns: 3, Rune: '-', Width: 1}) {
-		t.Fatal("fill rejected")
-	}
-	out := string(RenderANSI(s))
-	if !strings.Contains(out, "---") {
-		t.Fatalf("fill output=%q", out)
-	}
-}
-
-func BenchmarkIncrementalTextRender(b *testing.B) {
-	s := NewClientState()
-	s.SetTerminalSize(120, 40)
-	s.ApplyWindowLayout(protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 120, Height: 39}}}})
-	_ = RenderANSI(s)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		s.SetWritePosition(0, protocol.SetWritePosition{Row: 10, Column: i % 100})
-		s.WriteText(0, protocol.WriteText{CellWidth: 1, Text: []byte("x")})
-		_ = RenderANSI(s)
 	}
 }
 
@@ -690,8 +519,8 @@ func TestStatusOutputAcceptsBarrierlessDisplayBatch(t *testing.T) {
 	readOutputStream(protocol.StatusRenderSlot, protocol.NewDisplayDecoder(bytes.NewReader(encoder.Bytes())), ui, errs, nil, nil)
 	select {
 	case event := <-ui.events:
-		batch, ok := event.(displayBatchEvent)
-		if !ok || batch.slot != protocol.StatusRenderSlot || batch.layoutRevision != 0 || len(batch.commands) != len(commands)-1 {
+		frame, ok := event.(paneFrameEvent)
+		if !ok || frame.slot != protocol.StatusRenderSlot || frame.frame.layoutRevision != 0 || len(frame.frame.spans) != 1 {
 			t.Fatalf("status event = %#v", event)
 		}
 	default:
@@ -714,6 +543,75 @@ func TestPaneOutputStillRequiresRelayoutBarrier(t *testing.T) {
 		}
 	default:
 		t.Fatal("pane command without barrier was accepted")
+	}
+}
+
+func TestDisplayFrameCompilerExpandsWireLatches(t *testing.T) {
+	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
+	commands := []protocol.DisplayCommand{
+		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 4},
+		{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: 2, Style: protocol.Style{Bold: true}},
+		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 3, Column: 5},
+		{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: 2},
+		{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("ab")},
+		{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("c")},
+		{Opcode: protocol.DisplayOpcodePresent},
+	}
+	var frame renderFrame
+	for _, command := range commands {
+		ready, err := c.apply(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ready {
+			frame = c.frame
+		}
+	}
+	if len(frame.spans) != 2 || frame.spans[0].column != 5 || frame.spans[0].styleID != 2 || frame.spans[1].column != 7 || frame.spans[1].styleID != 0 {
+		t.Fatalf("compiled frame = %#v", frame)
+	}
+}
+
+func TestNativeScrollUsesRectangularMargins(t *testing.T) {
+	s := newScanoutState(true)
+	s.cols, s.rows = 12, 5
+	layout := protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{X: 6, Width: 6, Height: 4}}}}
+	if _, err := s.acceptLayout(layout); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.takeANSI()
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDeltas: []int{-1}}); err != nil {
+		t.Fatal(err)
+	}
+	out := string(s.takeANSI())
+	if !strings.Contains(out, "\x1b[1;4r") || !strings.Contains(out, "\x1b[7;12s") || !strings.Contains(out, "\x1b[1S") {
+		t.Fatalf("native scroll output = %q", out)
+	}
+}
+
+func TestFallbackScrollRetainsVisibleRows(t *testing.T) {
+	s := newScanoutState(false)
+	s.cols, s.rows = 4, 4
+	layout := protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 4, Height: 3}}}}
+	_, _ = s.acceptLayout(layout)
+	full := renderFrame{layoutRevision: 1, spans: []paintSpan{
+		{kind: paintText, row: 0, styleID: 0, cellWidth: 1, text: []byte("aaaa")},
+		{kind: paintText, row: 1, styleID: 0, cellWidth: 1, text: []byte("bbbb")},
+		{kind: paintText, row: 2, styleID: 0, cellWidth: 1, text: []byte("cccc")},
+	}}
+	if _, err := s.acceptFrame(0, full); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.takeANSI()
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDeltas: []int{-1}, spans: []paintSpan{{kind: paintText, row: 2, styleID: 0, cellWidth: 1, text: []byte("dddd")}}}); err != nil {
+		t.Fatal(err)
+	}
+	out := string(s.takeANSI())
+	if !strings.Contains(out, "bbbb") || !strings.Contains(out, "cccc") || !strings.Contains(out, "dddd") || strings.Contains(out, "\x1b[1S") {
+		t.Fatalf("fallback scroll output = %q", out)
 	}
 }
 
