@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -502,5 +503,48 @@ func TestSessionShutdownCleanlyClosesConnectionBeforeCancelingQUIC(t *testing.T)
 	}
 	if ctx.Err() == nil {
 		t.Fatal("session QUIC context was not canceled after the clean close")
+	}
+}
+
+func TestSessionClosesExistingConnectionBeforeAttachingReplacement(t *testing.T) {
+	s := NewSession(1)
+	replacement := &Connection{}
+	closed := false
+	var closeErr error
+	existing := &Connection{QUIC: &recordingQUICConnection{closeWithError: func(code quic.ApplicationErrorCode, message string) error {
+		if s.connection == replacement {
+			closeErr = fmt.Errorf("replacement was attached before existing connection was closed")
+		}
+		if code != protocol.SessionReplacedErrorCode || message != "session attached elsewhere" {
+			closeErr = fmt.Errorf("CloseWithError(%d, %q), want replacement close", code, message)
+		}
+		closed = true
+		return nil
+	}}}
+	s.connection = existing
+
+	s.attachConnection(replacement)
+
+	if !closed {
+		t.Fatal("existing QUIC connection was not closed")
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if s.connection != replacement {
+		t.Fatal("replacement connection was not attached")
+	}
+}
+
+func TestSessionReplacementCloseIsNotLoggable(t *testing.T) {
+	err := fmt.Errorf("read input frame: %w", &quic.ApplicationError{
+		ErrorCode:    protocol.SessionReplacedErrorCode,
+		ErrorMessage: "session attached elsewhere",
+	})
+	if !isSessionReplacedClose(err) {
+		t.Fatal("wrapped session replacement close was not recognized")
+	}
+	if isSessionReplacedClose(errors.New("read input frame: connection lost")) {
+		t.Fatal("ordinary connection error was recognized as session replacement")
 	}
 }

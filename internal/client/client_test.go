@@ -501,6 +501,21 @@ func TestCleanQUICCloseWinsWhenOutputEOFArrivesFirst(t *testing.T) {
 	}
 }
 
+func TestSessionReplacementIsTerminal(t *testing.T) {
+	err := &quic.ApplicationError{
+		ErrorCode:    protocol.SessionReplacedErrorCode,
+		ErrorMessage: "session attached elsewhere",
+	}
+	done := make(chan connectionResult, 1)
+	managementLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), &runtimeState{}, done, nil)
+	if result := <-done; !result.graceful || result.err != nil {
+		t.Fatalf("replacement result = %#v, want graceful terminal result", result)
+	}
+	if isTerminalQUICClose(&quic.ApplicationError{ErrorCode: 1, ErrorMessage: "transport failure"}) {
+		t.Fatal("ordinary application error was treated as terminal")
+	}
+}
+
 func TestReconnectEventsPreserveLastContact(t *testing.T) {
 	ui := &runtimeState{events: make(chan renderEvent, 2)}
 	lastContact := time.Now().Add(-time.Minute)

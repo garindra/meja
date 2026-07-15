@@ -621,7 +621,7 @@ func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeS
 		command, wireBytes, err := decoder.ReadCommand()
 		if err != nil {
 			connectionClosed := connectionContext != nil && connectionContext.Err() != nil
-			if errors.Is(err, io.EOF) || isCleanQUICClose(err) {
+			if errors.Is(err, io.EOF) || isTerminalQUICClose(err) {
 				return
 			}
 			if connectionClosed && errors.Is(err, io.ErrUnexpectedEOF) {
@@ -756,7 +756,7 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- con
 	for {
 		frame, err := decoder.ReadFrame()
 		if err != nil {
-			if isCleanQUICClose(err) {
+			if isTerminalQUICClose(err) {
 				done <- connectionResult{graceful: true}
 				return
 			}
@@ -783,9 +783,10 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- con
 	}
 }
 
-func isCleanQUICClose(err error) bool {
+func isTerminalQUICClose(err error) bool {
 	var applicationErr *quic.ApplicationError
-	return errors.As(err, &applicationErr) && applicationErr.ErrorCode == 0
+	return errors.As(err, &applicationErr) &&
+		(applicationErr.ErrorCode == 0 || applicationErr.ErrorCode == protocol.SessionReplacedErrorCode)
 }
 
 func forwardInput(ctx context.Context, stdin *os.File, input *atomic.Pointer[inputDestination], ui *runtimeState, errs chan<- error, done chan<- error) {

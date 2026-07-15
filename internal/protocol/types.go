@@ -3,6 +3,11 @@ package protocol
 const (
 	ALPN            = "meja/1"
 	ProtocolVersion = 3
+
+	// SessionReplacedErrorCode is a terminal QUIC application close: another
+	// client has taken ownership of the session, so the displaced client must
+	// exit instead of attempting to resume.
+	SessionReplacedErrorCode = 0x54414c49
 )
 
 const (

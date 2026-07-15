@@ -144,11 +144,16 @@ func (s *Session) runQUIC(ctx context.Context, listener *quic.Listener) {
 			return
 		}
 		go func() {
-			if err := serveConnection(ctx, s.daemon, s, conn); err != nil && s.daemon != nil {
+			if err := serveConnection(ctx, s.daemon, s, conn); err != nil && s.daemon != nil && !isSessionReplacedClose(err) {
 				s.daemon.logf("meja session %d: %v\n", s.ID, err)
 			}
 		}()
 	}
+}
+
+func isSessionReplacedClose(err error) bool {
+	var applicationErr *quic.ApplicationError
+	return errors.As(err, &applicationErr) && applicationErr.ErrorCode == protocol.SessionReplacedErrorCode
 }
 
 func listenQUICInRange(tlsConfig *tls.Config) (*quic.Listener, uint16, error) {
@@ -208,14 +213,14 @@ func (s *Session) shutdown() error {
 func (s *Session) attachConnection(connection *Connection) {
 	_ = s.coordinate(func() error {
 		previous := s.connection
+		if previous != nil && previous != connection && previous.QUIC != nil {
+			_ = previous.QUIC.CloseWithError(protocol.SessionReplacedErrorCode, "session attached elsewhere")
+		}
 		s.connection = connection
 		if connection != nil && connection.StatusOutput != nil {
 			if err := s.attachStatusOutput(connection, connection.StatusOutput); err != nil {
 				return err
 			}
-		}
-		if previous != nil && previous != connection && previous.QUIC != nil {
-			_ = previous.QUIC.CloseWithError(0x54414c49, "session resumed")
 		}
 		return nil
 	})
