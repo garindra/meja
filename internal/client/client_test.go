@@ -204,7 +204,8 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 	defer cancel()
 	var input atomic.Pointer[inputDestination]
 	input.Store(&inputDestination{frames: inputFrames, done: ctx.Done()})
-	go forwardInput(ctx, stdinR, &input, errs, done)
+	ui := &runtimeState{events: make(chan renderEvent, 1)}
+	go forwardInput(ctx, stdinR, &input, ui, errs, done)
 
 	if _, err := stdinW.Write([]byte("abc")); err != nil {
 		t.Fatalf("stdin write = %v", err)
@@ -237,6 +238,15 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected one input frame")
+	}
+	select {
+	case event := <-ui.events:
+		local, ok := event.(localInputEvent)
+		if !ok || string(local.data) != "abc" {
+			t.Fatalf("local input event = %#v", event)
+		}
+	default:
+		t.Fatal("expected local input event")
 	}
 
 	select {
@@ -275,6 +285,24 @@ func TestInputRoutesAfterConnectionDestinationIsInstalled(t *testing.T) {
 	case <-frames:
 	case <-time.After(time.Second):
 		t.Fatal("input was not routed after installing a connection destination")
+	}
+}
+
+func TestDroppedPredictedInputQueuesResetAfterLocalEvent(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	frames := make(chan protocol.Frame)
+	var input atomic.Pointer[inputDestination]
+	input.Store(&inputDestination{frames: frames, done: done})
+	ui := &runtimeState{events: make(chan renderEvent, 2)}
+	if err := sendCurrentPredictedInput(&input, ui, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if event := <-ui.events; event.(localInputEvent).data[0] != 'a' {
+		t.Fatalf("first event = %#v", event)
+	}
+	if event := <-ui.events; event != (inputPredictionResetEvent{}) {
+		t.Fatalf("second event = %#v", event)
 	}
 }
 

@@ -93,12 +93,15 @@ type renderFrame struct {
 	spans          []paintSpan
 	cursor         protocol.Cursor
 	cursorVisible  bool
+	cursorUpdated  bool
 }
 
 type paneFrameEvent struct {
 	slot  uint8
 	frame renderFrame
 }
+type localInputEvent struct{ data []byte }
+type inputPredictionResetEvent struct{}
 type layoutEvent struct{ layout protocol.WindowLayout }
 type sizeEvent struct{ cols, rows int }
 type reconnectEvent struct {
@@ -220,7 +223,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	input.Store(live.inputDestination())
-	go forwardInput(copyCtx, cfg.Stdin, &input, streamErrs, clientDone)
+	go forwardInput(copyCtx, cfg.Stdin, &input, ui, streamErrs, clientDone)
 	go forwardResize(copyCtx, cfg.Stdin, &input, ui, streamErrs)
 
 	for {
@@ -324,6 +327,25 @@ func sendCurrentInputEncoded[T any](current *atomic.Pointer[inputDestination], m
 		return err
 	}
 	return sendCurrentInput(current, protocol.Frame{Type: msgType, Payload: payload})
+}
+
+func sendCurrentPredictedInput(current *atomic.Pointer[inputDestination], ui *runtimeState, data []byte) error {
+	destination := current.Load()
+	if destination == nil {
+		return nil
+	}
+	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: data})
+	if err != nil {
+		return err
+	}
+	ui.emit(localInputEvent{data: append([]byte(nil), data...)})
+	select {
+	case destination.frames <- protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}:
+		return nil
+	case <-destination.done:
+		ui.emit(inputPredictionResetEvent{})
+		return nil
+	}
 }
 
 type connectionResult struct {
@@ -600,6 +622,7 @@ type displayFrameCompiler struct {
 	styles         map[uint32]protocol.Style
 	cursor         protocol.Cursor
 	cursorVisible  bool
+	cursorUpdated  bool
 	frame          renderFrame
 	frameReady     bool
 	paintStarted   bool
@@ -609,6 +632,7 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 	if c.frameReady {
 		c.frame = renderFrame{layoutRevision: c.layoutRevision}
 		c.frameReady = false
+		c.cursorUpdated = false
 	}
 	if command.Opcode == protocol.DisplayOpcodeRelayoutBarrier {
 		if c.slot == protocol.StatusRenderSlot {
@@ -669,6 +693,7 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 	case protocol.DisplayOpcodeCursorUpdate:
 		c.cursor = command.Cursor.Cursor
 		c.cursorVisible = command.Cursor.Visible
+		c.cursorUpdated = true
 	case protocol.DisplayOpcodeScroll:
 		if c.paintStarted {
 			return false, fmt.Errorf("SCROLL after paint on slot %d", c.slot)
@@ -680,6 +705,7 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		c.frame.layoutRevision = c.layoutRevision
 		c.frame.cursor = c.cursor
 		c.frame.cursorVisible = c.cursorVisible
+		c.frame.cursorUpdated = c.cursorUpdated
 		c.frameReady = true
 		c.paintStarted = false
 		return true, nil
@@ -725,12 +751,12 @@ func isCleanQUICClose(err error) bool {
 	return errors.As(err, &applicationErr) && applicationErr.ErrorCode == 0
 }
 
-func forwardInput(ctx context.Context, stdin *os.File, input *atomic.Pointer[inputDestination], errs chan<- error, done chan<- error) {
+func forwardInput(ctx context.Context, stdin *os.File, input *atomic.Pointer[inputDestination], ui *runtimeState, errs chan<- error, done chan<- error) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := stdin.Read(buf)
 		if n > 0 {
-			if sendErr := sendCurrentInputEncoded(input, protocol.MsgInputBytes, protocol.InputBytes{Data: append([]byte(nil), buf[:n]...)}, protocol.EncodeInputBytes); sendErr != nil {
+			if sendErr := sendCurrentPredictedInput(input, ui, append([]byte(nil), buf[:n]...)); sendErr != nil {
 				if ctx.Err() != nil {
 					return
 				}
@@ -843,6 +869,14 @@ type scanoutState struct {
 	lastContact       time.Time
 	rectangularScroll bool
 	caches            map[uint8]*paneScanoutCache
+	predictor         inputPredictor
+	activeCursor      physicalCursor
+}
+
+type physicalCursor struct {
+	row, column int
+	visible     bool
+	valid       bool
 }
 
 type paneScanoutCache struct {
@@ -898,8 +932,14 @@ func (s *scanoutState) acceptLayout(layout protocol.WindowLayout) (bool, error) 
 		return false, nil
 	}
 	if layout.LayoutRevision == s.layout.LayoutRevision && s.layout.LayoutRevision != 0 {
+		if layout.FocusedPaneID != s.layout.FocusedPaneID {
+			if _, err := s.resetPrediction(); err != nil {
+				return false, err
+			}
+		}
 		s.layout = layout
-		s.restoreCursor()
+		s.selectAuthoritativeCursor()
+		s.emitActiveCursor()
 		return true, nil
 	}
 	s.pendingLayouts[layout.LayoutRevision] = layout
@@ -940,6 +980,8 @@ func (s *scanoutState) tryActivate(revision uint64) (bool, error) {
 			return false, nil
 		}
 	}
+	s.predictor.clear()
+	s.activeCursor = physicalCursor{}
 	s.layout = layout
 	statusStyles := s.styles[protocol.StatusRenderSlot]
 	s.styles = make(map[uint8]map[uint32]protocol.Style)
@@ -948,10 +990,8 @@ func (s *scanoutState) tryActivate(revision uint64) (bool, error) {
 	}
 	s.cursors = make(map[uint8]protocol.CursorUpdate)
 	s.caches = make(map[uint8]*paneScanoutCache)
-	if !s.rectangularScroll {
-		for _, placement := range layout.Panes {
-			s.caches[placement.Slot] = newPaneScanoutCache(placement.Rect.Width, placement.Rect.Height)
-		}
+	for _, placement := range layout.Panes {
+		s.caches[placement.Slot] = newPaneScanoutCache(placement.Rect.Width, placement.Rect.Height)
 	}
 	s.clearContentRows()
 	s.emitLayoutBorders(layout)
@@ -972,6 +1012,86 @@ func (s *scanoutState) tryActivate(revision uint64) (bool, error) {
 			delete(s.pendingFrames, rev)
 		}
 	}
+	return true, nil
+}
+
+func (s *scanoutState) predictionContext() (predictionContext, *paneScanoutCache, protocol.Rect, bool) {
+	for _, placement := range s.layout.Panes {
+		if placement.PaneID != s.layout.FocusedPaneID {
+			continue
+		}
+		cursor, ok := s.cursors[placement.Slot]
+		cache := s.caches[placement.Slot]
+		if !ok || cache == nil {
+			return predictionContext{}, nil, protocol.Rect{}, false
+		}
+		return predictionContext{
+			target: predictionTarget{paneID: placement.PaneID, slot: placement.Slot, layoutRevision: s.layout.LayoutRevision},
+			cursor: cursor.Cursor, cursorVisible: cursor.Visible,
+			width: placement.Rect.Width, height: placement.Rect.Height,
+		}, cache, placement.Rect, true
+	}
+	return predictionContext{}, nil, protocol.Rect{}, false
+}
+
+func (s *scanoutState) acceptLocalInput(data []byte) (bool, error) {
+	context, cache, rect, ok := s.predictionContext()
+	if !ok {
+		return false, nil
+	}
+	result, changed := s.predictor.applyLocalInput(data, context, cache)
+	if !changed {
+		return false, nil
+	}
+	styles := s.styles[context.target.slot]
+	if styles == nil {
+		styles = defaultStyles()
+		s.styles[context.target.slot] = styles
+	}
+	if len(result.frame.spans) > 0 {
+		s.ansi.WriteString("\x1b[?25l")
+		if err := s.emitSpans(context.target.slot, rect, result.frame.spans, styles); err != nil {
+			return false, err
+		}
+	}
+	if result.hasCursorOverride {
+		s.setActiveCursor(rect, result.cursorOverride)
+	} else {
+		s.setActiveCursor(rect, s.cursors[context.target.slot])
+	}
+	s.emitActiveCursor()
+	return true, nil
+}
+
+func (s *scanoutState) resetPrediction() (bool, error) {
+	target := s.predictor.target
+	if target == (predictionTarget{}) {
+		s.predictor.clear()
+		return false, nil
+	}
+	placement, ok := placementForSlot(s.layout, target.slot)
+	cache := s.caches[target.slot]
+	if !ok || placement.PaneID != target.paneID || cache == nil {
+		s.predictor.clear()
+		return false, nil
+	}
+	frame, changed := s.predictor.reset(s.layout.LayoutRevision, cache)
+	if !changed {
+		return false, nil
+	}
+	styles := s.styles[target.slot]
+	if styles == nil {
+		styles = defaultStyles()
+		s.styles[target.slot] = styles
+	}
+	s.ansi.WriteString("\x1b[?25l")
+	if err := s.emitSpans(target.slot, placement.Rect, frame.spans, styles); err != nil {
+		return false, err
+	}
+	if s.isFocusedSlot(target.slot) {
+		s.setActiveCursor(placement.Rect, s.cursors[target.slot])
+	}
+	s.emitActiveCursor()
 	return true, nil
 }
 
@@ -1017,59 +1137,84 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 		styles[def.ID] = def.Style
 	}
 	cache := s.caches[slot]
+	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange), cursorUpdated: frame.cursorUpdated, scrolled: len(frame.scrollDeltas) > 0}
 	if cache != nil {
 		for _, delta := range frame.scrollDeltas {
 			cache.scroll(delta)
 		}
 		for _, span := range frame.spans {
-			if err := applySpanToCache(cache, span); err != nil {
+			if err := applySpanToCache(cache, span, &evidence); err != nil {
 				return err
-			}
-		}
-	}
-	s.ansi.WriteString("\x1b[?25l")
-	for _, delta := range frame.scrollDeltas {
-		if delta == 0 {
-			continue
-		}
-		if cache != nil {
-			if err := s.emitCachedPane(rect, cache, styles); err != nil {
-				return err
-			}
-			continue
-		}
-		// DECLRMM is enabled for the session. Margins are reset immediately.
-		fmt.Fprintf(&s.ansi, "\x1b[%d;%dr\x1b[%d;%ds\x1b[%d;%dH", rect.Y+1, rect.Y+rect.Height, rect.X+1, rect.X+rect.Width, rect.Y+1, rect.X+1)
-		if delta < 0 {
-			fmt.Fprintf(&s.ansi, "\x1b[%dS", -delta)
-		} else {
-			fmt.Fprintf(&s.ansi, "\x1b[%dT", delta)
-		}
-		fmt.Fprintf(&s.ansi, "\x1b[r\x1b[1;%ds", s.cols)
-	}
-	if cache == nil || len(frame.scrollDeltas) == 0 {
-		for _, span := range frame.spans {
-			style, ok := styles[span.styleID]
-			if !ok {
-				return fmt.Errorf("undefined style %d on slot %d", span.styleID, slot)
-			}
-			writeCursorPosition(&s.ansi, rect.Y+span.row+1, rect.X+span.column+1)
-			s.ansi.WriteString(sgrForStyle(style))
-			if span.kind == paintText {
-				s.ansi.Write(span.text)
-			} else {
-				for columns := 0; columns < span.fillColumns; columns += int(span.cellWidth) {
-					s.ansi.WriteRune(span.fillRune)
-				}
 			}
 		}
 	}
 	s.cursors[slot] = protocol.CursorUpdate{Cursor: frame.cursor, Visible: frame.cursorVisible}
-	s.restoreCursor()
+	result := predictionResult{frame: frame}
+	if cache != nil {
+		if placement, ok := placementForSlot(s.layout, slot); ok {
+			result = s.predictor.applyAuthoritativeFrame(predictionTarget{paneID: placement.PaneID, slot: slot, layoutRevision: frame.layoutRevision}, frame, evidence, cache)
+		}
+	}
+	display := result.frame
+	s.ansi.WriteString("\x1b[?25l")
+	fullPaneEmitted := false
+	for _, delta := range display.scrollDeltas {
+		if delta == 0 {
+			continue
+		}
+		if s.rectangularScroll && !result.repaintPane {
+			// DECLRMM is enabled for the session. Margins are reset immediately.
+			fmt.Fprintf(&s.ansi, "\x1b[%d;%dr\x1b[%d;%ds\x1b[%d;%dH", rect.Y+1, rect.Y+rect.Height, rect.X+1, rect.X+rect.Width, rect.Y+1, rect.X+1)
+			if delta < 0 {
+				fmt.Fprintf(&s.ansi, "\x1b[%dS", -delta)
+			} else {
+				fmt.Fprintf(&s.ansi, "\x1b[%dT", delta)
+			}
+			fmt.Fprintf(&s.ansi, "\x1b[r\x1b[1;%ds", s.cols)
+		}
+	}
+	if cache != nil && len(display.scrollDeltas) > 0 && (!s.rectangularScroll || result.repaintPane) {
+		if err := s.emitCachedPane(rect, cache, styles); err != nil {
+			return err
+		}
+		fullPaneEmitted = true
+	}
+	if !fullPaneEmitted {
+		if err := s.emitSpans(slot, rect, display.spans, styles); err != nil {
+			return err
+		}
+	}
+	if s.isFocusedSlot(slot) {
+		cursor := s.cursors[slot]
+		if result.hasCursorOverride {
+			cursor = result.cursorOverride
+		}
+		s.setActiveCursor(rect, cursor)
+	}
+	s.emitActiveCursor()
 	return nil
 }
 
-func applySpanToCache(cache *paneScanoutCache, span paintSpan) error {
+func (s *scanoutState) emitSpans(slot uint8, rect protocol.Rect, spans []paintSpan, styles map[uint32]protocol.Style) error {
+	for _, span := range spans {
+		style, ok := styles[span.styleID]
+		if !ok {
+			return fmt.Errorf("undefined style %d on slot %d", span.styleID, slot)
+		}
+		writeCursorPosition(&s.ansi, rect.Y+span.row+1, rect.X+span.column+1)
+		s.ansi.WriteString(sgrForStyle(style))
+		if span.kind == paintText {
+			s.ansi.Write(span.text)
+		} else {
+			for columns := 0; columns < span.fillColumns; columns += int(span.cellWidth) {
+				s.ansi.WriteRune(span.fillRune)
+			}
+		}
+	}
+	return nil
+}
+
+func applySpanToCache(cache *paneScanoutCache, span paintSpan, evidence *frameEvidence) error {
 	if span.row < 0 || span.row >= cache.rows || span.column < 0 || span.column >= cache.cols {
 		return errors.New("paint span outside pane cache")
 	}
@@ -1078,9 +1223,23 @@ func applySpanToCache(cache *paneScanoutCache, span paintSpan) error {
 		if column+int(width) > len(row) {
 			return errors.New("paint span exceeds pane cache")
 		}
+		position := cellPosition{row: span.row, column: column}
+		change, exists := evidence.touched[position]
+		if !exists {
+			change.before = row[column]
+		}
 		row[column] = protocol.Cell{Rune: r, StyleID: span.styleID, Width: width}
+		change.after = row[column]
+		evidence.touched[position] = change
 		for n := 1; n < int(width); n++ {
+			continuation := cellPosition{row: span.row, column: column + n}
+			continuationChange, continuationExists := evidence.touched[continuation]
+			if !continuationExists {
+				continuationChange.before = row[column+n]
+			}
 			row[column+n] = protocol.Cell{StyleID: span.styleID}
+			continuationChange.after = row[column+n]
+			evidence.touched[continuation] = continuationChange
 		}
 		column += int(width)
 		return nil
@@ -1128,21 +1287,43 @@ func (s *scanoutState) emitCachedPane(rect protocol.Rect, cache *paneScanoutCach
 	return nil
 }
 
-func (s *scanoutState) restoreCursor() {
+func (s *scanoutState) isFocusedSlot(slot uint8) bool {
 	for _, placement := range s.layout.Panes {
-		if placement.PaneID != s.layout.FocusedPaneID {
-			continue
+		if placement.Slot == slot {
+			return placement.PaneID == s.layout.FocusedPaneID
 		}
-		cursor := s.cursors[placement.Slot]
-		writeCursorPosition(&s.ansi, placement.Rect.Y+cursor.Cursor.Y+1, placement.Rect.X+cursor.Cursor.X+1)
-		if cursor.Visible {
-			s.ansi.WriteString("\x1b[?25h")
-		} else {
-			s.ansi.WriteString("\x1b[?25l")
+	}
+	return false
+}
+
+func (s *scanoutState) setActiveCursor(rect protocol.Rect, cursor protocol.CursorUpdate) {
+	s.activeCursor = physicalCursor{
+		row: rect.Y + cursor.Cursor.Y + 1, column: rect.X + cursor.Cursor.X + 1,
+		visible: cursor.Visible, valid: true,
+	}
+}
+
+func (s *scanoutState) selectAuthoritativeCursor() {
+	for _, placement := range s.layout.Panes {
+		if placement.PaneID == s.layout.FocusedPaneID {
+			s.setActiveCursor(placement.Rect, s.cursors[placement.Slot])
+			return
 		}
+	}
+	s.activeCursor = physicalCursor{}
+}
+
+func (s *scanoutState) emitActiveCursor() {
+	if !s.activeCursor.valid {
+		s.ansi.WriteString("\x1b[?25l")
 		return
 	}
-	s.ansi.WriteString("\x1b[?25l")
+	writeCursorPosition(&s.ansi, s.activeCursor.row, s.activeCursor.column)
+	if s.activeCursor.visible {
+		s.ansi.WriteString("\x1b[?25h")
+	} else {
+		s.ansi.WriteString("\x1b[?25l")
+	}
 }
 
 func (s *scanoutState) setReconnecting(reconnecting bool, lastContact, now time.Time) {
@@ -1161,7 +1342,7 @@ func (s *scanoutState) setReconnecting(reconnecting bool, lastContact, now time.
 	for i := len(message); i < s.cols; i++ {
 		s.ansi.WriteByte(' ')
 	}
-	s.restoreCursor()
+	s.emitActiveCursor()
 }
 
 func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
@@ -1186,11 +1367,30 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 		var err error
 		switch e := event.(type) {
 		case reconnectEvent:
+			_, err = state.resetPrediction()
+			if err != nil {
+				return false, "", err
+			}
 			state.setReconnecting(e.reconnecting, e.lastContact, time.Now())
 			needsPresent = true
 			reason = "reconnect state"
 		case sizeEvent:
+			if state.cols != 0 && (state.cols != e.cols || state.rows != e.rows) {
+				needed, resetErr := state.resetPrediction()
+				needsPresent = needed
+				err = resetErr
+			}
 			state.cols, state.rows = e.cols, e.rows
+			reason = "terminal-size"
+		case localInputEvent:
+			if r.dropConnectionEvents.Load() {
+				return false, "", nil
+			}
+			needsPresent, err = state.acceptLocalInput(e.data)
+			reason = "local-input"
+		case inputPredictionResetEvent:
+			needsPresent, err = state.resetPrediction()
+			reason = "input-drop"
 		case layoutEvent:
 			if r.dropConnectionEvents.Load() {
 				return false, "", nil
