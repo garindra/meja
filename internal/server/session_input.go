@@ -28,6 +28,8 @@ const (
 	serverCommandLastWindow
 	serverCommandClosePane
 	serverCommandEnterHistory
+	serverCommandSwapPanePrevious
+	serverCommandSwapPaneNext
 	serverCommandSelectIndex
 	serverCommandFocusDirection
 	serverCommandBeginWindowPrompt
@@ -86,6 +88,10 @@ func consumeInputByteLocked(client *ClientState, b byte) serverInputEvent {
 			return serverInputEvent{Command: serverCommandClosePane}
 		case '[':
 			return serverInputEvent{Command: serverCommandEnterHistory}
+		case '{':
+			return serverInputEvent{Command: serverCommandSwapPanePrevious}
+		case '}':
+			return serverInputEvent{Command: serverCommandSwapPaneNext}
 		case ',':
 			return serverInputEvent{Command: serverCommandBeginWindowPrompt}
 		case '$':

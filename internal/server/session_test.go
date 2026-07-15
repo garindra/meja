@@ -62,6 +62,96 @@ func TestSessionSplitCreatesNewPaneAndBindings(t *testing.T) {
 	}
 }
 
+func TestResizeRebuildsVisualRenderBindings(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 16, 4
+	first := &Pane{ID: 2, terminal: terminal.New(16, 4)}
+	second := &Pane{ID: 1, terminal: terminal.New(16, 4)}
+	s.NextPaneID = 3
+	s.CreateWindow(first, 0)
+	window := s.Windows[client.ActiveWindowID]
+	s.Panes[second.ID] = second
+	window.Layout = &SplitLayout{
+		Direction: SplitHorizontal,
+		Ratio:     500,
+		First:     &PaneLayout{PaneID: first.ID},
+		Second:    &PaneLayout{PaneID: second.ID},
+	}
+	s.rebuildBindingsLocked(client, window)
+	if got := client.RenderBindings[0].PaneID; got != first.ID {
+		t.Fatalf("initial slot 0 pane = %d, want %d", got, first.ID)
+	}
+
+	s.ResizeAll(16, 1)
+	if got := client.RenderBindings[0].PaneID; got != second.ID {
+		t.Fatalf("resized slot 0 pane = %d, want %d", got, second.ID)
+	}
+}
+
+func TestSwapFocusedPaneUsesVisualOrderAndKeepsFocus(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 120, 39
+	left := &Pane{ID: s.AddPaneID()}
+	s.CreateWindow(left, 0)
+	topRight := &Pane{ID: s.AddPaneID()}
+	if _, _, err := s.SplitFocusedPane(0, topRight, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	bottomRight := &Pane{ID: s.AddPaneID()}
+	window, _, err := s.SplitFocusedPane(0, bottomRight, SplitHorizontal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeRevision := window.LayoutRevision
+
+	window, state, changed, err := s.SwapFocusedPane(0, SwapPanePrevious)
+	if err != nil || !changed {
+		t.Fatalf("SwapFocusedPane(previous) changed=%v err=%v", changed, err)
+	}
+	placements := window.Layout.Compute(Rect{Width: 120, Height: 39})
+	if len(placements) != 3 || placements[0].PaneID != left.ID || placements[1].PaneID != bottomRight.ID || placements[2].PaneID != topRight.ID {
+		t.Fatalf("placements after previous swap = %#v", placements)
+	}
+	if state.FocusedPaneID != bottomRight.ID || window.LayoutRevision <= beforeRevision {
+		t.Fatalf("swap state=%#v revision=%d before=%d", state, window.LayoutRevision, beforeRevision)
+	}
+
+	window, state, changed, err = s.SwapFocusedPane(0, SwapPaneNext)
+	if err != nil || !changed {
+		t.Fatalf("SwapFocusedPane(next) changed=%v err=%v", changed, err)
+	}
+	placements = window.Layout.Compute(Rect{Width: 120, Height: 39})
+	if placements[1].PaneID != topRight.ID || placements[2].PaneID != bottomRight.ID || state.FocusedPaneID != bottomRight.ID {
+		t.Fatalf("placements after next swap = %#v state=%#v", placements, state)
+	}
+}
+
+func TestSwapFocusedPaneWrapsAtVisualEdges(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 24
+	first := &Pane{ID: s.AddPaneID()}
+	s.CreateWindow(first, 0)
+	second := &Pane{ID: s.AddPaneID()}
+	if _, _, err := s.SplitFocusedPane(0, second, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.FocusPane(0, first.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	window, state, changed, err := s.SwapFocusedPane(0, SwapPanePrevious)
+	if err != nil || !changed {
+		t.Fatalf("SwapFocusedPane(previous) changed=%v err=%v", changed, err)
+	}
+	placements := window.Layout.Compute(Rect{Width: 80, Height: 24})
+	if placements[1].PaneID != first.ID || state.FocusedPaneID != first.ID {
+		t.Fatalf("wrapped placements=%#v state=%#v", placements, state)
+	}
+}
+
 func TestRecursiveMixedSplitsAndCloseCollapseOnlyParent(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)

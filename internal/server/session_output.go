@@ -161,12 +161,6 @@ func (s *Session) publishStatusBar() error {
 }
 
 func (s *Session) publishWindowLayout() error {
-	// The layout carries the slot-to-pane mapping consumed by output streams.
-	// Rebuild it before encoding the management event so the layout and the
-	// subsequent per-slot snapshots describe the same binding epoch.
-	if _, _, _, err := s.RebuildRenderBindings(clientID0); err != nil {
-		return err
-	}
 	layout, err := s.WindowLayout(clientID0)
 	if err != nil {
 		return err

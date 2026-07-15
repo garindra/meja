@@ -106,10 +106,11 @@ func TestSSHCommandErrorIncludesRemoteStderr(t *testing.T) {
 
 func TestIncomingRenderBurstLog(t *testing.T) {
 	var log bytes.Buffer
-	ui := &runtimeState{debugRender: true, stderr: &log}
-	ui.recordIncomingRenderCommand(0, protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteText, Text: []byte("x")}, 3)
-	ui.recordIncomingRenderCommand(0, protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}, 1)
-	ui.flushIncomingRender()
+	diagnostics := newRenderDiagnostics(&log)
+	diagnostics.reportCommand(0, protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteText, Text: []byte("x")}, 3)
+	diagnostics.reportCommand(0, protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}, 1)
+	diagnostics.reportRedraw("test", 7)
+	diagnostics.close()
 
 	got := log.String()
 	for _, want := range []string{
@@ -119,13 +120,15 @@ func TestIncomingRenderBurstLog(t *testing.T) {
 		"text_bytes=1",
 		"commands=2",
 		"types=WriteText:1,Present:1",
+		"redraw request #1: test",
+		"redraw write #1 bytes=7",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("incoming burst log missing %q: %q", want, got)
 		}
 	}
 
-	ui.closeIncomingRenderLog()
+	diagnostics.close()
 	if strings.Count(log.String(), "incoming burst") != 1 {
 		t.Fatalf("closeIncomingRenderLog() duplicated burst log: %q", log.String())
 	}

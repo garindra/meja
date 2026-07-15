@@ -260,6 +260,10 @@ func (s *Session) handleServerInputEvent(c *Connection, event serverInputEvent) 
 		return false, s.commandClosePane(c)
 	case serverCommandEnterHistory:
 		return false, s.commandEnterHistory()
+	case serverCommandSwapPanePrevious:
+		return false, s.commandSwapPane(SwapPanePrevious)
+	case serverCommandSwapPaneNext:
+		return false, s.commandSwapPane(SwapPaneNext)
 	case serverCommandFocusDirection:
 		if _, _, err := s.FocusPaneDirection(clientID0, event.Direction); err != nil {
 			return false, err
@@ -381,6 +385,26 @@ func (s *Session) commandSplit(c *Connection, direction SplitDirection) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Session) commandSwapPane(direction PaneSwapDirection) error {
+	bindings, _ := s.RenderBindings(clientID0)
+	if len(bindings) < 2 {
+		return nil
+	}
+	handoff := s.beginOutputHandoff()
+	_, clientState, changed, err := s.SwapFocusedPane(clientID0, direction)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return s.publishVisibleSnapshots(handoff)
+	}
+	s.resizeSessionToClient(clientState)
+	if err := s.publishWindowLayout(); err != nil {
+		return err
+	}
+	return s.publishBindingsAndSnapshots(handoff)
 }
 
 func (s *Session) commandEnterHistory() error {

@@ -13,7 +13,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,7 +33,6 @@ const (
 	clientPingPeriod    = 2 * time.Second
 	clientPingTimeout   = 6 * time.Second
 	heartbeatCloseCode  = quic.ApplicationErrorCode(0x54414c48)
-	incomingBurstWindow = 50 * time.Millisecond
 )
 
 type Target struct {
@@ -45,51 +43,32 @@ type Target struct {
 }
 
 type Config struct {
-	Local              bool
-	Target             Target
-	Port               int
-	PortSet            bool
-	IdentityFile       string
-	DebugRender        bool
-	DebugRenderLogPath string
-	Cwd                string
-	Argv               []string
-	RemotePath         string
-	SocketSelector     control.SocketSelector
-	SessionID          uint64
-	SessionTarget      string
-	SessionName        string
-	Stdin              *os.File
-	Stdout             io.Writer
-	Stderr             io.Writer
+	Local                    bool
+	Target                   Target
+	Port                     int
+	PortSet                  bool
+	IdentityFile             string
+	RenderDiagnostics        bool
+	RenderDiagnosticsLogPath string
+	Cwd                      string
+	Argv                     []string
+	RemotePath               string
+	SocketSelector           control.SocketSelector
+	SessionID                uint64
+	SessionTarget            string
+	SessionName              string
+	Stdin                    *os.File
+	Stdout                   io.Writer
+	Stderr                   io.Writer
 }
 
 type runtimeState struct {
-	stdout         io.Writer
-	stderr         io.Writer
-	events         chan renderEvent
-	debugRender    bool
-	redrawRequests uint64
-	redrawWrites   uint64
-
-	incomingMu              sync.Mutex
-	incomingBurstStarted    time.Time
-	incomingBurstTimer      *time.Timer
-	incomingClosed          bool
-	incomingWireBytes       uint64
-	incomingTextBytes       uint64
-	incomingCommandCount    uint64
-	incomingMessageTypeHits map[protocol.DisplayOpcode]uint64
-	incomingWriteStyleHits  map[renderStyleKey]uint64
-	installedRenderStyles   map[renderStyleKey]protocol.Style
-	renderDone              chan struct{}
-	dropConnectionEvents    atomic.Bool
-	rectangularScroll       bool
-}
-
-type renderStyleKey struct {
-	slot uint8
-	id   uint32
+	stdout               io.Writer
+	events               chan renderEvent
+	diagnostics          *renderDiagnostics
+	renderDone           chan struct{}
+	dropConnectionEvents atomic.Bool
+	rectangularScroll    bool
 }
 
 type renderEvent any
@@ -178,25 +157,30 @@ func Run(ctx context.Context, cfg Config) error {
 
 	streamErrs := make(chan error, 32)
 	renderLog := cfg.Stderr
-	if cfg.DebugRenderLogPath != "" {
-		f, err := os.Create(cfg.DebugRenderLogPath)
+	if cfg.RenderDiagnosticsLogPath != "" {
+		f, err := os.Create(cfg.RenderDiagnosticsLogPath)
 		if err != nil {
-			return fmt.Errorf("open render log: %w", err)
+			return fmt.Errorf("open render diagnostics log: %w", err)
 		}
 		defer f.Close()
 		renderLog = f
 	}
 
+	diagnosticsEnabled := cfg.RenderDiagnostics || cfg.RenderDiagnosticsLogPath != ""
+	var diagnostics *renderDiagnostics
+	if diagnosticsEnabled {
+		diagnostics = newRenderDiagnostics(renderLog)
+		defer diagnostics.close()
+	}
+
 	ui := &runtimeState{
 		stdout:            cfg.Stdout,
-		stderr:            renderLog,
 		events:            make(chan renderEvent, 256),
-		debugRender:       cfg.DebugRender,
+		diagnostics:       diagnostics,
 		renderDone:        make(chan struct{}),
 		rectangularScroll: true,
 	}
 	ui.dropConnectionEvents.Store(false)
-	defer ui.closeIncomingRenderLog()
 	go ui.renderLoop(ctx, streamErrs)
 	ui.emit(sizeEvent{cols: int(cols), rows: int(rows)})
 
@@ -598,7 +582,9 @@ func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeS
 		if lastContact != nil {
 			lastContact.Store(time.Now().UnixNano())
 		}
-		ui.recordIncomingRenderCommand(slot, command, wireBytes)
+		if ui.diagnostics != nil {
+			ui.diagnostics.reportCommand(slot, command, wireBytes)
+		}
 		if command.Opcode == protocol.DisplayOpcodeNoop {
 			continue
 		}
@@ -1236,11 +1222,10 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 	}
 	state := newScanoutState(r.rectangularScroll)
 	present := func(reason string) error {
-		r.redrawRequests++
-		r.logRenderf("redraw request #%d: %s", r.redrawRequests, reason)
 		buf := state.takeANSI()
-		r.redrawWrites++
-		r.logRenderf("redraw write #%d bytes=%d", r.redrawWrites, len(buf))
+		if r.diagnostics != nil {
+			r.diagnostics.reportRedraw(reason, len(buf))
+		}
 		if len(buf) == 0 {
 			return nil
 		}
@@ -1335,198 +1320,6 @@ func (r *runtimeState) sync(ctx context.Context) {
 	case <-done:
 	case <-r.renderDone:
 	case <-ctx.Done():
-	}
-}
-
-func (r *runtimeState) logRenderf(format string, args ...any) {
-	if !r.debugRender || r.stderr == nil {
-		return
-	}
-	_, _ = fmt.Fprintf(r.stderr, "tali render: "+format+"\n", args...)
-}
-
-func (r *runtimeState) recordIncomingRenderCommand(slot uint8, command protocol.DisplayCommand, wireBytes uint64) {
-	if !r.debugRender || r.stderr == nil {
-		return
-	}
-
-	r.incomingMu.Lock()
-	if r.incomingClosed {
-		r.incomingMu.Unlock()
-		return
-	}
-	if r.incomingBurstStarted.IsZero() {
-		r.incomingBurstStarted = time.Now()
-		r.incomingMessageTypeHits = make(map[protocol.DisplayOpcode]uint64)
-		r.incomingWriteStyleHits = make(map[renderStyleKey]uint64)
-		r.incomingBurstTimer = time.AfterFunc(incomingBurstWindow, r.flushIncomingRender)
-	}
-	r.incomingWireBytes += wireBytes
-	r.incomingTextBytes += uint64(len(command.Text))
-	r.incomingCommandCount++
-	r.incomingMessageTypeHits[command.Opcode]++
-	key := renderStyleKey{slot: slot}
-	if command.Opcode == protocol.DisplayOpcodeStyleInstall {
-		key.id = command.StyleID
-		if r.installedRenderStyles == nil {
-			r.installedRenderStyles = make(map[renderStyleKey]protocol.Style)
-		}
-		r.installedRenderStyles[key] = command.Style
-	}
-	if command.Opcode == protocol.DisplayOpcodeSetWriteStyle {
-		key.id = command.StyleID
-		r.incomingWriteStyleHits[key]++
-	}
-	r.incomingMu.Unlock()
-}
-
-func (r *runtimeState) flushIncomingRender() {
-	r.incomingMu.Lock()
-	defer r.incomingMu.Unlock()
-	if r.incomingBurstStarted.IsZero() {
-		return
-	}
-	if r.incomingBurstTimer != nil {
-		r.incomingBurstTimer.Stop()
-		r.incomingBurstTimer = nil
-	}
-	startedAt := r.incomingBurstStarted
-	types := formatIncomingRenderTypes(r.incomingMessageTypeHits)
-	writeStyles := formatIncomingWriteStyles(r.incomingWriteStyleHits, r.installedRenderStyles)
-	r.logRenderf(
-		"incoming burst at=%s window=%s elapsed=%s wire_bytes=%d text_bytes=%d commands=%d types=%s write_styles=%s",
-		time.Now().Format(time.RFC3339Nano),
-		incomingBurstWindow,
-		time.Since(startedAt).Round(time.Millisecond),
-		r.incomingWireBytes,
-		r.incomingTextBytes,
-		r.incomingCommandCount,
-		types,
-		writeStyles,
-	)
-	r.incomingBurstStarted = time.Time{}
-	r.incomingWireBytes = 0
-	r.incomingTextBytes = 0
-	r.incomingCommandCount = 0
-	r.incomingMessageTypeHits = nil
-	r.incomingWriteStyleHits = nil
-}
-
-func formatIncomingWriteStyles(hits map[renderStyleKey]uint64, styles map[renderStyleKey]protocol.Style) string {
-	if len(hits) == 0 {
-		return "none"
-	}
-	keys := make([]renderStyleKey, 0, len(hits))
-	for key := range hits {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].slot != keys[j].slot {
-			return keys[i].slot < keys[j].slot
-		}
-		return keys[i].id < keys[j].id
-	})
-	parts := make([]string, 0, len(keys))
-	for _, key := range keys {
-		style, ok := styles[key]
-		description := "unknown"
-		if ok {
-			description = formatRenderStyle(style)
-		}
-		parts = append(parts, fmt.Sprintf("slot%d/id%d:%d{%s}", key.slot, key.id, hits[key], description))
-	}
-	return strings.Join(parts, ",")
-}
-func formatRenderStyle(style protocol.Style) string {
-	flags := make([]string, 0, 7)
-	if style.Bold {
-		flags = append(flags, "bold")
-	}
-	if style.Dim {
-		flags = append(flags, "dim")
-	}
-	if style.Blink {
-		flags = append(flags, "blink")
-	}
-	if style.Italic {
-		flags = append(flags, "italic")
-	}
-	if style.Underline {
-		flags = append(flags, "underline")
-	}
-	if style.Reverse {
-		flags = append(flags, "reverse")
-	}
-	if style.Invisible {
-		flags = append(flags, "invisible")
-	}
-	if len(flags) == 0 {
-		flags = append(flags, "plain")
-	}
-	return fmt.Sprintf("%s,fg=%s,bg=%s", strings.Join(flags, "+"), formatRenderColor(style.FG), formatRenderColor(style.BG))
-}
-func formatRenderColor(color protocol.Color) string {
-	switch color.Mode {
-	case "indexed":
-		return fmt.Sprintf("idx%d", color.Index)
-	case "rgb":
-		return fmt.Sprintf("#%02x%02x%02x", color.R, color.G, color.B)
-	default:
-		return "default"
-	}
-}
-
-func (r *runtimeState) closeIncomingRenderLog() {
-	r.incomingMu.Lock()
-	r.incomingClosed = true
-	r.incomingMu.Unlock()
-	r.flushIncomingRender()
-}
-
-func formatIncomingRenderTypes(types map[protocol.DisplayOpcode]uint64) string {
-	if len(types) == 0 {
-		return "none"
-	}
-	keys := make([]protocol.DisplayOpcode, 0, len(types))
-	for msgType := range types {
-		keys = append(keys, msgType)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	parts := make([]string, 0, len(keys))
-	for _, msgType := range keys {
-		parts = append(parts, fmt.Sprintf("%s:%d", incomingRenderOpcodeName(msgType), types[msgType]))
-	}
-	return strings.Join(parts, ",")
-}
-
-func incomingRenderOpcodeName(opcode protocol.DisplayOpcode) string {
-	switch opcode {
-	case protocol.DisplayOpcodeNoop:
-		return "Noop"
-	case protocol.DisplayOpcodeRelayoutBarrier:
-		return "RelayoutBarrier"
-	case protocol.DisplayOpcodeStyleInstall:
-		return "StyleInstall"
-	case protocol.DisplayOpcodeSetWritePosition:
-		return "SetWritePosition"
-	case protocol.DisplayOpcodeSetWriteStyle:
-		return "SetWriteStyle"
-	case protocol.DisplayOpcodeWriteText:
-		return "WriteText"
-	case protocol.DisplayOpcodeWriteTextUTF8:
-		return "WriteTextUTF8"
-	case protocol.DisplayOpcodeWriteTextUTF8Default:
-		return "WriteTextUTF8Default"
-	case protocol.DisplayOpcodeFill:
-		return "Fill"
-	case protocol.DisplayOpcodeCursorUpdate:
-		return "CursorUpdate"
-	case protocol.DisplayOpcodeScroll:
-		return "Scroll"
-	case protocol.DisplayOpcodePresent:
-		return "Present"
-	default:
-		return fmt.Sprintf("Opcode0x%02x", byte(opcode))
 	}
 }
 

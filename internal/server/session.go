@@ -299,6 +299,13 @@ type RenderBinding struct {
 	PaneID uint64
 }
 
+type PaneSwapDirection int8
+
+const (
+	SwapPanePrevious PaneSwapDirection = -1
+	SwapPaneNext     PaneSwapDirection = 1
+)
+
 type ClientState struct {
 	ID             uint64
 	SessionID      uint64
@@ -658,6 +665,44 @@ func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitD
 	return cloneWindow(window), cloneClientState(client), nil
 }
 
+func (s *Session) SwapFocusedPane(clientID uint64, direction PaneSwapDirection) (*Window, *ClientState, bool, error) {
+	client := s.Clients[clientID]
+	if client == nil {
+		return nil, nil, false, fmt.Errorf("unknown client %d", clientID)
+	}
+	window := s.Windows[client.ActiveWindowID]
+	if window == nil {
+		return nil, nil, false, fmt.Errorf("unknown window %d", client.ActiveWindowID)
+	}
+	if direction != SwapPanePrevious && direction != SwapPaneNext {
+		return nil, nil, false, fmt.Errorf("invalid pane swap direction %d", direction)
+	}
+
+	s.rebuildBindingsLocked(client, window)
+	if len(client.RenderBindings) < 2 {
+		return cloneWindow(window), cloneClientState(client), false, nil
+	}
+	current := -1
+	for i, binding := range client.RenderBindings {
+		if binding.PaneID == client.FocusedPaneID {
+			current = i
+			break
+		}
+	}
+	if current < 0 {
+		return cloneWindow(window), cloneClientState(client), false, nil
+	}
+	target := (current + int(direction) + len(client.RenderBindings)) % len(client.RenderBindings)
+	targetPaneID := client.RenderBindings[target].PaneID
+	if !swapLayoutPanes(window.Layout, client.FocusedPaneID, targetPaneID) {
+		return nil, nil, false, fmt.Errorf("swap panes %d and %d in window %d", client.FocusedPaneID, targetPaneID, window.ID)
+	}
+	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	client.setFocusedPane(client.FocusedPaneID)
+	s.rebuildBindingsLocked(client, window)
+	return cloneWindow(window), cloneClientState(client), true, nil
+}
+
 func (s *Session) CanSplitFocusedPane(clientID uint64) error {
 	client := s.Clients[clientID]
 	if client == nil {
@@ -968,6 +1013,9 @@ func (s *Session) ResizeAll(cols, rows uint16) {
 	for _, client := range s.Clients {
 		client.TerminalCols = cols
 		client.TerminalRows = rows
+		if window := s.Windows[client.ActiveWindowID]; window != nil {
+			s.rebuildBindingsLocked(client, window)
+		}
 	}
 	for _, window := range s.Windows {
 		window.LayoutRevision = s.nextLayoutRevisionLocked()
@@ -1030,6 +1078,31 @@ func replacePaneWithSplit(layout LayoutNode, targetPaneID, newPaneID uint64, dir
 		}
 	}
 	return layout, false
+}
+
+func swapLayoutPanes(layout LayoutNode, firstPaneID, secondPaneID uint64) bool {
+	first := paneLayoutByID(layout, firstPaneID)
+	second := paneLayoutByID(layout, secondPaneID)
+	if first == nil || second == nil || first == second {
+		return false
+	}
+	first.PaneID, second.PaneID = second.PaneID, first.PaneID
+	return true
+}
+
+func paneLayoutByID(layout LayoutNode, paneID uint64) *PaneLayout {
+	switch node := layout.(type) {
+	case *PaneLayout:
+		if node.PaneID == paneID {
+			return node
+		}
+	case *SplitLayout:
+		if pane := paneLayoutByID(node.First, paneID); pane != nil {
+			return pane
+		}
+		return paneLayoutByID(node.Second, paneID)
+	}
+	return nil
 }
 
 func removePaneFromLayout(layout LayoutNode, targetPaneID uint64) (LayoutNode, uint64, bool) {

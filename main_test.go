@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -72,6 +74,41 @@ func TestParseGlobalOptionsAcceptsProfileAndSocket(t *testing.T) {
 func TestParseGlobalOptionsRejectsProfileAndSocketTogether(t *testing.T) {
 	if _, _, err := parseGlobalOptions([]string{"-L", "dev", "-S", "/tmp/dev.sock"}); err == nil {
 		t.Fatal("-L with -S was accepted")
+	}
+}
+
+func TestDebugEnvironmentConfiguresClientDiagnostics(t *testing.T) {
+	t.Setenv("TALI_DEBUG", "")
+	t.Setenv("TALI_DEBUG_RENDER", "true")
+	t.Setenv("TALI_DEBUG_LOG", "/tmp/tali-render.log")
+	cfg := client.Config{}
+	applyDebugEnvironment(&cfg)
+	if !cfg.RenderDiagnostics || cfg.RenderDiagnosticsLogPath != "/tmp/tali-render.log" {
+		t.Fatalf("debug config = %#v", cfg)
+	}
+}
+
+func TestDebugLogEnvironmentEnablesDiagnostics(t *testing.T) {
+	t.Setenv("TALI_DEBUG", "")
+	t.Setenv("TALI_DEBUG_RENDER", "")
+	t.Setenv("TALI_DEBUG_LOG", "/tmp/tali-render.log")
+	cfg := client.Config{}
+	applyDebugEnvironment(&cfg)
+	if !cfg.RenderDiagnostics {
+		t.Fatal("TALI_DEBUG_LOG did not enable diagnostics")
+	}
+}
+
+func TestRenderDebugFlagsAreNotAccepted(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var flags connectionFlags
+	flags.register(fs)
+	if err := fs.Parse([]string{"--debug-render"}); err == nil {
+		t.Fatal("--debug-render was accepted")
+	}
+	if err := fs.Parse([]string{"--debug-render-log", "/tmp/render.log"}); err == nil {
+		t.Fatal("--debug-render-log was accepted")
 	}
 }
 

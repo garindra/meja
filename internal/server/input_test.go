@@ -47,6 +47,20 @@ func TestServerRecognizesRenameSessionPrefix(t *testing.T) {
 	}
 }
 
+func TestServerRecognizesSwapPanePrefixes(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	for key, want := range map[byte]serverInputCommand{
+		'{': serverCommandSwapPanePrevious,
+		'}': serverCommandSwapPaneNext,
+	} {
+		s.ConsumeInputByte(0, 0x02)
+		if event := s.ConsumeInputByte(0, key); event.Command != want {
+			t.Fatalf("prefix %q event = %#v, want command %d", key, event, want)
+		}
+	}
+}
+
 func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	s := NewSession(1)
 	s.NewClient(0)

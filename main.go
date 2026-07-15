@@ -55,6 +55,7 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 	}
 	if len(args) == 0 {
 		cfg := client.Config{Local: true, SocketSelector: selector, Stdin: stdin, Stdout: stdout, Stderr: stderr}
+		applyDebugEnvironment(&cfg)
 		if err := setDefaultLocalCwd(&cfg); err != nil {
 			return err
 		}
@@ -95,11 +96,9 @@ func parseGlobalOptions(args []string) (control.SocketSelector, []string, error)
 }
 
 type connectionFlags struct {
-	identity       string
-	remotePath     string
-	port           intFlagValue
-	debugRender    bool
-	debugRenderLog string
+	identity   string
+	remotePath string
+	port       intFlagValue
 }
 
 func (f *connectionFlags) register(fs *flag.FlagSet) {
@@ -107,23 +106,40 @@ func (f *connectionFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.remotePath, "remote-path", "tali", "remote tali executable path")
 	f.port.value = 4433
 	fs.Var(&f.port, "port", "SSH port")
-	fs.BoolVar(&f.debugRender, "debug-render", false, "enable client redraw logging")
-	fs.StringVar(&f.debugRenderLog, "debug-render-log", "", "write client redraw logs to this file")
 }
 
 func (f connectionFlags) config(selector control.SocketSelector, stdin *os.File, stdout, stderr io.Writer) client.Config {
-	return client.Config{
-		Port:               f.port.value,
-		PortSet:            f.port.set,
-		IdentityFile:       f.identity,
-		RemotePath:         f.remotePath,
-		SocketSelector:     selector,
-		DebugRender:        f.debugRender,
-		DebugRenderLogPath: f.debugRenderLog,
-		Stdin:              stdin,
-		Stdout:             stdout,
-		Stderr:             stderr,
+	cfg := client.Config{
+		Port:           f.port.value,
+		PortSet:        f.port.set,
+		IdentityFile:   f.identity,
+		RemotePath:     f.remotePath,
+		SocketSelector: selector,
+		Stdin:          stdin,
+		Stdout:         stdout,
+		Stderr:         stderr,
 	}
+	applyDebugEnvironment(&cfg)
+	return cfg
+}
+
+func applyDebugEnvironment(cfg *client.Config) {
+	cfg.RenderDiagnostics = cfg.RenderDiagnostics || debugEnvironmentEnabled("TALI_DEBUG") || debugEnvironmentEnabled("TALI_DEBUG_RENDER")
+	if cfg.RenderDiagnosticsLogPath == "" {
+		cfg.RenderDiagnosticsLogPath = os.Getenv("TALI_DEBUG_LOG")
+	}
+	if cfg.RenderDiagnosticsLogPath != "" {
+		cfg.RenderDiagnostics = true
+	}
+}
+
+func debugEnvironmentEnabled(name string) bool {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return false
+	}
+	enabled, err := strconv.ParseBool(value)
+	return err == nil && enabled
 }
 
 func runNew(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {

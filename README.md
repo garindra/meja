@@ -122,6 +122,17 @@ Connection flags belong before the host. `-i` selects an SSH identity,
 `--port` selects the SSH port, and `--remote-path` selects the exact remote
 `tali` executable. The default remote path is `tali`.
 
+Client render diagnostics are enabled through environment variables. Set
+`TALI_DEBUG=1` to enable all available diagnostics or
+`TALI_DEBUG_RENDER=1` to enable render diagnostics specifically. Diagnostics
+are written to stderr unless `TALI_DEBUG_LOG` names a file; setting that path
+also enables render diagnostics:
+
+```bash
+TALI_DEBUG_RENDER=1 tali
+TALI_DEBUG_LOG=/tmp/tali-render.log tali attach -t work
+```
+
 `tali new -c <directory>` (or `--cwd`) sets the session's starting directory
 for its initial pane and all later windows and splits. The directory is
 resolved on the target machine and must be absolute or begin with `~/`.

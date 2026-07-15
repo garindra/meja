@@ -96,36 +96,6 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 	}
 }
 
-func TestPublishedLayoutRebuildsSlotsBeforeEncoding(t *testing.T) {
-	session := NewSession(0)
-	client := session.NewClient(0)
-	client.TerminalCols = 16
-	client.TerminalRows = 4
-	first := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 4)}
-	second := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 4)}
-	session.CreateWindow(first, 0)
-	session.rebuildBindingsLocked(client, session.Windows[client.ActiveWindowID])
-	if _, _, err := session.SplitFocusedPane(0, second, SplitVertical); err != nil {
-		t.Fatal(err)
-	}
-	frames := make(chan protocol.Frame, 1)
-	session.attachConnection(testConnection(frames, nil))
-	if err := session.publishWindowLayout(); err != nil {
-		t.Fatal(err)
-	}
-	frame := <-frames
-	if frame.Type != protocol.MsgWindowLayout {
-		t.Fatalf("frame type = %d, want WINDOW_LAYOUT", frame.Type)
-	}
-	layout, err := protocol.DecodeWindowLayout(frame.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(layout.Panes) != 2 || layout.Panes[0].Slot != 0 || layout.Panes[1].Slot != 1 {
-		t.Fatalf("published slots = %#v", layout.Panes)
-	}
-}
-
 func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
 	handler := &Connection{Session: NewSession(0)}
@@ -375,6 +345,59 @@ func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 	}
 	if slot0.Len() <= before {
 		t.Fatal("first pane had no live output after returning to its split window")
+	}
+}
+
+func TestSwapPaneCommandMovesLiveOutputsToRevisedSlots(t *testing.T) {
+	session := NewSession(0)
+	client := session.NewClient(0)
+	client.TerminalCols = 16
+	client.TerminalRows = 4
+	handler := &Connection{Session: session}
+
+	first, firstUpdates := startTestPaneRenderer(handler, session.AddPaneID(), 8, 4)
+	second, secondUpdates := startTestPaneRenderer(handler, session.AddPaneID(), 8, 4)
+	defer close(firstUpdates)
+	defer close(secondUpdates)
+	session.CreateWindow(first, 0)
+	if _, _, err := session.SplitFocusedPane(0, second, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	frames := make(chan protocol.Frame, 1)
+	var slot0, slot1 bytes.Buffer
+	session.attachConnection(testConnection(frames, map[int]*OutputLease{
+		0: testOutputLease(0, &slot0),
+		1: testOutputLease(1, &slot1),
+	}))
+	if err := session.publishBindingsAndSnapshots(nil); err != nil {
+		t.Fatal(err)
+	}
+	syncPaneRenderer(t, first)
+	syncPaneRenderer(t, second)
+
+	if err := session.commandSwapPane(SwapPanePrevious); err != nil {
+		t.Fatal(err)
+	}
+	syncPaneRenderer(t, first)
+	syncPaneRenderer(t, second)
+	if first.outputLease == nil || first.outputLease.Slot != 1 || second.outputLease == nil || second.outputLease.Slot != 0 {
+		t.Fatalf("leases after swap: first=%#v second=%#v", first.outputLease, second.outputLease)
+	}
+	bindings, state := session.RenderBindings(0)
+	if len(bindings) != 2 || bindings[0].PaneID != second.ID || bindings[1].PaneID != first.ID || state.FocusedPaneID != second.ID {
+		t.Fatalf("bindings after swap=%#v state=%#v", bindings, state)
+	}
+
+	frame := <-frames
+	if frame.Type != protocol.MsgWindowLayout {
+		t.Fatalf("frame type = %d, want WINDOW_LAYOUT", frame.Type)
+	}
+	layout, err := protocol.DecodeWindowLayout(frame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layout.Panes) != 2 || layout.Panes[0].PaneID != second.ID || layout.Panes[0].Slot != 0 || layout.Panes[1].PaneID != first.ID || layout.Panes[1].Slot != 1 {
+		t.Fatalf("published layout after swap=%#v", layout)
 	}
 }
 
