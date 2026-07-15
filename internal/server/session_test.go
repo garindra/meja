@@ -1,11 +1,24 @@
 package server
 
 import (
+	"context"
+	"fmt"
 	"testing"
+
+	"github.com/quic-go/quic-go"
 
 	"github.com/garindra/meja/internal/protocol"
 	"github.com/garindra/meja/internal/server/terminal"
 )
+
+type recordingQUICConnection struct {
+	quic.Connection
+	closeWithError func(quic.ApplicationErrorCode, string) error
+}
+
+func (c *recordingQUICConnection) CloseWithError(code quic.ApplicationErrorCode, message string) error {
+	return c.closeWithError(code, message)
+}
 
 func TestPaneAndSplitLayoutsComputeExpectedRects(t *testing.T) {
 	single := (&PaneLayout{PaneID: 1}).Compute(Rect{X: 0, Y: 0, Width: 120, Height: 39})
@@ -457,5 +470,37 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	}
 	if state := s.SnapshotClient(0); state.ActiveWindowID != third.ID {
 		t.Fatalf("numeric-selection target = %d, want %d", state.ActiveWindowID, third.ID)
+	}
+}
+
+func TestSessionShutdownCleanlyClosesConnectionBeforeCancelingQUIC(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	closed := false
+	var closeErr error
+	connection := &recordingQUICConnection{closeWithError: func(code quic.ApplicationErrorCode, message string) error {
+		if ctx.Err() != nil {
+			closeErr = fmt.Errorf("QUIC context was canceled before the clean connection close")
+		}
+		if code != 0 || message != "" {
+			closeErr = fmt.Errorf("CloseWithError(%d, %q), want clean application close", code, message)
+		}
+		closed = true
+		return nil
+	}}
+	s := NewSession(1)
+	s.quicCancel = cancel
+	s.connection = &Connection{QUIC: connection}
+
+	if err := s.shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if !closed {
+		t.Fatal("active QUIC connection was not closed")
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("session QUIC context was not canceled after the clean close")
 	}
 }

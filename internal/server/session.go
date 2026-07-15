@@ -1,10 +1,17 @@
 package server
 
 import (
+	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
+	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
 
 	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
@@ -80,6 +87,85 @@ func (s *Session) stopOperations() {
 	s.stopOnce.Do(func() { close(s.operationsDone) })
 }
 
+// startQUIC is a daemon-to-session RPC over the Session actor's enduring
+// operations channel. Completion means the listener is bound, the initial
+// attach credential is installed, and the accept goroutine is running.
+func (s *Session) startQUIC(parent context.Context, tlsConfig *tls.Config) (uint16, string, time.Time, error) {
+	token, err := control.NewToken()
+	if err != nil {
+		return 0, "", time.Time{}, err
+	}
+	expiresAt := time.Now().Add(attachTTL)
+	if parent == nil {
+		parent = context.Background()
+	}
+	var port uint16
+	started := false
+	err = s.coordinate(func() error {
+		if s.stopping {
+			return control.ErrSessionUnavailable
+		}
+		if err := parent.Err(); err != nil {
+			return err
+		}
+		listener, boundPort, err := listenQUICInRange(tlsConfig)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithCancel(parent)
+		port = boundPort
+		s.port = port
+		s.quicListener = listener
+		s.quicCancel = cancel
+		s.attachToken = token
+		s.attachExpires = expiresAt
+		s.attachConsumed = false
+		go s.runQUIC(ctx, listener)
+		started = true
+		return nil
+	})
+	if err == nil && !started {
+		err = control.ErrSessionUnavailable
+	}
+	return port, control.EncodeToken(token), expiresAt, err
+}
+
+func (s *Session) runQUIC(ctx context.Context, listener *quic.Listener) {
+	for {
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, quic.ErrServerClosed) {
+				return
+			}
+			if s.daemon != nil {
+				s.daemon.logf("meja session %d: accept QUIC connection: %v\n", s.ID, err)
+			}
+			_ = s.shutdown()
+			return
+		}
+		go func() {
+			if err := serveConnection(ctx, s.daemon, s, conn); err != nil && s.daemon != nil {
+				s.daemon.logf("meja session %d: %v\n", s.ID, err)
+			}
+		}()
+	}
+}
+
+func listenQUICInRange(tlsConfig *tls.Config) (*quic.Listener, uint16, error) {
+	for port := control.DefaultUDPMin; port <= control.DefaultUDPMax; port++ {
+		listener, err := quic.ListenAddr(net.JoinHostPort("0.0.0.0", strconv.Itoa(port)), tlsConfig, &quic.Config{
+			MaxIdleTimeout:     quicMaxIdleTimeout,
+			KeepAlivePeriod:    quicKeepAlivePeriod,
+			MaxIncomingStreams: int64(protocol.MaxRenderSlots),
+			InitialPacketSize:  protocol.QUICInitialPacketSize,
+		})
+		if err == nil {
+			return listener, uint16(port), nil
+		}
+	}
+	return nil, 0, errors.New("no UDP port available in 60000-61000")
+}
+
 // shutdownNow runs only on the session actor. The Session releases its own
 // live resources, tells the Daemon to forget it, and lets runOperations exit
 // after replying to the operation that caused the shutdown.
@@ -93,8 +179,19 @@ func (s *Session) shutdownNow() {
 	s.resumeTokens = nil
 	connection := s.connection
 	s.connection = nil
+	// A ListenAddr listener closes established connections immediately. Send
+	// the clean application close first so the client exits instead of treating
+	// listener teardown as a transport failure and entering reconnect mode.
 	if connection != nil && connection.QUIC != nil {
 		_ = connection.QUIC.CloseWithError(0, "")
+	}
+	if s.quicCancel != nil {
+		s.quicCancel()
+		s.quicCancel = nil
+	}
+	if s.quicListener != nil {
+		_ = s.quicListener.Close()
+		s.quicListener = nil
 	}
 	if s.daemon != nil {
 		s.daemon.sessionExited(s)
@@ -168,29 +265,51 @@ func (s *Session) info() (name string, attached bool) {
 	return name, attached
 }
 
-func (s *Session) issueAttachToken() (string, time.Time, error) {
+// issueBootstrap is a daemon-to-session RPC over the Session actor's enduring
+// operations channel. Each call returns the stable listener port and installs
+// a fresh, single-use attach credential for initial attachment or reconnect.
+func (s *Session) issueBootstrap() (uint16, string, time.Time, error) {
 	token, err := control.NewToken()
 	if err != nil {
-		return "", time.Time{}, err
+		return 0, "", time.Time{}, err
 	}
 	expires := time.Now().Add(attachTTL)
+	var port uint16
+	issued := false
 	err = s.coordinate(func() error {
+		if s.stopping {
+			return control.ErrSessionUnavailable
+		}
+		port = s.port
 		s.attachToken = token
 		s.attachExpires = expires
 		s.attachConsumed = false
+		issued = true
 		return nil
 	})
-	return control.EncodeToken(token), expires, err
+	if err == nil && !issued {
+		err = control.ErrSessionUnavailable
+	}
+	return port, control.EncodeToken(token), expires, err
 }
 
 func (s *Session) consumeAttachToken(encoded string) error {
-	return s.coordinate(func() error {
+	checked := false
+	err := s.coordinate(func() error {
+		checked = true
+		if s.stopping {
+			return fmt.Errorf("session attachment rejected")
+		}
 		if s.attachConsumed || time.Now().After(s.attachExpires) || !control.EqualToken(encoded, s.attachToken) {
 			return fmt.Errorf("session attachment rejected")
 		}
 		s.attachConsumed = true
 		return nil
 	})
+	if err == nil && !checked {
+		return fmt.Errorf("session attachment rejected")
+	}
+	return err
 }
 
 func (s *Session) beginAttachment() (string, uint64, error) {
@@ -200,12 +319,20 @@ func (s *Session) beginAttachment() (string, uint64, error) {
 	}
 	encoded := control.EncodeToken(token)
 	var generation uint64
+	issued := false
 	err = s.coordinate(func() error {
+		if s.stopping {
+			return fmt.Errorf("session attachment rejected")
+		}
 		s.generation++
 		generation = s.generation
 		s.resumeTokens = map[string]uint64{encoded: generation}
+		issued = true
 		return nil
 	})
+	if err == nil && !issued {
+		err = fmt.Errorf("session attachment rejected")
+	}
 	return encoded, generation, err
 }
 
@@ -216,15 +343,23 @@ func (s *Session) resumeAttachment(encoded string, generation uint64) (string, u
 	}
 	nextToken := control.EncodeToken(token)
 	var nextGeneration uint64
+	issued := false
 	err = s.coordinate(func() error {
+		if s.stopping {
+			return fmt.Errorf("session resume rejected")
+		}
 		if current, ok := s.resumeTokens[encoded]; !ok || current != generation || generation != s.generation {
 			return fmt.Errorf("session resume rejected")
 		}
 		s.generation++
 		nextGeneration = s.generation
 		s.resumeTokens = map[string]uint64{nextToken: nextGeneration}
+		issued = true
 		return nil
 	})
+	if err == nil && !issued {
+		err = fmt.Errorf("session resume rejected")
+	}
 	return nextToken, nextGeneration, err
 }
 
@@ -249,6 +384,9 @@ type Session struct {
 	resumeTokens   map[string]uint64
 	generation     uint64
 	daemon         *Daemon
+	port           uint16
+	quicListener   *quic.Listener
+	quicCancel     context.CancelFunc
 	connection     *Connection
 	defaultCwd     string
 	operations     chan sessionOperation

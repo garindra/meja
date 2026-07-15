@@ -10,6 +10,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
 )
 
@@ -18,7 +19,7 @@ const (
 	quicKeepAlivePeriod = 2 * time.Second
 )
 
-func serveConnection(ctx context.Context, d *Daemon, conn quic.Connection) error {
+func serveConnection(ctx context.Context, d *Daemon, listenerSession *Session, conn quic.Connection) error {
 	defer conn.CloseWithError(0, "")
 
 	var err error
@@ -56,7 +57,12 @@ func serveConnection(ctx context.Context, d *Daemon, conn quic.Connection) error
 		if attach.Version != protocol.ProtocolVersion {
 			return errors.New("unsupported session protocol version")
 		}
-		s, err = d.attach(attach.SessionID, attach.Token)
+		if attach.SessionID != listenerSession.ID {
+			err = control.ErrSessionUnavailable
+		} else {
+			s = listenerSession
+			err = s.consumeAttachToken(attach.Token)
+		}
 		if err == nil {
 			resumeEncoded, generation, err = s.beginAttachment()
 		}
@@ -68,7 +74,12 @@ func serveConnection(ctx context.Context, d *Daemon, conn quic.Connection) error
 		if resume.Version != protocol.ProtocolVersion {
 			return errors.New("unsupported session protocol version")
 		}
-		s, resumeEncoded, generation, err = d.resume(resume.SessionID, resume.ResumeToken, resume.Generation)
+		if resume.SessionID != listenerSession.ID {
+			err = control.ErrSessionUnavailable
+		} else {
+			s = listenerSession
+			resumeEncoded, generation, err = s.resumeAttachment(resume.ResumeToken, resume.Generation)
+		}
 		responseType = protocol.MsgSessionResumeOK
 	default:
 		return fmt.Errorf("expected session attachment, got message type %d", first.Type)

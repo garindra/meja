@@ -91,7 +91,8 @@ meja -L dev server stop
 ## Servers and sockets
 
 Each socket identifies an isolated Meja server process with its own sessions,
-session-ID sequence, QUIC listener, and certificate. `-L` selects a named
+session-ID sequence, and certificate. Each session owns a separate QUIC
+listener. `-L` selects a named
 profile and `-S` selects an exact socket path. They are global, mutually
 exclusive options and must appear before the command:
 
@@ -185,7 +186,8 @@ from the protected Unix control socket and connect to the QUIC server through
 protected control socket is selected by `-L` or `-S`; the socket directory is
 mode 0700 and the socket is mode 0600. Session IDs increase from 1 for the
 lifetime of a daemon. Session names are unique within one server/socket. A
-session is destroyed when its last pane exits.
+session is destroyed when its last pane exits, which closes its QUIC listener
+and releases its UDP port.
 
 `meja server stop` cleanly disconnects active clients as if they detached,
 gracefully stops the active daemon, and reports its PID when available. SIGINT
@@ -195,8 +197,9 @@ and SIGTERM on a foreground daemon use the same client-disconnect behavior.
 
 The daemon runs under the SSH-authenticated account, so panes naturally have
 that account's UID/GID and environment. No root credential switching is used.
-The daemon generates a self-signed TLS 1.3 certificate and chooses a UDP port
-in 60000–61000. The client uses an internal `InsecureSkipVerify` setting only
+The daemon generates a self-signed TLS 1.3 certificate. When a session is
+created, it binds a UDP port in 60000–61000 that is not shared with another
+session. The client uses an internal `InsecureSkipVerify` setting only
 with a mandatory exact SPKI `VerifyConnection` pin from the bootstrap; there
 is no genuinely unverified production TLS mode and no CA/certificate/key setup
 is required.

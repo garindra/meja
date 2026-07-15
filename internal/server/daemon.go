@@ -13,14 +13,10 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"net"
 	"os"
 	"sort"
-	"strconv"
 	"sync"
 	"time"
-
-	"github.com/quic-go/quic-go"
 
 	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
@@ -40,15 +36,16 @@ type Config struct {
 // registry access is serialized by requests; control handlers query it and
 // then query Sessions separately, so neither actor waits on the other.
 type Daemon struct {
-	logMu    sync.Mutex
-	requests chan daemonRequest
-	nextID   uint64
-	sessions map[uint64]*Session
-	names    map[string]*Session
-	certHash string
-	port     uint16
-	stop     context.CancelFunc
-	stderr   io.Writer
+	logMu     sync.Mutex
+	requests  chan daemonRequest
+	nextID    uint64
+	sessions  map[uint64]*Session
+	names     map[string]*Session
+	tlsConfig *tls.Config
+	certHash  string
+	serverCtx context.Context
+	stop      context.CancelFunc
+	stderr    io.Writer
 }
 
 type daemonRequest struct {
@@ -110,12 +107,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13}
-	listener, port, err := listenQUICInRange(tlsConfig)
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
-	d := &Daemon{requests: make(chan daemonRequest, 64), nextID: 1, sessions: make(map[uint64]*Session), names: make(map[string]*Session), certHash: hash, port: port, stop: stop, stderr: cfg.Stderr}
+	d := &Daemon{requests: make(chan daemonRequest, 64), nextID: 1, sessions: make(map[uint64]*Session), names: make(map[string]*Session), tlsConfig: tlsConfig, certHash: hash, serverCtx: serverCtx, stop: stop, stderr: cfg.Stderr}
 	actorCtx, stopActor := context.WithCancel(context.Background())
 	go d.runRequests(actorCtx)
 	defer func() {
@@ -130,40 +122,11 @@ func Run(ctx context.Context, cfg Config) error {
 		case <-serverCtx.Done():
 		}
 	}()
-	controlErr := make(chan error, 1)
-	go func() {
-		err := control.Serve(serverCtx, socket, d.handleControl)
-		controlErr <- err
-		if err != nil {
-			stop()
-		}
-	}()
-	for {
-		conn, acceptErr := listener.Accept(serverCtx)
-		if acceptErr != nil {
-			if errors.Is(acceptErr, context.Canceled) {
-				select {
-				case err := <-controlErr:
-					return err
-				default:
-					return nil
-				}
-			}
-			return fmt.Errorf("accept QUIC connection: %w", acceptErr)
-		}
-		go func() {
-			if err := serveConnection(serverCtx, d, conn); err != nil {
-				d.logf("meja session: %v\n", err)
-			}
-		}()
-		select {
-		case err := <-controlErr:
-			if err != nil {
-				return err
-			}
-		default:
-		}
+	err = control.Serve(serverCtx, socket, d.handleControl)
+	if err != nil {
+		stop()
 	}
+	return err
 }
 
 func (d *Daemon) logSessionAttached(sessionID uint64) {
@@ -177,21 +140,6 @@ func (d *Daemon) logf(format string, args ...any) {
 	d.logMu.Lock()
 	defer d.logMu.Unlock()
 	fmt.Fprintf(d.stderr, format, args...)
-}
-
-func listenQUICInRange(tlsConfig *tls.Config) (*quic.Listener, uint16, error) {
-	for port := control.DefaultUDPMin; port <= control.DefaultUDPMax; port++ {
-		listener, err := quic.ListenAddr(net.JoinHostPort("0.0.0.0", strconv.Itoa(port)), tlsConfig, &quic.Config{
-			MaxIdleTimeout:     quicMaxIdleTimeout,
-			KeepAlivePeriod:    quicKeepAlivePeriod,
-			MaxIncomingStreams: int64(protocol.MaxRenderSlots),
-			InitialPacketSize:  protocol.QUICInitialPacketSize,
-		})
-		if err == nil {
-			return listener, uint16(port), nil
-		}
-	}
-	return nil, 0, errors.New("no UDP port available in 60000-61000")
 }
 
 func daemonCertificate() (tls.Certificate, string, error) {
@@ -255,6 +203,10 @@ func (d *Daemon) handleControl(operation string, target control.SessionTarget) (
 	}
 	var s *Session
 	var operationErr error
+	created := false
+	var port uint16
+	var encodedToken string
+	var expires time.Time
 	d.call(func() {
 		switch operation {
 		case "create-session":
@@ -274,9 +226,15 @@ func (d *Daemon) handleControl(operation string, target control.SessionTarget) (
 			}
 			s = newSession(d.nextID, target.Name)
 			s.daemon = d
+			port, encodedToken, expires, operationErr = s.startQUIC(d.serverCtx, d.tlsConfig)
+			if operationErr != nil {
+				_ = s.shutdown()
+				return
+			}
 			d.sessions[d.nextID] = s
 			d.reserveSessionName(s, target.Name)
 			d.nextID++
+			created = true
 		case "connect-session":
 			if target.Name != "" {
 				s = d.sessionByName(target.Name)
@@ -294,11 +252,14 @@ func (d *Daemon) handleControl(operation string, target control.SessionTarget) (
 		return control.Bootstrap{}, nil, 0, operationErr
 	}
 
-	encodedToken, expires, err := s.issueAttachToken()
-	if err != nil {
-		return control.Bootstrap{}, nil, 0, err
+	if !created {
+		var err error
+		port, encodedToken, expires, err = s.issueBootstrap()
+		if err != nil {
+			return control.Bootstrap{}, nil, 0, err
+		}
 	}
-	return control.Bootstrap{Version: control.ProtocolVersion, SessionID: s.ID, Port: d.port, AttachToken: encodedToken, ExpiresAt: expires, CertSPKISHA256: d.certHash}, nil, 0, nil
+	return control.Bootstrap{Version: control.ProtocolVersion, SessionID: s.ID, Port: port, AttachToken: encodedToken, ExpiresAt: expires, CertSPKISHA256: d.certHash}, nil, 0, nil
 }
 
 // disconnectActiveClients uses the same clean QUIC close path as an explicit
@@ -418,26 +379,6 @@ func (d *Daemon) session(id uint64) *Session {
 	var session *Session
 	d.call(func() { session = d.sessions[id] })
 	return session
-}
-
-func (d *Daemon) attach(id uint64, encoded string) (*Session, error) {
-	s := d.session(id)
-	if s == nil {
-		return nil, control.ErrSessionUnavailable
-	}
-	if err := s.consumeAttachToken(encoded); err != nil {
-		return nil, err
-	}
-	return s, nil
-}
-
-func (d *Daemon) resume(id uint64, encoded string, generation uint64) (*Session, string, uint64, error) {
-	s := d.session(id)
-	if s == nil {
-		return nil, "", 0, control.ErrSessionUnavailable
-	}
-	encodedToken, nextGeneration, err := s.resumeAttachment(encoded, generation)
-	return s, encodedToken, nextGeneration, err
 }
 
 func (d *Daemon) activate(s *Session, connection *Connection) {

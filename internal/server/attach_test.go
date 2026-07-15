@@ -2,14 +2,40 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/garindra/meja/internal/control"
+	"github.com/garindra/meja/internal/protocol"
 )
 
+func newControlTestDaemon(t *testing.T) *Daemon {
+	t.Helper()
+	cert, hash, err := daemonCertificate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &Daemon{
+		nextID:    1,
+		sessions:  map[uint64]*Session{},
+		names:     map[string]*Session{},
+		tlsConfig: &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13},
+		certHash:  hash,
+		serverCtx: ctx,
+	}
+	t.Cleanup(func() {
+		d.disconnectActiveClients()
+		cancel()
+	})
+	return d
+}
+
 func TestDaemonAllocatesMonotonicSessionIDsAndSingleUseAttach(t *testing.T) {
-	d := &Daemon{nextID: 1, sessions: map[uint64]*Session{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	d := newControlTestDaemon(t)
 	b1, _, _, err := d.handleControl("create-session", control.SessionTarget{})
 	if err != nil {
 		t.Fatal(err)
@@ -21,10 +47,11 @@ func TestDaemonAllocatesMonotonicSessionIDsAndSingleUseAttach(t *testing.T) {
 	if b1.SessionID != 1 || b2.SessionID != 2 {
 		t.Fatalf("IDs = %d, %d", b1.SessionID, b2.SessionID)
 	}
-	if _, err := d.attach(b1.SessionID, b1.AttachToken); err != nil {
+	firstSession := d.sessions[b1.SessionID]
+	if err := firstSession.consumeAttachToken(b1.AttachToken); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.attach(b1.SessionID, b1.AttachToken); err == nil {
+	if err := firstSession.consumeAttachToken(b1.AttachToken); err == nil {
 		t.Fatal("single-use attach token accepted twice")
 	}
 }
@@ -40,7 +67,7 @@ func TestSessionAttachedLogIsEmittedForEveryAttach(t *testing.T) {
 }
 
 func TestDaemonConnectSessionDoesNotCreateMissingSession(t *testing.T) {
-	d := &Daemon{nextID: 1, sessions: map[uint64]*Session{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	d := newControlTestDaemon(t)
 	if _, _, _, err := d.handleControl("connect-session", control.SessionTarget{ID: 99}); err == nil {
 		t.Fatal("connect-session created missing session")
 	}
@@ -57,7 +84,7 @@ func TestDaemonConnectSessionDoesNotCreateMissingSession(t *testing.T) {
 }
 
 func TestDaemonRejectsExpiredAttachToken(t *testing.T) {
-	d := &Daemon{nextID: 1, sessions: map[uint64]*Session{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	d := newControlTestDaemon(t)
 	b, _, _, err := d.handleControl("create-session", control.SessionTarget{})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +96,7 @@ func TestDaemonRejectsExpiredAttachToken(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.attach(b.SessionID, b.AttachToken); err == nil {
+	if err := s.consumeAttachToken(b.AttachToken); err == nil {
 		t.Fatal("expired attach token accepted")
 	}
 }
@@ -89,7 +116,7 @@ func TestDaemonListsSessionIDsInOrder(t *testing.T) {
 }
 
 func TestDaemonCreatesListsAndConnectsNamedSession(t *testing.T) {
-	d := &Daemon{nextID: 1, sessions: map[uint64]*Session{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	d := newControlTestDaemon(t)
 	created, _, _, err := d.handleControl("create-session", control.SessionTarget{Name: "work"})
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +135,7 @@ func TestDaemonCreatesListsAndConnectsNamedSession(t *testing.T) {
 }
 
 func TestDaemonRenamesSessionUniquely(t *testing.T) {
-	d := &Daemon{nextID: 1, sessions: map[uint64]*Session{}, port: 60001, certHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	d := newControlTestDaemon(t)
 	first, _, _, _ := d.handleControl("create-session", control.SessionTarget{Name: "one"})
 	_, _, _, _ = d.handleControl("create-session", control.SessionTarget{Name: "two"})
 	state := d.sessions[first.SessionID]
@@ -121,4 +148,39 @@ func TestDaemonRenamesSessionUniquely(t *testing.T) {
 	if err := d.renameSession(state, "two"); err == nil {
 		t.Fatal("rename to an existing name was accepted")
 	}
+}
+
+func TestSessionQUICPortsAreUniqueAndReleasedOnShutdown(t *testing.T) {
+	d := newControlTestDaemon(t)
+	first, _, _, err := d.handleControl("create-session", control.SessionTarget{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, _, err := d.handleControl("create-session", control.SessionTarget{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Port == second.Port {
+		t.Fatalf("sessions share UDP port %d", first.Port)
+	}
+	reconnect, _, _, err := d.handleControl("connect-session", control.SessionTarget{ID: first.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconnect.Port != first.Port {
+		t.Fatalf("reconnect port = %d, want stable session port %d", reconnect.Port, first.Port)
+	}
+	if reconnect.AttachToken == first.AttachToken {
+		t.Fatal("reconnect reused the initial attach token")
+	}
+
+	firstSession := d.sessions[first.SessionID]
+	if err := firstSession.shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: int(first.Port)})
+	if err != nil {
+		t.Fatalf("session UDP port %d remained bound after shutdown: %v", first.Port, err)
+	}
+	_ = rebound.Close()
 }
