@@ -184,20 +184,36 @@ func Run(ctx context.Context, cfg Config) error {
 	go ui.renderLoop(ctx, streamErrs)
 	ui.emit(sizeEvent{cols: int(cols), rows: int(rows)})
 
-	rawState, err := term.MakeRaw(int(cfg.Stdin.Fd()))
-	if err != nil {
-		return fmt.Errorf("set terminal raw mode: %w", err)
+	var terminalMu sync.Mutex
+	var rawState *term.State
+	terminalActive := false
+	enterTerminal := func() error {
+		terminalMu.Lock()
+		defer terminalMu.Unlock()
+		if terminalActive {
+			return nil
+		}
+		state, err := term.MakeRaw(int(cfg.Stdin.Fd()))
+		if err != nil {
+			return fmt.Errorf("set terminal raw mode: %w", err)
+		}
+		if _, err := io.WriteString(cfg.Stdout, "\x1b[?1049h\x1b[?69h\x1b[H\x1b[2J"); err != nil {
+			_ = term.Restore(int(cfg.Stdin.Fd()), state)
+			return fmt.Errorf("enter alternate screen: %w", err)
+		}
+		rawState = state
+		terminalActive = true
+		return nil
 	}
-	if _, err := io.WriteString(cfg.Stdout, "\x1b[?1049h\x1b[?69h\x1b[H\x1b[2J"); err != nil {
-		_ = term.Restore(int(cfg.Stdin.Fd()), rawState)
-		return fmt.Errorf("enter alternate screen: %w", err)
-	}
-	var restoreOnce sync.Once
 	restoreTerminal := func() {
-		restoreOnce.Do(func() {
-			_, _ = fmt.Fprintf(cfg.Stdout, "\x1b[r\x1b[1;%ds\x1b[?69l\x1b[?25h\x1b[0m\x1b[?1049l", cols)
-			_ = term.Restore(int(cfg.Stdin.Fd()), rawState)
-		})
+		terminalMu.Lock()
+		defer terminalMu.Unlock()
+		if !terminalActive {
+			return
+		}
+		_, _ = fmt.Fprintf(cfg.Stdout, "\x1b[r\x1b[1;%ds\x1b[?69l\x1b[?25h\x1b[0m\x1b[?1049l", cols)
+		_ = term.Restore(int(cfg.Stdin.Fd()), rawState)
+		terminalActive = false
 	}
 	defer restoreTerminal()
 
@@ -218,7 +234,7 @@ func Run(ctx context.Context, cfg Config) error {
 	var input atomic.Pointer[inputDestination]
 
 	ui.beginConnection(false, time.Now())
-	live, err := openConnection(ctx, bootstrap, hostname, cols, rows, cfg, "", 0, ui)
+	live, err := openConnection(ctx, bootstrap, hostname, cols, rows, cfg, "", 0, ui, enterTerminal)
 	if err != nil {
 		return err
 	}
@@ -248,7 +264,7 @@ func Run(ctx context.Context, cfg Config) error {
 					return err
 				}
 				ui.beginConnection(true, lastContact)
-				candidate, reconnectErr := openConnection(ctx, bootstrap, hostname, cols, rows, cfg, resumeToken, generation, ui)
+				candidate, reconnectErr := openConnection(ctx, bootstrap, hostname, cols, rows, cfg, resumeToken, generation, ui, nil)
 				if reconnectErr != nil {
 					fallbackCfg := cfg
 					fallbackCfg.SessionID = bootstrap.SessionID
@@ -259,7 +275,7 @@ func Run(ctx context.Context, cfg Config) error {
 						fallbackHost, hostErr := resolveConnectionHostname(ctx, cfg)
 						if hostErr == nil {
 							ui.beginConnection(true, lastContact)
-							candidate, reconnectErr = openConnection(ctx, fallback, fallbackHost, cols, rows, cfg, "", 0, ui)
+							candidate, reconnectErr = openConnection(ctx, fallback, fallbackHost, cols, rows, cfg, "", 0, ui, nil)
 							if reconnectErr == nil {
 								bootstrap, hostname = fallback, fallbackHost
 							}
@@ -394,7 +410,7 @@ func (c *liveConnection) destroy() {
 	c.workers.Wait()
 }
 
-func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname string, cols, rows uint16, cfg Config, resumeToken string, generation uint64, ui *runtimeState) (*liveConnection, error) {
+func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname string, cols, rows uint16, cfg Config, resumeToken string, generation uint64, ui *runtimeState, onFirstManagementFrame func() error) (*liveConnection, error) {
 	tlsConfig, err := loadTLSConfig(bootstrap.CertSPKISHA256)
 	if err != nil {
 		return nil, err
@@ -407,7 +423,7 @@ func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname s
 		InitialPacketSize:     protocol.QUICInitialPacketSize,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", addr, err)
+		return nil, quicDialError(addr, err)
 	}
 	connCtx, cancel := context.WithCancel(ctx)
 	live := &liveConnection{
@@ -451,9 +467,9 @@ func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname s
 		return fail(err)
 	}
 	mgmtDecoder := protocol.NewDecoder(mgmtStream, protocol.DefaultMaxFrameSize)
-	attachResult, err := mgmtDecoder.ReadFrame()
+	attachResult, err := readInitialManagementFrame(mgmtDecoder, onFirstManagementFrame)
 	if err != nil {
-		return fail(fmt.Errorf("read session attachment result: %w", err))
+		return fail(err)
 	}
 	switch attachResult.Type {
 	case protocol.MsgSessionAttachOK:
@@ -507,6 +523,27 @@ func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname s
 		}
 	})
 	return live, nil
+}
+
+func quicDialError(addr string, err error) error {
+	var idleTimeout *quic.IdleTimeoutError
+	if errors.As(err, &idleTimeout) {
+		return fmt.Errorf("UDP %s is unreachable: %w", addr, err)
+	}
+	return fmt.Errorf("dial %s: %w", addr, err)
+}
+
+func readInitialManagementFrame(decoder *protocol.Decoder, onFrame func() error) (protocol.Frame, error) {
+	frame, err := decoder.ReadFrame()
+	if err != nil {
+		return protocol.Frame{}, fmt.Errorf("read session attachment result: %w", err)
+	}
+	if onFrame != nil {
+		if err := onFrame(); err != nil {
+			return protocol.Frame{}, err
+		}
+	}
+	return frame, nil
 }
 
 func waitReconnect(ctx context.Context, delay time.Duration) error {

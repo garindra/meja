@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -101,6 +102,66 @@ func TestSSHCommandErrorIncludesRemoteStderr(t *testing.T) {
 	want := "SSH bootstrap failed: EOF: bash: meja: command not found"
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err, want)
+	}
+}
+
+func TestInitialManagementFrameActivatesTerminalAfterRead(t *testing.T) {
+	var wire bytes.Buffer
+	want := protocol.Frame{Type: protocol.MsgSessionAttachOK, Payload: []byte("attached")}
+	if err := protocol.NewEncoder(&wire).WriteFrame(want); err != nil {
+		t.Fatal(err)
+	}
+	activated := false
+	got, err := readInitialManagementFrame(protocol.NewDecoder(&wire, protocol.DefaultMaxFrameSize), func() error {
+		activated = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !activated {
+		t.Fatal("terminal was not activated after receiving the initial management frame")
+	}
+	if got.Type != want.Type || !bytes.Equal(got.Payload, want.Payload) {
+		t.Fatalf("frame = %#v, want %#v", got, want)
+	}
+}
+
+func TestInitialManagementReadFailureDoesNotActivateTerminal(t *testing.T) {
+	activated := false
+	_, err := readInitialManagementFrame(protocol.NewDecoder(bytes.NewReader(nil), protocol.DefaultMaxFrameSize), func() error {
+		activated = true
+		return nil
+	})
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("error = %v, want EOF", err)
+	}
+	if activated {
+		t.Fatal("terminal activated before an initial management frame was received")
+	}
+}
+
+func TestQUICDialIdleTimeoutReportsUnreachableUDPAddress(t *testing.T) {
+	err := quicDialError("example.com:60000", &quic.IdleTimeoutError{})
+	want := "UDP example.com:60000 is unreachable: timeout: no recent network activity"
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err, want)
+	}
+	var timeout *quic.IdleTimeoutError
+	if !errors.As(err, &timeout) {
+		t.Fatal("formatted error does not preserve the QUIC idle timeout")
+	}
+}
+
+func TestQUICDialOtherErrorsKeepDialContext(t *testing.T) {
+	cause := errors.New("resolve failed")
+	err := quicDialError("example.com:60000", cause)
+	want := "dial example.com:60000: resolve failed"
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err, want)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("formatted error does not preserve the dial failure")
 	}
 }
 
