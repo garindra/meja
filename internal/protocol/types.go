@@ -1,7 +1,7 @@
 package protocol
 
 const (
-	ALPN            = "tali/7"
+	ALPN            = "tali/8"
 	ProtocolVersion = 3
 )
 
@@ -13,8 +13,6 @@ const (
 	MsgInputBytes
 	MsgResizePane
 	MsgWindowLayout
-	MsgPing
-	MsgPong
 	MsgSessionAttach
 	MsgSessionAttachOK
 	MsgSessionAttachFailed
@@ -142,16 +140,6 @@ type CursorUpdate struct {
 
 type Scroll struct {
 	Delta int
-}
-
-type Ping struct {
-	Seq           uint64
-	SentUnixMilli int64
-}
-
-type Pong struct {
-	Seq           uint64
-	SentUnixMilli int64
 }
 
 type Color struct {

@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	quicMaxIdleTimeout  = 60 * time.Second
-	quicKeepAlivePeriod = 10 * time.Second
+	quicMaxIdleTimeout  = 6 * time.Second
+	quicKeepAlivePeriod = 2 * time.Second
 )
 
 func serveConnection(ctx context.Context, d *Daemon, conn quic.Connection) error {
@@ -206,7 +206,7 @@ func serveConnection(ctx context.Context, d *Daemon, conn quic.Connection) error
 
 func (c *Connection) handleManagement(decoder *protocol.Decoder, done chan<- error) {
 	for {
-		frame, err := decoder.ReadFrame()
+		_, err := decoder.ReadFrame()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				done <- nil
@@ -214,21 +214,6 @@ func (c *Connection) handleManagement(decoder *protocol.Decoder, done chan<- err
 			}
 			done <- fmt.Errorf("read management frame: %w", err)
 			return
-		}
-		switch frame.Type {
-		case protocol.MsgPing:
-			msg, err := protocol.DecodePing(frame.Payload)
-			if err != nil {
-				done <- err
-				return
-			}
-			if err := sendEncoded(c.managementOut, protocol.MsgPong, protocol.Pong{
-				Seq:           msg.Seq,
-				SentUnixMilli: msg.SentUnixMilli,
-			}, protocol.EncodePong); err != nil {
-				done <- err
-				return
-			}
 		}
 	}
 }

@@ -425,16 +425,6 @@ func TestReconnectEventsPreserveLastContact(t *testing.T) {
 	}
 }
 
-func TestHeartbeatExpiresAfterMissedPongs(t *testing.T) {
-	now := time.Now()
-	if heartbeatExpired(now, now.Add(-clientPingTimeout+time.Millisecond).UnixNano()) {
-		t.Fatal("heartbeat expired before timeout")
-	}
-	if !heartbeatExpired(now, now.Add(-clientPingTimeout).UnixNano()) {
-		t.Fatal("heartbeat remained live at timeout")
-	}
-}
-
 func TestReconnectStateIsLocalToRuntime(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -28,11 +28,8 @@ import (
 )
 
 const (
-	quicMaxIdleTimeout  = 60 * time.Second
-	quicKeepAlivePeriod = 10 * time.Second
-	clientPingPeriod    = 2 * time.Second
-	clientPingTimeout   = 6 * time.Second
-	heartbeatCloseCode  = quic.ApplicationErrorCode(0x54414c48)
+	quicMaxIdleTimeout  = 6 * time.Second
+	quicKeepAlivePeriod = 2 * time.Second
 )
 
 type Target struct {
@@ -478,11 +475,6 @@ func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname s
 	}
 	live.start(func() { managementLoop(mgmtDecoder, ui, live.done, &live.lastContact) })
 	live.start(func() {
-		sendPeriodicPing(connCtx, live.mgmtFrames, errs, &live.lastContact, func() {
-			_ = conn.CloseWithError(heartbeatCloseCode, "heartbeat timeout")
-		})
-	})
-	live.start(func() {
 		for {
 			select {
 			case <-errs:
@@ -723,11 +715,6 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- con
 				return
 			}
 			ui.emit(layoutEvent{layout: msg})
-		case protocol.MsgPong:
-			if _, err := protocol.DecodePong(frame.Payload); err != nil {
-				done <- connectionResult{err: err}
-				return
-			}
 		default:
 		}
 	}
@@ -785,45 +772,6 @@ func forwardResize(ctx context.Context, tty *os.File, input *atomic.Pointer[inpu
 			}
 		}
 	}
-}
-
-func sendPeriodicPing(ctx context.Context, mgmtFrames chan<- protocol.Frame, errs chan<- error, lastContact *atomic.Int64, closeConnection func()) {
-	ticker := time.NewTicker(clientPingPeriod)
-	defer ticker.Stop()
-
-	var seq uint64
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-ticker.C:
-			if heartbeatExpired(now, lastContact.Load()) {
-				closeConnection()
-				return
-			}
-			seq++
-			payload, err := protocol.EncodePing(nil, protocol.Ping{
-				Seq:           seq,
-				SentUnixMilli: time.Now().UnixMilli(),
-			})
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				errs <- err
-				return
-			}
-			select {
-			case mgmtFrames <- protocol.Frame{Type: protocol.MsgPing, Payload: payload}:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}
-}
-
-func heartbeatExpired(now time.Time, lastContactUnixNano int64) bool {
-	return !now.Before(time.Unix(0, lastContactUnixNano).Add(clientPingTimeout))
 }
 
 func terminalSize(f *os.File) (uint16, uint16, error) {
