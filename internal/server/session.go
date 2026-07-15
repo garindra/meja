@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"tali/internal/control"
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/control"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 const (

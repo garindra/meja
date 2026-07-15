@@ -1,6 +1,6 @@
 package client
 
-import "tali/internal/protocol"
+import "github.com/garindra/meja/internal/protocol"
 
 type predictionTarget struct {
 	paneID         uint64

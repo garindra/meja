@@ -20,7 +20,7 @@ const (
 )
 
 // OutputIndexFromStreamID maps server-initiated unidirectional QUIC stream IDs
-// (3, 7, 11, ...) to Tali's connection-local display output indices. Index 0
+// (3, 7, 11, ...) to Meja's connection-local display output indices. Index 0
 // is the status surface; indices 1..8 correspond to pane slots 0..7.
 func OutputIndexFromStreamID(id uint64) (uint8, bool) {
 	if id&3 != 3 {

@@ -1,1 +1,1 @@
-./bin/tali server run
+./bin/meja server run

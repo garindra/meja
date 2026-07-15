@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 const (
@@ -203,7 +203,7 @@ func (s *renderDiagnosticState) flushBurst() {
 }
 
 func (s *renderDiagnosticState) logf(format string, args ...any) {
-	_, _ = fmt.Fprintf(s.writer, "tali render: "+format+"\n", args...)
+	_, _ = fmt.Fprintf(s.writer, "meja render: "+format+"\n", args...)
 }
 
 func formatIncomingWriteStyles(hits map[renderStyleKey]uint64, styles map[renderStyleKey]protocol.Style) string {

@@ -1,7 +1,7 @@
 package protocol
 
 const (
-	ALPN            = "tali/8"
+	ALPN            = "meja/1"
 	ProtocolVersion = 3
 )
 

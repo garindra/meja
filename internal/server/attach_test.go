@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"tali/internal/control"
+	"github.com/garindra/meja/internal/control"
 )
 
 func TestDaemonAllocatesMonotonicSessionIDsAndSingleUseAttach(t *testing.T) {
@@ -34,7 +34,7 @@ func TestSessionAttachedLogIsEmittedForEveryAttach(t *testing.T) {
 	d := &Daemon{stderr: &log}
 	d.logSessionAttached(7)
 	d.logSessionAttached(7)
-	if got, want := log.String(), "tali server: session 7 attached\ntali server: session 7 attached\n"; got != want {
+	if got, want := log.String(), "meja server: session 7 attached\nmeja server: session 7 attached\n"; got != want {
 		t.Fatalf("log = %q, want %q", got, want)
 	}
 }

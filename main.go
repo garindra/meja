@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"text/tabwriter"
 
-	"tali/internal/client"
-	"tali/internal/control"
-	"tali/internal/server"
+	"github.com/garindra/meja/internal/client"
+	"github.com/garindra/meja/internal/control"
+	"github.com/garindra/meja/internal/server"
 )
 
 func main() {
@@ -22,12 +22,12 @@ func main() {
 	if err := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		if usageErr, ok := err.(usageError); ok {
 			if usageErr.text != "" {
-				fmt.Fprintf(os.Stderr, "tali: %s\n", usageErr.text)
+				fmt.Fprintf(os.Stderr, "meja: %s\n", usageErr.text)
 			}
 			fmt.Fprintln(os.Stderr, usage)
 			os.Exit(2)
 		}
-		fmt.Fprintf(os.Stderr, "tali: %v\n", err)
+		fmt.Fprintf(os.Stderr, "meja: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -37,12 +37,12 @@ type usageError struct{ text string }
 func (e usageError) Error() string { return e.text }
 
 const usage = `usage:
-  tali [-L profile | -S socket-path]
-  tali [-L profile | -S socket-path] <host> [-- command args...]
-  tali [-L profile | -S socket-path] new [-s session-name] [-c directory] [options] [host] [-- command args...]
-  tali [-L profile | -S socket-path] attach|a -t <session-id-or-name> [host]
-  tali [-L profile | -S socket-path] ls [host]
-  tali [-L profile | -S socket-path] server run|stop`
+  meja [-L profile | -S socket-path]
+  meja [-L profile | -S socket-path] <host> [-- command args...]
+  meja [-L profile | -S socket-path] new [-s session-name] [-c directory] [options] [host] [-- command args...]
+  meja [-L profile | -S socket-path] attach|a -t <session-id-or-name> [host]
+  meja [-L profile | -S socket-path] ls [host]
+  meja [-L profile | -S socket-path] server run|stop`
 
 func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.Writer) error {
 	selector, args, err := parseGlobalOptions(args)
@@ -81,7 +81,7 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 }
 
 func parseGlobalOptions(args []string) (control.SocketSelector, []string, error) {
-	fs := flag.NewFlagSet("tali", flag.ContinueOnError)
+	fs := flag.NewFlagSet("meja", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	profile := fs.String("L", "", "server profile")
 	socket := fs.String("S", "", "exact server socket path")
@@ -103,7 +103,7 @@ type connectionFlags struct {
 
 func (f *connectionFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.identity, "i", "", "path to SSH identity file")
-	fs.StringVar(&f.remotePath, "remote-path", "tali", "remote tali executable path")
+	fs.StringVar(&f.remotePath, "remote-path", "meja", "remote meja executable path")
 	f.port.value = 4433
 	fs.Var(&f.port, "port", "SSH port")
 }
@@ -124,9 +124,9 @@ func (f connectionFlags) config(selector control.SocketSelector, stdin *os.File,
 }
 
 func applyDebugEnvironment(cfg *client.Config) {
-	cfg.RenderDiagnostics = cfg.RenderDiagnostics || debugEnvironmentEnabled("TALI_DEBUG") || debugEnvironmentEnabled("TALI_DEBUG_RENDER")
+	cfg.RenderDiagnostics = cfg.RenderDiagnostics || debugEnvironmentEnabled("MEJA_DEBUG") || debugEnvironmentEnabled("MEJA_DEBUG_RENDER")
 	if cfg.RenderDiagnosticsLogPath == "" {
-		cfg.RenderDiagnosticsLogPath = os.Getenv("TALI_DEBUG_LOG")
+		cfg.RenderDiagnosticsLogPath = os.Getenv("MEJA_DEBUG_LOG")
 	}
 	if cfg.RenderDiagnosticsLogPath != "" {
 		cfg.RenderDiagnostics = true

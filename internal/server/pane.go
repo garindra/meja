@@ -14,7 +14,7 @@ import (
 
 	"github.com/creack/pty"
 
-	"tali/internal/server/terminal"
+	"github.com/garindra/meja/internal/server/terminal"
 )
 
 // Pane owns a child process, PTY, terminal emulator, and its four enduring

@@ -352,7 +352,7 @@ func (t *TerminalState) Apply(data []byte) Update {
 				update.VisibleChange = true
 				t.Parser.state = parserText
 			case '=', '>':
-				// Application/numeric keypad mode does not affect Tali's input protocol.
+				// Application/numeric keypad mode does not affect Meja's input protocol.
 				t.Parser.state = parserText
 			case '(', ')', '*', '+', '-', '.', '/', '%':
 				if data[0] == '(' {

@@ -23,5 +23,5 @@ func logUnsupportedf(format string, args ...any) {
 	if debugLogger.w == nil {
 		return
 	}
-	_, _ = fmt.Fprintf(debugLogger.w, "tali terminal: "+format+"\n", args...)
+	_, _ = fmt.Fprintf(debugLogger.w, "meja terminal: "+format+"\n", args...)
 }

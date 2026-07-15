@@ -22,9 +22,9 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"tali/internal/control"
-	"tali/internal/protocol"
-	"tali/internal/server/terminal"
+	"github.com/garindra/meja/internal/control"
+	"github.com/garindra/meja/internal/protocol"
+	"github.com/garindra/meja/internal/server/terminal"
 )
 
 const attachTTL = 2 * time.Minute
@@ -153,7 +153,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		go func() {
 			if err := serveConnection(serverCtx, d, conn); err != nil {
-				d.logf("tali session: %v\n", err)
+				d.logf("meja session: %v\n", err)
 			}
 		}()
 		select {
@@ -167,7 +167,7 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 func (d *Daemon) logSessionAttached(sessionID uint64) {
-	d.logf("tali server: session %d attached\n", sessionID)
+	d.logf("meja server: session %d attached\n", sessionID)
 }
 
 func (d *Daemon) logf(format string, args ...any) {
@@ -204,7 +204,7 @@ func daemonCertificate() (tls.Certificate, string, error) {
 		return tls.Certificate{}, "", err
 	}
 	now := time.Now()
-	tmpl := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "tali-daemon"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(24 * time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, DNSNames: []string{"tali-daemon"}}
+	tmpl := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "meja-daemon"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(24 * time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, DNSNames: []string{"meja-daemon"}}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, publicKey, privateKey)
 	if err != nil {
 		return tls.Certificate{}, "", err

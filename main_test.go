@@ -10,8 +10,8 @@ import (
 	"reflect"
 	"testing"
 
-	"tali/internal/client"
-	"tali/internal/control"
+	"github.com/garindra/meja/internal/client"
+	"github.com/garindra/meja/internal/control"
 )
 
 func TestCommandAfterTarget(t *testing.T) {
@@ -64,7 +64,7 @@ func TestParseGlobalOptionsAcceptsProfileAndSocket(t *testing.T) {
 	if selector.Profile != "dev" || !reflect.DeepEqual(args, []string{"attach", "-t", "3"}) {
 		t.Fatalf("selector=%#v args=%v", selector, args)
 	}
-	exact := filepath.Join(t.TempDir(), "tali.sock")
+	exact := filepath.Join(t.TempDir(), "meja.sock")
 	selector, _, err = parseGlobalOptions([]string{"-S", exact, "ls"})
 	if err != nil || selector.Path != exact {
 		t.Fatalf("selector=%#v err=%v", selector, err)
@@ -78,24 +78,24 @@ func TestParseGlobalOptionsRejectsProfileAndSocketTogether(t *testing.T) {
 }
 
 func TestDebugEnvironmentConfiguresClientDiagnostics(t *testing.T) {
-	t.Setenv("TALI_DEBUG", "")
-	t.Setenv("TALI_DEBUG_RENDER", "true")
-	t.Setenv("TALI_DEBUG_LOG", "/tmp/tali-render.log")
+	t.Setenv("MEJA_DEBUG", "")
+	t.Setenv("MEJA_DEBUG_RENDER", "true")
+	t.Setenv("MEJA_DEBUG_LOG", "/tmp/meja-render.log")
 	cfg := client.Config{}
 	applyDebugEnvironment(&cfg)
-	if !cfg.RenderDiagnostics || cfg.RenderDiagnosticsLogPath != "/tmp/tali-render.log" {
+	if !cfg.RenderDiagnostics || cfg.RenderDiagnosticsLogPath != "/tmp/meja-render.log" {
 		t.Fatalf("debug config = %#v", cfg)
 	}
 }
 
 func TestDebugLogEnvironmentEnablesDiagnostics(t *testing.T) {
-	t.Setenv("TALI_DEBUG", "")
-	t.Setenv("TALI_DEBUG_RENDER", "")
-	t.Setenv("TALI_DEBUG_LOG", "/tmp/tali-render.log")
+	t.Setenv("MEJA_DEBUG", "")
+	t.Setenv("MEJA_DEBUG_RENDER", "")
+	t.Setenv("MEJA_DEBUG_LOG", "/tmp/meja-render.log")
 	cfg := client.Config{}
 	applyDebugEnvironment(&cfg)
 	if !cfg.RenderDiagnostics {
-		t.Fatal("TALI_DEBUG_LOG did not enable diagnostics")
+		t.Fatal("MEJA_DEBUG_LOG did not enable diagnostics")
 	}
 }
 

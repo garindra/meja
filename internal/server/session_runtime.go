@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 func (s *Session) startPane(pane *Pane) {

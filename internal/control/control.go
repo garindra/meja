@@ -24,17 +24,17 @@ import (
 
 const (
 	ProtocolVersion   = 2
-	BootstrapPrefix   = "TALI_BOOTSTRAP_V2 "
-	SessionListPrefix = "TALI_SESSION_LIST_V2 "
+	BootstrapPrefix   = "MEJA_BOOTSTRAP_V1 "
+	SessionListPrefix = "MEJA_SESSION_LIST_V1 "
 	DefaultUDPMin     = 60000
 	DefaultUDPMax     = 61000
 	controlTimeout    = 2 * time.Second
 )
 
 var (
-	ErrDaemonUnavailable  = errors.New("tali daemon unavailable")
-	ErrSessionUnavailable = errors.New("tali session unavailable")
-	ErrServerRunning      = errors.New("tali server already running")
+	ErrDaemonUnavailable  = errors.New("meja daemon unavailable")
+	ErrSessionUnavailable = errors.New("meja session unavailable")
+	ErrServerRunning      = errors.New("meja server already running")
 )
 
 const DefaultProfile = "default"
@@ -76,7 +76,7 @@ func (s SocketSelector) Resolve() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
 	}
-	return filepath.Join(home, ".tali", normalized.Profile, "tali.sock"), nil
+	return filepath.Join(home, ".meja", normalized.Profile, "meja.sock"), nil
 }
 
 func (s SocketSelector) Args() ([]string, error) {
@@ -359,7 +359,7 @@ func ParseSessionListOutput(output []byte) ([]SessionInfo, error) {
 		}
 	}
 	if len(found) == 0 {
-		return nil, errors.New("SSH command did not return a Tali session list")
+		return nil, errors.New("SSH command did not return a Meja session list")
 	}
 	var list SessionList
 	if err := json.Unmarshal(found, &list); err != nil {
@@ -383,7 +383,7 @@ func ParseBootstrapOutput(output []byte) (Bootstrap, error) {
 		}
 	}
 	if len(found) == 0 {
-		return Bootstrap{}, errors.New("SSH command did not return a Tali bootstrap")
+		return Bootstrap{}, errors.New("SSH command did not return a Meja bootstrap")
 	}
 	var b Bootstrap
 	if err := json.Unmarshal(found, &b); err != nil {
@@ -442,7 +442,7 @@ func startDetachedServer(executable string, selector SocketSelector) error {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = devNull, devNull, devNull
 	if err := cmd.Start(); err != nil {
 		_ = devNull.Close()
-		return fmt.Errorf("start tali daemon: %w", err)
+		return fmt.Errorf("start meja daemon: %w", err)
 	}
 	_ = cmd.Process.Release()
 	_ = devNull.Close()

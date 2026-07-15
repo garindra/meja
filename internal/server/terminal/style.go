@@ -1,6 +1,6 @@
 package terminal
 
-import "tali/internal/protocol"
+import "github.com/garindra/meja/internal/protocol"
 
 type Style = protocol.Style
 type Color = protocol.Color

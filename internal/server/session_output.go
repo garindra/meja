@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"io"
 
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 const (

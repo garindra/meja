@@ -1,4 +1,4 @@
-module tali
+module github.com/garindra/meja
 
 go 1.22
 

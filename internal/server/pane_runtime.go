@@ -9,8 +9,8 @@ import (
 
 	"github.com/creack/pty"
 
-	"tali/internal/protocol"
-	"tali/internal/server/terminal"
+	"github.com/garindra/meja/internal/protocol"
+	"github.com/garindra/meja/internal/server/terminal"
 )
 
 var ptyReadBuffers = sync.Pool{New: func() any { return make([]byte, 32*1024) }}

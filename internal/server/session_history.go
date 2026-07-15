@@ -5,8 +5,8 @@ import (
 	"io"
 	"strconv"
 
-	"tali/internal/protocol"
-	"tali/internal/server/terminal"
+	"github.com/garindra/meja/internal/protocol"
+	"github.com/garindra/meja/internal/server/terminal"
 )
 
 type HistorySnapshot struct {

@@ -66,7 +66,7 @@ func TestSocketSelectorResolvesProfilesAndExactPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(home, ".tali", "dev.test_1", "tali.sock")
+	want := filepath.Join(home, ".meja", "dev.test_1", "meja.sock")
 	if path != want {
 		t.Fatalf("profile path = %q, want %q", path, want)
 	}
@@ -74,7 +74,7 @@ func TestSocketSelectorResolvesProfilesAndExactPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if defaultPath != filepath.Join(home, ".tali", DefaultProfile, "tali.sock") {
+	if defaultPath != filepath.Join(home, ".meja", DefaultProfile, "meja.sock") {
 		t.Fatalf("default path = %q", defaultPath)
 	}
 	exact := filepath.Join(home, "exact.sock")
@@ -101,8 +101,8 @@ func TestSocketSelectorArgsPreserveProfileOrExactPath(t *testing.T) {
 	if err != nil || len(args) != 2 || args[0] != "-L" || args[1] != "dev" {
 		t.Fatalf("profile args = %v, %v", args, err)
 	}
-	args, err = (SocketSelector{Path: "/private/tali.sock"}).Args()
-	if err != nil || len(args) != 2 || args[0] != "-S" || args[1] != "/private/tali.sock" {
+	args, err = (SocketSelector{Path: "/private/meja.sock"}).Args()
+	if err != nil || len(args) != 2 || args[0] != "-S" || args[1] != "/private/meja.sock" {
 		t.Fatalf("socket args = %v, %v", args, err)
 	}
 }
@@ -115,7 +115,7 @@ func TestEnsureSocketDirDoesNotChmodExistingParent(t *testing.T) {
 	if err := os.Chmod(parent, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := EnsureSocketDir(filepath.Join(parent, "tali.sock")); err == nil {
+	if err := EnsureSocketDir(filepath.Join(parent, "meja.sock")); err == nil {
 		t.Fatal("shared parent was accepted")
 	}
 	info, err := os.Stat(parent)
@@ -128,7 +128,7 @@ func TestEnsureSocketDirDoesNotChmodExistingParent(t *testing.T) {
 }
 
 func TestServerLockIsExclusivePerSocket(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "profile", "tali.sock")
+	socket := filepath.Join(t.TempDir(), "profile", "meja.sock")
 	first, err := AcquireServerLock(socket)
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestRemoveStaleSocketDoesNotDeleteActiveSocket(t *testing.T) {
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	socket := filepath.Join(dir, "tali.sock")
+	socket := filepath.Join(dir, "meja.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +171,7 @@ func TestRemoveStaleSocketDeletesUnboundSocket(t *testing.T) {
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	socket := filepath.Join(dir, "tali.sock")
+	socket := filepath.Join(dir, "meja.sock")
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +190,7 @@ func TestRemoveStaleSocketDeletesUnboundSocket(t *testing.T) {
 
 func TestControlRPCUsesPrivateSocketAndDoesNotStartOnConnect(t *testing.T) {
 	dir := t.TempDir()
-	socket := filepath.Join(dir, "tali", "control.sock")
+	socket := filepath.Join(dir, "meja", "control.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	want := testBootstrap()

@@ -10,7 +10,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 const (

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 func TestCanonicalDefaultStyleOwnsIDZero(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 func testPredictionContext() predictionContext {

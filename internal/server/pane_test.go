@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"tali/internal/server/terminal"
+	"github.com/garindra/meja/internal/server/terminal"
 )
 
 func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
@@ -89,7 +89,7 @@ func TestDefaultShellUsesEnvironmentWithSafeFallback(t *testing.T) {
 
 func TestResolveStartingDirectoryExpandsTargetUserHome(t *testing.T) {
 	home := t.TempDir()
-	project := filepath.Join(home, "projects", "tali")
+	project := filepath.Join(home, "projects", "meja")
 	if err := os.MkdirAll(project, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestResolveStartingDirectoryExpandsTargetUserHome(t *testing.T) {
 	for raw, want := range map[string]string{
 		"":                home,
 		"~":               home,
-		"~/projects/tali": project,
+		"~/projects/meja": project,
 		project:           project,
 	} {
 		got, err := resolveStartingDirectoryForUser(raw, unixUser)

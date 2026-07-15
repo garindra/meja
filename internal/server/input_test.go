@@ -6,8 +6,8 @@ import (
 	"os"
 	"testing"
 
-	"tali/internal/protocol"
-	"tali/internal/server/terminal"
+	"github.com/garindra/meja/internal/protocol"
+	"github.com/garindra/meja/internal/server/terminal"
 )
 
 func TestTranslateApplicationCursor(t *testing.T) {

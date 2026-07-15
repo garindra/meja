@@ -3,7 +3,7 @@ package server
 import (
 	"unicode/utf8"
 
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 func normalizedRune(r rune) rune {

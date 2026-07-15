@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"tali/internal/control"
+	"github.com/garindra/meja/internal/control"
 )
 
 func fetchBootstrap(ctx context.Context, cfg Config) (control.Bootstrap, error) {
@@ -31,7 +31,7 @@ func fetchBootstrap(ctx context.Context, cfg Config) (control.Bootstrap, error) 
 func fetchRemoteBootstrap(ctx context.Context, cfg Config) (control.Bootstrap, error) {
 	remotePath := cfg.RemotePath
 	if remotePath == "" {
-		remotePath = "tali"
+		remotePath = "meja"
 	}
 	command, err := controllerCommand(remotePath, cfg.SocketSelector, configSessionTarget(cfg), cfg.SessionName)
 	if err != nil {
@@ -135,7 +135,7 @@ func configSessionTarget(cfg Config) string {
 
 func controllerCommandPrefix(remotePath string, selector control.SocketSelector) (string, error) {
 	if remotePath == "" {
-		remotePath = "tali"
+		remotePath = "meja"
 	}
 	selectorArgs, err := selector.Args()
 	if err != nil {

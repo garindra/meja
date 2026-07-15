@@ -1,1 +1,1 @@
-tail -f /tmp/tali-terminal.log
+tail -f /tmp/meja-terminal.log

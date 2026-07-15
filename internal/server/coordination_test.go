@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 func TestSessionCoordinatorSerializesOperations(t *testing.T) {

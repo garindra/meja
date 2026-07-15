@@ -3,8 +3,8 @@ package server
 import (
 	"testing"
 
-	"tali/internal/protocol"
-	"tali/internal/server/terminal"
+	"github.com/garindra/meja/internal/protocol"
+	"github.com/garindra/meja/internal/server/terminal"
 )
 
 func TestPaneAndSplitLayoutsComputeExpectedRects(t *testing.T) {

@@ -23,8 +23,8 @@ import (
 	"github.com/quic-go/quic-go"
 	"golang.org/x/term"
 
-	"tali/internal/control"
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/control"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 const (
@@ -145,7 +145,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	// Keep the user's normal terminal active for initial SSH diagnostics,
 	// authentication prompts, and host-key handling. Reconnect bootstrap occurs
-	// later inside the already-active Tali display.
+	// later inside the already-active Meja display.
 	bootstrap, err := fetchBootstrap(ctx, cfg)
 	if err != nil {
 		return err
@@ -1332,7 +1332,7 @@ func (s *scanoutState) setReconnecting(reconnecting bool, lastContact, now time.
 		return
 	}
 	seconds := max(0, int(now.Sub(lastContact)/time.Second))
-	message := []rune("tali is reconnecting... [Last contact " + strconv.Itoa(seconds) + " seconds ago]")
+	message := []rune("meja is reconnecting... [Last contact " + strconv.Itoa(seconds) + " seconds ago]")
 	if len(message) > s.cols {
 		message = message[:s.cols]
 	}

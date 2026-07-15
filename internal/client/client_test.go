@@ -16,8 +16,8 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"tali/internal/control"
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/control"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 type lockedBuffer struct {
@@ -63,22 +63,22 @@ func TestParseTargetInvalid(t *testing.T) {
 
 func TestControllerCommandSelectsStartOrConnect(t *testing.T) {
 	selector := control.SocketSelector{Profile: "dev"}
-	start, err := controllerCommand("/opt/tali", selector, "", "")
-	if err != nil || start != "'/opt/tali' '-L' 'dev' __control-v1 start-session" {
+	start, err := controllerCommand("/opt/meja", selector, "", "")
+	if err != nil || start != "'/opt/meja' '-L' 'dev' __control-v1 start-session" {
 		t.Fatalf("start command = %q, %v", start, err)
 	}
-	connect, err := controllerCommand("/opt/tali", selector, "42", "")
-	if err != nil || connect != "'/opt/tali' '-L' 'dev' __control-v1 connect-session '42'" {
+	connect, err := controllerCommand("/opt/meja", selector, "42", "")
+	if err != nil || connect != "'/opt/meja' '-L' 'dev' __control-v1 connect-session '42'" {
 		t.Fatalf("connect command = %q, %v", connect, err)
 	}
 }
 
 func TestControllerCommandQuotesExactSocketPath(t *testing.T) {
-	command, err := controllerCommand("/opt/tali", control.SocketSelector{Path: "/tmp/tali user's/dev.sock"}, "", "")
+	command, err := controllerCommand("/opt/meja", control.SocketSelector{Path: "/tmp/meja user's/dev.sock"}, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "'/opt/tali' '-S' '/tmp/tali user'\\''s/dev.sock' __control-v1 start-session"
+	want := "'/opt/meja' '-S' '/tmp/meja user'\\''s/dev.sock' __control-v1 start-session"
 	if command != want {
 		t.Fatalf("command = %q, want %q", command, want)
 	}
@@ -86,19 +86,19 @@ func TestControllerCommandQuotesExactSocketPath(t *testing.T) {
 
 func TestControllerCommandQuotesSessionNames(t *testing.T) {
 	selector := control.SocketSelector{Profile: "default"}
-	start, err := controllerCommand("tali", selector, "", "my work")
+	start, err := controllerCommand("meja", selector, "", "my work")
 	if err != nil || !strings.HasSuffix(start, "start-session 'my work'") {
 		t.Fatalf("named start command = %q, %v", start, err)
 	}
-	attach, err := controllerCommand("tali", selector, "my work", "")
+	attach, err := controllerCommand("meja", selector, "my work", "")
 	if err != nil || !strings.HasSuffix(attach, "connect-session 'my work'") {
 		t.Fatalf("named attach command = %q, %v", attach, err)
 	}
 }
 
 func TestSSHCommandErrorIncludesRemoteStderr(t *testing.T) {
-	err := sshCommandError("SSH bootstrap failed", io.EOF, "bash: tali: command not found\n")
-	want := "SSH bootstrap failed: EOF: bash: tali: command not found"
+	err := sshCommandError("SSH bootstrap failed", io.EOF, "bash: meja: command not found\n")
+	want := "SSH bootstrap failed: EOF: bash: meja: command not found"
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err, want)
 	}
@@ -336,7 +336,7 @@ func TestStoppedConnectionEventsAreDropped(t *testing.T) {
 	go ui.renderLoop(ctx, errs)
 	ui.emit(sizeEvent{cols: 80, rows: 24})
 	ui.beginConnection(true, time.Now())
-	waitForBufferText(t, &stdout, "tali is reconnecting")
+	waitForBufferText(t, &stdout, "meja is reconnecting")
 	ui.stopConnection()
 	before := stdout.Len()
 	ui.emit(layoutEvent{layout: testSnapshotLayout(11)})
@@ -376,7 +376,7 @@ func TestStatusFullRefreshClearsReconnectIndicator(t *testing.T) {
 	go ui.renderLoop(ctx, errs)
 	ui.emit(sizeEvent{cols: 80, rows: 24})
 	ui.beginConnection(true, time.Now())
-	waitForBufferText(t, &stdout, "tali is reconnecting")
+	waitForBufferText(t, &stdout, "meja is reconnecting")
 	ui.emit(paneFrameEvent{slot: protocol.StatusRenderSlot, frame: renderFrame{
 		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}}}},
 		spans: []paintSpan{
@@ -389,7 +389,7 @@ func TestStatusFullRefreshClearsReconnectIndicator(t *testing.T) {
 	stdout.mu.Lock()
 	output := stdout.String()
 	stdout.mu.Unlock()
-	lastReconnect := strings.LastIndex(output, "tali is reconnecting")
+	lastReconnect := strings.LastIndex(output, "meja is reconnecting")
 	if lastReconnect < 0 || !strings.Contains(output[lastReconnect:], "ready") {
 		t.Fatalf("reconnect indicator was not replaced after connection became usable: %q", output)
 	}
@@ -464,10 +464,10 @@ func TestReconnectStateIsLocalToRuntime(t *testing.T) {
 	ui1.emit(sizeEvent{cols: 80, rows: 24})
 	ui2.emit(sizeEvent{cols: 80, rows: 24})
 	ui1.beginConnection(true, time.Now())
-	waitForBufferText(t, &first, "tali is reconnecting")
+	waitForBufferText(t, &first, "meja is reconnecting")
 	time.Sleep(20 * time.Millisecond)
 	second.mu.Lock()
-	leaked := strings.Contains(second.String(), "tali is reconnecting")
+	leaked := strings.Contains(second.String(), "meja is reconnecting")
 	second.mu.Unlock()
 	if leaked {
 		t.Fatal("reconnect state leaked to an independent runtime")

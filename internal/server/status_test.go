@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {

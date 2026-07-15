@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"tali/internal/protocol"
-	"tali/internal/server/terminal"
+	"github.com/garindra/meja/internal/protocol"
+	"github.com/garindra/meja/internal/server/terminal"
 )
 
 func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {

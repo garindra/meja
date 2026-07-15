@@ -5,7 +5,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"tali/internal/protocol"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 // OutputLease is one enduring pane-output slot for the lifetime of a
