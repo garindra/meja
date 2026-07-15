@@ -237,12 +237,28 @@ func (s *Session) finishOutputHandoff(handoff *outputHandoff, bindings []RenderB
 			}
 		}
 	}
-	for range handoff.pending {
+	stillPending := make(map[int]struct{}, len(handoff.pending))
+	for slot := range handoff.pending {
+		stillPending[slot] = struct{}{}
+	}
+	for i := 0; i < len(handoff.pending); i++ {
 		lease := <-handoff.released
 		if lease == nil {
 			continue
 		}
+		delete(stillPending, lease.Slot)
 		if binding, ok := bySlot[lease.Slot]; ok {
+			if err := s.attachBinding(binding); err != nil {
+				return err
+			}
+		}
+	}
+	// A pane can already have lost its old connection's lease before a
+	// reconnect begins. Its release then returns nil, but the handoff still
+	// completed and the replacement output for that logical slot must be
+	// attached. Wait for every release above, then attach those nil slots.
+	for slot := range stillPending {
+		if binding, ok := bySlot[slot]; ok {
 			if err := s.attachBinding(binding); err != nil {
 				return err
 			}

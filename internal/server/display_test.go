@@ -293,6 +293,35 @@ func TestOutputHandoffAttachesEachReleasedSlotImmediately(t *testing.T) {
 	}
 }
 
+func TestOutputHandoffAttachesReplacementAfterNilRelease(t *testing.T) {
+	session := NewSession(0)
+	client := session.NewClient(0)
+	client.TerminalCols = 16
+	client.TerminalRows = 4
+	pane := &Pane{ID: session.AddPaneID(), terminal: terminal.New(16, 4)}
+	session.CreateWindow(pane, 0)
+	updates := startTestPaneLoop(session, pane)
+	defer close(updates)
+
+	written := newSignalWriter()
+	session.attachConnection(testConnection(nil, map[int]*OutputLease{0: testOutputLease(0, written)}))
+	bindings, _ := session.RenderBindings(0)
+	handoff := &outputHandoff{
+		released: make(chan *OutputLease, 1),
+		pending:  map[int]struct{}{0: {}},
+	}
+	handoff.released <- nil
+
+	if err := session.finishOutputHandoff(handoff, bindings); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-written.written:
+	case <-time.After(time.Second):
+		t.Fatal("replacement output was not attached after a nil old-lease release")
+	}
+}
+
 func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 	session := NewSession(0)
 	client := session.NewClient(0)
