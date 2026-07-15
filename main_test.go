@@ -12,6 +12,7 @@ import (
 
 	"github.com/garindra/meja/internal/client"
 	"github.com/garindra/meja/internal/control"
+	"github.com/garindra/meja/internal/version"
 )
 
 func TestCommandAfterTarget(t *testing.T) {
@@ -74,6 +75,26 @@ func TestParseGlobalOptionsAcceptsProfileAndSocket(t *testing.T) {
 func TestParseGlobalOptionsRejectsProfileAndSocketTogether(t *testing.T) {
 	if _, _, err := parseGlobalOptions([]string{"-L", "dev", "-S", "/tmp/dev.sock"}); err == nil {
 		t.Fatal("-L with -S was accepted")
+	}
+}
+
+func TestVersionCommandOutput(t *testing.T) {
+	previous := version.Value
+	version.Value = "v1.2.3"
+	t.Cleanup(func() { version.Value = previous })
+
+	stdin, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"version"}, stdin, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := stdout.String(), "meja 1.2.3\n"; got != want {
+		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
 

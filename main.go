@@ -14,6 +14,7 @@ import (
 	"github.com/garindra/meja/internal/client"
 	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/server"
+	"github.com/garindra/meja/internal/version"
 )
 
 func main() {
@@ -37,6 +38,7 @@ type usageError struct{ text string }
 func (e usageError) Error() string { return e.text }
 
 const usage = `usage:
+  meja version
   meja [-L profile | -S socket-path]
   meja [-L profile | -S socket-path] <host> [-- command args...]
   meja [-L profile | -S socket-path] new [-s session-name] [-c directory] [options] [host] [-- command args...]
@@ -70,6 +72,12 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 		return runList(ctx, selector, args[1:], stdin, stdout, stderr)
 	case "server":
 		return runServer(ctx, selector, args[1:], stdout, stderr)
+	case "version":
+		if len(args) != 1 {
+			return usageError{"version accepts no arguments"}
+		}
+		fmt.Fprintf(stdout, "meja %s\n", version.Current())
+		return nil
 	case "__control-v1":
 		return runControl(ctx, selector, args[1:], stdout)
 	case "help", "-h", "--help":

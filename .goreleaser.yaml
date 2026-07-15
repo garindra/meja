@@ -1,0 +1,32 @@
+version: 2
+
+project_name: meja
+
+builds:
+  - id: meja
+    main: .
+    binary: meja
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/garindra/meja/internal/version.Value={{.Version}}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats:
+      - tar.gz
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc

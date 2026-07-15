@@ -49,9 +49,9 @@ meja new -c /srv/app prod -- /usr/bin/bash -l
 
 An unrecognized first word is treated as a remote target, making `meja prod`
 the shorthand for `meja new prod`. The words `new`, `attach`, `a`, `ls`,
-`server`, and `help` are reserved commands. Use the explicit form for an SSH
-host alias with one of those names, or whenever connection-specific flags are
-needed:
+`server`, `version`, and `help` are reserved commands. Use the explicit form
+for an SSH host alias with one of those names, or whenever connection-specific
+flags are needed:
 
 ```bash
 meja new server

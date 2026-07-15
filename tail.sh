@@ -1,1 +1,0 @@
-tail -f /tmp/meja-terminal.log
