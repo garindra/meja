@@ -144,6 +144,7 @@ func (s *Session) publishStatusBar() error {
 		styleID = statusPromptStyleID
 		text = prompt.Label + string(prompt.Text)
 	} else if client.StatusMessage != "" {
+		styleID = statusPromptStyleID
 		text = client.StatusMessage
 	} else {
 		list := s.WindowStatuses(clientID0)

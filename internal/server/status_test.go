@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/garindra/meja/internal/protocol"
 )
@@ -162,6 +163,64 @@ func TestZoomedWindowStatusIncludesZFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertStatusText(t, statusClient.read(t), "[0] 0:bash*Z ")
+}
+
+func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
+	s := NewSession(0)
+	s.statusMessageDuration = 10 * time.Millisecond
+	client := s.NewClient(clientID0)
+	client.TerminalCols, client.TerminalRows = 80, 23
+	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash", terminal: newTerminal(80, 23)}, clientID0)
+	statusClient := newStatusTestClient()
+	s.attachConnection(testConnection(nil, nil, &statusClient.wire))
+	handler := &Connection{Session: s}
+
+	if _, err := s.BeginCommandPrompt(clientID0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.publishStatusBar(); err != nil {
+		t.Fatal(err)
+	}
+	statusClient.read(t)
+	_, events, terminated := s.ConsumePromptInput(clientID0, []byte("send-keys\r"))
+	if !terminated || len(events) == 0 {
+		t.Fatalf("command prompt events=%#v terminated=%v", events, terminated)
+	}
+	if err := runStatusEvent(t, handler, events[len(events)-1]); err != nil {
+		t.Fatal(err)
+	}
+	errorStatus := statusClient.read(t)
+	assertStatusText(t, errorStatus, `unknown command "send-keys"`)
+	for i, cell := range errorStatus.Cells {
+		if cell.StyleID != statusPromptStyleID {
+			t.Fatalf("error status cell %d style=%d, want %d", i, cell.StyleID, statusPromptStyleID)
+		}
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		cleared := false
+		if err := s.coordinate(func() error {
+			cleared = s.Clients[clientID0].StatusMessage == ""
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if cleared {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("command error did not clear")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	normalStatus := statusClient.read(t)
+	assertStatusText(t, normalStatus, "[0] 0:bash* ")
+	for i, cell := range normalStatus.Cells {
+		if cell.StyleID != statusNormalStyleID {
+			t.Fatalf("restored status cell %d style=%d, want %d", i, cell.StyleID, statusNormalStyleID)
+		}
+	}
 }
 
 func runStatusEvent(t *testing.T, handler *Connection, event serverInputEvent) error {

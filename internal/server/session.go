@@ -384,28 +384,30 @@ type Session struct {
 	NextPaneID         uint64
 	NextLayoutRevision uint64
 
-	attachToken         []byte
-	attachExpires       time.Time
-	attachConsumed      bool
-	resumeTokens        map[string]uint64
-	generation          uint64
-	daemon              *Daemon
-	port                uint16
-	quicListener        *quic.Listener
-	quicCancel          context.CancelFunc
-	connection          *Connection
-	defaultCwd          string
-	operations          chan sessionOperation
-	operationsDone      chan struct{}
-	statusCommands      chan statusCommand
-	stopOnce            sync.Once
-	processNames        ProcessObserver
-	nameMonitor         sync.Once
-	autosave            sync.Once
-	autosaveNow         chan struct{}
-	promptContinuations map[uint64]promptContinuation
-	stopping            bool
-	ended               bool
+	attachToken           []byte
+	attachExpires         time.Time
+	attachConsumed        bool
+	resumeTokens          map[string]uint64
+	generation            uint64
+	daemon                *Daemon
+	port                  uint16
+	quicListener          *quic.Listener
+	quicCancel            context.CancelFunc
+	connection            *Connection
+	defaultCwd            string
+	operations            chan sessionOperation
+	operationsDone        chan struct{}
+	statusCommands        chan statusCommand
+	stopOnce              sync.Once
+	processNames          ProcessObserver
+	nameMonitor           sync.Once
+	autosave              sync.Once
+	autosaveNow           chan struct{}
+	promptContinuations   map[uint64]promptContinuation
+	nextStatusMessageID   uint64
+	statusMessageDuration time.Duration
+	stopping              bool
+	ended                 bool
 }
 
 type Window struct {
@@ -492,6 +494,7 @@ type ClientState struct {
 	ResizeRepeatUntil time.Time
 	Prompt            *PromptState
 	StatusMessage     string
+	statusMessageID   uint64
 	LastWindowID      uint64
 	HasLastWindow     bool
 }
@@ -614,10 +617,29 @@ func (s *Session) BeginCommandPrompt(clientID uint64) (*PromptState, error) {
 	return s.BeginPrompt(clientID, PromptKindCommand, ":", "")
 }
 
-func (s *Session) setStatusMessage(clientID uint64, message string) {
-	if client := s.Clients[clientID]; client != nil {
-		client.StatusMessage = message
+func (s *Session) showStatusMessage(clientID uint64, message string) {
+	client := s.Clients[clientID]
+	if client == nil {
+		return
 	}
+	s.nextStatusMessageID++
+	client.StatusMessage = message
+	client.statusMessageID = s.nextStatusMessageID
+	messageID := client.statusMessageID
+	duration := s.statusMessageDuration
+	if duration <= 0 {
+		duration = time.Second
+	}
+	time.AfterFunc(duration, func() {
+		s.post(func() error {
+			client := s.Clients[clientID]
+			if client == nil || client.statusMessageID != messageID {
+				return nil
+			}
+			client.StatusMessage = ""
+			return s.publishStatusBar()
+		})
+	})
 }
 
 func (s *Session) beginConfirmationPrompt(clientID uint64, label string, continuation promptContinuation) (*PromptState, error) {

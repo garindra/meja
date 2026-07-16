@@ -280,7 +280,6 @@ func (s *Session) executeSessionCommand(c *Connection, argv []string) (bool, err
 	if !ok {
 		return false, fmt.Errorf("unknown command %q", argv[0])
 	}
-	s.setStatusMessage(clientID0, "")
 	execution, err := command.execute(&commandContext{daemon: c.Daemon, session: s, connection: c}, argv[1:])
 	return execution.detach, err
 }

@@ -281,7 +281,7 @@ func (s *Session) handlePromptEvent(c *Connection, event serverInputEvent) (bool
 				}
 			}
 			if err != nil {
-				s.setStatusMessage(clientID0, err.Error())
+				s.showStatusMessage(clientID0, err.Error())
 				return false, s.publishStatusBar()
 			}
 		default:
