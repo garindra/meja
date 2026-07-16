@@ -478,12 +478,14 @@ type ClientState struct {
 	TerminalCols   uint16
 	TerminalRows   uint16
 
-	RenderBindings []RenderBinding
-	HistoryViews   map[uint64]*HistoryView
-	InputState     serverInputState
-	Prompt         *PromptState
-	LastWindowID   uint64
-	HasLastWindow  bool
+	RenderBindings    []RenderBinding
+	HistoryViews      map[uint64]*HistoryView
+	InputState        serverInputState
+	PrefixEscape      []byte
+	ResizeRepeatUntil time.Time
+	Prompt            *PromptState
+	LastWindowID      uint64
+	HasLastWindow     bool
 }
 
 func (c *ClientState) setFocusedPane(paneID uint64) {
@@ -552,6 +554,8 @@ func (s *Session) BeginPrompt(clientID uint64, kind PromptKind, label, initial s
 	}
 	text := []rune(initial)
 	client.InputState = serverInputNormal
+	client.PrefixEscape = nil
+	client.ResizeRepeatUntil = time.Time{}
 	client.Prompt = &PromptState{
 		Kind:           kind,
 		TargetWindowID: window.ID,
@@ -573,6 +577,8 @@ func (s *Session) BeginRenameWindowPrompt(clientID uint64) (*PromptState, error)
 	}
 	text := []rune(window.Name)
 	client.InputState = serverInputNormal
+	client.PrefixEscape = nil
+	client.ResizeRepeatUntil = time.Time{}
 	client.Prompt = &PromptState{
 		Kind:           PromptKindRenameWindow,
 		TargetWindowID: window.ID,
@@ -590,6 +596,8 @@ func (s *Session) BeginRenameSessionPrompt(clientID uint64) (*PromptState, error
 	}
 	text := []rune(s.Name)
 	client.InputState = serverInputNormal
+	client.PrefixEscape = nil
+	client.ResizeRepeatUntil = time.Time{}
 	client.Prompt = &PromptState{
 		Kind:   PromptKindRenameSession,
 		Label:  "(rename-session) ",
@@ -605,6 +613,8 @@ func (s *Session) beginConfirmationPrompt(clientID uint64, label string, continu
 		return nil, fmt.Errorf("unknown client %d", clientID)
 	}
 	client.InputState = serverInputNormal
+	client.PrefixEscape = nil
+	client.ResizeRepeatUntil = time.Time{}
 	client.Prompt = &PromptState{Kind: PromptKindConfirm, Label: label}
 	if continuation == nil {
 		delete(s.promptContinuations, clientID)
@@ -841,6 +851,32 @@ func (s *Session) FocusPane(clientID, paneID uint64) (*Window, *ClientState, err
 	window.ActivePaneID = paneID
 	client.setFocusedPane(paneID)
 	return cloneWindow(window), cloneClientState(client), nil
+}
+
+func (s *Session) ResizeFocusedPane(clientID uint64, direction PaneResizeDirection, amount int) (*Window, *ClientState, bool, error) {
+	client := s.Clients[clientID]
+	if client == nil {
+		return nil, nil, false, fmt.Errorf("unknown client %d", clientID)
+	}
+	window := s.Windows[client.ActiveWindowID]
+	if window == nil {
+		return nil, nil, false, fmt.Errorf("unknown window %d", client.ActiveWindowID)
+	}
+	if direction > ResizePaneRight {
+		return nil, nil, false, fmt.Errorf("invalid pane resize direction %d", direction)
+	}
+	if amount <= 0 {
+		return nil, nil, false, fmt.Errorf("pane resize amount must be positive")
+	}
+	if !ResizePaneBoundary(window.Layout, client.FocusedPaneID, direction, amount, Rect{
+		Width:  int(client.TerminalCols),
+		Height: int(client.TerminalRows),
+	}) {
+		return cloneWindow(window), cloneClientState(client), false, nil
+	}
+	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	s.rebuildBindingsLocked(client, window)
+	return cloneWindow(window), cloneClientState(client), true, nil
 }
 
 func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitDirection) (*Window, *ClientState, error) {
@@ -1577,6 +1613,7 @@ func cloneClientState(c *ClientState) *ClientState {
 	}
 	out := *c
 	out.RenderBindings = append([]RenderBinding(nil), c.RenderBindings...)
+	out.PrefixEscape = append([]byte(nil), c.PrefixEscape...)
 	out.Prompt = clonePromptState(c.Prompt)
 	return &out
 }

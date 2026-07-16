@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/garindra/meja/internal/protocol"
 )
@@ -92,6 +93,147 @@ func TestServerParsesPrefixArrowAndWindowIndex(t *testing.T) {
 	s.ConsumeInputByte(0, 0x02)
 	if event := s.ConsumeInputByte(0, '3'); event.Command != serverCommandSelectIndex || event.Index != 3 {
 		t.Fatalf("numeric window event = %#v", event)
+	}
+}
+
+func TestServerParsesModifiedPrefixArrowsForResize(t *testing.T) {
+	tests := []struct {
+		name      string
+		sequence  []byte
+		direction PaneResizeDirection
+		amount    int
+	}{
+		{name: "control up", sequence: []byte("\x1b[1;5A"), direction: ResizePaneUp, amount: 1},
+		{name: "control down", sequence: []byte("\x1b[1;5B"), direction: ResizePaneDown, amount: 1},
+		{name: "control right", sequence: []byte("\x1b[1;5C"), direction: ResizePaneRight, amount: 1},
+		{name: "control left", sequence: []byte("\x1b[1;5D"), direction: ResizePaneLeft, amount: 1},
+		{name: "parameterized meta", sequence: []byte("\x1b[1;3D"), direction: ResizePaneLeft, amount: 5},
+		{name: "escape-prefixed meta", sequence: []byte("\x1b\x1b[A"), direction: ResizePaneUp, amount: 5},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := NewSession(0)
+			s.NewClient(0)
+			s.ConsumeInputByte(0, 0x02)
+			var event serverInputEvent
+			for _, b := range test.sequence {
+				event = s.ConsumeInputByte(0, b)
+			}
+			if event.Command != serverCommandResizePane || event.ResizeDirection != test.direction || event.ResizeAmount != test.amount {
+				t.Fatalf("resize event = %#v", event)
+			}
+			client := s.SnapshotClient(0)
+			if client.InputState != serverInputNormal || len(client.PrefixEscape) != 0 {
+				t.Fatalf("parser did not reset after resize: %#v", client)
+			}
+		})
+	}
+}
+
+func TestServerResetsOverlongPrefixCSI(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	s.ConsumeInputByte(0, 0x02)
+	for _, b := range append([]byte("\x1b["), []byte("11111111111111111111111111111111")...) {
+		s.ConsumeInputByte(0, b)
+	}
+	client := s.SnapshotClient(0)
+	if client.InputState != serverInputNormal || len(client.PrefixEscape) != 0 {
+		t.Fatalf("overlong CSI left parser active: %#v", client)
+	}
+}
+
+func TestPaneResizeBindingRepeatsWithoutPrefix(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	now := time.Unix(100, 0)
+	var event serverInputEvent
+	for _, b := range append([]byte{0x02}, []byte("\x1b[1;5C")...) {
+		event = consumeInputByteLockedAt(client, b, now)
+	}
+	if event.Command != serverCommandResizePane || event.ResizeDirection != ResizePaneRight || event.ResizeAmount != 1 {
+		t.Fatalf("initial resize event = %#v", event)
+	}
+	if want := now.Add(paneResizeRepeatWindow); !client.ResizeRepeatUntil.Equal(want) {
+		t.Fatalf("repeat deadline = %v, want %v", client.ResizeRepeatUntil, want)
+	}
+
+	repeatedAt := now.Add(100 * time.Millisecond)
+	for _, b := range []byte("\x1b[1;5C") {
+		event = consumeInputByteLockedAt(client, b, repeatedAt)
+	}
+	if event.Command != serverCommandResizePane || event.ResizeDirection != ResizePaneRight || event.ResizeAmount != 1 {
+		t.Fatalf("repeated resize event = %#v", event)
+	}
+	if want := repeatedAt.Add(paneResizeRepeatWindow); !client.ResizeRepeatUntil.Equal(want) {
+		t.Fatalf("rearmed deadline = %v, want %v", client.ResizeRepeatUntil, want)
+	}
+}
+
+func TestPaneResizeRepeatCancellationPreservesInput(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		wantData []byte
+	}{
+		{name: "ordinary byte", input: []byte{'x'}, wantData: []byte{'x'}},
+		{name: "plain arrow", input: []byte("\x1b[A"), wantData: []byte("\x1b[A")},
+		{name: "unknown escape", input: []byte("\x1bx"), wantData: []byte("\x1bx")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &ClientState{InputState: serverInputNormal, ResizeRepeatUntil: time.Unix(200, 0)}
+			now := time.Unix(199, 750_000_000)
+			var event serverInputEvent
+			for _, b := range test.input {
+				event = consumeInputByteLockedAt(client, b, now)
+			}
+			if event.Command != serverCommandLiteral {
+				t.Fatalf("cancellation event = %#v", event)
+			}
+			got := event.Data
+			if len(got) == 0 {
+				got = []byte{event.Byte}
+			}
+			if !bytes.Equal(got, test.wantData) {
+				t.Fatalf("preserved input = %q, want %q", got, test.wantData)
+			}
+			if !client.ResizeRepeatUntil.IsZero() || client.InputState != serverInputNormal || len(client.PrefixEscape) != 0 {
+				t.Fatalf("repeat state not cleared: %#v", client)
+			}
+		})
+	}
+}
+
+func TestPaneResizeRepeatExpires(t *testing.T) {
+	deadline := time.Unix(300, 0)
+	client := &ClientState{InputState: serverInputNormal, ResizeRepeatUntil: deadline}
+	event := consumeInputByteLockedAt(client, 0x1b, deadline)
+	if event.Command != serverCommandLiteral || event.Byte != 0x1b {
+		t.Fatalf("expired repeat event = %#v", event)
+	}
+	if !client.ResizeRepeatUntil.IsZero() {
+		t.Fatalf("expired repeat deadline was not cleared: %v", client.ResizeRepeatUntil)
+	}
+}
+
+func TestHandleInputBytesAppliesRepeatedPaneResize(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 24
+	left := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
+	s.CreateWindow(left, 0)
+	right := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
+	if _, _, err := s.SplitFocusedPane(0, right, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	input := append([]byte{0x02}, []byte("\x1b[1;5C\x1b[1;5C")...)
+	if detach, err := s.handleInputBytes(&Connection{Session: s}, input); err != nil || detach {
+		t.Fatalf("handleInputBytes() detach=%v err=%v", detach, err)
+	}
+	placements := s.Windows[client.ActiveWindowID].Layout.Compute(Rect{Width: 80, Height: 24})
+	if placements[0].Rect.Width != 41 || placements[1].Rect.Width != 38 {
+		t.Fatalf("placements after repeated resize = %#v", placements)
 	}
 }
 

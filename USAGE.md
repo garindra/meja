@@ -145,11 +145,17 @@ the command key. Normal typing continues to go to the focused pane.
 | `Ctrl+b`, `%` | Split the focused pane left/right. |
 | `Ctrl+b`, `"` | Split the focused pane top/bottom. |
 | `Ctrl+b`, `↑` / `↓` / `←` / `→` | Focus the pane in that direction. |
+| `Ctrl+b`, `Ctrl+↑` / `Ctrl+↓` / `Ctrl+←` / `Ctrl+→` | Move a pane boundary by one row or column. |
+| `Ctrl+b`, `Alt+↑` / `Alt+↓` / `Alt+←` / `Alt+→` | Move a pane boundary by five rows or columns. |
 | `Ctrl+b`, `{` | Swap the focused pane with the previous pane. |
 | `Ctrl+b`, `}` | Swap the focused pane with the next pane. |
 | `Ctrl+b`, `x` | Close the focused pane. Closing the final pane ends the session. |
 
 Each window supports up to eight visible panes.
+Pane sizes are stored as part of the window layout and are included in named
+session snapshots. After either resize binding, additional Ctrl- or
+Alt-modified arrows repeat the resize without another prefix for 500
+milliseconds after the previous adjustment.
 
 ### Windows and names
 

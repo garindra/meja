@@ -37,6 +37,15 @@ type SplitLayout struct {
 	Second    LayoutNode
 }
 
+type PaneResizeDirection uint8
+
+const (
+	ResizePaneUp PaneResizeDirection = iota
+	ResizePaneDown
+	ResizePaneLeft
+	ResizePaneRight
+)
+
 func (p *PaneLayout) Compute(rect Rect) []PanePlacement {
 	return []PanePlacement{{PaneID: p.PaneID, Rect: rect}}
 }
@@ -52,37 +61,9 @@ func (s *SplitLayout) Compute(rect Rect) []PanePlacement {
 	if s.Direction != SplitVertical && s.Direction != SplitHorizontal {
 		return nil
 	}
-	axisSize := rect.Width
-	if s.Direction == SplitHorizontal {
-		axisSize = rect.Height
-	}
-	if axisSize <= 1 {
+	firstRect, secondRect, ok := s.rects(rect)
+	if !ok {
 		return append(s.First.Compute(rect), s.Second.Compute(rect)...)
-	}
-	ratio := int(s.Ratio)
-	if ratio <= 0 || ratio >= 1000 {
-		ratio = 500
-	}
-	available := axisSize - 1
-	firstSize := (available * ratio) / 1000
-	if firstSize < 1 {
-		firstSize = 1
-	}
-	secondSize := available - firstSize
-	if secondSize < 1 {
-		secondSize = 1
-		firstSize = available - secondSize
-	}
-	firstRect := rect
-	secondRect := rect
-	if s.Direction == SplitVertical {
-		firstRect.Width = firstSize
-		secondRect.X += firstSize + 1
-		secondRect.Width = secondSize
-	} else {
-		firstRect.Height = firstSize
-		secondRect.Y += firstSize + 1
-		secondRect.Height = secondSize
 	}
 	out := append(s.First.Compute(firstRect), s.Second.Compute(secondRect)...)
 	sort.Slice(out, func(i, j int) bool {
@@ -97,6 +78,48 @@ func (s *SplitLayout) Compute(rect Rect) []PanePlacement {
 	return out
 }
 
+func (s *SplitLayout) rects(rect Rect) (Rect, Rect, bool) {
+	axisSize := rect.Width
+	if s.Direction == SplitHorizontal {
+		axisSize = rect.Height
+	}
+	if axisSize <= 1 {
+		return Rect{}, Rect{}, false
+	}
+	available := axisSize - 1
+	firstSize := splitFirstSize(available, s.Ratio)
+	secondSize := available - firstSize
+	firstRect := rect
+	secondRect := rect
+	if s.Direction == SplitVertical {
+		firstRect.Width = firstSize
+		secondRect.X += firstSize + 1
+		secondRect.Width = secondSize
+	} else {
+		firstRect.Height = firstSize
+		secondRect.Y += firstSize + 1
+		secondRect.Height = secondSize
+	}
+	return firstRect, secondRect, true
+}
+
+func splitFirstSize(available int, ratio uint16) int {
+	value := int(ratio)
+	if value <= 0 || value >= 1000 {
+		value = 500
+	}
+	firstSize := (available * value) / 1000
+	if firstSize < 1 {
+		firstSize = 1
+	}
+	secondSize := available - firstSize
+	if secondSize < 1 {
+		secondSize = 1
+		firstSize = available - secondSize
+	}
+	return firstSize
+}
+
 func (s *SplitLayout) PaneIDs() []uint64 {
 	if s == nil {
 		return nil
@@ -104,4 +127,135 @@ func (s *SplitLayout) PaneIDs() []uint64 {
 	out := append([]uint64{}, s.First.PaneIDs()...)
 	out = append(out, s.Second.PaneIDs()...)
 	return out
+}
+
+type resizeCandidate struct {
+	split     *SplitLayout
+	rect      Rect
+	preferred bool
+}
+
+// ResizePaneBoundary moves the closest split boundary for paneID in the
+// requested screen direction. A boundary on that side is preferred; when the
+// pane is at the outside edge, the closest split on the same axis is moved
+// instead, matching tmux resize-pane behavior.
+func ResizePaneBoundary(layout LayoutNode, paneID uint64, direction PaneResizeDirection, amount int, rect Rect) bool {
+	if layout == nil || direction > ResizePaneRight || amount <= 0 || !containsPane(layout.PaneIDs(), paneID) {
+		return false
+	}
+	var candidates []resizeCandidate
+	collectResizeCandidates(layout, paneID, direction, rect, &candidates)
+	if len(candidates) == 0 {
+		return false
+	}
+	target := candidates[0]
+	for _, candidate := range candidates {
+		if candidate.preferred {
+			target = candidate
+			break
+		}
+	}
+	return resizeSplitBoundary(target.split, target.rect, direction, amount)
+}
+
+func collectResizeCandidates(layout LayoutNode, paneID uint64, direction PaneResizeDirection, rect Rect, out *[]resizeCandidate) {
+	split, ok := layout.(*SplitLayout)
+	if !ok || split == nil {
+		return
+	}
+	firstRect, secondRect, valid := split.rects(rect)
+	if !valid {
+		return
+	}
+	inFirst := containsPane(split.First.PaneIDs(), paneID)
+	if inFirst {
+		collectResizeCandidates(split.First, paneID, direction, firstRect, out)
+	} else if containsPane(split.Second.PaneIDs(), paneID) {
+		collectResizeCandidates(split.Second, paneID, direction, secondRect, out)
+	} else {
+		return
+	}
+	vertical := direction == ResizePaneLeft || direction == ResizePaneRight
+	if vertical != (split.Direction == SplitVertical) {
+		return
+	}
+	preferred := (inFirst && (direction == ResizePaneRight || direction == ResizePaneDown)) ||
+		(!inFirst && (direction == ResizePaneLeft || direction == ResizePaneUp))
+	*out = append(*out, resizeCandidate{split: split, rect: rect, preferred: preferred})
+}
+
+func resizeSplitBoundary(split *SplitLayout, rect Rect, direction PaneResizeDirection, amount int) bool {
+	firstRect, _, ok := split.rects(rect)
+	if !ok {
+		return false
+	}
+	available := rect.Width - 1
+	current := firstRect.Width
+	minimumFirst := layoutMinimumSize(split.First, SplitVertical)
+	minimumSecond := layoutMinimumSize(split.Second, SplitVertical)
+	if split.Direction == SplitHorizontal {
+		available = rect.Height - 1
+		current = firstRect.Height
+		minimumFirst = layoutMinimumSize(split.First, SplitHorizontal)
+		minimumSecond = layoutMinimumSize(split.Second, SplitHorizontal)
+	}
+	minimum, maximum := minimumFirst, available-minimumSecond
+	if minimum > maximum {
+		return false
+	}
+	desired := current + amount
+	if direction == ResizePaneLeft || direction == ResizePaneUp {
+		desired = current - amount
+	}
+	if desired < minimum {
+		desired = minimum
+	}
+	if desired > maximum {
+		desired = maximum
+	}
+	if desired == current {
+		return false
+	}
+
+	bestRatio, bestSize, bestDistance := uint16(0), current, int(^uint(0)>>1)
+	for ratio := 1; ratio < 1000; ratio++ {
+		size := splitFirstSize(available, uint16(ratio))
+		if size < minimum || size > maximum {
+			continue
+		}
+		if desired < current && size >= current || desired > current && size <= current {
+			continue
+		}
+		distance := size - desired
+		if distance < 0 {
+			distance = -distance
+		}
+		if distance < bestDistance {
+			bestRatio, bestSize, bestDistance = uint16(ratio), size, distance
+		}
+	}
+	if bestRatio == 0 || bestSize == current {
+		return false
+	}
+	split.Ratio = bestRatio
+	return true
+}
+
+func layoutMinimumSize(layout LayoutNode, axis SplitDirection) int {
+	switch node := layout.(type) {
+	case *PaneLayout:
+		return 1
+	case *SplitLayout:
+		first := layoutMinimumSize(node.First, axis)
+		second := layoutMinimumSize(node.Second, axis)
+		if node.Direction == axis {
+			return first + 1 + second
+		}
+		if second > first {
+			return second
+		}
+		return first
+	default:
+		return 1
+	}
 }

@@ -47,6 +47,119 @@ func TestPaneAndSplitLayoutsComputeExpectedRects(t *testing.T) {
 	}
 }
 
+func TestResizePaneBoundaryMovesInScreenDirection(t *testing.T) {
+	layout := &SplitLayout{
+		Direction: SplitVertical,
+		Ratio:     500,
+		First:     &PaneLayout{PaneID: 1},
+		Second:    &PaneLayout{PaneID: 2},
+	}
+	rect := Rect{Width: 80, Height: 24}
+	if !ResizePaneBoundary(layout, 1, ResizePaneLeft, 5, rect) {
+		t.Fatal("left resize did not change layout")
+	}
+	placements := layout.Compute(rect)
+	if placements[0].Rect.Width != 34 || placements[1].Rect.Width != 45 {
+		t.Fatalf("left resize placements = %#v", placements)
+	}
+	if !ResizePaneBoundary(layout, 1, ResizePaneRight, 5, rect) {
+		t.Fatal("right resize did not change layout")
+	}
+	placements = layout.Compute(rect)
+	if placements[0].Rect.Width != 39 || placements[1].Rect.Width != 40 {
+		t.Fatalf("right resize placements = %#v", placements)
+	}
+	if !ResizePaneBoundary(layout, 2, ResizePaneLeft, 5, rect) {
+		t.Fatal("left resize of right pane did not change layout")
+	}
+	placements = layout.Compute(rect)
+	if placements[0].Rect.Width != 34 || placements[1].Rect.Width != 45 {
+		t.Fatalf("right pane left resize placements = %#v", placements)
+	}
+}
+
+func TestResizePaneBoundaryMovesHorizontalBoundary(t *testing.T) {
+	layout := &SplitLayout{
+		Direction: SplitHorizontal,
+		Ratio:     500,
+		First:     &PaneLayout{PaneID: 1},
+		Second:    &PaneLayout{PaneID: 2},
+	}
+	rect := Rect{Width: 80, Height: 24}
+	if !ResizePaneBoundary(layout, 1, ResizePaneUp, 3, rect) {
+		t.Fatal("up resize did not change layout")
+	}
+	placements := layout.Compute(rect)
+	if placements[0].Rect.Height != 8 || placements[1].Rect.Height != 15 {
+		t.Fatalf("up resize placements = %#v", placements)
+	}
+	if !ResizePaneBoundary(layout, 1, ResizePaneDown, 3, rect) {
+		t.Fatal("down resize did not change layout")
+	}
+	placements = layout.Compute(rect)
+	if placements[0].Rect.Height != 11 || placements[1].Rect.Height != 12 {
+		t.Fatalf("down resize placements = %#v", placements)
+	}
+}
+
+func TestResizePaneBoundarySelectsNearestBoundaryOnRequestedSide(t *testing.T) {
+	inner := &SplitLayout{
+		Direction: SplitVertical,
+		Ratio:     500,
+		First:     &PaneLayout{PaneID: 2},
+		Second:    &PaneLayout{PaneID: 3},
+	}
+	layout := &SplitLayout{
+		Direction: SplitVertical,
+		Ratio:     500,
+		First:     &PaneLayout{PaneID: 1},
+		Second:    inner,
+	}
+	rect := Rect{Width: 120, Height: 24}
+	before := layout.Compute(rect)
+	if !ResizePaneBoundary(layout, 2, ResizePaneLeft, 5, rect) {
+		t.Fatal("middle pane left resize did not change layout")
+	}
+	afterLeft := layout.Compute(rect)
+	if afterLeft[0].Rect.Width != before[0].Rect.Width-5 {
+		t.Fatalf("left resize moved wrong boundary: before=%#v after=%#v", before, afterLeft)
+	}
+	leftWidth := afterLeft[0].Rect.Width
+	beforeMiddleWidth := afterLeft[1].Rect.Width
+	if !ResizePaneBoundary(layout, 2, ResizePaneRight, 5, rect) {
+		t.Fatal("middle pane right resize did not change layout")
+	}
+	afterRight := layout.Compute(rect)
+	if afterRight[0].Rect.Width != leftWidth || afterRight[1].Rect.Width != beforeMiddleWidth+5 {
+		t.Fatalf("right resize moved wrong boundary: before=%#v after=%#v", afterLeft, afterRight)
+	}
+}
+
+func TestResizePaneBoundaryClampsForNestedPaneMinimums(t *testing.T) {
+	layout := &SplitLayout{
+		Direction: SplitVertical,
+		Ratio:     500,
+		First:     &PaneLayout{PaneID: 1},
+		Second: &SplitLayout{
+			Direction: SplitVertical,
+			Ratio:     500,
+			First:     &PaneLayout{PaneID: 2},
+			Second:    &PaneLayout{PaneID: 3},
+		},
+	}
+	rect := Rect{Width: 8, Height: 4}
+	if !ResizePaneBoundary(layout, 1, ResizePaneRight, 100, rect) {
+		t.Fatal("clamped resize did not change layout")
+	}
+	placements := layout.Compute(rect)
+	if placements[0].Rect.Width != 4 || placements[1].Rect.Width != 1 || placements[2].Rect.Width != 1 {
+		t.Fatalf("clamped placements = %#v", placements)
+	}
+	if ResizePaneBoundary(layout, 1, ResizePaneRight, 1, rect) {
+		t.Fatal("resize moved boundary past nested minimum")
+	}
+}
+
 func TestSessionSplitCreatesNewPaneAndBindings(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
@@ -72,6 +185,59 @@ func TestSessionSplitCreatesNewPaneAndBindings(t *testing.T) {
 	}
 	if clientState.RenderBindings[1].PaneID != pane1.ID {
 		t.Fatalf("second render slot = %#v", clientState.RenderBindings)
+	}
+}
+
+func TestResizeFocusedPaneAdvancesRevisionAndPersistsRatio(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 24
+	left := &Pane{ID: s.AddPaneID()}
+	s.CreateWindow(left, 0)
+	right := &Pane{ID: s.AddPaneID()}
+	if _, _, err := s.SplitFocusedPane(0, right, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.FocusPane(0, left.ID); err != nil {
+		t.Fatal(err)
+	}
+	before := s.Windows[client.ActiveWindowID].LayoutRevision
+	window, _, changed, err := s.ResizeFocusedPane(0, ResizePaneRight, 5)
+	if err != nil || !changed {
+		t.Fatalf("ResizeFocusedPane() changed=%v err=%v", changed, err)
+	}
+	if window.LayoutRevision <= before {
+		t.Fatalf("layout revision = %d, want > %d", window.LayoutRevision, before)
+	}
+	persisted, err := persistedLayout(window.Layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Ratio <= 0.5 {
+		t.Fatalf("persisted resized ratio = %f, want > 0.5", persisted.Ratio)
+	}
+}
+
+func TestResizePaneCommandRelayoutsPaneTerminals(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 24
+	left := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
+	s.CreateWindow(left, 0)
+	right := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
+	if _, _, err := s.SplitFocusedPane(0, right, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.FocusPane(0, left.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.commandResizePane(ResizePaneRight, 5); err != nil {
+		t.Fatal(err)
+	}
+	leftCols, leftRows := left.TerminalSize()
+	rightCols, rightRows := right.TerminalSize()
+	if leftCols != 44 || rightCols != 35 || leftRows != 24 || rightRows != 24 {
+		t.Fatalf("terminal sizes after resize: left=%dx%d right=%dx%d", leftCols, leftRows, rightCols, rightRows)
 	}
 }
 

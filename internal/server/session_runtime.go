@@ -229,7 +229,13 @@ func (s *Session) handleServerInputEvent(c *Connection, event serverInputEvent) 
 		if pane == nil {
 			return false, nil
 		}
-		if err := pane.sendInput([]byte{event.Byte}); err != nil {
+		data := event.Data
+		if len(data) == 0 {
+			data = []byte{event.Byte}
+		} else if translated, consumed, ok := translateApplicationCursor(data, pane.UsesApplicationCursorKeys()); ok && consumed == len(data) {
+			data = translated
+		}
+		if err := pane.sendInput(data); err != nil {
 			return false, fmt.Errorf("write pty: %w", err)
 		}
 		return false, nil
@@ -270,6 +276,8 @@ func (s *Session) handleServerInputEvent(c *Connection, event serverInputEvent) 
 			return false, err
 		}
 		return false, s.publishWindowLayout()
+	case serverCommandResizePane:
+		return false, s.commandResizePane(event.ResizeDirection, event.ResizeAmount)
 	case serverCommandBeginWindowPrompt:
 		return false, s.commandBeginRenameWindowPrompt()
 	case serverCommandBeginSessionPrompt:
@@ -402,6 +410,26 @@ func (s *Session) commandSwapPane(direction PaneSwapDirection) error {
 	}
 	handoff := s.beginOutputHandoff()
 	_, clientState, changed, err := s.SwapFocusedPane(clientID0, direction)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return s.publishVisibleSnapshots(handoff)
+	}
+	s.resizeSessionToClient(clientState)
+	if err := s.publishWindowLayout(); err != nil {
+		return err
+	}
+	return s.publishBindingsAndSnapshots(handoff)
+}
+
+func (s *Session) commandResizePane(direction PaneResizeDirection, amount int) error {
+	clientState := s.SnapshotClient(clientID0)
+	if clientState == nil {
+		return nil
+	}
+	handoff := s.beginOutputHandoff()
+	_, clientState, changed, err := s.ResizeFocusedPane(clientID0, direction, amount)
 	if err != nil {
 		return err
 	}

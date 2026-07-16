@@ -2,8 +2,13 @@ package server
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
+	"time"
 	"unicode/utf8"
 )
+
+const paneResizeRepeatWindow = 500 * time.Millisecond
 
 type serverInputState uint8
 
@@ -12,6 +17,8 @@ const (
 	serverInputPrefix
 	serverInputPrefixESC
 	serverInputPrefixCSI
+	serverInputResizeRepeatESC
+	serverInputResizeRepeatCSI
 )
 
 type serverInputCommand uint8
@@ -32,20 +39,24 @@ const (
 	serverCommandSwapPaneNext
 	serverCommandSelectIndex
 	serverCommandFocusDirection
+	serverCommandResizePane
 	serverCommandBeginWindowPrompt
 	serverCommandBeginSessionPrompt
 	serverCommandPrompt
 )
 
 type serverInputEvent struct {
-	Command        serverInputCommand
-	Byte           byte
-	Index          int
-	Direction      byte
-	PromptAction   PromptAction
-	PromptKind     PromptKind
-	PromptWindowID uint64
-	PromptText     string
+	Command         serverInputCommand
+	Byte            byte
+	Data            []byte
+	Index           int
+	Direction       byte
+	ResizeDirection PaneResizeDirection
+	ResizeAmount    int
+	PromptAction    PromptAction
+	PromptKind      PromptKind
+	PromptWindowID  uint64
+	PromptText      string
 }
 
 func (s *Session) ConsumeInputByte(clientID uint64, b byte) serverInputEvent {
@@ -56,17 +67,22 @@ func (s *Session) ConsumeInputByte(clientID uint64, b byte) serverInputEvent {
 	if client.Prompt != nil {
 		return consumePromptByteLocked(client, b)
 	}
-	return consumeInputByteLocked(client, b)
+	return consumeInputByteLockedAt(client, b, time.Now())
 }
 
 func consumeInputByteLocked(client *ClientState, b byte) serverInputEvent {
+	return consumeInputByteLockedAt(client, b, time.Now())
+}
+
+func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) serverInputEvent {
 	switch client.InputState {
 	case serverInputPrefix:
 		if b == 0x1b {
 			client.InputState = serverInputPrefixESC
+			client.PrefixEscape = []byte{b}
 			return serverInputEvent{}
 		}
-		client.InputState = serverInputNormal
+		resetPrefixInput(client)
 		switch b {
 		case 0x02:
 			return serverInputEvent{Command: serverCommandLiteral, Byte: 0x02}
@@ -103,23 +119,165 @@ func consumeInputByteLocked(client *ClientState, b byte) serverInputEvent {
 		}
 	case serverInputPrefixESC:
 		if b == '[' {
+			client.PrefixEscape = append(client.PrefixEscape, b)
 			client.InputState = serverInputPrefixCSI
 			return serverInputEvent{}
 		}
-		client.InputState = serverInputNormal
-	case serverInputPrefixCSI:
-		client.InputState = serverInputNormal
-		if b == 'A' || b == 'B' || b == 'C' || b == 'D' {
-			return serverInputEvent{Command: serverCommandFocusDirection, Direction: b}
+		if b == 0x1b && len(client.PrefixEscape) == 1 {
+			client.PrefixEscape = append(client.PrefixEscape, b)
+			return serverInputEvent{}
 		}
+		resetPrefixInput(client)
+	case serverInputPrefixCSI:
+		client.PrefixEscape = append(client.PrefixEscape, b)
+		if len(client.PrefixEscape) > 32 {
+			resetPrefixInput(client)
+			return serverInputEvent{}
+		}
+		if b < 0x40 || b > 0x7e {
+			return serverInputEvent{}
+		}
+		sequence := append([]byte(nil), client.PrefixEscape...)
+		resetPrefixInput(client)
+		event := decodePrefixCSI(sequence)
+		if event.Command == serverCommandResizePane {
+			armPaneResizeRepeat(client, now)
+		}
+		return event
+	case serverInputResizeRepeatESC:
+		if !paneResizeRepeatActive(client, now) {
+			return cancelPaneResizeRepeatWithInput(client, b)
+		}
+		if b == '[' {
+			client.PrefixEscape = append(client.PrefixEscape, b)
+			client.InputState = serverInputResizeRepeatCSI
+			return serverInputEvent{}
+		}
+		if b == 0x1b && len(client.PrefixEscape) == 1 {
+			client.PrefixEscape = append(client.PrefixEscape, b)
+			return serverInputEvent{}
+		}
+		return cancelPaneResizeRepeatWithInput(client, b)
+	case serverInputResizeRepeatCSI:
+		client.PrefixEscape = append(client.PrefixEscape, b)
+		if !paneResizeRepeatActive(client, now) || len(client.PrefixEscape) > 32 {
+			return cancelPaneResizeRepeatWithInput(client)
+		}
+		if b < 0x40 || b > 0x7e {
+			return serverInputEvent{}
+		}
+		sequence := append([]byte(nil), client.PrefixEscape...)
+		resetPrefixInput(client)
+		event := decodePrefixCSI(sequence)
+		if event.Command == serverCommandResizePane {
+			armPaneResizeRepeat(client, now)
+			return event
+		}
+		cancelPaneResizeRepeat(client)
+		return serverInputEvent{Command: serverCommandLiteral, Data: sequence}
 	default:
+		if paneResizeRepeatActive(client, now) {
+			if b == 0x1b {
+				client.InputState = serverInputResizeRepeatESC
+				client.PrefixEscape = []byte{b}
+				return serverInputEvent{}
+			}
+			cancelPaneResizeRepeat(client)
+		} else if !client.ResizeRepeatUntil.IsZero() {
+			cancelPaneResizeRepeat(client)
+		}
 		if b == 0x02 {
 			client.InputState = serverInputPrefix
+			client.PrefixEscape = nil
 			return serverInputEvent{}
 		}
 		return serverInputEvent{Command: serverCommandLiteral, Byte: b}
 	}
 	return serverInputEvent{}
+}
+
+func armPaneResizeRepeat(client *ClientState, now time.Time) {
+	client.InputState = serverInputNormal
+	client.PrefixEscape = nil
+	client.ResizeRepeatUntil = now.Add(paneResizeRepeatWindow)
+}
+
+func paneResizeRepeatActive(client *ClientState, now time.Time) bool {
+	return client != nil && !client.ResizeRepeatUntil.IsZero() && now.Before(client.ResizeRepeatUntil)
+}
+
+func cancelPaneResizeRepeat(client *ClientState) {
+	client.InputState = serverInputNormal
+	client.PrefixEscape = nil
+	client.ResizeRepeatUntil = time.Time{}
+}
+
+func cancelPaneResizeRepeatWithInput(client *ClientState, suffix ...byte) serverInputEvent {
+	data := append([]byte(nil), client.PrefixEscape...)
+	data = append(data, suffix...)
+	cancelPaneResizeRepeat(client)
+	return serverInputEvent{Command: serverCommandLiteral, Data: data}
+}
+
+func resetPrefixInput(client *ClientState) {
+	client.InputState = serverInputNormal
+	client.PrefixEscape = nil
+}
+
+func decodePrefixCSI(sequence []byte) serverInputEvent {
+	index := 0
+	meta := false
+	if index >= len(sequence) || sequence[index] != 0x1b {
+		return serverInputEvent{}
+	}
+	index++
+	if index < len(sequence) && sequence[index] == 0x1b {
+		meta = true
+		index++
+	}
+	if index >= len(sequence) || sequence[index] != '[' || len(sequence)-index < 2 {
+		return serverInputEvent{}
+	}
+	index++
+	final := sequence[len(sequence)-1]
+	if final < 'A' || final > 'D' {
+		return serverInputEvent{}
+	}
+	modifier := 1
+	params := string(sequence[index : len(sequence)-1])
+	if params != "" {
+		parts := strings.Split(params, ";")
+		parsed, err := strconv.Atoi(parts[len(parts)-1])
+		if err != nil {
+			return serverInputEvent{}
+		}
+		modifier = parsed
+	}
+	if meta {
+		modifier = 3
+	}
+	if modifier == 1 {
+		return serverInputEvent{Command: serverCommandFocusDirection, Direction: final}
+	}
+	amount := 0
+	if modifier == 5 {
+		amount = 1
+	} else if modifier == 3 {
+		amount = 5
+	}
+	if amount == 0 {
+		return serverInputEvent{}
+	}
+	direction := ResizePaneUp
+	switch final {
+	case 'B':
+		direction = ResizePaneDown
+	case 'C':
+		direction = ResizePaneRight
+	case 'D':
+		direction = ResizePaneLeft
+	}
+	return serverInputEvent{Command: serverCommandResizePane, ResizeDirection: direction, ResizeAmount: amount}
 }
 
 func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
@@ -264,7 +422,7 @@ func (s *Session) ConsumePromptInput(clientID uint64, data []byte) (int, []serve
 
 func (s *Session) InputIsNormal(clientID uint64) bool {
 	client := s.Clients[clientID]
-	return client != nil && client.Prompt == nil && client.InputState == serverInputNormal
+	return client != nil && client.Prompt == nil && client.InputState == serverInputNormal && !paneResizeRepeatActive(client, time.Now())
 }
 
 func translateApplicationCursor(data []byte, enabled bool) ([]byte, int, bool) {
