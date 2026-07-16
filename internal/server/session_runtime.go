@@ -52,9 +52,9 @@ func (s *Session) handlePaneProcessExitNow(paneID uint64) error {
 	return s.rebindOutputsAndPublishLayout(handoff)
 }
 
-func (s *Session) createWindow(c *Connection, cwd string, argv []string, cols, rows uint16) (*Pane, *Window, *ClientState, error) {
+func (s *Session) createWindow(cwd string, argv []string, cols, rows uint16, shell string) (*Pane, *Window, *ClientState, error) {
 	paneID := s.AddPaneID()
-	pane, err := StartPane(paneID, paneRequest{Cwd: cwd, Command: argv, Cols: cols, Rows: rows, Shell: c.shell})
+	pane, err := StartPane(paneID, paneRequest{Cwd: cwd, Command: argv, Cols: cols, Rows: rows, Shell: shell})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("start pane: %w", err)
 	}
@@ -232,50 +232,10 @@ func (s *Session) handleServerInputEvent(c *Connection, event serverInputEvent) 
 			return false, fmt.Errorf("write pty: %w", err)
 		}
 		return false, nil
-	case serverCommandCreateWindow:
-		return false, s.commandCreateWindow(c)
-	case serverCommandSplitVertical:
-		return false, s.commandSplit(c, SplitVertical)
-	case serverCommandSplitHorizontal:
-		return false, s.commandSplit(c, SplitHorizontal)
-	case serverCommandDetach:
-		return true, nil
-	case serverCommandNextWindow:
-		if id, ok := s.RelativeWindowID(clientID0, 1); ok {
-			return false, s.commandSelectWindow(id)
-		}
-	case serverCommandPreviousWindow:
-		if id, ok := s.RelativeWindowID(clientID0, -1); ok {
-			return false, s.commandSelectWindow(id)
-		}
-	case serverCommandLastWindow:
-		if id, ok := s.LastWindowID(clientID0); ok {
-			return false, s.commandSelectWindow(id)
-		}
-	case serverCommandSelectIndex:
-		if id, ok := s.WindowIDByIndex(event.Index); ok {
-			return false, s.commandSelectWindow(id)
-		}
-	case serverCommandClosePane:
-		return false, s.commandClosePane(c)
-	case serverCommandEnterHistory:
-		return false, s.commandEnterHistory()
-	case serverCommandSwapPanePrevious:
-		return false, s.commandSwapPane(SwapPanePrevious)
-	case serverCommandSwapPaneNext:
-		return false, s.commandSwapPane(SwapPaneNext)
-	case serverCommandFocusDirection:
-		return false, s.commandFocusPaneDirection(event.Direction)
-	case serverCommandResizePane:
-		return false, s.commandResizePane(event.ResizeDirection, event.ResizeAmount)
-	case serverCommandToggleZoom:
-		return false, s.commandToggleZoom()
-	case serverCommandBeginWindowPrompt:
-		return false, s.commandBeginRenameWindowPrompt()
-	case serverCommandBeginSessionPrompt:
-		return false, s.commandBeginRenameSessionPrompt()
+	case serverCommandExecute:
+		return s.executeSessionCommand(c, event.CommandArgs)
 	case serverCommandPrompt:
-		return false, s.handlePromptEvent(c, event)
+		return s.handlePromptEvent(c, event)
 	}
 	return false, nil
 }
@@ -294,35 +254,42 @@ func (s *Session) commandBeginRenameSessionPrompt() error {
 	return s.publishStatusBar()
 }
 
-func (s *Session) handlePromptEvent(c *Connection, event serverInputEvent) error {
+func (s *Session) handlePromptEvent(c *Connection, event serverInputEvent) (bool, error) {
 	if event.PromptKind == PromptKindConfirm &&
 		(event.PromptAction == PromptActionSubmit || event.PromptAction == PromptActionCancel) {
-		return s.resolvePrompt(clientID0, promptResult{
+		return false, s.resolvePrompt(clientID0, promptResult{
 			Accepted: event.PromptAction == PromptActionSubmit && event.PromptText == "y",
 			Text:     event.PromptText,
 		})
 	}
 	switch event.PromptAction {
 	case PromptActionChanged, PromptActionCancel:
-		return s.publishStatusBar()
+		return false, s.publishStatusBar()
 	case PromptActionSubmit:
 		switch event.PromptKind {
 		case PromptKindRenameWindow:
-			if _, err := s.RenameWindow(event.PromptWindowID, event.PromptText); err != nil {
-				return err
-			}
+			return s.executeSessionCommand(c, []string{"rename-window", event.PromptText})
 		case PromptKindRenameSession:
-			if c.Daemon == nil {
-				return s.finishSessionRename(event.PromptText, true)
+			return s.executeSessionCommand(c, []string{"rename-session", event.PromptText})
+		case PromptKindCommand:
+			argv, err := parseCommandLine(event.PromptText)
+			if err == nil {
+				var detach bool
+				detach, err = s.executeSessionCommand(c, argv)
+				if err == nil {
+					return detach, nil
+				}
 			}
-			c.Daemon.requestSessionRename(s, s.Name, event.PromptText)
-			return s.publishStatusBar()
+			if err != nil {
+				s.setStatusMessage(clientID0, err.Error())
+				return false, s.publishStatusBar()
+			}
 		default:
-			return fmt.Errorf("unsupported prompt kind %d", event.PromptKind)
+			return false, fmt.Errorf("unsupported prompt kind %d", event.PromptKind)
 		}
-		return s.publishStatusBar()
+		return false, nil
 	default:
-		return nil
+		return false, nil
 	}
 }
 
@@ -332,7 +299,7 @@ func (s *Session) commandCreateWindow(c *Connection) error {
 	if err != nil {
 		return err
 	}
-	pane, _, _, err := s.createWindow(c, s.defaultCwd, nil, cols, rows)
+	pane, _, _, err := s.createWindow(s.defaultCwd, nil, cols, rows, c.shell)
 	if err != nil {
 		return err
 	}
@@ -464,20 +431,7 @@ func (s *Session) commandEnterHistory() error {
 	return err
 }
 
-func (s *Session) commandClosePane(c *Connection) error {
-	_, err := s.beginConfirmationPrompt(clientID0, "kill-pane? (y/N) ", func(result promptResult) error {
-		if !result.Accepted {
-			return s.publishStatusBar()
-		}
-		return s.commandClosePaneNow(c)
-	})
-	if err != nil {
-		return err
-	}
-	return s.publishStatusBar()
-}
-
-func (s *Session) commandClosePaneNow(c *Connection) error {
+func (s *Session) commandClosePaneNow() error {
 	handoff := s.beginOutputHandoff()
 	closedPane, window, clientState, _, _, finalPane, err := s.CloseFocusedPane(clientID0)
 	if err != nil {

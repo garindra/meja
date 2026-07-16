@@ -572,7 +572,7 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 	syncPaneRenderer(t, first)
 	syncPaneRenderer(t, second)
 
-	if err := handler.Session.commandClosePaneNow(handler); err != nil {
+	if err := handler.Session.commandClosePaneNow(); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, first)

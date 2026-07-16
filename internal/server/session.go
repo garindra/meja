@@ -16,7 +16,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
 )
 
@@ -94,7 +93,7 @@ func (s *Session) stopOperations() {
 // operations channel. Completion means the listener is bound, the initial
 // attach credential is installed, and the accept goroutine is running.
 func (s *Session) startQUIC(parent context.Context, tlsConfig *tls.Config) (uint16, string, time.Time, error) {
-	token, err := control.NewToken()
+	token, err := protocol.NewAuthToken()
 	if err != nil {
 		return 0, "", time.Time{}, err
 	}
@@ -106,7 +105,7 @@ func (s *Session) startQUIC(parent context.Context, tlsConfig *tls.Config) (uint
 	started := false
 	err = s.coordinate(func() error {
 		if s.stopping {
-			return control.ErrSessionUnavailable
+			return errSessionUnavailable
 		}
 		if err := parent.Err(); err != nil {
 			return err
@@ -128,9 +127,9 @@ func (s *Session) startQUIC(parent context.Context, tlsConfig *tls.Config) (uint
 		return nil
 	})
 	if err == nil && !started {
-		err = control.ErrSessionUnavailable
+		err = errSessionUnavailable
 	}
-	return port, control.EncodeToken(token), expiresAt, err
+	return port, protocol.EncodeAuthToken(token), expiresAt, err
 }
 
 func (s *Session) runQUIC(ctx context.Context, listener *quic.Listener) {
@@ -160,7 +159,7 @@ func isSessionReplacedClose(err error) bool {
 }
 
 func listenQUICInRange(tlsConfig *tls.Config) (*quic.Listener, uint16, error) {
-	for port := control.DefaultUDPMin; port <= control.DefaultUDPMax; port++ {
+	for port := protocol.DefaultUDPMin; port <= protocol.DefaultUDPMax; port++ {
 		listener, err := quic.ListenAddr(net.JoinHostPort("0.0.0.0", strconv.Itoa(port)), tlsConfig, &quic.Config{
 			MaxIdleTimeout:     quicMaxIdleTimeout,
 			KeepAlivePeriod:    quicKeepAlivePeriod,
@@ -277,7 +276,7 @@ func (s *Session) info() (name string, attached bool) {
 // operations channel. Each call returns the stable listener port and installs
 // a fresh, single-use attach credential for initial attachment or reconnect.
 func (s *Session) issueBootstrap() (uint16, string, time.Time, error) {
-	token, err := control.NewToken()
+	token, err := protocol.NewAuthToken()
 	if err != nil {
 		return 0, "", time.Time{}, err
 	}
@@ -286,7 +285,7 @@ func (s *Session) issueBootstrap() (uint16, string, time.Time, error) {
 	issued := false
 	err = s.coordinate(func() error {
 		if s.stopping {
-			return control.ErrSessionUnavailable
+			return errSessionUnavailable
 		}
 		port = s.port
 		s.attachToken = token
@@ -296,9 +295,9 @@ func (s *Session) issueBootstrap() (uint16, string, time.Time, error) {
 		return nil
 	})
 	if err == nil && !issued {
-		err = control.ErrSessionUnavailable
+		err = errSessionUnavailable
 	}
-	return port, control.EncodeToken(token), expires, err
+	return port, protocol.EncodeAuthToken(token), expires, err
 }
 
 func (s *Session) consumeAttachToken(encoded string) error {
@@ -308,7 +307,7 @@ func (s *Session) consumeAttachToken(encoded string) error {
 		if s.stopping {
 			return fmt.Errorf("session attachment rejected")
 		}
-		if s.attachConsumed || time.Now().After(s.attachExpires) || !control.EqualToken(encoded, s.attachToken) {
+		if s.attachConsumed || time.Now().After(s.attachExpires) || !protocol.EqualAuthToken(encoded, s.attachToken) {
 			return fmt.Errorf("session attachment rejected")
 		}
 		s.attachConsumed = true
@@ -321,11 +320,11 @@ func (s *Session) consumeAttachToken(encoded string) error {
 }
 
 func (s *Session) beginAttachment() (string, uint64, error) {
-	token, err := control.NewToken()
+	token, err := protocol.NewAuthToken()
 	if err != nil {
 		return "", 0, err
 	}
-	encoded := control.EncodeToken(token)
+	encoded := protocol.EncodeAuthToken(token)
 	var generation uint64
 	issued := false
 	err = s.coordinate(func() error {
@@ -345,11 +344,11 @@ func (s *Session) beginAttachment() (string, uint64, error) {
 }
 
 func (s *Session) resumeAttachment(encoded string, generation uint64) (string, uint64, error) {
-	token, err := control.NewToken()
+	token, err := protocol.NewAuthToken()
 	if err != nil {
 		return "", 0, err
 	}
-	nextToken := control.EncodeToken(token)
+	nextToken := protocol.EncodeAuthToken(token)
 	var nextGeneration uint64
 	issued := false
 	err = s.coordinate(func() error {
@@ -435,6 +434,7 @@ const (
 	PromptKindRenameWindow PromptKind = iota + 1
 	PromptKindRenameSession
 	PromptKindConfirm
+	PromptKindCommand
 )
 
 type PromptAction uint8
@@ -447,14 +447,13 @@ const (
 )
 
 type PromptState struct {
-	Kind           PromptKind
-	Action         PromptAction
-	TargetWindowID uint64
-	Label          string
-	Text           []rune
-	Cursor         int
-	pendingUTF8    []byte
-	PendingEscape  []byte
+	Kind          PromptKind
+	Action        PromptAction
+	Label         string
+	Text          []rune
+	Cursor        int
+	pendingUTF8   []byte
+	PendingEscape []byte
 }
 
 type promptResult struct {
@@ -492,6 +491,7 @@ type ClientState struct {
 	PrefixEscape      []byte
 	ResizeRepeatUntil time.Time
 	Prompt            *PromptState
+	StatusMessage     string
 	LastWindowID      uint64
 	HasLastWindow     bool
 }
@@ -562,11 +562,10 @@ func (s *Session) BeginPrompt(clientID uint64, kind PromptKind, label, initial s
 	client.PrefixEscape = nil
 	client.ResizeRepeatUntil = time.Time{}
 	client.Prompt = &PromptState{
-		Kind:           kind,
-		TargetWindowID: window.ID,
-		Label:          label,
-		Text:           text,
-		Cursor:         len(text),
+		Kind:   kind,
+		Label:  label,
+		Text:   text,
+		Cursor: len(text),
 	}
 	return clonePromptState(client.Prompt), nil
 }
@@ -585,11 +584,10 @@ func (s *Session) BeginRenameWindowPrompt(clientID uint64) (*PromptState, error)
 	client.PrefixEscape = nil
 	client.ResizeRepeatUntil = time.Time{}
 	client.Prompt = &PromptState{
-		Kind:           PromptKindRenameWindow,
-		TargetWindowID: window.ID,
-		Label:          "(rename-window) ",
-		Text:           text,
-		Cursor:         len(text),
+		Kind:   PromptKindRenameWindow,
+		Label:  "(rename-window) ",
+		Text:   text,
+		Cursor: len(text),
 	}
 	return clonePromptState(client.Prompt), nil
 }
@@ -610,6 +608,16 @@ func (s *Session) BeginRenameSessionPrompt(clientID uint64) (*PromptState, error
 		Cursor: len(text),
 	}
 	return clonePromptState(client.Prompt), nil
+}
+
+func (s *Session) BeginCommandPrompt(clientID uint64) (*PromptState, error) {
+	return s.BeginPrompt(clientID, PromptKindCommand, ":", "")
+}
+
+func (s *Session) setStatusMessage(clientID uint64, message string) {
+	if client := s.Clients[clientID]; client != nil {
+		client.StatusMessage = message
+	}
 }
 
 func (s *Session) beginConfirmationPrompt(clientID uint64, label string, continuation promptContinuation) (*PromptState, error) {

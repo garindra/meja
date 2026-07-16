@@ -4,11 +4,30 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"slices"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/garindra/meja/internal/protocol"
 )
+
+func isCommandInput(event serverInputEvent, args ...string) bool {
+	return event.Command == serverCommandExecute && slices.Equal(event.CommandArgs, args)
+}
+
+func resizeDirectionFlag(direction PaneResizeDirection) string {
+	switch direction {
+	case ResizePaneUp:
+		return "-U"
+	case ResizePaneDown:
+		return "-D"
+	case ResizePaneRight:
+		return "-R"
+	default:
+		return "-L"
+	}
+}
 
 func TestTranslateApplicationCursor(t *testing.T) {
 	got, consumed, ok := translateApplicationCursor([]byte("\x1b[Drest"), true)
@@ -29,7 +48,7 @@ func TestServerConsumesPrefixCommandsAndForwardsLiteralBytes(t *testing.T) {
 	if event := s.ConsumeInputByte(0, 0x02); event.Command != serverCommandNone {
 		t.Fatalf("prefix start event = %#v", event)
 	}
-	if event := s.ConsumeInputByte(0, '['); event.Command != serverCommandEnterHistory {
+	if event := s.ConsumeInputByte(0, '['); !isCommandInput(event, "copy-mode") {
 		t.Fatalf("history prefix event = %#v", event)
 	}
 	s.ConsumeInputByte(0, 0x02)
@@ -38,11 +57,42 @@ func TestServerConsumesPrefixCommandsAndForwardsLiteralBytes(t *testing.T) {
 	}
 }
 
+func TestEveryPrefixBindingExpandsToCanonicalCommandArgs(t *testing.T) {
+	bindings := []struct {
+		key  byte
+		argv []string
+	}{
+		{'c', []string{"new-window"}},
+		{'%', []string{"split-window", "-h"}},
+		{'"', []string{"split-window", "-v"}},
+		{'d', []string{"detach-client"}},
+		{'n', []string{"next-window"}},
+		{'p', []string{"previous-window"}},
+		{'l', []string{"last-window"}},
+		{'x', []string{"confirm-before", "kill-pane"}},
+		{'z', []string{"resize-pane", "-Z"}},
+		{'[', []string{"copy-mode"}},
+		{'{', []string{"swap-pane", "-U"}},
+		{'}', []string{"swap-pane", "-D"}},
+		{',', []string{"rename-window"}},
+		{'$', []string{"rename-session"}},
+		{':', []string{"command-prompt"}},
+	}
+	for _, binding := range bindings {
+		s := NewSession(1)
+		s.NewClient(clientID0)
+		s.ConsumeInputByte(clientID0, 0x02)
+		if event := s.ConsumeInputByte(clientID0, binding.key); !isCommandInput(event, binding.argv...) {
+			t.Errorf("prefix %q = %#v, want %v", binding.key, event, binding.argv)
+		}
+	}
+}
+
 func TestServerRecognizesRenameSessionPrefix(t *testing.T) {
 	s := NewSession(1)
 	s.NewClient(0)
 	s.ConsumeInputByte(0, 0x02)
-	if event := s.ConsumeInputByte(0, '$'); event.Command != serverCommandBeginSessionPrompt {
+	if event := s.ConsumeInputByte(0, '$'); !isCommandInput(event, "rename-session") {
 		t.Fatalf("rename-session event = %#v", event)
 	}
 }
@@ -50,13 +100,13 @@ func TestServerRecognizesRenameSessionPrefix(t *testing.T) {
 func TestServerRecognizesSwapPanePrefixes(t *testing.T) {
 	s := NewSession(0)
 	s.NewClient(0)
-	for key, want := range map[byte]serverInputCommand{
-		'{': serverCommandSwapPanePrevious,
-		'}': serverCommandSwapPaneNext,
+	for key, want := range map[byte][]string{
+		'{': {"swap-pane", "-U"},
+		'}': {"swap-pane", "-D"},
 	} {
 		s.ConsumeInputByte(0, 0x02)
-		if event := s.ConsumeInputByte(0, key); event.Command != want {
-			t.Fatalf("prefix %q event = %#v, want command %d", key, event, want)
+		if event := s.ConsumeInputByte(0, key); !isCommandInput(event, want...) {
+			t.Fatalf("prefix %q event = %#v, want command %v", key, event, want)
 		}
 	}
 }
@@ -65,7 +115,7 @@ func TestServerRecognizesToggleZoomPrefix(t *testing.T) {
 	s := NewSession(0)
 	s.NewClient(0)
 	s.ConsumeInputByte(0, 0x02)
-	if event := s.ConsumeInputByte(0, 'z'); event.Command != serverCommandToggleZoom {
+	if event := s.ConsumeInputByte(0, 'z'); !isCommandInput(event, "resize-pane", "-Z") {
 		t.Fatalf("toggle zoom event = %#v", event)
 	}
 }
@@ -83,7 +133,7 @@ func TestClosePanePromptsBeforeKilling(t *testing.T) {
 
 	s.ConsumeInputByte(0, 0x02)
 	event := s.ConsumeInputByte(0, 'x')
-	if event.Command != serverCommandClosePane {
+	if !isCommandInput(event, "confirm-before", "kill-pane") {
 		t.Fatalf("close-pane event = %#v", event)
 	}
 	if _, err := s.handleServerInputEvent(handler, event); err != nil {
@@ -146,12 +196,12 @@ func TestServerParsesPrefixArrowAndWindowIndex(t *testing.T) {
 	s.NewClient(0)
 	for _, b := range []byte{0x02, 0x1b, '[', 'A'} {
 		event := s.ConsumeInputByte(0, b)
-		if b == 'A' && (event.Command != serverCommandFocusDirection || event.Direction != 'A') {
+		if b == 'A' && !isCommandInput(event, "select-pane", "-U") {
 			t.Fatalf("prefix arrow event = %#v", event)
 		}
 	}
 	s.ConsumeInputByte(0, 0x02)
-	if event := s.ConsumeInputByte(0, '3'); event.Command != serverCommandSelectIndex || event.Index != 3 {
+	if event := s.ConsumeInputByte(0, '3'); !isCommandInput(event, "select-window", "-t", ":3") {
 		t.Fatalf("numeric window event = %#v", event)
 	}
 }
@@ -179,7 +229,7 @@ func TestServerParsesModifiedPrefixArrowsForResize(t *testing.T) {
 			for _, b := range test.sequence {
 				event = s.ConsumeInputByte(0, b)
 			}
-			if event.Command != serverCommandResizePane || event.ResizeDirection != test.direction || event.ResizeAmount != test.amount {
+			if !isCommandInput(event, "resize-pane", resizeDirectionFlag(test.direction), strconv.Itoa(test.amount)) {
 				t.Fatalf("resize event = %#v", event)
 			}
 			client := s.SnapshotClient(0)
@@ -211,7 +261,7 @@ func TestPaneResizeBindingRepeatsWithoutPrefix(t *testing.T) {
 	for _, b := range append([]byte{0x02}, []byte("\x1b[1;5C")...) {
 		event = consumeInputByteLockedAt(client, b, now)
 	}
-	if event.Command != serverCommandResizePane || event.ResizeDirection != ResizePaneRight || event.ResizeAmount != 1 {
+	if !isCommandInput(event, "resize-pane", "-R", "1") {
 		t.Fatalf("initial resize event = %#v", event)
 	}
 	if want := now.Add(paneResizeRepeatWindow); !client.ResizeRepeatUntil.Equal(want) {
@@ -222,7 +272,7 @@ func TestPaneResizeBindingRepeatsWithoutPrefix(t *testing.T) {
 	for _, b := range []byte("\x1b[1;5C") {
 		event = consumeInputByteLockedAt(client, b, repeatedAt)
 	}
-	if event.Command != serverCommandResizePane || event.ResizeDirection != ResizePaneRight || event.ResizeAmount != 1 {
+	if !isCommandInput(event, "resize-pane", "-R", "1") {
 		t.Fatalf("repeated resize event = %#v", event)
 	}
 	if want := repeatedAt.Add(paneResizeRepeatWindow); !client.ResizeRepeatUntil.Equal(want) {
@@ -304,7 +354,7 @@ func TestServerPromptEditsAndCancelsAuthoritatively(t *testing.T) {
 	window, _ := s.CreateWindow(pane, 0)
 
 	s.ConsumeInputByte(0, 0x02)
-	if event := s.ConsumeInputByte(0, ','); event.Command != serverCommandBeginWindowPrompt {
+	if event := s.ConsumeInputByte(0, ','); !isCommandInput(event, "rename-window") {
 		t.Fatalf("rename prompt event = %#v", event)
 	}
 	if _, err := s.BeginRenameWindowPrompt(0); err != nil {

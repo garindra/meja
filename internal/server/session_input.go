@@ -26,38 +26,18 @@ type serverInputCommand uint8
 const (
 	serverCommandNone serverInputCommand = iota
 	serverCommandLiteral
-	serverCommandCreateWindow
-	serverCommandSplitVertical
-	serverCommandSplitHorizontal
-	serverCommandDetach
-	serverCommandNextWindow
-	serverCommandPreviousWindow
-	serverCommandLastWindow
-	serverCommandClosePane
-	serverCommandEnterHistory
-	serverCommandSwapPanePrevious
-	serverCommandSwapPaneNext
-	serverCommandSelectIndex
-	serverCommandFocusDirection
-	serverCommandResizePane
-	serverCommandToggleZoom
-	serverCommandBeginWindowPrompt
-	serverCommandBeginSessionPrompt
+	serverCommandExecute
 	serverCommandPrompt
 )
 
 type serverInputEvent struct {
-	Command         serverInputCommand
-	Byte            byte
-	Data            []byte
-	Index           int
-	Direction       byte
-	ResizeDirection PaneResizeDirection
-	ResizeAmount    int
-	PromptAction    PromptAction
-	PromptKind      PromptKind
-	PromptWindowID  uint64
-	PromptText      string
+	Command      serverInputCommand
+	Byte         byte
+	Data         []byte
+	CommandArgs  []string
+	PromptAction PromptAction
+	PromptKind   PromptKind
+	PromptText   string
 }
 
 func (s *Session) ConsumeInputByte(clientID uint64, b byte) serverInputEvent {
@@ -88,36 +68,38 @@ func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) server
 		case 0x02:
 			return serverInputEvent{Command: serverCommandLiteral, Byte: 0x02}
 		case 'c':
-			return serverInputEvent{Command: serverCommandCreateWindow}
+			return commandInputEvent("new-window")
 		case '%':
-			return serverInputEvent{Command: serverCommandSplitVertical}
+			return commandInputEvent("split-window", "-h")
 		case '"':
-			return serverInputEvent{Command: serverCommandSplitHorizontal}
+			return commandInputEvent("split-window", "-v")
 		case 'd':
-			return serverInputEvent{Command: serverCommandDetach}
+			return commandInputEvent("detach-client")
 		case 'n':
-			return serverInputEvent{Command: serverCommandNextWindow}
+			return commandInputEvent("next-window")
 		case 'p':
-			return serverInputEvent{Command: serverCommandPreviousWindow}
+			return commandInputEvent("previous-window")
 		case 'l':
-			return serverInputEvent{Command: serverCommandLastWindow}
+			return commandInputEvent("last-window")
 		case 'x':
-			return serverInputEvent{Command: serverCommandClosePane}
+			return commandInputEvent("confirm-before", "kill-pane")
 		case 'z':
-			return serverInputEvent{Command: serverCommandToggleZoom}
+			return commandInputEvent("resize-pane", "-Z")
 		case '[':
-			return serverInputEvent{Command: serverCommandEnterHistory}
+			return commandInputEvent("copy-mode")
 		case '{':
-			return serverInputEvent{Command: serverCommandSwapPanePrevious}
+			return commandInputEvent("swap-pane", "-U")
 		case '}':
-			return serverInputEvent{Command: serverCommandSwapPaneNext}
+			return commandInputEvent("swap-pane", "-D")
 		case ',':
-			return serverInputEvent{Command: serverCommandBeginWindowPrompt}
+			return commandInputEvent("rename-window")
 		case '$':
-			return serverInputEvent{Command: serverCommandBeginSessionPrompt}
+			return commandInputEvent("rename-session")
+		case ':':
+			return commandInputEvent("command-prompt")
 		default:
 			if b >= '0' && b <= '9' {
-				return serverInputEvent{Command: serverCommandSelectIndex, Index: int(b - '0')}
+				return commandInputEvent("select-window", "-t", ":"+string(b))
 			}
 		}
 	case serverInputPrefixESC:
@@ -143,7 +125,7 @@ func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) server
 		sequence := append([]byte(nil), client.PrefixEscape...)
 		resetPrefixInput(client)
 		event := decodePrefixCSI(sequence)
-		if event.Command == serverCommandResizePane {
+		if isResizeCommandEvent(event) {
 			armPaneResizeRepeat(client, now)
 		}
 		return event
@@ -172,7 +154,7 @@ func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) server
 		sequence := append([]byte(nil), client.PrefixEscape...)
 		resetPrefixInput(client)
 		event := decodePrefixCSI(sequence)
-		if event.Command == serverCommandResizePane {
+		if isResizeCommandEvent(event) {
 			armPaneResizeRepeat(client, now)
 			return event
 		}
@@ -227,6 +209,14 @@ func resetPrefixInput(client *ClientState) {
 	client.PrefixEscape = nil
 }
 
+func commandInputEvent(args ...string) serverInputEvent {
+	return serverInputEvent{Command: serverCommandExecute, CommandArgs: args}
+}
+
+func isResizeCommandEvent(event serverInputEvent) bool {
+	return event.Command == serverCommandExecute && len(event.CommandArgs) > 0 && event.CommandArgs[0] == "resize-pane"
+}
+
 func decodePrefixCSI(sequence []byte) serverInputEvent {
 	index := 0
 	meta := false
@@ -260,7 +250,7 @@ func decodePrefixCSI(sequence []byte) serverInputEvent {
 		modifier = 3
 	}
 	if modifier == 1 {
-		return serverInputEvent{Command: serverCommandFocusDirection, Direction: final}
+		return commandInputEvent("select-pane", directionFlag(final))
 	}
 	amount := 0
 	if modifier == 5 {
@@ -271,16 +261,20 @@ func decodePrefixCSI(sequence []byte) serverInputEvent {
 	if amount == 0 {
 		return serverInputEvent{}
 	}
-	direction := ResizePaneUp
+	return commandInputEvent("resize-pane", directionFlag(final), strconv.Itoa(amount))
+}
+
+func directionFlag(final byte) string {
 	switch final {
+	case 'A':
+		return "-U"
 	case 'B':
-		direction = ResizePaneDown
+		return "-D"
 	case 'C':
-		direction = ResizePaneRight
-	case 'D':
-		direction = ResizePaneLeft
+		return "-R"
+	default:
+		return "-L"
 	}
-	return serverInputEvent{Command: serverCommandResizePane, ResizeDirection: direction, ResizeAmount: amount}
 }
 
 func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
@@ -296,9 +290,8 @@ func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
 		return serverInputEvent{}
 	}
 	event := serverInputEvent{
-		Command:        serverCommandPrompt,
-		PromptKind:     prompt.Kind,
-		PromptWindowID: prompt.TargetWindowID,
+		Command:    serverCommandPrompt,
+		PromptKind: prompt.Kind,
 	}
 	switch b {
 	case '\r', '\n':
@@ -319,6 +312,12 @@ func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
 	case 0x08, 0x7f:
 		prompt.pendingUTF8 = nil
 		deletePromptRune(prompt)
+		prompt.Action = PromptActionChanged
+		event.PromptAction = PromptActionChanged
+	case 0x15: // Ctrl-U
+		prompt.pendingUTF8 = nil
+		prompt.Text = nil
+		prompt.Cursor = 0
 		prompt.Action = PromptActionChanged
 		event.PromptAction = PromptActionChanged
 	default:
@@ -390,11 +389,10 @@ func cancelPromptLocked(client *ClientState) serverInputEvent {
 
 func promptEventLocked(prompt *PromptState, action PromptAction, text string) serverInputEvent {
 	return serverInputEvent{
-		Command:        serverCommandPrompt,
-		PromptAction:   action,
-		PromptKind:     prompt.Kind,
-		PromptWindowID: prompt.TargetWindowID,
-		PromptText:     text,
+		Command:      serverCommandPrompt,
+		PromptAction: action,
+		PromptKind:   prompt.Kind,
+		PromptText:   text,
 	}
 }
 

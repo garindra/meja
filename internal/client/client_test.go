@@ -7,8 +7,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +21,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
 )
 
@@ -62,49 +65,145 @@ func TestParseTargetInvalid(t *testing.T) {
 	}
 }
 
-func TestControllerCommandSelectsStartOrConnect(t *testing.T) {
-	selector := control.SocketSelector{Profile: "dev"}
-	start, err := controllerCommand("/opt/meja", selector, "", "")
-	if err != nil || start != "'/opt/meja' '-L' 'dev' __control-v1 start-session" {
-		t.Fatalf("start command = %q, %v", start, err)
-	}
-	connect, err := controllerCommand("/opt/meja", selector, "42", "")
-	if err != nil || connect != "'/opt/meja' '-L' 'dev' __control-v1 connect-session '42'" {
-		t.Fatalf("connect command = %q, %v", connect, err)
-	}
-}
-
-func TestControllerCommandQuotesExactSocketPath(t *testing.T) {
-	command, err := controllerCommand("/opt/meja", control.SocketSelector{Path: "/tmp/meja user's/dev.sock"}, "", "")
+func TestSSHForwardCommandCarriesOnlySocketSelector(t *testing.T) {
+	command, err := sshForwardCommand("/opt/meja", SocketSelector{Path: "/tmp/meja user's/dev.sock"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "'/opt/meja' '-S' '/tmp/meja user'\\''s/dev.sock' __control-v1 start-session"
+	want := "'/opt/meja' '-S' '/tmp/meja user'\\''s/dev.sock' __ssh-forward-v1"
 	if command != want {
 		t.Fatalf("command = %q, want %q", command, want)
 	}
 }
 
-func TestControllerCommandQuotesSessionNames(t *testing.T) {
-	selector := control.SocketSelector{Profile: "default"}
-	start, err := controllerCommand("meja", selector, "", "my work")
-	if err != nil || !strings.HasSuffix(start, "start-session 'my work'") {
-		t.Fatalf("named start command = %q, %v", start, err)
-	}
-	attach, err := controllerCommand("meja", selector, "my work", "")
-	if err != nil || !strings.HasSuffix(attach, "connect-session 'my work'") {
-		t.Fatalf("named attach command = %q, %v", attach, err)
-	}
-}
-
-func TestRestoreControllerCommandIncludesProfileNameAndMode(t *testing.T) {
-	command, err := restoreControllerCommand("/opt/meja", control.SocketSelector{Profile: "dev"}, "my work", "prepare")
+func TestSSHForwardCommandIncludesProfile(t *testing.T) {
+	command, err := sshForwardCommand("/opt/meja", SocketSelector{Profile: "dev"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "'/opt/meja' '-L' 'dev' __control-v1 restore-session 'my work' 'prepare'"
+	want := "'/opt/meja' '-L' 'dev' __ssh-forward-v1"
 	if command != want {
 		t.Fatalf("command = %q, want %q", command, want)
+	}
+}
+
+func TestSocketSelectorArgsPreserveProfileOrExactPath(t *testing.T) {
+	args, err := (SocketSelector{Profile: "dev"}).Args()
+	if err != nil || len(args) != 2 || args[0] != "-L" || args[1] != "dev" {
+		t.Fatalf("profile args = %v, %v", args, err)
+	}
+	args, err = (SocketSelector{Path: "/private/meja.sock"}).Args()
+	if err != nil || len(args) != 2 || args[0] != "-S" || args[1] != "/private/meja.sock" {
+		t.Fatalf("socket args = %v, %v", args, err)
+	}
+}
+
+func TestSocketSelectorRejectsUnsafeProfilesAndRelativePaths(t *testing.T) {
+	for _, selector := range []SocketSelector{
+		{Profile: "../dev"},
+		{Profile: "dev/user"},
+		{Path: "relative.sock"},
+		{Profile: "dev", Path: "/tmp/meja.sock"},
+	} {
+		if _, err := selector.Normalize(); err == nil {
+			t.Fatalf("selector %#v was accepted", selector)
+		}
+	}
+}
+
+func TestForwardCommandAddsRemoteWorkingDirectoryAndProxiesFrames(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "meja.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		request, err := protocol.ReadCommandRequest(conn)
+		if err == nil && request.WorkingDirectory == "" {
+			err = errors.New("forwarder omitted remote working directory")
+		}
+		if err == nil && !reflect.DeepEqual(request.Args, []string{"ls"}) {
+			err = fmt.Errorf("forwarded args = %v", request.Args)
+		}
+		if err == nil {
+			err = protocol.WriteCommandFrame(conn, protocol.CommandFrame{Type: protocol.CommandFrameExit})
+		}
+		done <- err
+	}()
+	var input, output bytes.Buffer
+	if err := protocol.WriteCommandRequest(&input, protocol.CommandRequest{Args: []string{"ls"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ForwardCommand(context.Background(), SocketSelector{Path: socket}, &input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	frame, err := protocol.ReadCommandFrame(&output)
+	if err != nil || frame.Type != protocol.CommandFrameExit {
+		t.Fatalf("forwarded response = %#v, %v", frame, err)
+	}
+}
+
+func TestRunForwardsArbitraryNonAttachCommandWithoutTerminal(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "meja.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan error, 1)
+	wantArgs := []string{"future-command", "--opaque", "value"}
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		request, err := protocol.ReadCommandRequest(conn)
+		if err == nil && !reflect.DeepEqual(request.Args, wantArgs) {
+			err = fmt.Errorf("forwarded args = %v, want %v", request.Args, wantArgs)
+		}
+		if err == nil {
+			err = protocol.WriteCommandOutput(conn, protocol.CommandFrameStdout, []byte("future output\n"))
+		}
+		if err == nil {
+			err = protocol.WriteCommandFrame(conn, protocol.CommandFrame{Type: protocol.CommandFrameExit})
+		}
+		done <- err
+	}()
+	stdin, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	var stdout bytes.Buffer
+	err = Run(context.Background(), Config{
+		Local:          true,
+		SocketSelector: SocketSelector{Path: socket},
+		CommandArgs:    wantArgs,
+		Stdin:          stdin,
+		Stdout:         &stdout,
+		Stderr:         io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "future output\n" {
+		t.Fatalf("stdout = %q", stdout.String())
 	}
 }
 

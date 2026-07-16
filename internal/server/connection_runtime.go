@@ -10,7 +10,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
 )
 
@@ -47,6 +46,7 @@ func serveConnection(ctx context.Context, d *Daemon, listenerSession *Session, c
 	var s *Session
 	var resumeEncoded string
 	var generation uint64
+	var attachCols, attachRows uint16
 	responseType := protocol.MsgSessionAttachOK
 	switch first.Type {
 	case protocol.MsgSessionAttach:
@@ -58,7 +58,7 @@ func serveConnection(ctx context.Context, d *Daemon, listenerSession *Session, c
 			return errors.New("unsupported session protocol version")
 		}
 		if attach.SessionID != listenerSession.ID {
-			err = control.ErrSessionUnavailable
+			err = errSessionUnavailable
 		} else {
 			s = listenerSession
 			err = s.consumeAttachToken(attach.Token)
@@ -66,6 +66,7 @@ func serveConnection(ctx context.Context, d *Daemon, listenerSession *Session, c
 		if err == nil {
 			resumeEncoded, generation, err = s.beginAttachment()
 		}
+		attachCols, attachRows = attach.Cols, attach.Rows
 	case protocol.MsgSessionResume:
 		resume, decodeErr := protocol.DecodeSessionResume(first.Payload)
 		if decodeErr != nil {
@@ -75,11 +76,12 @@ func serveConnection(ctx context.Context, d *Daemon, listenerSession *Session, c
 			return errors.New("unsupported session protocol version")
 		}
 		if resume.SessionID != listenerSession.ID {
-			err = control.ErrSessionUnavailable
+			err = errSessionUnavailable
 		} else {
 			s = listenerSession
 			resumeEncoded, generation, err = s.resumeAttachment(resume.ResumeToken, resume.Generation)
 		}
+		attachCols, attachRows = resume.Cols, resume.Rows
 		responseType = protocol.MsgSessionResumeOK
 	default:
 		return fmt.Errorf("expected session attachment, got message type %d", first.Type)
@@ -147,39 +149,21 @@ func serveConnection(ctx context.Context, d *Daemon, listenerSession *Session, c
 		d.deactivate(s, handler)
 	}()
 
-	createPane, err := expectDecoded(mgmtDecoder, protocol.MsgCreatePane, protocol.DecodeCreatePane)
-	if err != nil {
-		return fmt.Errorf("read create pane: %w", err)
-	}
 	if err := s.coordinate(func() error {
 		s.EnsureClient(clientID0)
-		s.SetClientSize(clientID0, createPane.Cols, createPane.Rows)
-		if !s.HasWindows() {
-			cwd, err := resolveStartingDirectory(createPane.Cwd)
-			if err != nil {
-				s.shutdownNow()
-				return err
+		if attachCols == 0 || attachRows == 0 {
+			pane, _ := s.ActivePane(clientID0)
+			if pane == nil {
+				return errors.New("session has no active pane")
 			}
-			s.defaultCwd = cwd
-			initialPane, _, _, err := s.createWindow(handler, s.defaultCwd, createPane.Argv, createPane.Cols, createPane.Rows)
-			if err != nil {
-				s.shutdownNow()
-				return err
-			}
-			if err := sendEncoded(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: initialPane.ID}, protocol.EncodePaneCreated); err != nil {
-				return err
-			}
-			s.startPane(initialPane)
-			return handler.Session.rebindOutputsAndPublishLayout(nil)
+			cols, rows := pane.TerminalSize()
+			attachCols, attachRows = uint16(cols), uint16(rows)
 		}
-
 		handoff := handler.Session.beginOutputHandoff()
-		s.ResizeAll(createPane.Cols, createPane.Rows)
-		_, pane, _, err := s.ReattachClient(clientID0)
+		s.SetClientSize(clientID0, attachCols, attachRows)
+		s.ResizeAll(attachCols, attachRows)
+		_, _, _, err := s.ReattachClient(clientID0)
 		if err != nil {
-			return err
-		}
-		if err := sendEncoded(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: pane.ID}, protocol.EncodePaneCreated); err != nil {
 			return err
 		}
 		return handler.Session.rebindOutputsAndPublishLayout(handoff)

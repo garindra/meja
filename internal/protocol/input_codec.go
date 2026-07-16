@@ -2,64 +2,6 @@ package protocol
 
 import "fmt"
 
-func EncodeCreatePane(dst []byte, msg CreatePane) ([]byte, error) {
-	w := PayloadWriter{Buf: dst}
-	w.String(msg.Cwd)
-	var err error
-	w.Buf, err = encodeArgv(w.Buf, msg.Argv)
-	if err != nil {
-		return nil, fmt.Errorf("encode CreatePane: %w", err)
-	}
-	w.Uvarint(uint64(msg.Cols))
-	w.Uvarint(uint64(msg.Rows))
-	return w.Buf, nil
-}
-
-func DecodeCreatePane(payload []byte) (CreatePane, error) {
-	r := PayloadReader{Data: payload}
-	cwd, err := r.String(MaxStringLen)
-	if err != nil {
-		return CreatePane{}, fmt.Errorf("decode CreatePane: %w", err)
-	}
-	argv, err := decodeArgv(&r)
-	if err != nil {
-		return CreatePane{}, fmt.Errorf("decode CreatePane: %w", err)
-	}
-	cols, err := r.Uvarint()
-	if err != nil {
-		return CreatePane{}, fmt.Errorf("decode CreatePane: %w", err)
-	}
-	rows, err := r.Uvarint()
-	if err != nil {
-		return CreatePane{}, fmt.Errorf("decode CreatePane: %w", err)
-	}
-	if cols == 0 || rows == 0 || cols > MaxGridCols || rows > MaxGridRows {
-		return CreatePane{}, fmt.Errorf("decode CreatePane: invalid size %dx%d", cols, rows)
-	}
-	if err := r.Done(); err != nil {
-		return CreatePane{}, fmt.Errorf("decode CreatePane: %w", err)
-	}
-	return CreatePane{Cwd: cwd, Argv: argv, Cols: uint16(cols), Rows: uint16(rows)}, nil
-}
-
-func EncodePaneCreated(dst []byte, msg PaneCreated) ([]byte, error) {
-	w := PayloadWriter{Buf: dst}
-	w.Uvarint(msg.PaneID)
-	return w.Buf, nil
-}
-
-func DecodePaneCreated(payload []byte) (PaneCreated, error) {
-	r := PayloadReader{Data: payload}
-	paneID, err := r.Uvarint()
-	if err != nil {
-		return PaneCreated{}, fmt.Errorf("decode PaneCreated: %w", err)
-	}
-	if err := r.Done(); err != nil {
-		return PaneCreated{}, fmt.Errorf("decode PaneCreated: %w", err)
-	}
-	return PaneCreated{PaneID: paneID}, nil
-}
-
 func EncodeInputBytes(dst []byte, msg InputBytes) ([]byte, error) {
 	w := PayloadWriter{Buf: dst}
 	w.Raw(msg.Data)

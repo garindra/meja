@@ -39,23 +39,21 @@ Connect to a new remote session using a hostname, `user@host`, or an OpenSSH
 config alias:
 
 ```bash
-meja prod
-meja prod -- /usr/bin/bash -l
-meja new user@host
-meja new -s work prod
-meja -L dev new prod
-meja new -c /srv/app prod -- /usr/bin/bash -l
+meja -h prod
+meja -h prod new -- /usr/bin/bash -l
+meja new -h user@host
+meja new -s work -h prod
+meja -L dev new -h prod
+meja new -c /srv/app -h prod -- /usr/bin/bash -l
 ```
 
-An unrecognized first word is treated as a remote target, making `meja prod`
-the shorthand for `meja new prod`. The words `new`, `attach`, `a`, `ls`,
-`server`, `version`, and `help` are reserved commands. Use the explicit form
-for an SSH host alias with one of those names, or whenever connection-specific
-flags are needed:
+`-h` (or `--host`) is the SSH transport option. It accepts a hostname,
+`user@host`, or OpenSSH alias, so command arguments never need to be parsed by
+the client to discover where they should be sent:
 
 ```bash
-meja new server
-meja new -i ~/.ssh/prod_ed25519 prod
+meja new -h server
+meja new -i ~/.ssh/prod_ed25519 -h prod
 ```
 
 Attach to an existing session by numeric ID or name. Omitting the host selects
@@ -64,16 +62,16 @@ the local server:
 ```bash
 meja attach -t 12
 meja attach -t work
-meja a -t 12 prod
-meja -L dev a -t work prod
+meja a -t 12 -h prod
+meja -L dev a -t work -h prod
 ```
 
 List local or remote sessions:
 
 ```bash
 meja ls
-meja ls prod
-meja -L dev ls prod
+meja ls -h prod
+meja -L dev ls -h prod
 ```
 
 The list is headed `Active Sessions` and shows each session's numeric ID,
@@ -82,10 +80,10 @@ name (or `<unnamed>`), and whether a client is currently attached.
 Run or stop the local per-user server explicitly:
 
 ```bash
-meja server run
-meja server stop
-meja -L dev server run
-meja -L dev server stop
+meja start-server
+meja kill-server
+meja -L dev start-server
+meja -L dev kill-server
 ```
 
 ## Servers and sockets
@@ -94,16 +92,17 @@ Each socket identifies an isolated Meja server process with its own sessions,
 session-ID sequence, and certificate. Each session owns a separate QUIC
 listener. `-L` selects a named
 profile and `-S` selects an exact socket path. They are global, mutually
-exclusive options and must appear before the command:
+exclusive transport options. Transport options may appear anywhere before
+`--` and are removed before the command argv is forwarded:
 
 ```bash
 meja -L work
 meja -L work attach -t 3
-meja -L work new -s work prod
-meja -L work server stop
+meja -L work new -s work -h prod
+meja -L work kill-server
 
 meja -S /home/alice/run/meja.sock
-meja -S /home/alice/run/meja.sock server stop
+meja -S /home/alice/run/meja.sock kill-server
 ```
 
 With no selector, Meja uses the `default` profile. Named profiles resolve to
@@ -117,17 +116,18 @@ Meja never changes the permissions of an existing socket parent. An existing
 parent must already be owned by the current user with mode 0700, so a socket
 cannot be placed directly in a shared directory such as `/tmp`.
 
-Commands that create a session start the selected server if its socket is
-missing or stale. `attach`, `ls`, and `server stop` never start a missing
-server. A foreground `server run` and an automatically detached server use the
+Commands that create or restore a session start the selected server if its
+socket is missing or stale. `attach`, `ls`, and `kill-server` require a running
+server. A foreground `start-server` and an automatically detached server use the
 same profile selector. A per-socket lifetime lock prevents two server processes
 from owning the same profile. A foreground server logs
 `meja server: session <id> attached` for each successful client attachment,
 including reconnects and reattachments.
 
-Connection flags belong before the host. `-i` selects an SSH identity,
-`--port` selects the SSH port, and `--remote-path` selects the exact remote
-`meja` executable. The default remote path is `meja`.
+`-h` selects the SSH host, `-i` selects an SSH identity, `--port` selects the
+SSH port, and `--remote-path` selects the exact remote `meja` executable. These
+transport options may appear anywhere before `--`. The default remote path is
+`meja`.
 
 Client render diagnostics are enabled through environment variables. Set
 `MEJA_DEBUG=1` to enable all available diagnostics or
@@ -146,7 +146,7 @@ resolved on the target machine and must be absolute or begin with `~/`.
 Quote a remote home-relative path so the local shell does not expand it first:
 
 ```bash
-meja new -c '~/projects/app' prod
+meja new -c '~/projects/app' -h prod
 ```
 
 The command following `--` applies only to the initial pane. Later panes start
@@ -154,42 +154,36 @@ the target user's shell in the session's starting directory.
 When `-c` is omitted, a local session inherits the invoking process's current
 directory; a remote session starts in the remote user's home directory.
 
-## SSH bootstrap
+## SSH command forwarding
 
-For a remote connection, the local client invokes the installed `ssh`
-executable with one of these private, versioned remote commands:
+For a remote command, the local client invokes the installed `ssh` executable
+with one private, versioned forwarding command:
 
 ```text
-meja __control-v1 start-session
-meja __control-v1 start-session <session-name>
-meja __control-v1 connect-session <session-id-or-name>
-meja __control-v1 list-sessions
-meja -L <profile> __control-v1 <operation>
-meja -S <socket-path> __control-v1 <operation>
+meja -L <profile> __ssh-forward-v1
+meja -S <socket-path> __ssh-forward-v1
 ```
 
-The start/connect operations emit exactly one `MEJA_BOOTSTRAP_V1 {json}`
-record. The list operation emits exactly one `MEJA_SESSION_LIST_V1 {json}`
-record. Diagnostics go to stderr. These commands are a machine interface, not
-the user-facing session-management interface.
+The user's command arguments travel in a framed request on SSH stdin. The
+remote process resolves the selected Unix socket, starts the server if needed,
+and forwards the request without interpreting the command. Framed stdout,
+stderr, attach-bootstrap, and exit responses return on SSH stdout.
 
 The bootstrap JSON contains a numeric session ID, UDP port, expiring
 single-use attach token, and the SHA-256 hash of the daemon certificate's
 SubjectPublicKeyInfo.
 
-Local connections skip SSH entirely. They obtain the same bootstrap directly
-from the protected Unix control socket and connect to the QUIC server through
-`127.0.0.1`. Local reconnects also use the control socket directly.
+Local connections skip SSH entirely. They send the same command request directly
+to the protected Unix command socket and connect to the QUIC server through
+`127.0.0.1`. Local reconnects also use the command socket directly.
 
-`start-session` starts the per-Unix-user daemon when necessary.
-`connect-session` only performs an RPC and never starts a missing daemon. The
-protected control socket is selected by `-L` or `-S`; the socket directory is
+The protected command socket is selected by `-L` or `-S`; the socket directory is
 mode 0700 and the socket is mode 0600. Session IDs increase from 1 for the
 lifetime of a daemon. Session names are unique within one server/socket. A
 session is destroyed when its last pane exits, which closes its QUIC listener
 and releases its UDP port.
 
-`meja server stop` cleanly disconnects active clients as if they detached,
+`meja kill-server` cleanly disconnects active clients as if they detached,
 gracefully stops the active daemon, and reports its PID when available. SIGINT
 and SIGTERM on a foreground daemon use the same client-disconnect behavior.
 
@@ -244,6 +238,6 @@ terminal contents, replaces the client-visible status bar with an orange
 reconnecting indicator with a `Press Ctrl+c to exit` hint, and drops other
 input while disconnected. It first retries
 the pinned QUIC resume credential. If that fails, it obtains a fresh
-single-use attach token through the local control socket or the versioned SSH
-control command, as appropriate. Input resumes only after the server's layout,
+single-use attach token through the local command socket or the versioned SSH
+forwarding command, as appropriate. Input resumes only after the server's layout,
 status bar, and full visible-pane renders have been applied.

@@ -14,7 +14,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
 )
 
@@ -365,7 +364,7 @@ func shellJoin(argv []string) string {
 		}) == -1 {
 			quoted[index] = arg
 		} else {
-			quoted[index] = control.ShellQuote(arg)
+			quoted[index] = shellQuote(arg)
 		}
 	}
 	return strings.Join(quoted, " ")
@@ -390,7 +389,7 @@ func validatePersistedSession(snapshot PersistedSession) error {
 	if snapshot.Version != snapshotVersion {
 		return fmt.Errorf("unsupported snapshot version %d", snapshot.Version)
 	}
-	if err := control.ValidateSessionName(snapshot.Name); err != nil {
+	if err := validateSessionName(snapshot.Name); err != nil {
 		return fmt.Errorf("snapshot session name: %w", err)
 	}
 	if len(snapshot.Windows) == 0 {
@@ -441,6 +440,10 @@ func validatePersistedSession(snapshot PersistedSession) error {
 		}
 	}
 	return nil
+}
+
+func shellQuote(raw string) string {
+	return "'" + strings.ReplaceAll(raw, "'", "'\\''") + "'"
 }
 
 func validatePersistedLayout(layout PersistedLayout) ([]uint64, error) {

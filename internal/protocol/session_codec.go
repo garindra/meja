@@ -7,6 +7,8 @@ func EncodeSessionAttach(dst []byte, msg SessionAttach) ([]byte, error) {
 	w.Uvarint(uint64(msg.Version))
 	w.Uvarint(msg.SessionID)
 	w.String(msg.Token)
+	w.Uvarint(uint64(msg.Cols))
+	w.Uvarint(uint64(msg.Rows))
 	return w.Buf, nil
 }
 
@@ -24,10 +26,24 @@ func DecodeSessionAttach(payload []byte) (SessionAttach, error) {
 	if err != nil {
 		return SessionAttach{}, fmt.Errorf("decode session attach: %w", err)
 	}
+	cols, err := r.Uvarint()
+	if err != nil {
+		return SessionAttach{}, fmt.Errorf("decode session attach columns: %w", err)
+	}
+	if cols > 65535 {
+		return SessionAttach{}, fmt.Errorf("decode session attach columns: %d", cols)
+	}
+	rows, err := r.Uvarint()
+	if err != nil {
+		return SessionAttach{}, fmt.Errorf("decode session attach rows: %w", err)
+	}
+	if rows > 65535 {
+		return SessionAttach{}, fmt.Errorf("decode session attach rows: %d", rows)
+	}
 	if err := r.Done(); err != nil {
 		return SessionAttach{}, fmt.Errorf("decode session attach: %w", err)
 	}
-	return SessionAttach{Version: int(version), SessionID: sessionID, Token: token}, nil
+	return SessionAttach{Version: int(version), SessionID: sessionID, Token: token, Cols: uint16(cols), Rows: uint16(rows)}, nil
 }
 
 func EncodeSessionAttachOK(dst []byte, msg SessionAttachOK) ([]byte, error) {
@@ -86,6 +102,8 @@ func EncodeSessionResume(dst []byte, msg SessionResume) ([]byte, error) {
 	w.Uvarint(msg.SessionID)
 	w.String(msg.ResumeToken)
 	w.Uvarint(msg.Generation)
+	w.Uvarint(uint64(msg.Cols))
+	w.Uvarint(uint64(msg.Rows))
 	return w.Buf, nil
 }
 func DecodeSessionResume(payload []byte) (SessionResume, error) {
@@ -106,10 +124,24 @@ func DecodeSessionResume(payload []byte) (SessionResume, error) {
 	if err != nil {
 		return SessionResume{}, err
 	}
+	cols, err := r.Uvarint()
+	if err != nil {
+		return SessionResume{}, fmt.Errorf("decode session resume columns: %w", err)
+	}
+	if cols > 65535 {
+		return SessionResume{}, fmt.Errorf("decode session resume columns: %d", cols)
+	}
+	rows, err := r.Uvarint()
+	if err != nil {
+		return SessionResume{}, fmt.Errorf("decode session resume rows: %w", err)
+	}
+	if rows > 65535 {
+		return SessionResume{}, fmt.Errorf("decode session resume rows: %d", rows)
+	}
 	if err := r.Done(); err != nil {
 		return SessionResume{}, err
 	}
-	return SessionResume{Version: int(version), SessionID: id, ResumeToken: token, Generation: generation}, nil
+	return SessionResume{Version: int(version), SessionID: id, ResumeToken: token, Generation: generation, Cols: uint16(cols), Rows: uint16(rows)}, nil
 }
 
 func EncodeSessionResumeOK(dst []byte, msg SessionResumeOK) ([]byte, error) {

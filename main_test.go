@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"flag"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,70 +10,141 @@ import (
 	"testing"
 
 	"github.com/garindra/meja/internal/client"
-	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/version"
 )
 
-func TestCommandAfterTarget(t *testing.T) {
-	command, err := commandAfterTarget([]string{"--", "/bin/sh", "-l"})
+func parseTestInvocation(t *testing.T, args ...string) client.Config {
+	t.Helper()
+	stdin, err := os.Open(os.DevNull)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(command, []string{"/bin/sh", "-l"}) {
-		t.Fatalf("command = %#v", command)
-	}
-}
-
-func TestDefaultLocalCwdUsesInvokerDirectoryUnlessExplicit(t *testing.T) {
-	want, err := os.Getwd()
+	t.Cleanup(func() { _ = stdin.Close() })
+	cfg, err := parseInvocation(args, stdin, io.Discard, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := client.Config{}
-	if err := setDefaultLocalCwd(&cfg); err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Cwd != want {
-		t.Fatalf("default local cwd = %q, want %q", cfg.Cwd, want)
-	}
+	return cfg
+}
 
-	cfg.Cwd = "~/explicit"
-	if err := setDefaultLocalCwd(&cfg); err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Cwd != "~/explicit" {
-		t.Fatalf("explicit cwd was replaced with %q", cfg.Cwd)
+func TestInvocationForwardsCommandArgumentsWithoutCommandParsing(t *testing.T) {
+	want := []string{"restore-session", "-t", "work", "--commands=whatever-the-server-supports"}
+	cfg := parseTestInvocation(t, want...)
+	if !cfg.Local || !reflect.DeepEqual(cfg.CommandArgs, want) {
+		t.Fatalf("config = %#v, want exact command argv %v", cfg, want)
 	}
 }
 
-func TestParseGlobalOptionsDefaultsToDefaultProfile(t *testing.T) {
-	selector, args, err := parseGlobalOptions([]string{"ls"})
+func TestInvocationExtractsTransportOptionsAnywhereBeforeSeparator(t *testing.T) {
+	cfg := parseTestInvocation(t,
+		"restore", "-t", "work",
+		"-h", "alice@example.com",
+		"-L", "dev",
+		"-i", "/keys/meja",
+		"--port=2202",
+		"--remote-path", "/opt/meja",
+	)
+	if cfg.Local || cfg.Target.Original != "alice@example.com" || cfg.SocketSelector.Profile != "dev" {
+		t.Fatalf("remote transport = %#v", cfg)
+	}
+	if cfg.IdentityFile != "/keys/meja" || cfg.Port != 2202 || !cfg.PortSet || cfg.RemotePath != "/opt/meja" {
+		t.Fatalf("SSH options = %#v", cfg)
+	}
+	want := []string{"restore", "-t", "work"}
+	if !reflect.DeepEqual(cfg.CommandArgs, want) {
+		t.Fatalf("forwarded argv = %v, want %v", cfg.CommandArgs, want)
+	}
+}
+
+func TestInvocationPreservesEverythingAtAndAfterSeparator(t *testing.T) {
+	want := []string{"new", "-s", "work", "--", "/bin/sh", "-h", "literal", "-L", "literal"}
+	cfg := parseTestInvocation(t, want...)
+	if !cfg.Local || !reflect.DeepEqual(cfg.CommandArgs, want) {
+		t.Fatalf("forwarded argv = %v, want %v", cfg.CommandArgs, want)
+	}
+}
+
+func TestInvocationDefaultsToNewSessionAndInvokerDirectory(t *testing.T) {
+	cfg := parseTestInvocation(t)
+	wantCwd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selector.Profile != "default" || selector.Path != "" || !reflect.DeepEqual(args, []string{"ls"}) {
-		t.Fatalf("selector=%#v args=%v", selector, args)
+	if !cfg.Local || cfg.Cwd != wantCwd || !reflect.DeepEqual(cfg.CommandArgs, []string{"new-session"}) {
+		t.Fatalf("default config = %#v", cfg)
 	}
 }
 
-func TestParseGlobalOptionsAcceptsProfileAndSocket(t *testing.T) {
-	selector, args, err := parseGlobalOptions([]string{"-L", "dev", "attach", "-t", "3"})
+func TestRemoteInvocationLeavesWorkingDirectoryForForwarder(t *testing.T) {
+	cfg := parseTestInvocation(t, "-h", "prod", "new-session", "-c", "~/work")
+	if cfg.Local || cfg.Cwd != "" {
+		t.Fatalf("remote config = %#v", cfg)
+	}
+	want := []string{"new-session", "-c", "~/work"}
+	if !reflect.DeepEqual(cfg.CommandArgs, want) {
+		t.Fatalf("forwarded argv = %v, want %v", cfg.CommandArgs, want)
+	}
+}
+
+func TestLegacyTrailingHostPreservesRemotePathAndDaemonArguments(t *testing.T) {
+	remotePath := "/home/garindra/extra-storage/home/garindra/projects/tali/bin/linux-amd64/meja"
+	cfg := parseTestInvocation(t,
+		"-L", "dev",
+		"restore", "-t", "YOYO",
+		"--remote-path="+remotePath,
+		"ubuntu-kas8",
+	)
+	if cfg.Local || cfg.Target.Original != "ubuntu-kas8" {
+		t.Fatalf("SSH target = %#v", cfg.Target)
+	}
+	if cfg.RemotePath != remotePath {
+		t.Fatalf("remote path = %q, want %q", cfg.RemotePath, remotePath)
+	}
+	wantArgs := []string{"restore", "-t", "YOYO"}
+	if !reflect.DeepEqual(cfg.CommandArgs, wantArgs) {
+		t.Fatalf("forwarded argv = %v, want %v", cfg.CommandArgs, wantArgs)
+	}
+}
+
+func TestLegacyTrailingHostWorksAroundInitialCommandSeparator(t *testing.T) {
+	cfg := parseTestInvocation(t, "new", "-s", "work", "prod", "--", "/bin/sh", "-h", "literal")
+	if cfg.Local || cfg.Target.Original != "prod" {
+		t.Fatalf("SSH target = %#v", cfg.Target)
+	}
+	wantArgs := []string{"new", "-s", "work", "--", "/bin/sh", "-h", "literal"}
+	if !reflect.DeepEqual(cfg.CommandArgs, wantArgs) {
+		t.Fatalf("forwarded argv = %v, want %v", cfg.CommandArgs, wantArgs)
+	}
+}
+
+func TestInvocationAcceptsProfileAndSocketSelectors(t *testing.T) {
+	profile := parseTestInvocation(t, "list-sessions", "-L", "dev")
+	if profile.SocketSelector.Profile != "dev" {
+		t.Fatalf("profile selector = %#v", profile.SocketSelector)
+	}
+	exactPath := filepath.Join(t.TempDir(), "meja.sock")
+	exact := parseTestInvocation(t, "-S", exactPath, "list-sessions")
+	if exact.SocketSelector.Path != exactPath {
+		t.Fatalf("socket selector = %#v", exact.SocketSelector)
+	}
+}
+
+func TestInvocationRejectsInvalidTransportEnvelope(t *testing.T) {
+	stdin, err := os.Open(os.DevNull)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selector.Profile != "dev" || !reflect.DeepEqual(args, []string{"attach", "-t", "3"}) {
-		t.Fatalf("selector=%#v args=%v", selector, args)
-	}
-	exact := filepath.Join(t.TempDir(), "meja.sock")
-	selector, _, err = parseGlobalOptions([]string{"-S", exact, "ls"})
-	if err != nil || selector.Path != exact {
-		t.Fatalf("selector=%#v err=%v", selector, err)
-	}
-}
-
-func TestParseGlobalOptionsRejectsProfileAndSocketTogether(t *testing.T) {
-	if _, _, err := parseGlobalOptions([]string{"-L", "dev", "-S", "/tmp/dev.sock"}); err == nil {
-		t.Fatal("-L with -S was accepted")
+	defer stdin.Close()
+	for _, args := range [][]string{
+		{"-L", "dev", "-S", "/tmp/dev.sock", "ls"},
+		{"-h", "one", "--host", "two", "ls"},
+		{"--port", "70000", "ls"},
+		{"-h"},
+		{"--host=", "ls"},
+	} {
+		if _, err := parseInvocation(args, stdin, io.Discard, io.Discard); err == nil {
+			t.Fatalf("invocation %v was accepted", args)
+		}
 	}
 }
 
@@ -117,77 +187,5 @@ func TestDebugLogEnvironmentEnablesDiagnostics(t *testing.T) {
 	applyDebugEnvironment(&cfg)
 	if !cfg.RenderDiagnostics {
 		t.Fatal("MEJA_DEBUG_LOG did not enable diagnostics")
-	}
-}
-
-func TestRenderDebugFlagsAreNotAccepted(t *testing.T) {
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	var flags connectionFlags
-	flags.register(fs)
-	if err := fs.Parse([]string{"--debug-render"}); err == nil {
-		t.Fatal("--debug-render was accepted")
-	}
-	if err := fs.Parse([]string{"--debug-render-log", "/tmp/render.log"}); err == nil {
-		t.Fatal("--debug-render-log was accepted")
-	}
-}
-
-func TestUnrecognizedFirstWordRoutesToRemoteConnect(t *testing.T) {
-	stdin, err := os.Open(os.DevNull)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stdin.Close()
-	var stdout, stderr bytes.Buffer
-	err = run(context.Background(), []string{"prod"}, stdin, &stdout, &stderr)
-	if _, isUsageError := err.(usageError); isUsageError {
-		t.Fatalf("shorthand was treated as a command error: %v", err)
-	}
-}
-
-func TestRestoreAcceptsRemoteHostSuffix(t *testing.T) {
-	stdin, err := os.Open(os.DevNull)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stdin.Close()
-	var stdout, stderr bytes.Buffer
-	err = run(context.Background(), []string{"restore", "-t", "work", "--commands=prepare", "prod"}, stdin, &stdout, &stderr)
-	if _, isUsageError := err.(usageError); isUsageError {
-		t.Fatalf("remote restore suffix was rejected by CLI parsing: %v", err)
-	}
-}
-
-func TestRestoreRejectsUnknownCommandMode(t *testing.T) {
-	stdin, err := os.Open(os.DevNull)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stdin.Close()
-	err = run(context.Background(), []string{"restore", "-t", "work", "--commands=maybe"}, stdin, io.Discard, io.Discard)
-	if _, ok := err.(usageError); !ok {
-		t.Fatalf("invalid restore command mode error = %T %v", err, err)
-	}
-}
-
-func TestCommandAfterTargetRequiresSeparator(t *testing.T) {
-	if _, err := commandAfterTarget([]string{"uname"}); err == nil {
-		t.Fatal("command without -- was accepted")
-	}
-}
-
-func TestWriteSessionListShowsNamesAndAttachmentState(t *testing.T) {
-	var output bytes.Buffer
-	err := writeSessionList(&output, []control.SessionInfo{
-		{ID: 1},
-		{ID: 2, Name: "work", Attached: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "Active Sessions\nID  NAME       STATUS\n1   <unnamed>  detached\n2   work       attached\n"
-	if got := output.String(); got != want {
-		t.Fatalf("output = %q, want %q", got, want)
 	}
 }

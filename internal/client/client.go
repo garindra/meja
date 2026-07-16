@@ -24,7 +24,6 @@ import (
 	"github.com/quic-go/quic-go"
 	"golang.org/x/term"
 
-	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
 	"github.com/garindra/meja/internal/theme"
 )
@@ -52,14 +51,11 @@ type Config struct {
 	RenderDiagnostics        bool
 	RenderDiagnosticsLogPath string
 	Cwd                      string
-	Argv                     []string
 	RemotePath               string
-	SocketSelector           control.SocketSelector
-	SessionID                uint64
-	SessionTarget            string
-	SessionName              string
-	RestoreTarget            string
-	RestoreCommands          string
+	SocketSelector           SocketSelector
+	CommandArgs              []string
+	TerminalCols             uint16
+	TerminalRows             uint16
 	Stdin                    *os.File
 	Stdout                   io.Writer
 	Stderr                   io.Writer
@@ -144,18 +140,27 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Stdout == nil {
 		return errors.New("stdout is required")
 	}
-	cols, rows, err := terminalSize(cfg.Stdin)
-	if err != nil {
-		return err
+	cols, rows, terminalErr := terminalSize(cfg.Stdin)
+	if terminalErr == nil {
+		cfg.TerminalCols = cols
+		cfg.TerminalRows = drawableRows(int(rows))
 	}
 
-	// Keep the user's normal terminal active for initial SSH diagnostics,
-	// authentication prompts, and host-key handling. Reconnect bootstrap occurs
-	// later inside the already-active Meja display.
-	bootstrap, err := fetchBootstrap(ctx, cfg)
+	result, err := executeCommand(ctx, cfg)
 	if err != nil {
 		return err
 	}
+	bootstrapResult, err := consumeCommandResult(cfg, result)
+	if err != nil {
+		return err
+	}
+	if bootstrapResult == nil {
+		return nil
+	}
+	if terminalErr != nil {
+		return terminalErr
+	}
+	bootstrap := *bootstrapResult
 	hostname, err := resolveConnectionHostname(ctx, cfg)
 	if err != nil {
 		return err
@@ -273,10 +278,7 @@ func Run(ctx context.Context, cfg Config) error {
 				candidate, reconnectErr := openConnection(clientCtx, bootstrap, hostname, cols, rows, cfg, resumeToken, generation, ui, nil)
 				if reconnectErr != nil {
 					fallbackCfg := cfg
-					fallbackCfg.SessionID = bootstrap.SessionID
-					fallbackCfg.SessionTarget = fmt.Sprintf("%d", bootstrap.SessionID)
-					fallbackCfg.RestoreTarget = ""
-					fallbackCfg.RestoreCommands = ""
+					fallbackCfg.CommandArgs = []string{"attach-session", "-t", fmt.Sprintf("%d", bootstrap.SessionID)}
 					fallbackCfg.Stderr = io.Discard
 					fallback, fallbackErr := fetchBootstrap(clientCtx, fallbackCfg)
 					if fallbackErr == nil {
@@ -421,7 +423,7 @@ func (c *liveConnection) destroy() {
 	c.workers.Wait()
 }
 
-func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname string, cols, rows uint16, cfg Config, resumeToken string, generation uint64, ui *runtimeState, onFirstManagementFrame func() error) (*liveConnection, error) {
+func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, hostname string, cols, rows uint16, cfg Config, resumeToken string, generation uint64, ui *runtimeState, onFirstManagementFrame func() error) (*liveConnection, error) {
 	tlsConfig, err := loadTLSConfig(bootstrap.CertSPKISHA256)
 	if err != nil {
 		return nil, err
@@ -467,9 +469,9 @@ func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname s
 		return fail(err)
 	}
 	if resumeToken == "" {
-		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, SessionID: bootstrap.SessionID, Token: bootstrap.AttachToken}, protocol.EncodeSessionAttach)
+		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, SessionID: bootstrap.SessionID, Token: bootstrap.AttachToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionAttach)
 	} else {
-		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionResume, protocol.SessionResume{Version: protocol.ProtocolVersion, SessionID: bootstrap.SessionID, ResumeToken: resumeToken, Generation: generation}, protocol.EncodeSessionResume)
+		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionResume, protocol.SessionResume{Version: protocol.ProtocolVersion, SessionID: bootstrap.SessionID, ResumeToken: resumeToken, Generation: generation, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionResume)
 	}
 	if err != nil {
 		return fail(err)
@@ -508,19 +510,6 @@ func openConnection(ctx context.Context, bootstrap control.Bootstrap, hostname s
 		return fail(streamErr)
 	case <-ctx.Done():
 		return fail(ctx.Err())
-	}
-	if err := enqueueEncoded(live.mgmtFrames, protocol.MsgCreatePane, protocol.CreatePane{Cwd: cfg.Cwd, Argv: cfg.Argv, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeCreatePane); err != nil {
-		return fail(err)
-	}
-	createdFrame, err := mgmtDecoder.ReadFrame()
-	if err != nil {
-		return fail(fmt.Errorf("read pane created: %w", err))
-	}
-	if createdFrame.Type != protocol.MsgPaneCreated {
-		return fail(fmt.Errorf("unexpected pane message type %d", createdFrame.Type))
-	}
-	if _, err := protocol.DecodePaneCreated(createdFrame.Payload); err != nil {
-		return fail(fmt.Errorf("decode pane created: %w", err))
 	}
 	live.start(func() { managementLoop(mgmtDecoder, ui, live.done, &live.lastContact) })
 	live.start(func() {

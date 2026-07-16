@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/garindra/meja/internal/control"
 )
 
 type recordingProcessObserver struct {
@@ -291,7 +289,7 @@ func TestRestoreCommandModesPrepareSkipAndRun(t *testing.T) {
 }
 
 func TestDaemonRestoresSnapshotWindowsLayoutsAndPanes(t *testing.T) {
-	d := newControlTestDaemon(t)
+	d := newCommandTestDaemon(t)
 	d.snapshotDir = filepath.Join(t.TempDir(), "snapshots")
 	snapshot := PersistedSession{
 		Version: snapshotVersion, Name: "work", SavedAt: time.Now(), ActiveWindow: 1,
@@ -307,7 +305,7 @@ func TestDaemonRestoresSnapshotWindowsLayoutsAndPanes(t *testing.T) {
 	if _, err := writeSessionSnapshot(d.snapshotDir, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	bootstrap, _, _, err := d.handleControl("restore-session-skip", control.SessionTarget{Name: "work"})
+	bootstrap, _, err := d.executeSessionOperation("restore-session-skip", commandSessionTarget{name: "work"})
 	if err != nil {
 		t.Fatal(err)
 	}

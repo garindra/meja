@@ -38,22 +38,22 @@ then `$`. Automatic snapshots begin once the session has a name.
 Give `meja` an SSH host, `user@host`, or an alias from your OpenSSH config:
 
 ```bash
-meja prod
-meja user@prod
+meja -h prod
+meja -h user@prod
 ```
 
 Those commands create a new, unnamed session on the remote machine. For a
 remote session you expect to keep, use the explicit form and give it a name:
 
 ```bash
-meja new -s deploy prod
+meja new -s deploy -h prod
 ```
 
 You can also choose its starting directory or initial command:
 
 ```bash
-meja new -s deploy -c /srv/app prod
-meja new -s logs prod -- journalctl -f
+meja new -s deploy -c /srv/app -h prod
+meja new -s logs -h prod -- journalctl -f
 ```
 
 The command after `--` runs only in the first pane. New windows and splits use
@@ -71,13 +71,13 @@ Attach again by name or numeric ID:
 meja attach -t work
 
 # Remote
-meja attach -t deploy prod
+meja attach -t deploy -h prod
 ```
 
 `attach` has the shorter alias `a`, so this is equivalent:
 
 ```bash
-meja a -t deploy prod
+meja a -t deploy -h prod
 ```
 
 Use `attach` while the original session is still alive. If its server or final
@@ -101,7 +101,7 @@ Restore a local or remote named session with:
 
 ```bash
 meja restore -t work
-meja restore -t deploy prod
+meja restore -t deploy -h prod
 ```
 
 By default, Meja starts fresh shells and types each saved command at its prompt
@@ -123,7 +123,7 @@ Keep `ls` as the fallback when you forget a name or ID:
 
 ```bash
 meja ls
-meja ls prod
+meja ls -h prod
 ```
 
 It shows each session's numeric ID, name, and whether a client is currently
@@ -199,40 +199,27 @@ While that view is open, these keys do not need the `Ctrl+b` prefix:
 
 ```text
 meja version
-meja [global-options]
-meja [global-options] <host> [-- command args...]
-meja [global-options] new [options] [host [-- command args...]]
-meja [global-options] attach|a [options] -t <session-id-or-name> [host]
-meja [global-options] restore [options] -t <session-name> [host]
-meja [global-options] ls [options] [host]
-meja [global-options] server run|stop
+meja [transport-options] [command [command-args...]]
 ```
 
-Use `meja help`, `meja -h`, or `meja --help` to print the built-in synopsis.
+Use `meja help` or `meja --help` to print the built-in synopsis. `-h` is the
+SSH host option.
 
 ### Argument and option placement
 
-- Global options must appear before the command or host.
-- Command-specific and SSH options must appear before the host. Parsing stops
-  at the host argument.
-- A command for the initial pane must appear after the host and `--`.
-- Omitting the host selects the local server. Supplying a host selects the
+- Transport options may appear anywhere before `--`; the client removes them
+  without parsing the remaining command arguments.
+- A command for the initial pane must appear after `--`.
+- Omitting `-h` selects the local server. Supplying `-h <host>` selects the
   server belonging to the SSH-authenticated user on that machine.
-
-An unrecognized first word is treated as a host, making `meja prod` shorthand
-for `meja new prod`. The words `new`, `attach`, `a`, `restore`, `ls`, `server`,
-`version`, and `help` are reserved. Use the explicit form for a host alias with
-one of those names:
-
-```bash
-meja new server
-```
+- With no command, Meja forwards `new-session`.
 
 ### Global server selection
 
 ```text
 -L <profile>       Use a named server profile.
 -S <socket-path>   Use an exact server socket path.
+-h, --host <host>  Use a hostname, user@host, or OpenSSH alias.
 ```
 
 `-L` and `-S` are mutually exclusive. With neither option, Meja uses the
@@ -243,14 +230,14 @@ A profile resolves to `~/.meja/<profile>/meja.sock`, so the default socket is
 `_`, and `-`. An exact `-S` path must be absolute.
 
 The selector is resolved on the machine hosting the session. For example,
-`meja -L work ls prod` lists sessions from the `work` profile on `prod`.
+`meja -L work ls -h prod` lists sessions from the `work` profile on `prod`.
 
 Each profile or socket is an isolated server with its own sessions, session-ID
 sequence, and snapshots.
 
 ### Remote connection options
 
-The following options are accepted by `new`, `attach`, `restore`, and `ls`:
+The following transport options work with every forwarded command:
 
 ```text
 -i <identity-file>      Pass an SSH identity file.
@@ -258,20 +245,18 @@ The following options are accepted by `new`, `attach`, `restore`, and `ls`:
 --remote-path <path>    Select the remote meja executable (default: meja).
 ```
 
-These options matter only when a host is supplied. If `--port` is omitted,
+These options matter only when `-h` is supplied. If `--port` is omitted,
 Meja lets OpenSSH choose the port from its configuration and defaults. The
 remote executable path is used exactly as supplied.
 
 ### `new`
 
 ```text
-meja [global-options] new [new-options] [connection-options]
-meja [global-options] new [new-options] [connection-options] <host>
-     [-- command args...]
+meja [transport-options] new [new-options] [-- command args...]
 ```
 
-`new` creates and attaches to a session. Without a host it creates the session
-locally. With a host it creates the session remotely through SSH.
+`new` creates and attaches to a session. Without `-h` it creates the session
+locally. With `-h` it creates the session remotely through SSH.
 
 ```text
 -s <session-name>    Give the session a unique name.
@@ -284,16 +269,16 @@ splits. It is resolved on the target machine and must be absolute or begin with
 `~/`. Quote a remote home-relative path so your local shell does not expand it:
 
 ```bash
-meja new -c '~/projects/app' prod
+meja new -c '~/projects/app' -h prod
 ```
 
 When `-c` is omitted, a local session inherits the invoking process's current
 directory. A remote session starts in the remote user's home directory.
 
-The command after `<host> --` applies only to the initial pane:
+The command after `--` applies only to the initial pane:
 
 ```bash
-meja new prod -- /usr/bin/bash -l
+meja new -h prod -- /usr/bin/bash -l
 ```
 
 Creating a session starts the selected server automatically when its socket is
@@ -302,20 +287,18 @@ missing or stale.
 ### `attach` / `a`
 
 ```text
-meja [global-options] attach [connection-options]
-     -t <session-id-or-name> [host]
-meja [global-options] a [connection-options]
-     -t <session-id-or-name> [host]
+meja [transport-options] attach -t <session-id-or-name>
+meja [transport-options] a -t <session-id-or-name>
 ```
 
 `-t` is required and accepts either a positive numeric ID or a session name.
-Without a host, Meja connects directly through the local control socket. With a
-host, it obtains the connection information through SSH.
+Without `-h`, Meja connects directly through the local command socket. With
+`-h`, it obtains the connection information through SSH.
 
 ```bash
 meja attach -t 12
 meja attach -t work
-meja attach -i ~/.ssh/prod_ed25519 --port 2222 -t work prod
+meja attach -i ~/.ssh/prod_ed25519 --port 2222 -t work -h prod
 ```
 
 Attaching to a session that is already attached replaces the existing client.
@@ -324,8 +307,8 @@ Attaching to a session that is already attached replaces the existing client.
 ### `restore`
 
 ```text
-meja [global-options] restore [connection-options]
-     -t <session-name> [--commands=prepare|skip|run] [host]
+meja [transport-options] restore -t <session-name>
+     [--commands=prepare|skip|run]
 ```
 
 `-t` is required and must be a session name, not a numeric ID. `restore` reads
@@ -355,7 +338,7 @@ Restoring starts the selected server automatically when necessary.
 ### `ls`
 
 ```text
-meja [global-options] ls [connection-options] [host]
+meja [transport-options] ls
 ```
 
 `ls` prints the active sessions for the selected local or remote server:
@@ -369,34 +352,33 @@ ID  NAME       STATUS
 
 Rows are ordered by numeric ID. `ls` does not start a missing server.
 
-### `server run` and `server stop`
+### `start-server` and `kill-server`
 
 ```text
-meja [global-options] server run
-meja [global-options] server stop
+meja [transport-options] start-server
+meja [transport-options] kill-server
 ```
 
-`server run` runs the selected local per-user server in the foreground.
+`start-server` runs the selected local per-user server in the foreground.
 Session-creating commands normally start the same server in the background, so
 running it manually is optional.
 
-`server stop` cleanly disconnects active clients, stops the server, and prints
+`kill-server` cleanly disconnects active clients, stops the server, and prints
 its PID when available. It does not start a missing server.
 
 These commands are local. To manage a server on another machine, run `meja
-server ...` through SSH on that machine.
+start-server` or `meja kill-server` through SSH on that machine.
 
 ### `version` and help
 
 ```bash
 meja version
 meja help
-meja -h
 meja --help
 ```
 
 `version` prints `meja <version>` and accepts no additional arguments. The help
-forms print the command synopsis.
+forms print the command synopsis. `-h` requires an SSH host.
 
 ### Session names
 
@@ -407,7 +389,7 @@ within one server profile or socket.
 ### Server and socket behavior
 
 - `new` and `restore` start the selected server if needed.
-- `attach`, `ls`, and `server stop` require an already-running server.
+- `attach`, `ls`, and `kill-server` require an already-running server.
 - Socket directories created by Meja use mode `0700`; sockets use mode `0600`.
 - Meja does not relax permissions on an existing socket parent directory. The
   parent must already belong to the current user and have mode `0700`.
@@ -428,18 +410,16 @@ render diagnostics specifically. Diagnostics go to stderr unless
 `MEJA_DEBUG_LOG` names a file; setting that path also enables render
 diagnostics.
 
-### Private control command
+### Private SSH forwarding command
 
-`__control-v1` is the machine-facing SSH bootstrap interface used internally by
-the client:
+`__ssh-forward-v1` is the machine-facing SSH transport used internally by the
+client:
 
 ```text
-meja [global-options] __control-v1 start-session [session-name]
-meja [global-options] __control-v1 connect-session <session-id-or-name>
-meja [global-options] __control-v1 restore-session <session-name> <command-mode>
-meja [global-options] __control-v1 list-sessions
+meja [-L profile | -S socket-path] __ssh-forward-v1
 ```
 
-Start, connect, and restore emit one `MEJA_BOOTSTRAP_V1` JSON record. Listing
-emits one `MEJA_SESSION_LIST_V1` JSON record. This interface is versioned and is
-not intended for direct interactive use.
+The command request is read as framed data from stdin and forwarded to the
+selected Unix socket. Framed command output is copied to stdout. The forwarder
+understands only `-L` and `-S`; command names and arguments are interpreted by
+the server.

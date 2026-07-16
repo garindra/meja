@@ -2,17 +2,15 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
-	"text/tabwriter"
 
 	"github.com/garindra/meja/internal/client"
-	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/server"
 	"github.com/garindra/meja/internal/version"
 )
@@ -39,99 +37,226 @@ func (e usageError) Error() string { return e.text }
 
 const usage = `usage:
   meja version
-  meja [-L profile | -S socket-path]
-  meja [-L profile | -S socket-path] <host> [-- command args...]
-  meja [-L profile | -S socket-path] new [-s session-name] [-c directory] [options] [host] [-- command args...]
-  meja [-L profile | -S socket-path] attach|a -t <session-id-or-name> [host]
-  meja [-L profile | -S socket-path] restore -t <session-name> [--commands=prepare|skip|run] [host]
-  meja [-L profile | -S socket-path] ls [host]
-  meja [-L profile | -S socket-path] server run|stop`
+  meja [transport-options] [command [command-args...]]
+
+transport options (removed before forwarding):
+  -L profile              select a named server socket
+  -S socket-path          select an exact server socket
+  -h, --host user@host    run the command on an SSH host
+  -i identity-file        use an SSH identity file
+  --port port             use an SSH port
+  --remote-path path      remote meja executable (default: meja)
+
+transport options may appear anywhere before --. With no command, Meja runs
+new-session. Use --help to show this text.`
 
 func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.Writer) error {
-	selector, args, err := parseGlobalOptions(args)
+	cfg, err := parseInvocation(args, stdin, stdout, stderr)
 	if err != nil {
-		if err == flag.ErrHelp {
-			fmt.Fprintln(stdout, usage)
-			return nil
-		}
 		return usageError{err.Error()}
 	}
-	if len(args) == 0 {
-		cfg := client.Config{Local: true, SocketSelector: selector, Stdin: stdin, Stdout: stdout, Stderr: stderr}
-		applyDebugEnvironment(&cfg)
-		if err := setDefaultLocalCwd(&cfg); err != nil {
+	command := cfg.CommandArgs[0]
+	if command == "help" || command == "--help" {
+		if len(cfg.CommandArgs) != 1 {
+			return usageError{command + " accepts no arguments"}
+		}
+		fmt.Fprintln(stdout, usage)
+		return nil
+	}
+	switch command {
+	case "start-server":
+		if !cfg.Local {
+			return usageError{"start-server is local; invoke it through SSH to start a remote server"}
+		}
+		if len(cfg.CommandArgs) != 1 {
+			return usageError{"start-server accepts no arguments"}
+		}
+		socket, err := cfg.SocketSelector.Resolve()
+		if err != nil {
 			return err
 		}
-		return client.Run(ctx, cfg)
-	}
-	switch args[0] {
-	case "new":
-		return runNew(ctx, selector, args[1:], stdin, stdout, stderr)
-	case "attach", "a":
-		return runAttach(ctx, selector, args[1:], stdin, stdout, stderr)
-	case "restore":
-		return runRestore(ctx, selector, args[1:], stdin, stdout, stderr)
-	case "ls":
-		return runList(ctx, selector, args[1:], stdin, stdout, stderr)
-	case "server":
-		return runServer(ctx, selector, args[1:], stdout, stderr)
+		return server.Run(ctx, server.Config{ControlPath: socket, Stdout: stdout, Stderr: stderr})
 	case "version":
-		if len(args) != 1 {
+		if len(cfg.CommandArgs) != 1 {
 			return usageError{"version accepts no arguments"}
 		}
 		fmt.Fprintf(stdout, "meja %s\n", version.Current())
 		return nil
-	case "__control-v1":
-		return runControl(ctx, selector, args[1:], stdout)
-	case "help", "-h", "--help":
-		fmt.Fprintln(stdout, usage)
-		return nil
-	default:
-		return runNew(ctx, selector, args, stdin, stdout, stderr)
+	case "__ssh-forward-v1":
+		if !cfg.Local || len(cfg.CommandArgs) != 1 {
+			return usageError{"__ssh-forward-v1 accepts no arguments"}
+		}
+		return client.ForwardCommand(ctx, cfg.SocketSelector, stdin, stdout)
 	}
+	if command == "server" && len(cfg.CommandArgs) >= 2 && cfg.CommandArgs[1] == "run" {
+		if !cfg.Local {
+			return usageError{"server run is local; invoke start-server through SSH on the remote host"}
+		}
+		if len(cfg.CommandArgs) != 2 {
+			return usageError{"server run accepts no arguments"}
+		}
+		socket, err := cfg.SocketSelector.Resolve()
+		if err != nil {
+			return err
+		}
+		return server.Run(ctx, server.Config{ControlPath: socket, Stdout: stdout, Stderr: stderr})
+	}
+	return client.Run(ctx, cfg)
 }
 
-func parseGlobalOptions(args []string) (control.SocketSelector, []string, error) {
-	fs := flag.NewFlagSet("meja", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	profile := fs.String("L", "", "server profile")
-	socket := fs.String("S", "", "exact server socket path")
-	if err := fs.Parse(args); err != nil {
-		return control.SocketSelector{}, nil, err
-	}
-	selector, err := (control.SocketSelector{Profile: *profile, Path: *socket}).Normalize()
-	if err != nil {
-		return control.SocketSelector{}, nil, err
-	}
-	return selector, fs.Args(), nil
-}
-
-type connectionFlags struct {
+type invocationOptions struct {
+	profile    string
+	socket     string
+	host       string
 	identity   string
 	remotePath string
-	port       intFlagValue
+	port       int
+	portSet    bool
 }
 
-func (f *connectionFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&f.identity, "i", "", "path to SSH identity file")
-	fs.StringVar(&f.remotePath, "remote-path", "meja", "remote meja executable path")
-	f.port.value = 4433
-	fs.Var(&f.port, "port", "SSH port")
-}
-
-func (f connectionFlags) config(selector control.SocketSelector, stdin *os.File, stdout, stderr io.Writer) client.Config {
+func parseInvocation(args []string, stdin *os.File, stdout, stderr io.Writer) (client.Config, error) {
+	options := invocationOptions{remotePath: "meja", port: 4433}
+	commandArgs := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if arg == "--" {
+			commandArgs = append(commandArgs, args[index:]...)
+			break
+		}
+		name, inlineValue, hasInlineValue, recognized := transportOption(arg)
+		if !recognized {
+			commandArgs = append(commandArgs, arg)
+			continue
+		}
+		value := inlineValue
+		if !hasInlineValue {
+			index++
+			if index >= len(args) {
+				return client.Config{}, fmt.Errorf("%s requires a value", name)
+			}
+			value = args[index]
+		}
+		if value == "" {
+			return client.Config{}, fmt.Errorf("%s requires a non-empty value", name)
+		}
+		if err := options.set(name, value); err != nil {
+			return client.Config{}, err
+		}
+	}
+	selector, err := (client.SocketSelector{Profile: options.profile, Path: options.socket}).Normalize()
+	if err != nil {
+		return client.Config{}, err
+	}
+	if options.host == "" {
+		commandArgs, options.host = splitLegacyCommandHost(commandArgs)
+	}
+	if len(commandArgs) == 0 {
+		commandArgs = []string{"new-session"}
+	}
 	cfg := client.Config{
-		Port:           f.port.value,
-		PortSet:        f.port.set,
-		IdentityFile:   f.identity,
-		RemotePath:     f.remotePath,
+		Local:          options.host == "",
+		Port:           options.port,
+		PortSet:        options.portSet,
+		IdentityFile:   options.identity,
+		RemotePath:     options.remotePath,
 		SocketSelector: selector,
+		CommandArgs:    commandArgs,
 		Stdin:          stdin,
 		Stdout:         stdout,
 		Stderr:         stderr,
 	}
 	applyDebugEnvironment(&cfg)
-	return cfg
+	if options.host != "" {
+		cfg.Target, err = client.ParseTarget(options.host)
+		if err != nil {
+			return client.Config{}, err
+		}
+	} else {
+		cfg.Cwd, err = os.Getwd()
+		if err != nil {
+			return client.Config{}, fmt.Errorf("resolve current working directory: %w", err)
+		}
+	}
+	return cfg, nil
+}
+
+func splitLegacyCommandHost(args []string) ([]string, string) {
+	if len(args) < 2 || !supportsLegacyCommandHost(args[0]) {
+		return args, ""
+	}
+	stop := len(args)
+	for index, arg := range args {
+		if arg == "--" {
+			stop = index
+			break
+		}
+	}
+	positionalIndex := -1
+	for index := 1; index < stop; index++ {
+		arg := args[index]
+		if strings.HasPrefix(arg, "-") {
+			if !strings.Contains(arg, "=") {
+				index++
+			}
+			continue
+		}
+		if positionalIndex != -1 {
+			return args, ""
+		}
+		positionalIndex = index
+	}
+	if positionalIndex == -1 {
+		return args, ""
+	}
+	host := args[positionalIndex]
+	forwarded := make([]string, 0, len(args)-1)
+	forwarded = append(forwarded, args[:positionalIndex]...)
+	forwarded = append(forwarded, args[positionalIndex+1:]...)
+	return forwarded, host
+}
+
+func supportsLegacyCommandHost(command string) bool {
+	switch command {
+	case "new", "new-session", "attach", "a", "attach-session", "restore", "restore-session", "ls", "list-sessions":
+		return true
+	default:
+		return false
+	}
+}
+
+func transportOption(arg string) (name, value string, hasValue, recognized bool) {
+	name, value, hasValue = strings.Cut(arg, "=")
+	switch name {
+	case "-L", "-S", "-h", "--host", "-i", "--port", "-port", "--remote-path", "-remote-path":
+		return name, value, hasValue, true
+	default:
+		return "", "", false, false
+	}
+}
+
+func (options *invocationOptions) set(name, value string) error {
+	switch name {
+	case "-L":
+		options.profile = value
+	case "-S":
+		options.socket = value
+	case "-h", "--host":
+		if options.host != "" {
+			return fmt.Errorf("SSH host was specified more than once")
+		}
+		options.host = value
+	case "-i":
+		options.identity = value
+	case "--remote-path", "-remote-path":
+		options.remotePath = value
+	case "--port", "-port":
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("invalid SSH port %q", value)
+		}
+		options.port, options.portSet = port, true
+	}
+	return nil
 }
 
 func applyDebugEnvironment(cfg *client.Config) {
@@ -151,307 +276,4 @@ func debugEnvironmentEnabled(name string) bool {
 	}
 	enabled, err := strconv.ParseBool(value)
 	return err == nil && enabled
-}
-
-func runNew(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("new", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	var flags connectionFlags
-	flags.register(fs)
-	sessionName := fs.String("s", "", "session name")
-	var cwd string
-	fs.StringVar(&cwd, "c", "", "starting directory for new panes")
-	fs.StringVar(&cwd, "cwd", "", "starting directory for new panes")
-	if err := fs.Parse(args); err != nil {
-		return usageError{err.Error()}
-	}
-	remaining := fs.Args()
-	if *sessionName != "" {
-		if err := control.ValidateSessionName(*sessionName); err != nil {
-			return err
-		}
-	}
-	cfg := flags.config(selector, stdin, stdout, stderr)
-	cfg.SessionName = *sessionName
-	cfg.Cwd = cwd
-	if len(remaining) == 0 {
-		cfg.Local = true
-		if err := setDefaultLocalCwd(&cfg); err != nil {
-			return err
-		}
-		return client.Run(ctx, cfg)
-	}
-	target, err := client.ParseTarget(remaining[0])
-	if err != nil {
-		return err
-	}
-	command, err := commandAfterTarget(remaining[1:])
-	if err != nil {
-		return err
-	}
-	cfg.Target = target
-	cfg.Argv = command
-	return client.Run(ctx, cfg)
-}
-
-func setDefaultLocalCwd(cfg *client.Config) error {
-	if cfg.Cwd != "" {
-		return nil
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("resolve current working directory: %w", err)
-	}
-	cfg.Cwd = cwd
-	return nil
-}
-
-func runAttach(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("attach", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	var flags connectionFlags
-	flags.register(fs)
-	sessionRaw := fs.String("t", "", "session ID or name")
-	if err := fs.Parse(args); err != nil {
-		return usageError{err.Error()}
-	}
-	if *sessionRaw == "" {
-		return usageError{"attach requires -t <session-id-or-name>"}
-	}
-	_, err := control.ParseSessionTarget(*sessionRaw)
-	if err != nil {
-		return err
-	}
-	remaining := fs.Args()
-	if len(remaining) > 1 {
-		return usageError{"attach accepts at most one host"}
-	}
-	cfg := flags.config(selector, stdin, stdout, stderr)
-	cfg.SessionTarget = *sessionRaw
-	if len(remaining) == 0 {
-		cfg.Local = true
-	} else {
-		cfg.Target, err = client.ParseTarget(remaining[0])
-		if err != nil {
-			return err
-		}
-	}
-	return client.Run(ctx, cfg)
-}
-
-func runRestore(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	var flags connectionFlags
-	flags.register(fs)
-	sessionName := fs.String("t", "", "snapshot session name")
-	commandMode := fs.String("commands", "prepare", "restore commands: prepare, skip, or run")
-	if err := fs.Parse(args); err != nil {
-		return usageError{err.Error()}
-	}
-	if *sessionName == "" {
-		return usageError{"restore requires -t <session-name>"}
-	}
-	if err := control.ValidateSessionName(*sessionName); err != nil {
-		return err
-	}
-	switch *commandMode {
-	case "prepare", "skip", "run":
-	default:
-		return usageError{"--commands must be prepare, skip, or run"}
-	}
-	remaining := fs.Args()
-	if len(remaining) > 1 {
-		return usageError{"restore accepts at most one host"}
-	}
-	cfg := flags.config(selector, stdin, stdout, stderr)
-	cfg.RestoreTarget = *sessionName
-	cfg.RestoreCommands = *commandMode
-	var err error
-	if len(remaining) == 0 {
-		cfg.Local = true
-	} else {
-		cfg.Target, err = client.ParseTarget(remaining[0])
-		if err != nil {
-			return err
-		}
-	}
-	return client.Run(ctx, cfg)
-}
-
-func runList(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("ls", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	var flags connectionFlags
-	flags.register(fs)
-	if err := fs.Parse(args); err != nil {
-		return usageError{err.Error()}
-	}
-	remaining := fs.Args()
-	if len(remaining) > 1 {
-		return usageError{"ls accepts at most one host"}
-	}
-	cfg := flags.config(selector, stdin, stdout, stderr)
-	var err error
-	if len(remaining) == 0 {
-		cfg.Local = true
-	} else {
-		cfg.Target, err = client.ParseTarget(remaining[0])
-		if err != nil {
-			return err
-		}
-	}
-	sessions, err := client.ListSessions(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	return writeSessionList(stdout, sessions)
-}
-
-func writeSessionList(w io.Writer, sessions []control.SessionInfo) error {
-	if _, err := fmt.Fprintln(w, "Active Sessions"); err != nil {
-		return err
-	}
-	table := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "ID\tNAME\tSTATUS"); err != nil {
-		return err
-	}
-	for _, session := range sessions {
-		name := session.Name
-		if name == "" {
-			name = "<unnamed>"
-		}
-		status := "detached"
-		if session.Attached {
-			status = "attached"
-		}
-		if _, err := fmt.Fprintf(table, "%d\t%s\t%s\n", session.ID, name, status); err != nil {
-			return err
-		}
-	}
-	return table.Flush()
-}
-
-func runServer(ctx context.Context, selector control.SocketSelector, args []string, stdout, stderr io.Writer) error {
-	if len(args) != 1 {
-		return usageError{"server requires run or stop"}
-	}
-	switch args[0] {
-	case "run":
-		socket, err := selector.Resolve()
-		if err != nil {
-			return err
-		}
-		return server.Run(ctx, server.Config{ControlPath: socket, Stdout: stdout, Stderr: stderr})
-	case "stop":
-		socket, err := selector.Resolve()
-		if err != nil {
-			return err
-		}
-		pid, err := control.StopServer(ctx, socket)
-		if err != nil {
-			return err
-		}
-		if pid > 0 {
-			fmt.Fprintf(stdout, "stopped server PID %d\n", pid)
-		} else {
-			fmt.Fprintln(stdout, "stopped server (PID unavailable)")
-		}
-		return nil
-	default:
-		return usageError{"server requires run or stop"}
-	}
-}
-
-func runControl(ctx context.Context, selector control.SocketSelector, args []string, stdout io.Writer) error {
-	if len(args) == 0 {
-		return usageError{"__control-v1 requires an operation"}
-	}
-	switch args[0] {
-	case "start-session":
-		if len(args) > 2 {
-			return usageError{"__control-v1 start-session accepts at most one session name"}
-		}
-		name := ""
-		if len(args) == 2 {
-			name = args[1]
-		}
-		executable, err := control.CurrentExecutable()
-		if err != nil {
-			return err
-		}
-		bootstrap, err := control.StartSession(ctx, executable, selector, name)
-		if err != nil {
-			return err
-		}
-		return control.WriteBootstrap(stdout, bootstrap)
-	case "connect-session":
-		if len(args) != 2 {
-			return usageError{"__control-v1 connect-session requires a session ID or name"}
-		}
-		socket, err := selector.Resolve()
-		if err != nil {
-			return err
-		}
-		bootstrap, err := control.ConnectSession(ctx, socket, args[1])
-		if err != nil {
-			return err
-		}
-		return control.WriteBootstrap(stdout, bootstrap)
-	case "restore-session":
-		if len(args) != 3 {
-			return usageError{"__control-v1 restore-session requires a session name and command mode"}
-		}
-		executable, err := control.CurrentExecutable()
-		if err != nil {
-			return err
-		}
-		bootstrap, err := control.StartRestoreSession(ctx, executable, selector, args[1], args[2])
-		if err != nil {
-			return err
-		}
-		return control.WriteBootstrap(stdout, bootstrap)
-	case "list-sessions":
-		if len(args) != 1 {
-			return usageError{"__control-v1 list-sessions accepts no arguments"}
-		}
-		socket, err := selector.Resolve()
-		if err != nil {
-			return err
-		}
-		sessions, err := control.ListSessions(ctx, socket)
-		if err != nil {
-			return err
-		}
-		return control.WriteSessionList(stdout, sessions)
-	default:
-		return usageError{"unsupported __control-v1 operation"}
-	}
-}
-
-func commandAfterTarget(args []string) ([]string, error) {
-	if len(args) == 0 {
-		return nil, nil
-	}
-	if args[0] != "--" {
-		return nil, usageError{"remote command must follow --"}
-	}
-	return append([]string(nil), args[1:]...), nil
-}
-
-type intFlagValue struct {
-	value int
-	set   bool
-}
-
-func (f *intFlagValue) String() string { return strconv.Itoa(f.value) }
-
-func (f *intFlagValue) Set(raw string) error {
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		return err
-	}
-	f.value = value
-	f.set = true
-	return nil
 }

@@ -861,7 +861,7 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	}
 	s.ConsumeInputByte(0, 0x02)
 	event := s.ConsumeInputByte(0, '2')
-	if event.Command != serverCommandSelectIndex || event.Index != 2 {
+	if !isCommandInput(event, "select-window", "-t", ":2") {
 		t.Fatalf("numeric selection event = %#v", event)
 	}
 

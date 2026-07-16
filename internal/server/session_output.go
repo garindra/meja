@@ -143,6 +143,8 @@ func (s *Session) publishStatusBar() error {
 	if prompt := s.ActivePrompt(clientID0); prompt != nil {
 		styleID = statusPromptStyleID
 		text = prompt.Label + string(prompt.Text)
+	} else if client.StatusMessage != "" {
+		text = client.StatusMessage
 	} else {
 		list := s.WindowStatuses(clientID0)
 		if name := s.SessionName(); name != "" {

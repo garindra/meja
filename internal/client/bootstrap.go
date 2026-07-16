@@ -1,102 +1,28 @@
 package client
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 
-	"github.com/garindra/meja/internal/control"
+	"github.com/garindra/meja/internal/protocol"
 )
 
-func fetchBootstrap(ctx context.Context, cfg Config) (control.Bootstrap, error) {
-	if cfg.Local {
-		socket, err := cfg.SocketSelector.Resolve()
-		if err != nil {
-			return control.Bootstrap{}, err
-		}
-		if cfg.RestoreTarget != "" {
-			executable, err := control.CurrentExecutable()
-			if err != nil {
-				return control.Bootstrap{}, err
-			}
-			return control.StartRestoreSession(ctx, executable, cfg.SocketSelector, cfg.RestoreTarget, cfg.RestoreCommands)
-		}
-		if target := configSessionTarget(cfg); target != "" {
-			return control.ConnectSession(ctx, socket, target)
-		}
-		executable, err := control.CurrentExecutable()
-		if err != nil {
-			return control.Bootstrap{}, err
-		}
-		return control.StartSession(ctx, executable, cfg.SocketSelector, cfg.SessionName)
-	}
-	return fetchRemoteBootstrap(ctx, cfg)
-}
-
-func fetchRemoteBootstrap(ctx context.Context, cfg Config) (control.Bootstrap, error) {
-	remotePath := cfg.RemotePath
-	if remotePath == "" {
-		remotePath = "meja"
-	}
-	var command string
-	var err error
-	if cfg.RestoreTarget != "" {
-		command, err = restoreControllerCommand(remotePath, cfg.SocketSelector, cfg.RestoreTarget, cfg.RestoreCommands)
-	} else {
-		command, err = controllerCommand(remotePath, cfg.SocketSelector, configSessionTarget(cfg), cfg.SessionName)
-	}
+func fetchBootstrap(ctx context.Context, cfg Config) (protocol.CommandBootstrap, error) {
+	result, err := executeCommand(ctx, cfg)
 	if err != nil {
-		return control.Bootstrap{}, err
+		return protocol.CommandBootstrap{}, err
 	}
-	target := cfg.Target.Original
-	if target == "" {
-		if cfg.Target.Username != "" {
-			target = cfg.Target.Username + "@"
-		}
-		target += cfg.Target.Hostname
-	}
-	args := make([]string, 0, 6)
-	if cfg.IdentityFile != "" {
-		args = append(args, "-i", cfg.IdentityFile)
-	}
-	if cfg.PortSet {
-		args = append(args, "-p", fmt.Sprintf("%d", cfg.Port))
-	}
-	args = append(args, target, command)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	cmd.Stdin = cfg.Stdin
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return control.Bootstrap{}, sshCommandError("SSH bootstrap failed", err, stderr.String())
-	}
-	if stderr.Len() > 0 && cfg.Stderr != nil {
-		_, _ = stderr.WriteTo(cfg.Stderr)
-	}
-	bootstrap, err := control.ParseBootstrapOutput(stdout.Bytes())
+	bootstrap, err := consumeCommandResult(cfg, result)
 	if err != nil {
-		return control.Bootstrap{}, err
+		return protocol.CommandBootstrap{}, err
 	}
-	return bootstrap, nil
-}
-
-func restoreControllerCommand(remotePath string, selector control.SocketSelector, name, commandMode string) (string, error) {
-	if err := control.ValidateSessionName(name); err != nil {
-		return "", err
+	if bootstrap == nil {
+		return protocol.CommandBootstrap{}, errors.New("command did not attach a session")
 	}
-	switch commandMode {
-	case "prepare", "skip", "run":
-	default:
-		return "", fmt.Errorf("invalid restore command mode %q", commandMode)
-	}
-	command, err := controllerCommandPrefix(remotePath, selector)
-	if err != nil {
-		return "", err
-	}
-	return command + " __control-v1 restore-session " + control.ShellQuote(name) + " " + control.ShellQuote(commandMode), nil
+	return *bootstrap, nil
 }
 
 func resolveConnectionHostname(ctx context.Context, cfg Config) (string, error) {
@@ -129,88 +55,6 @@ func resolveSSHHostname(ctx context.Context, target Target) (string, error) {
 		return "", fmt.Errorf("resolve SSH hostname: OpenSSH returned no hostname")
 	}
 	return target.Hostname, nil
-}
-
-func controllerCommand(remotePath string, selector control.SocketSelector, sessionTarget, sessionName string) (string, error) {
-	command, err := controllerCommandPrefix(remotePath, selector)
-	if err != nil {
-		return "", err
-	}
-	if sessionTarget == "" {
-		command += " __control-v1 start-session"
-		if sessionName != "" {
-			if err := control.ValidateSessionName(sessionName); err != nil {
-				return "", err
-			}
-			command += " " + control.ShellQuote(sessionName)
-		}
-		return command, nil
-	}
-	if _, err := control.ParseSessionTarget(sessionTarget); err != nil {
-		return "", err
-	}
-	return command + " __control-v1 connect-session " + control.ShellQuote(sessionTarget), nil
-}
-
-func configSessionTarget(cfg Config) string {
-	if cfg.SessionTarget != "" {
-		return cfg.SessionTarget
-	}
-	if cfg.SessionID != 0 {
-		return fmt.Sprintf("%d", cfg.SessionID)
-	}
-	return ""
-}
-
-func controllerCommandPrefix(remotePath string, selector control.SocketSelector) (string, error) {
-	if remotePath == "" {
-		remotePath = "meja"
-	}
-	selectorArgs, err := selector.Args()
-	if err != nil {
-		return "", err
-	}
-	command := control.ShellQuote(remotePath)
-	for _, arg := range selectorArgs {
-		command += " " + control.ShellQuote(arg)
-	}
-	return command, nil
-}
-
-func ListSessions(ctx context.Context, cfg Config) ([]control.SessionInfo, error) {
-	if cfg.Local {
-		socket, err := cfg.SocketSelector.Resolve()
-		if err != nil {
-			return nil, err
-		}
-		return control.ListSessions(ctx, socket)
-	}
-	command, err := controllerCommandPrefix(cfg.RemotePath, cfg.SocketSelector)
-	if err != nil {
-		return nil, err
-	}
-	command += " __control-v1 list-sessions"
-	target := cfg.Target.Original
-	args := make([]string, 0, 6)
-	if cfg.IdentityFile != "" {
-		args = append(args, "-i", cfg.IdentityFile)
-	}
-	if cfg.PortSet {
-		args = append(args, "-p", fmt.Sprintf("%d", cfg.Port))
-	}
-	args = append(args, target, command)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	cmd.Stdin = cfg.Stdin
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, sshCommandError("SSH session list failed", err, stderr.String())
-	}
-	if stderr.Len() > 0 && cfg.Stderr != nil {
-		_, _ = stderr.WriteTo(cfg.Stderr)
-	}
-	return control.ParseSessionListOutput(stdout.Bytes())
 }
 
 func sshCommandError(operation string, err error, stderr string) error {

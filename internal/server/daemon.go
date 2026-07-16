@@ -9,17 +9,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 
-	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
 )
 
@@ -93,12 +90,12 @@ func Run(ctx context.Context, cfg Config) error {
 	socket := cfg.ControlPath
 	if socket == "" {
 		var err error
-		socket, err = control.ControlPath()
+		socket, err = defaultCommandSocketPath()
 		if err != nil {
 			return err
 		}
 	}
-	lock, err := control.AcquireServerLock(socket)
+	lock, err := acquireCommandServerLock(socket)
 	if err != nil {
 		return err
 	}
@@ -123,7 +120,7 @@ func Run(ctx context.Context, cfg Config) error {
 		case <-serverCtx.Done():
 		}
 	}()
-	err = control.Serve(serverCtx, socket, d.handleControl)
+	err = serveCommandSocket(serverCtx, socket, d)
 	if err != nil {
 		stop()
 	}
@@ -169,142 +166,6 @@ func daemonCertificate() (tls.Certificate, string, error) {
 	}
 	hash := sha256.Sum256(parsed.RawSubjectPublicKeyInfo)
 	return cert, hex.EncodeToString(hash[:]), nil
-}
-
-func (d *Daemon) handleControl(operation string, target control.SessionTarget) (control.Bootstrap, []control.SessionInfo, int, error) {
-	if operation == "stop-server" {
-		var stop context.CancelFunc
-		d.call(func() { stop = d.stop })
-		if stop == nil {
-			return control.Bootstrap{}, nil, 0, errors.New("server stop unavailable")
-		}
-		pid := os.Getpid()
-		d.disconnectActiveClients()
-		stop()
-		return control.Bootstrap{}, nil, pid, nil
-	}
-	if operation == "list-sessions" {
-		type listedSession struct {
-			id    uint64
-			state *Session
-		}
-		var states []listedSession
-		d.call(func() {
-			states = make([]listedSession, 0, len(d.sessions))
-			for id, state := range d.sessions {
-				states = append(states, listedSession{id: id, state: state})
-			}
-		})
-
-		sessions := make([]control.SessionInfo, 0, len(states))
-		for _, listed := range states {
-			if listed.state != nil {
-				name, attached := listed.state.info()
-				sessions = append(sessions, control.SessionInfo{ID: listed.id, Name: name, Attached: attached})
-			}
-		}
-		sort.Slice(sessions, func(i, j int) bool { return sessions[i].ID < sessions[j].ID })
-		return control.Bootstrap{}, sessions, 0, nil
-	}
-	restoreMode, restoring := restoreModeForOperation(operation)
-	var restoreSnapshot PersistedSession
-	if restoring {
-		if target.ID != 0 || target.Name == "" {
-			return control.Bootstrap{}, nil, 0, errors.New("restore requires a session name")
-		}
-		if err := control.ValidateSessionName(target.Name); err != nil {
-			return control.Bootstrap{}, nil, 0, err
-		}
-		var err error
-		restoreSnapshot, err = readPersistedSession(filepath.Join(d.snapshotDir, target.Name+".json"), target.Name)
-		if err != nil {
-			return control.Bootstrap{}, nil, 0, err
-		}
-	}
-	var s *Session
-	var operationErr error
-	created := false
-	var port uint16
-	var encodedToken string
-	var expires time.Time
-	d.call(func() {
-		switch operation {
-		case "create-session":
-			if target.Name != "" {
-				if err := control.ValidateSessionName(target.Name); err != nil {
-					operationErr = err
-					return
-				}
-				if d.sessionByName(target.Name) != nil {
-					operationErr = fmt.Errorf("session %q already exists", target.Name)
-					return
-				}
-			}
-			if d.nextID == 0 {
-				operationErr = errors.New("session ID exhausted")
-				return
-			}
-			s = newSession(d.nextID, target.Name)
-			s.daemon = d
-			s.startAutosave(d.snapshotDir)
-			port, encodedToken, expires, operationErr = s.startQUIC(d.serverCtx, d.tlsConfig)
-			if operationErr != nil {
-				_ = s.shutdown()
-				return
-			}
-			d.sessions[d.nextID] = s
-			d.reserveSessionName(s, target.Name)
-			d.nextID++
-			created = true
-		case "connect-session":
-			if target.Name != "" {
-				s = d.sessionByName(target.Name)
-			} else {
-				s = d.sessions[target.ID]
-			}
-			if s == nil {
-				operationErr = control.ErrSessionUnavailable
-			}
-		case "restore-session-prepare", "restore-session-skip", "restore-session-run":
-			if d.sessionByName(target.Name) != nil {
-				operationErr = fmt.Errorf("session %q already exists; attach to it instead", target.Name)
-				return
-			}
-			if d.nextID == 0 {
-				operationErr = errors.New("session ID exhausted")
-				return
-			}
-			s = newSession(d.nextID, restoreSnapshot.Name)
-			s.daemon = d
-			s.startAutosave(d.snapshotDir)
-			port, encodedToken, expires, operationErr = s.startQUIC(d.serverCtx, d.tlsConfig)
-			if operationErr == nil {
-				operationErr = s.restoreSnapshot(restoreSnapshot, restoreMode)
-			}
-			if operationErr != nil {
-				_ = s.shutdown()
-				return
-			}
-			d.sessions[d.nextID] = s
-			d.reserveSessionName(s, restoreSnapshot.Name)
-			d.nextID++
-			created = true
-		default:
-			operationErr = errors.New("unsupported control operation")
-		}
-	})
-	if operationErr != nil {
-		return control.Bootstrap{}, nil, 0, operationErr
-	}
-
-	if !created {
-		var err error
-		port, encodedToken, expires, err = s.issueBootstrap()
-		if err != nil {
-			return control.Bootstrap{}, nil, 0, err
-		}
-	}
-	return control.Bootstrap{Version: control.ProtocolVersion, SessionID: s.ID, Port: port, AttachToken: encodedToken, ExpiresAt: expires, CertSPKISHA256: d.certHash}, nil, 0, nil
 }
 
 // disconnectActiveClients uses the same clean QUIC close path as an explicit
@@ -357,11 +218,11 @@ func (d *Daemon) renameSession(state *Session, name string) error {
 }
 
 func (d *Daemon) validateSessionRename(state *Session, name string) error {
-	if err := control.ValidateSessionName(name); err != nil {
+	if err := validateSessionName(name); err != nil {
 		return err
 	}
 	if d.sessions[state.ID] != state {
-		return control.ErrSessionUnavailable
+		return errSessionUnavailable
 	}
 	if existing := d.sessionByName(name); existing != nil && existing != state {
 		return fmt.Errorf("session %q already exists", name)
