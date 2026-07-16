@@ -61,6 +61,15 @@ func TestServerRecognizesSwapPanePrefixes(t *testing.T) {
 	}
 }
 
+func TestServerRecognizesToggleZoomPrefix(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	s.ConsumeInputByte(0, 0x02)
+	if event := s.ConsumeInputByte(0, 'z'); event.Command != serverCommandToggleZoom {
+		t.Fatalf("toggle zoom event = %#v", event)
+	}
+}
+
 func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	s := NewSession(1)
 	s.NewClient(0)

@@ -416,8 +416,18 @@ type Window struct {
 	Name           string
 	AutomaticName  bool
 	ActivePaneID   uint64
+	Zoomed         bool
+	ZoomedPaneID   uint64
 	Layout         LayoutNode
 	LayoutRevision uint64
+}
+
+func (w *Window) clearZoom() {
+	if w == nil {
+		return
+	}
+	w.Zoomed = false
+	w.ZoomedPaneID = 0
 }
 
 type PromptKind uint8
@@ -479,7 +489,6 @@ type ClientState struct {
 	TerminalRows   uint16
 
 	RenderBindings    []RenderBinding
-	HistoryViews      map[uint64]*HistoryView
 	InputState        serverInputState
 	PrefixEscape      []byte
 	ResizeRepeatUntil time.Time
@@ -519,7 +528,7 @@ func (s *Session) nextLayoutRevisionLocked() uint64 {
 }
 
 func (s *Session) NewClient(id uint64) *ClientState {
-	client := &ClientState{ID: id, SessionID: s.ID, HistoryViews: map[uint64]*HistoryView{}}
+	client := &ClientState{ID: id, SessionID: s.ID}
 	s.Clients[id] = client
 	return client
 }
@@ -531,13 +540,10 @@ func (s *Session) EnsureClient(id uint64) *ClientState {
 
 func (s *Session) ensureClientLocked(id uint64) *ClientState {
 	if client := s.Clients[id]; client != nil {
-		if client.HistoryViews == nil {
-			client.HistoryViews = map[uint64]*HistoryView{}
-		}
 		s.ensureClientFocusLocked(client)
 		return client
 	}
-	client := &ClientState{ID: id, SessionID: s.ID, HistoryViews: map[uint64]*HistoryView{}}
+	client := &ClientState{ID: id, SessionID: s.ID}
 	s.ensureClientFocusLocked(client)
 	s.Clients[id] = client
 	return client
@@ -848,9 +854,41 @@ func (s *Session) FocusPane(clientID, paneID uint64) (*Window, *ClientState, err
 	if !windowHasPane(window, paneID) {
 		return nil, nil, fmt.Errorf("pane %d not visible in window %d", paneID, window.ID)
 	}
+	if window.Zoomed && window.ZoomedPaneID != paneID {
+		window.clearZoom()
+		window.LayoutRevision = s.nextLayoutRevisionLocked()
+		s.rebuildBindingsLocked(client, window)
+	}
 	window.ActivePaneID = paneID
 	client.setFocusedPane(paneID)
 	return cloneWindow(window), cloneClientState(client), nil
+}
+
+func (s *Session) ToggleZoom(clientID uint64) (*Window, *ClientState, bool, error) {
+	client := s.Clients[clientID]
+	if client == nil {
+		return nil, nil, false, fmt.Errorf("unknown client %d", clientID)
+	}
+	window := s.Windows[client.ActiveWindowID]
+	if window == nil {
+		return nil, nil, false, fmt.Errorf("unknown window %d", client.ActiveWindowID)
+	}
+	if len(window.Layout.PaneIDs()) <= 1 {
+		return cloneWindow(window), cloneClientState(client), false, nil
+	}
+	if window.Zoomed {
+		window.clearZoom()
+	} else {
+		if !windowHasPane(window, client.FocusedPaneID) {
+			return nil, nil, false, fmt.Errorf("focused pane %d not in window %d", client.FocusedPaneID, window.ID)
+		}
+		window.Zoomed = true
+		window.ZoomedPaneID = client.FocusedPaneID
+		window.ActivePaneID = client.FocusedPaneID
+	}
+	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	s.rebuildBindingsLocked(client, window)
+	return cloneWindow(window), cloneClientState(client), true, nil
 }
 
 func (s *Session) ResizeFocusedPane(clientID uint64, direction PaneResizeDirection, amount int) (*Window, *ClientState, bool, error) {
@@ -868,10 +906,13 @@ func (s *Session) ResizeFocusedPane(clientID uint64, direction PaneResizeDirecti
 	if amount <= 0 {
 		return nil, nil, false, fmt.Errorf("pane resize amount must be positive")
 	}
-	if !ResizePaneBoundary(window.Layout, client.FocusedPaneID, direction, amount, Rect{
+	unzoomed := window.Zoomed
+	window.clearZoom()
+	resized := ResizePaneBoundary(window.Layout, client.FocusedPaneID, direction, amount, Rect{
 		Width:  int(client.TerminalCols),
 		Height: int(client.TerminalRows),
-	}) {
+	})
+	if !resized && !unzoomed {
 		return cloneWindow(window), cloneClientState(client), false, nil
 	}
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
@@ -897,6 +938,7 @@ func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitD
 	if direction != SplitVertical && direction != SplitHorizontal {
 		return nil, nil, fmt.Errorf("invalid split direction %d", direction)
 	}
+	window.clearZoom()
 	updated, replaced := replacePaneWithSplit(window.Layout, client.FocusedPaneID, pane.ID, direction)
 	if !replaced {
 		return nil, nil, fmt.Errorf("focused pane %d not found in layout", client.FocusedPaneID)
@@ -922,6 +964,7 @@ func (s *Session) SwapFocusedPane(clientID uint64, direction PaneSwapDirection) 
 	if direction != SwapPanePrevious && direction != SwapPaneNext {
 		return nil, nil, false, fmt.Errorf("invalid pane swap direction %d", direction)
 	}
+	window.clearZoom()
 
 	s.rebuildBindingsLocked(client, window)
 	if len(client.RenderBindings) < 2 {
@@ -976,9 +1019,6 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 		return nil, nil, nil, false, 0, false, fmt.Errorf("unknown window %d", c.ActiveWindowID)
 	}
 	paneIDs := window.Layout.PaneIDs()
-	for _, client := range s.Clients {
-		delete(client.HistoryViews, c.FocusedPaneID)
-	}
 	if len(paneIDs) <= 1 {
 		closedPane = s.Panes[c.FocusedPaneID]
 		delete(s.Panes, c.FocusedPaneID)
@@ -997,6 +1037,9 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 		return closedPane, cloneWindow(nextWindow), cloneClientState(c), true, closedWindowID, false, nil
 	}
 	closedPane = s.Panes[c.FocusedPaneID]
+	if window.Zoomed && window.ZoomedPaneID == c.FocusedPaneID {
+		window.clearZoom()
+	}
 	updated, nextFocusedPaneID, removed := removePaneFromLayout(window.Layout, c.FocusedPaneID)
 	if !removed || updated == nil {
 		return nil, nil, nil, false, 0, false, fmt.Errorf("focused pane %d not found in layout", c.FocusedPaneID)
@@ -1027,16 +1070,19 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 	if owner == nil || s.Panes[paneID] == nil {
 		return nil, cloneClientState(c), false, false, nil
 	}
-	for _, state := range s.Clients {
-		delete(state.HistoryViews, paneID)
-	}
 	delete(s.Panes, paneID)
+	if owner.Zoomed && owner.ZoomedPaneID == paneID {
+		owner.clearZoom()
+	}
 	if len(owner.Layout.PaneIDs()) > 1 {
 		updated, nextFocusedPaneID, ok := removePaneFromLayout(owner.Layout, paneID)
 		if !ok || updated == nil {
 			return nil, nil, false, false, fmt.Errorf("pane %d not found in window %d layout", paneID, owner.ID)
 		}
 		owner.Layout = updated
+		if len(updated.PaneIDs()) <= 1 {
+			owner.clearZoom()
+		}
 		owner.LayoutRevision = s.nextLayoutRevisionLocked()
 		if owner.ActivePaneID == paneID {
 			owner.ActivePaneID = nextFocusedPaneID
@@ -1081,9 +1127,6 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	}
 	closedPanes = make([]*Pane, 0, len(paneIDs))
 	for _, paneID := range paneIDs {
-		for _, client := range s.Clients {
-			delete(client.HistoryViews, paneID)
-		}
 		if p := s.Panes[paneID]; p != nil {
 			closedPanes = append(closedPanes, p)
 		}
@@ -1110,6 +1153,7 @@ type WindowStatus struct {
 	Index    int
 	Title    string
 	Active   bool
+	Zoomed   bool
 }
 
 func (s *Session) WindowStatuses(clientID uint64) []WindowStatus {
@@ -1125,6 +1169,7 @@ func (s *Session) WindowStatuses(clientID uint64) []WindowStatus {
 			Index:    window.DisplayIndex,
 			Title:    window.Name,
 			Active:   window.ID == active,
+			Zoomed:   window.Zoomed,
 		})
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Index < list[j].Index })
@@ -1141,7 +1186,7 @@ func (s *Session) WindowLayout(clientID uint64) (protocol.WindowLayout, error) {
 		return protocol.WindowLayout{}, fmt.Errorf("unknown window %d", client.ActiveWindowID)
 	}
 	rect := Rect{Width: int(client.TerminalCols), Height: int(client.TerminalRows)}
-	placements := window.Layout.Compute(rect)
+	placements := visibleWindowPlacements(window, rect)
 	out := make([]protocol.PanePlacement, 0, len(placements))
 	for _, placement := range placements {
 		slot := uint8(0)
@@ -1179,7 +1224,7 @@ func (s *Session) VisiblePlacements(clientID uint64) ([]PanePlacement, *Window, 
 	if window == nil {
 		return nil, nil, nil, fmt.Errorf("unknown window %d", client.ActiveWindowID)
 	}
-	placements := clonePlacements(window.Layout.Compute(Rect{Width: int(client.TerminalCols), Height: int(client.TerminalRows)}))
+	placements := clonePlacements(visibleWindowPlacements(window, Rect{Width: int(client.TerminalCols), Height: int(client.TerminalRows)}))
 	return placements, cloneWindow(window), cloneClientState(client), nil
 }
 
@@ -1219,7 +1264,7 @@ func (s *Session) RebuildRenderBindings(clientID uint64) ([]RenderBinding, *Wind
 }
 
 func (s *Session) rebuildBindingsLocked(client *ClientState, window *Window) {
-	placements := window.Layout.Compute(Rect{Width: int(client.TerminalCols), Height: int(client.TerminalRows)})
+	placements := visibleWindowPlacements(window, Rect{Width: int(client.TerminalCols), Height: int(client.TerminalRows)})
 	sort.Slice(placements, func(i, j int) bool {
 		if placements[i].Rect.Y != placements[j].Rect.Y {
 			return placements[i].Rect.Y < placements[j].Rect.Y
@@ -1274,12 +1319,17 @@ func (s *Session) ResizeAll(cols, rows uint16) {
 	for _, window := range s.Windows {
 		window.LayoutRevision = s.nextLayoutRevisionLocked()
 		placements := window.Layout.Compute(Rect{Width: int(cols), Height: int(rows)})
+		byPane := make(map[uint64]Rect, len(placements))
 		for _, placement := range placements {
-			pane := s.Panes[placement.PaneID]
-			if pane == nil {
-				continue
+			byPane[placement.PaneID] = placement.Rect
+		}
+		if window.Zoomed && windowHasPane(window, window.ZoomedPaneID) {
+			byPane[window.ZoomedPaneID] = Rect{Width: int(cols), Height: int(rows)}
+		}
+		for paneID, rect := range byPane {
+			if pane := s.Panes[paneID]; pane != nil {
+				targets = append(targets, resizeTarget{pane: pane, rect: rect})
 			}
-			targets = append(targets, resizeTarget{pane: pane, rect: placement.Rect})
 		}
 	}
 	for _, target := range targets {
@@ -1438,9 +1488,21 @@ func cloneWindow(window *Window) *Window {
 		Name:           window.Name,
 		AutomaticName:  window.AutomaticName,
 		ActivePaneID:   window.ActivePaneID,
+		Zoomed:         window.Zoomed,
+		ZoomedPaneID:   window.ZoomedPaneID,
 		Layout:         window.Layout,
 		LayoutRevision: window.LayoutRevision,
 	}
+}
+
+func visibleWindowPlacements(window *Window, rect Rect) []PanePlacement {
+	if window == nil || window.Layout == nil {
+		return nil
+	}
+	if window.Zoomed && windowHasPane(window, window.ZoomedPaneID) {
+		return []PanePlacement{{PaneID: window.ZoomedPaneID, Rect: rect}}
+	}
+	return window.Layout.Compute(rect)
 }
 
 const processNameRefreshInterval = time.Second

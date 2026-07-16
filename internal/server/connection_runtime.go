@@ -169,14 +169,8 @@ func serveConnection(ctx context.Context, d *Daemon, listenerSession *Session, c
 			if err := sendEncoded(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: initialPane.ID}, protocol.EncodePaneCreated); err != nil {
 				return err
 			}
-			if err := handler.Session.publishStatusBar(); err != nil {
-				return err
-			}
-			if err := handler.Session.publishWindowLayout(); err != nil {
-				return err
-			}
 			s.startPane(initialPane)
-			return handler.Session.publishBindingsAndSnapshots(nil)
+			return handler.Session.rebindOutputsAndPublishLayout(nil)
 		}
 
 		handoff := handler.Session.beginOutputHandoff()
@@ -188,13 +182,7 @@ func serveConnection(ctx context.Context, d *Daemon, listenerSession *Session, c
 		if err := sendEncoded(mgmtFrames, protocol.MsgPaneCreated, protocol.PaneCreated{PaneID: pane.ID}, protocol.EncodePaneCreated); err != nil {
 			return err
 		}
-		if err := handler.Session.publishStatusBar(); err != nil {
-			return err
-		}
-		if err := handler.Session.publishWindowLayout(); err != nil {
-			return err
-		}
-		return handler.Session.publishBindingsAndSnapshots(handoff)
+		return handler.Session.rebindOutputsAndPublishLayout(handoff)
 	}); err != nil {
 		return err
 	}

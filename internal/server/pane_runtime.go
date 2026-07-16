@@ -47,19 +47,13 @@ func (l *paneOutputRateLimiter) reserve(now time.Time, bytes int) time.Duration 
 	return time.Duration(-l.tokens / paneOutputBytesPerSecond * float64(time.Second))
 }
 
-func (p *Pane) attachOutput(lease *OutputLease, refresh func(*renderOutput) error) error {
-	return p.attachOutputMode(lease, true, refresh)
-}
-
-func (p *Pane) attachOutputMode(lease *OutputLease, live bool, refresh func(*renderOutput) error) error {
+func (p *Pane) attachOutputStream(lease *OutputLease, layoutRevision uint64) error {
+	attachment := &paneOutputAttach{Lease: lease, LayoutRevision: layoutRevision}
 	if p.commands == nil {
-		if refresh == nil {
-			return nil
-		}
-		return refresh(newRenderOutput(lease.Stream))
+		return p.renderAttachedView(newRenderOutput(lease.Stream), layoutRevision)
 	}
 	select {
-	case p.commands <- paneCommand{attach: lease, live: live, refresh: refresh}:
+	case p.commands <- paneCommand{attach: attachment}:
 		return nil
 	case <-p.mainDone:
 		return nil
@@ -68,14 +62,51 @@ func (p *Pane) attachOutputMode(lease *OutputLease, live bool, refresh func(*ren
 	}
 }
 
-func (p *Pane) detachOutput(stream io.Writer) error {
+func (p *Pane) renderAttachedView(output *renderOutput, layoutRevision uint64) error {
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: layoutRevision}); err != nil {
+		return err
+	}
+	if err := installStyle(output, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {
+		return err
+	}
+	switch p.currentViewMode() {
+	case paneViewLive:
+		return sendFullRender(output, p)
+	case paneViewHistory:
+		return p.renderHistorySnapshot(output)
+	default:
+		return fmt.Errorf("pane %d has invalid view mode %d", p.ID, p.currentViewMode())
+	}
+}
+
+// attachOutputWithRefresh is the low-level renderer hook used by pane tests.
+// Session layout code attaches through attachOutputStream instead.
+func (p *Pane) attachOutputWithRefresh(lease *OutputLease, refresh func(*renderOutput) error) error {
+	attachment := &paneOutputAttach{Lease: lease, Refresh: refresh}
+	if p.commands == nil {
+		if refresh == nil {
+			return nil
+		}
+		return refresh(newRenderOutput(lease.Stream))
+	}
+	select {
+	case p.commands <- paneCommand{attach: attachment}:
+		return nil
+	case <-p.mainDone:
+		return nil
+	case <-p.done:
+		return nil
+	}
+}
+
+func (p *Pane) detachOutputStream(stream io.Writer) error {
 	if p.commands == nil {
 		return nil
 	}
 	return p.sendRenderCommand(paneCommand{detach: stream})
 }
 
-func (p *Pane) releaseOutput(done chan<- *OutputLease) {
+func (p *Pane) releaseOutputStream(done chan<- *OutputLease) {
 	if p.commands == nil {
 		done <- p.outputLease
 		p.outputLease = nil
@@ -184,7 +215,6 @@ func runPTYWriter(pane *Pane, failed func(error)) {
 func (pane *Pane) run() {
 	defer close(pane.mainDone)
 	var output *renderOutput
-	liveOutput := false
 	var aggregate Update
 	var idle, maxAge *time.Timer
 	var idleC, maxC <-chan time.Time
@@ -243,7 +273,7 @@ func (pane *Pane) run() {
 		disarm(idle, &idleC)
 		disarm(maxAge, &maxC)
 		pending = false
-		if output != nil && liveOutput {
+		if output != nil && pane.currentViewMode() == paneViewLive {
 			if err := emitTerminalUpdate(output, pane, aggregate); err != nil {
 				output = nil
 				pane.outputLease = nil
@@ -262,7 +292,6 @@ func (pane *Pane) run() {
 				lease := pane.outputLease
 				pane.outputLease = nil
 				output = nil
-				liveOutput = false
 				command.release.returnLease(lease)
 				continue
 			}
@@ -270,22 +299,32 @@ func (pane *Pane) run() {
 				if pane.outputLease != nil && pane.outputLease.Stream == command.detach {
 					pane.outputLease = nil
 					output = nil
-					liveOutput = false
 				}
 				command.done <- nil
 				continue
 			}
 			if command.attach != nil {
-				pane.outputLease = command.attach
-				output = newRenderOutput(command.attach.Stream)
-				liveOutput = command.live
-				if command.refresh != nil {
-					if err := command.refresh(output); err != nil {
-						pane.outputLease = nil
-						output = nil
-						liveOutput = false
-					}
+				pane.outputLease = command.attach.Lease
+				output = newRenderOutput(command.attach.Lease.Stream)
+				var err error
+				if command.attach.Refresh != nil {
+					err = command.attach.Refresh(output)
+				} else {
+					err = pane.renderAttachedView(output, command.attach.LayoutRevision)
 				}
+				if err != nil {
+					pane.outputLease = nil
+					output = nil
+				}
+				continue
+			}
+			if command.history != nil {
+				result := pane.handleHistoryRequest(output, command.history)
+				if result.Err != nil {
+					pane.outputLease = nil
+					output = nil
+				}
+				command.history.Result <- result
 				continue
 			}
 			if command.apply != nil && output != nil {
@@ -293,7 +332,6 @@ func (pane *Pane) run() {
 				if err != nil {
 					pane.outputLease = nil
 					output = nil
-					liveOutput = false
 				}
 				command.done <- err
 			} else if command.resize != nil {
@@ -304,9 +342,6 @@ func (pane *Pane) run() {
 				pane.terminal.Resize(int(command.resize.cols), int(command.resize.rows))
 				pane.publishTerminalMetadata()
 				command.done <- err
-			} else if command.history != nil {
-				command.history <- captureTerminalHistorySnapshot(pane.terminal)
-				command.done <- nil
 			} else {
 				command.done <- nil
 			}
@@ -315,7 +350,7 @@ func (pane *Pane) run() {
 				flush()
 				return
 			}
-			trackDamage := output != nil && liveOutput
+			trackDamage := output != nil && pane.currentViewMode() == paneViewLive
 			if !pending {
 				aggregate.ResetFor(pane.terminal.Rows, trackDamage)
 			}
@@ -361,28 +396,22 @@ func (pane *Pane) run() {
 	}
 }
 
-func (s *Session) emitHistoryMove(pane *Pane, move historyMove) error {
-	view := s.HistoryView(clientID0, pane.ID)
-	if view == nil {
-		return nil
-	}
-	return pane.applyRender(func(output *renderOutput) error {
-		if move.Delta != 0 {
-			if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: move.Delta}); err != nil {
-				return err
-			}
-		}
-		compiler := newDisplayCompiler(output, styleDefinitionsMap(view.Snapshot.Styles))
-		for _, run := range historyMoveRuns(view, move) {
-			if err := compiler.writeCells(run.Row, run.Column, run.Cells); err != nil {
-				return err
-			}
-		}
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: move.Cursor, Visible: true}}); err != nil {
+func renderHistoryMove(output *renderOutput, view *paneHistoryView, move historyMove) error {
+	if move.Delta != 0 {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: move.Delta}); err != nil {
 			return err
 		}
-		return output.present()
-	})
+	}
+	compiler := newDisplayCompiler(output, styleDefinitionsMap(view.Snapshot.Styles))
+	for _, run := range historyMoveRuns(view, move) {
+		if err := compiler.writeCells(run.Row, run.Column, run.Cells); err != nil {
+			return err
+		}
+	}
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: move.Cursor, Visible: true}}); err != nil {
+		return err
+	}
+	return output.present()
 }
 
 type displayCellRun struct {
@@ -390,7 +419,7 @@ type displayCellRun struct {
 	Cells       []protocol.Cell
 }
 
-func historyMoveRuns(view *HistoryView, move historyMove) []displayCellRun {
+func historyMoveRuns(view *paneHistoryView, move historyMove) []displayCellRun {
 	if move.Delta == 0 {
 		return nil
 	}
@@ -412,7 +441,7 @@ func historyMoveRuns(view *HistoryView, move historyMove) []displayCellRun {
 	return runs
 }
 
-func historyCounterRun(view *HistoryView, viewportRow int, oldLabel, newLabel string) displayCellRun {
+func historyCounterRun(view *paneHistoryView, viewportRow int, oldLabel, newLabel string) displayCellRun {
 	snapshot := view.Snapshot
 	width := max(len(oldLabel), len(newLabel))
 	start := max(0, snapshot.Cols-width)
@@ -478,14 +507,7 @@ func sendFullRender(output *renderOutput, pane *Pane) error {
 	return output.present()
 }
 
-func sendCurrentViewSnapshot(output *renderOutput, pane *Pane, view *HistoryView) error {
-	if view != nil {
-		return sendHistorySnapshot(output, pane, view)
-	}
-	return sendFullRender(output, pane)
-}
-
-func sendHistorySnapshot(output *renderOutput, pane *Pane, view *HistoryView) error {
+func sendHistorySnapshot(output *renderOutput, pane *Pane, view *paneHistoryView) error {
 	snapshot := view.Snapshot
 	for _, def := range snapshot.Styles {
 		if err := installStyle(output, def.ID, def.Style); err != nil {
@@ -504,12 +526,6 @@ func sendHistorySnapshot(output *renderOutput, pane *Pane, view *HistoryView) er
 		return err
 	}
 	return output.present()
-}
-
-func (s *Session) sendHistorySnapshotSerialized(pane *Pane, view *HistoryView) error {
-	return pane.applyRender(func(output *renderOutput) error {
-		return sendHistorySnapshot(output, pane, view)
-	})
 }
 
 func installStyle(output *renderOutput, id uint32, style protocol.Style) error {

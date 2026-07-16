@@ -150,11 +150,17 @@ func (s *Session) publishStatusBar() error {
 			text = fmt.Sprintf("[%d] ", s.ID)
 		}
 		for _, window := range list {
-			marker := ' '
+			flags := ""
 			if window.Active {
-				marker = '*'
+				flags += "*"
 			}
-			text += fmt.Sprintf("%d:%s%c ", window.Index, window.Title, marker)
+			if window.Zoomed {
+				flags += "Z"
+			}
+			if flags == "" {
+				flags = " "
+			}
+			text += fmt.Sprintf("%d:%s%s ", window.Index, window.Title, flags)
 		}
 	}
 	return s.sendStatusCommand(statusCommand{model: &statusModel{width: width, text: text, styleID: styleID}})
@@ -198,17 +204,23 @@ func (s *Session) beginOutputHandoff() *outputHandoff {
 			continue
 		}
 		handoff.pending[binding.Slot] = struct{}{}
-		pane.releaseOutput(handoff.released)
+		pane.releaseOutputStream(handoff.released)
 	}
 	return handoff
 }
 
-func (s *Session) publishBindingsAndSnapshots(handoff *outputHandoff) error {
+func (s *Session) rebindOutputsAndPublishLayout(handoff *outputHandoff) error {
 	bindings, _, _, err := s.RebuildRenderBindings(clientID0)
 	if err != nil {
 		return err
 	}
-	return s.finishOutputHandoff(handoff, bindings)
+	if err := s.finishOutputHandoff(handoff, bindings); err != nil {
+		return err
+	}
+	if err := s.publishStatusBar(); err != nil {
+		return err
+	}
+	return s.publishWindowLayout()
 }
 
 func (s *Session) finishOutputHandoff(handoff *outputHandoff, bindings []RenderBinding) error {
@@ -271,16 +283,7 @@ func (s *Session) attachBinding(binding RenderBinding) error {
 	if lease == nil {
 		return nil
 	}
-	view := s.HistoryView(clientID0, pane.ID)
-	return pane.attachOutputMode(lease, view == nil, func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: window.LayoutRevision}); err != nil {
-			return err
-		}
-		if err := installStyle(output, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {
-			return err
-		}
-		return sendCurrentViewSnapshot(output, pane, view)
-	})
+	return pane.attachOutputStream(lease, window.LayoutRevision)
 }
 
 func (s *Session) publishVisibleSnapshots(handoff *outputHandoff) error {
@@ -291,7 +294,7 @@ func (s *Session) publishVisibleSnapshots(handoff *outputHandoff) error {
 func (s *Session) detachLeases(leases map[int]*OutputLease) error {
 	for _, pane := range s.PanesSnapshot() {
 		for _, lease := range leases {
-			if err := pane.detachOutput(lease.Stream); err != nil {
+			if err := pane.detachOutputStream(lease.Stream); err != nil {
 				return err
 			}
 		}

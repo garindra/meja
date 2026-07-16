@@ -40,6 +40,7 @@ const (
 	serverCommandSelectIndex
 	serverCommandFocusDirection
 	serverCommandResizePane
+	serverCommandToggleZoom
 	serverCommandBeginWindowPrompt
 	serverCommandBeginSessionPrompt
 	serverCommandPrompt
@@ -102,6 +103,8 @@ func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) server
 			return serverInputEvent{Command: serverCommandLastWindow}
 		case 'x':
 			return serverInputEvent{Command: serverCommandClosePane}
+		case 'z':
+			return serverInputEvent{Command: serverCommandToggleZoom}
 		case '[':
 			return serverInputEvent{Command: serverCommandEnterHistory}
 		case '{':
@@ -522,6 +525,11 @@ func (s *Session) FocusPaneDirection(clientID uint64, direction byte) (*Window, 
 	window := s.Windows[client.ActiveWindowID]
 	if window == nil {
 		return nil, nil, fmt.Errorf("unknown window %d", client.ActiveWindowID)
+	}
+	if window.Zoomed {
+		window.clearZoom()
+		window.LayoutRevision = s.nextLayoutRevisionLocked()
+		s.rebuildBindingsLocked(client, window)
 	}
 	placements := window.Layout.Compute(Rect{Width: int(client.TerminalCols), Height: int(client.TerminalRows)})
 	var current *PanePlacement

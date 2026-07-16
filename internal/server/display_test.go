@@ -122,7 +122,7 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 	state := session
 	handler := &Connection{Session: state}
 	state.attachConnection(testConnection(nil, map[int]*OutputLease{0: testOutputLease(0, &wire)}))
-	if err := handler.Session.publishBindingsAndSnapshots(nil); err != nil {
+	if err := handler.Session.rebindOutputsAndPublishLayout(nil); err != nil {
 		t.Fatal(err)
 	}
 	commands := decodePendingCommands(t, wire.Bytes())
@@ -139,7 +139,7 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 
 	var first, second bytes.Buffer
 	firstLease := testOutputLease(0, &first)
-	if err := pane.attachOutput(firstLease, func(output *renderOutput) error {
+	if err := pane.attachOutputWithRefresh(firstLease, func(output *renderOutput) error {
 		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1}); err != nil {
 			return err
 		}
@@ -155,7 +155,7 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 		t.Fatal("first attached stream received no refresh")
 	}
 	released := make(chan *OutputLease, 1)
-	pane.releaseOutput(released)
+	pane.releaseOutputStream(released)
 	if got := <-released; got != firstLease {
 		t.Fatal("pane returned a different output lease")
 	}
@@ -172,7 +172,7 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 		t.Fatal("detached stream received output")
 	}
 
-	if err := pane.attachOutput(testOutputLease(0, &second), func(output *renderOutput) error {
+	if err := pane.attachOutputWithRefresh(testOutputLease(0, &second), func(output *renderOutput) error {
 		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 2}); err != nil {
 			return err
 		}
@@ -193,13 +193,13 @@ func TestOldStreamCleanupDoesNotDetachReplacement(t *testing.T) {
 	defer close(output)
 
 	var oldStream, replacement bytes.Buffer
-	if err := pane.attachOutput(testOutputLease(0, &oldStream), nil); err != nil {
+	if err := pane.attachOutputWithRefresh(testOutputLease(0, &oldStream), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := pane.attachOutput(testOutputLease(0, &replacement), nil); err != nil {
+	if err := pane.attachOutputWithRefresh(testOutputLease(0, &replacement), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := pane.detachOutput(&oldStream); err != nil {
+	if err := pane.detachOutputStream(&oldStream); err != nil {
 		t.Fatal(err)
 	}
 	if err := pane.applyRender(func(output *renderOutput) error {
@@ -222,7 +222,7 @@ func TestPaneRendererCanAttachReplacementAfterWriteFailure(t *testing.T) {
 	defer close(output)
 
 	writeErr := errors.New("stream closed")
-	if err := pane.attachOutput(testOutputLease(0, errorWriter{err: writeErr}), func(output *renderOutput) error {
+	if err := pane.attachOutputWithRefresh(testOutputLease(0, errorWriter{err: writeErr}), func(output *renderOutput) error {
 		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
 			return err
 		}
@@ -233,7 +233,7 @@ func TestPaneRendererCanAttachReplacementAfterWriteFailure(t *testing.T) {
 	syncPaneRenderer(t, pane)
 
 	var replacement bytes.Buffer
-	if err := pane.attachOutput(testOutputLease(0, &replacement), func(output *renderOutput) error {
+	if err := pane.attachOutputWithRefresh(testOutputLease(0, &replacement), func(output *renderOutput) error {
 		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
 			return err
 		}
@@ -327,6 +327,48 @@ func TestOutputHandoffAttachesReplacementAfterNilRelease(t *testing.T) {
 	}
 }
 
+func TestBindingPublicationWaitsForHandoffCompletion(t *testing.T) {
+	session := NewSession(0)
+	client := session.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 8, 3
+	pane := &Pane{ID: session.AddPaneID(), terminal: newTerminal(8, 3)}
+	session.CreateWindow(pane, 0)
+	frames := make(chan protocol.Frame, 1)
+	var paneWire bytes.Buffer
+	session.attachConnection(testConnection(frames, map[int]*OutputLease{0: testOutputLease(0, &paneWire)}))
+	handoff := &outputHandoff{
+		released: make(chan *OutputLease, 1),
+		pending:  map[int]struct{}{0: {}},
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- session.rebindOutputsAndPublishLayout(handoff)
+	}()
+	select {
+	case frame := <-frames:
+		t.Fatalf("layout frame %d published before lease release", frame.Type)
+	default:
+	}
+
+	handoff.released <- testOutputLease(0, &paneWire)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("binding publication did not finish after lease release")
+	}
+	select {
+	case frame := <-frames:
+		if frame.Type != protocol.MsgWindowLayout {
+			t.Fatalf("published frame type = %d, want WINDOW_LAYOUT", frame.Type)
+		}
+	default:
+		t.Fatal("layout was not published after binding completion")
+	}
+}
+
 func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 	session := NewSession(0)
 	client := session.NewClient(0)
@@ -344,7 +386,7 @@ func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 	}
 	var slot0, slot1 bytes.Buffer
 	handler.Session.attachConnection(testConnection(nil, map[int]*OutputLease{0: testOutputLease(0, &slot0), 1: testOutputLease(1, &slot1)}))
-	if err := handler.Session.publishBindingsAndSnapshots(nil); err != nil {
+	if err := handler.Session.rebindOutputsAndPublishLayout(nil); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, first)
@@ -354,7 +396,7 @@ func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 	third, thirdUpdates := startTestPaneRenderer(handler, session.AddPaneID(), 16, 4)
 	defer close(thirdUpdates)
 	session.CreateWindow(third, 0)
-	if err := handler.Session.publishBindingsAndSnapshots(handoff); err != nil {
+	if err := handler.Session.rebindOutputsAndPublishLayout(handoff); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, third)
@@ -363,7 +405,7 @@ func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 	if _, _, err := session.SelectWindow(0, firstWindow.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := handler.Session.publishBindingsAndSnapshots(handoff); err != nil {
+	if err := handler.Session.rebindOutputsAndPublishLayout(handoff); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, first)
@@ -404,9 +446,10 @@ func TestSwapPaneCommandMovesLiveOutputsToRevisedSlots(t *testing.T) {
 		0: testOutputLease(0, &slot0),
 		1: testOutputLease(1, &slot1),
 	}))
-	if err := session.publishBindingsAndSnapshots(nil); err != nil {
+	if err := session.rebindOutputsAndPublishLayout(nil); err != nil {
 		t.Fatal(err)
 	}
+	<-frames // Initial layout is now published after the initial binding succeeds.
 	syncPaneRenderer(t, first)
 	syncPaneRenderer(t, second)
 
@@ -436,6 +479,76 @@ func TestSwapPaneCommandMovesLiveOutputsToRevisedSlots(t *testing.T) {
 	}
 }
 
+func TestZoomCommandRebindsOnlyFocusedPaneAndRestoresSplit(t *testing.T) {
+	session := NewSession(0)
+	client := session.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 16, 4
+	handler := &Connection{Session: session}
+
+	first, firstUpdates := startTestPaneRenderer(handler, session.AddPaneID(), 8, 4)
+	second, secondUpdates := startTestPaneRenderer(handler, session.AddPaneID(), 8, 4)
+	defer close(firstUpdates)
+	defer close(secondUpdates)
+	session.CreateWindow(first, 0)
+	if _, _, err := session.SplitFocusedPane(0, second, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := session.FocusPane(0, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	frames := make(chan protocol.Frame, 2)
+	var slot0, slot1 bytes.Buffer
+	session.attachConnection(testConnection(frames, map[int]*OutputLease{
+		0: testOutputLease(0, &slot0),
+		1: testOutputLease(1, &slot1),
+	}))
+	if err := session.rebindOutputsAndPublishLayout(nil); err != nil {
+		t.Fatal(err)
+	}
+	<-frames // Initial layout is now published after the initial binding succeeds.
+	syncPaneRenderer(t, first)
+	syncPaneRenderer(t, second)
+
+	if err := session.commandToggleZoom(); err != nil {
+		t.Fatal(err)
+	}
+	syncPaneRenderer(t, first)
+	syncPaneRenderer(t, second)
+	bindings, state := session.RenderBindings(0)
+	if len(bindings) != 1 || bindings[0].PaneID != first.ID || bindings[0].Slot != 0 || state.FocusedPaneID != first.ID {
+		t.Fatalf("zoomed bindings=%#v state=%#v", bindings, state)
+	}
+	if first.outputLease == nil || first.outputLease.Slot != 0 || second.outputLease != nil {
+		t.Fatalf("zoomed leases: first=%#v second=%#v", first.outputLease, second.outputLease)
+	}
+	frame := <-frames
+	layout, err := protocol.DecodeWindowLayout(frame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layout.Panes) != 1 || layout.Panes[0].PaneID != first.ID || layout.Panes[0].Rect != (protocol.Rect{Width: 16, Height: 4}) {
+		t.Fatalf("zoomed layout = %#v", layout)
+	}
+
+	if err := session.commandToggleZoom(); err != nil {
+		t.Fatal(err)
+	}
+	syncPaneRenderer(t, first)
+	syncPaneRenderer(t, second)
+	bindings, _ = session.RenderBindings(0)
+	if len(bindings) != 2 || first.outputLease == nil || first.outputLease.Slot != 0 || second.outputLease == nil || second.outputLease.Slot != 1 {
+		t.Fatalf("unzoomed bindings=%#v leases: first=%#v second=%#v", bindings, first.outputLease, second.outputLease)
+	}
+	frame = <-frames
+	layout, err = protocol.DecodeWindowLayout(frame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layout.Panes) != 2 || layout.Panes[0].Rect.Width != 7 || layout.Panes[1].Rect.Width != 8 {
+		t.Fatalf("unzoomed layout = %#v", layout)
+	}
+}
+
 func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *testing.T) {
 	session := NewSession(0)
 	client := session.NewClient(0)
@@ -453,7 +566,7 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 	}
 	var slot0, slot1 bytes.Buffer
 	handler.Session.attachConnection(testConnection(nil, map[int]*OutputLease{0: testOutputLease(0, &slot0), 1: testOutputLease(1, &slot1)}))
-	if err := handler.Session.publishBindingsAndSnapshots(nil); err != nil {
+	if err := handler.Session.rebindOutputsAndPublishLayout(nil); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, first)
@@ -523,7 +636,7 @@ func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
 	stream := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
 	attached := make(chan error, 1)
 	go func() {
-		attached <- pane.attachOutput(testOutputLease(0, stream), func(output *renderOutput) error {
+		attached <- pane.attachOutputWithRefresh(testOutputLease(0, stream), func(output *renderOutput) error {
 			if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
 				return err
 			}
@@ -553,7 +666,7 @@ func TestPaneReleaseAcknowledgesRendererExit(t *testing.T) {
 		handler := &Connection{Session: NewSession(0)}
 		output := startTestPaneLoop(handler.Session, pane)
 		released := make(chan *OutputLease, 1)
-		pane.releaseOutput(released)
+		pane.releaseOutputStream(released)
 		close(output)
 		select {
 		case lease := <-released:

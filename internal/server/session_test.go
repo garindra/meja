@@ -241,6 +241,216 @@ func TestResizePaneCommandRelayoutsPaneTerminals(t *testing.T) {
 	}
 }
 
+func TestToggleZoomProjectsFocusedPaneWithoutChangingLayout(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 24
+	left := &Pane{ID: s.AddPaneID()}
+	s.CreateWindow(left, 0)
+	right := &Pane{ID: s.AddPaneID()}
+	if _, _, err := s.SplitFocusedPane(0, right, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.FocusPane(0, left.ID); err != nil {
+		t.Fatal(err)
+	}
+	root := s.Windows[client.ActiveWindowID].Layout.(*SplitLayout)
+	ratio := root.Ratio
+	window, state, changed, err := s.ToggleZoom(0)
+	if err != nil || !changed {
+		t.Fatalf("ToggleZoom() changed=%v err=%v", changed, err)
+	}
+	if !window.Zoomed || window.ZoomedPaneID != left.ID || root.Ratio != ratio {
+		t.Fatalf("zoom changed underlying layout: window=%#v ratio=%d want=%d", window, root.Ratio, ratio)
+	}
+	if len(state.RenderBindings) != 1 || state.RenderBindings[0].PaneID != left.ID || state.RenderBindings[0].Slot != 0 {
+		t.Fatalf("zoomed bindings = %#v", state.RenderBindings)
+	}
+	layout, err := s.WindowLayout(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layout.Panes) != 1 || layout.Panes[0].PaneID != left.ID || layout.Panes[0].Rect != (protocol.Rect{Width: 80, Height: 24}) {
+		t.Fatalf("zoomed protocol layout = %#v", layout)
+	}
+
+	window, state, changed, err = s.ToggleZoom(0)
+	if err != nil || !changed || window.Zoomed {
+		t.Fatalf("unzoom changed=%v window=%#v err=%v", changed, window, err)
+	}
+	if len(state.RenderBindings) != 2 || root.Ratio != ratio {
+		t.Fatalf("unzoomed bindings=%#v ratio=%d want=%d", state.RenderBindings, root.Ratio, ratio)
+	}
+}
+
+func TestToggleZoomSinglePaneIsNoOp(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 24
+	s.CreateWindow(&Pane{ID: s.AddPaneID()}, 0)
+	window, _, changed, err := s.ToggleZoom(0)
+	if err != nil || changed || window.Zoomed {
+		t.Fatalf("single pane ToggleZoom() changed=%v window=%#v err=%v", changed, window, err)
+	}
+}
+
+func TestZoomCommandResizesOnlyVisiblePaneToFullWindow(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 24
+	left := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
+	s.CreateWindow(left, 0)
+	right := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
+	if _, _, err := s.SplitFocusedPane(0, right, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.FocusPane(0, left.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.ResizeAll(80, 24)
+	if err := s.commandToggleZoom(); err != nil {
+		t.Fatal(err)
+	}
+	leftCols, leftRows := left.TerminalSize()
+	rightCols, rightRows := right.TerminalSize()
+	if leftCols != 80 || leftRows != 24 || rightCols != 40 || rightRows != 24 {
+		t.Fatalf("zoomed sizes: left=%dx%d right=%dx%d", leftCols, leftRows, rightCols, rightRows)
+	}
+	s.ResizeAll(100, 30)
+	leftCols, leftRows = left.TerminalSize()
+	rightCols, rightRows = right.TerminalSize()
+	if leftCols != 100 || leftRows != 30 || rightCols != 50 || rightRows != 30 {
+		t.Fatalf("resized zoomed sizes: left=%dx%d right=%dx%d", leftCols, leftRows, rightCols, rightRows)
+	}
+	if err := s.commandToggleZoom(); err != nil {
+		t.Fatal(err)
+	}
+	leftCols, leftRows = left.TerminalSize()
+	rightCols, rightRows = right.TerminalSize()
+	if leftCols != 49 || leftRows != 30 || rightCols != 50 || rightRows != 30 {
+		t.Fatalf("unzoomed sizes: left=%dx%d right=%dx%d", leftCols, leftRows, rightCols, rightRows)
+	}
+}
+
+func TestLayoutOperationsUnzoomWindow(t *testing.T) {
+	t.Run("focus direction", func(t *testing.T) {
+		s, left, right := newZoomTestSession(t)
+		if _, _, err := s.FocusPane(0, left.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := s.ToggleZoom(0); err != nil {
+			t.Fatal(err)
+		}
+		window, state, err := s.FocusPaneDirection(0, 'C')
+		if err != nil || window.Zoomed || state.FocusedPaneID != right.ID || len(state.RenderBindings) != 2 {
+			t.Fatalf("focus after zoom: window=%#v state=%#v err=%v", window, state, err)
+		}
+	})
+	t.Run("resize", func(t *testing.T) {
+		s, left, _ := newZoomTestSession(t)
+		if _, _, err := s.FocusPane(0, left.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := s.ToggleZoom(0); err != nil {
+			t.Fatal(err)
+		}
+		window, state, changed, err := s.ResizeFocusedPane(0, ResizePaneRight, 1)
+		if err != nil || !changed || window.Zoomed || len(state.RenderBindings) != 2 {
+			t.Fatalf("resize after zoom: changed=%v window=%#v state=%#v err=%v", changed, window, state, err)
+		}
+	})
+	t.Run("swap", func(t *testing.T) {
+		s, _, _ := newZoomTestSession(t)
+		if _, _, _, err := s.ToggleZoom(0); err != nil {
+			t.Fatal(err)
+		}
+		window, state, changed, err := s.SwapFocusedPane(0, SwapPanePrevious)
+		if err != nil || !changed || window.Zoomed || len(state.RenderBindings) != 2 {
+			t.Fatalf("swap after zoom: changed=%v window=%#v state=%#v err=%v", changed, window, state, err)
+		}
+	})
+	t.Run("split", func(t *testing.T) {
+		s, _, _ := newZoomTestSession(t)
+		if _, _, _, err := s.ToggleZoom(0); err != nil {
+			t.Fatal(err)
+		}
+		window, state, err := s.SplitFocusedPane(0, &Pane{ID: s.AddPaneID()}, SplitHorizontal)
+		if err != nil || window.Zoomed || len(state.RenderBindings) != 3 {
+			t.Fatalf("split after zoom: window=%#v state=%#v err=%v", window, state, err)
+		}
+	})
+}
+
+func TestZoomStateSurvivesWindowSwitch(t *testing.T) {
+	s, left, _ := newZoomTestSession(t)
+	if _, _, err := s.FocusPane(0, left.ID); err != nil {
+		t.Fatal(err)
+	}
+	zoomed, _, _, err := s.ToggleZoom(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zoomedWindowID := zoomed.ID
+	s.CreateWindow(&Pane{ID: s.AddPaneID()}, 0)
+	window, state, err := s.SelectWindow(0, zoomedWindowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !window.Zoomed || window.ZoomedPaneID != left.ID || len(state.RenderBindings) != 1 || state.RenderBindings[0].PaneID != left.ID {
+		t.Fatalf("restored zoomed window=%#v state=%#v", window, state)
+	}
+}
+
+func TestPaneExitMaintainsOrClearsZoomAsLayoutAllows(t *testing.T) {
+	s, left, right := newZoomTestSession(t)
+	third := &Pane{ID: s.AddPaneID()}
+	if _, _, err := s.SplitFocusedPane(0, third, SplitHorizontal); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.FocusPane(0, left.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := s.ToggleZoom(0); err != nil {
+		t.Fatal(err)
+	}
+	window, _, final, removed, err := s.RemovePane(right.ID, 0)
+	if err != nil || final || !removed || !window.Zoomed || window.ZoomedPaneID != left.ID {
+		t.Fatalf("hidden pane exit: window=%#v final=%v removed=%v err=%v", window, final, removed, err)
+	}
+	window, state, final, removed, err := s.RemovePane(third.ID, 0)
+	if err != nil || final || !removed || window.Zoomed || len(state.RenderBindings) != 1 || state.RenderBindings[0].PaneID != left.ID {
+		t.Fatalf("last hidden pane exit: window=%#v state=%#v final=%v removed=%v err=%v", window, state, final, removed, err)
+	}
+}
+
+func TestClosingZoomedPaneClearsZoom(t *testing.T) {
+	s, left, _ := newZoomTestSession(t)
+	if _, _, err := s.FocusPane(0, left.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := s.ToggleZoom(0); err != nil {
+		t.Fatal(err)
+	}
+	_, window, state, windowClosed, _, _, err := s.CloseFocusedPane(0)
+	if err != nil || windowClosed || window.Zoomed || len(state.RenderBindings) != 1 {
+		t.Fatalf("close zoomed pane: window=%#v state=%#v windowClosed=%v err=%v", window, state, windowClosed, err)
+	}
+}
+
+func newZoomTestSession(t *testing.T) (*Session, *Pane, *Pane) {
+	t.Helper()
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 24
+	left := &Pane{ID: s.AddPaneID()}
+	s.CreateWindow(left, 0)
+	right := &Pane{ID: s.AddPaneID()}
+	if _, _, err := s.SplitFocusedPane(0, right, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	return s, left, right
+}
+
 func TestResizeRebuildsVisualRenderBindings(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)

@@ -40,7 +40,7 @@ func (s *Session) handlePaneProcessExitNow(paneID uint64) error {
 		return nil
 	}
 	handoff := s.beginOutputHandoff()
-	window, clientState, finalPane, removed, err := s.RemovePane(paneID, clientID0)
+	_, clientState, finalPane, removed, err := s.RemovePane(paneID, clientID0)
 	if err != nil || !removed {
 		return err
 	}
@@ -48,17 +48,8 @@ func (s *Session) handlePaneProcessExitNow(paneID uint64) error {
 		s.ended = true
 		return nil
 	}
-	if err := s.publishStatusBar(); err != nil {
-		return err
-	}
-	if window == nil || clientState == nil {
-		return nil
-	}
 	s.resizeSessionToClient(clientState)
-	if err := s.publishWindowLayout(); err != nil {
-		return err
-	}
-	return s.publishBindingsAndSnapshots(handoff)
+	return s.rebindOutputsAndPublishLayout(handoff)
 }
 
 func (s *Session) createWindow(c *Connection, cwd string, argv []string, cols, rows uint16) (*Pane, *Window, *ClientState, error) {
@@ -159,7 +150,7 @@ func (s *Session) readInputFrames(c *Connection, decoder *protocol.Decoder, done
 
 func (s *Session) handleInputBytes(c *Connection, data []byte) (bool, error) {
 	pane, _ := s.ActivePane(clientID0)
-	if pane != nil && s.InputIsNormal(clientID0) && !s.IsHistoryPane(clientID0, pane.ID) &&
+	if pane != nil && s.InputIsNormal(clientID0) && !pane.isHistoryMode() &&
 		bytes.IndexByte(data, 0x02) < 0 && (!pane.UsesApplicationCursorKeys() || bytes.IndexByte(data, 0x1b) < 0) {
 		if err := pane.sendInput(data); err != nil {
 			return false, fmt.Errorf("write pty input: %w", err)
@@ -187,8 +178,8 @@ func (s *Session) handleInputBytes(c *Connection, data []byte) (bool, error) {
 		if pane == nil {
 			break
 		}
-		if s.IsHistoryPane(clientID0, pane.ID) {
-			return false, s.handleHistoryInput(pane, data[index:])
+		if pane.isHistoryMode() {
+			return false, pane.handleHistoryInput(data[index:])
 		}
 		if translated, consumed, ok := translateApplicationCursor(data[index:], s.InputIsNormal(clientID0) && pane.UsesApplicationCursorKeys()); ok {
 			if err := pane.sendInput(translated); err != nil {
@@ -208,7 +199,9 @@ func (s *Session) handleInputBytes(c *Connection, data []byte) (bool, error) {
 
 func (s *Session) resizeClient(c *Connection, cols, rows uint16) error {
 	handoff := s.beginOutputHandoff()
-	s.ClearHistoryViews()
+	if err := s.exitAllPaneHistoryModes(); err != nil {
+		return err
+	}
 	s.SetClientSize(clientID0, cols, rows)
 	s.ResizeAll(cols, rows)
 	if err := s.publishStatusBar(); err != nil {
@@ -272,12 +265,11 @@ func (s *Session) handleServerInputEvent(c *Connection, event serverInputEvent) 
 	case serverCommandSwapPaneNext:
 		return false, s.commandSwapPane(SwapPaneNext)
 	case serverCommandFocusDirection:
-		if _, _, err := s.FocusPaneDirection(clientID0, event.Direction); err != nil {
-			return false, err
-		}
-		return false, s.publishWindowLayout()
+		return false, s.commandFocusPaneDirection(event.Direction)
 	case serverCommandResizePane:
 		return false, s.commandResizePane(event.ResizeDirection, event.ResizeAmount)
+	case serverCommandToggleZoom:
+		return false, s.commandToggleZoom()
 	case serverCommandBeginWindowPrompt:
 		return false, s.commandBeginRenameWindowPrompt()
 	case serverCommandBeginSessionPrompt:
@@ -344,14 +336,8 @@ func (s *Session) commandCreateWindow(c *Connection) error {
 	if err != nil {
 		return err
 	}
-	if err := s.publishStatusBar(); err != nil {
-		return err
-	}
-	if err := s.publishWindowLayout(); err != nil {
-		return err
-	}
 	s.startPane(pane)
-	if err := s.publishBindingsAndSnapshots(handoff); err != nil {
+	if err := s.rebindOutputsAndPublishLayout(handoff); err != nil {
 		return err
 	}
 	return nil
@@ -362,13 +348,7 @@ func (s *Session) commandSelectWindow(windowID uint64) error {
 	if _, _, err := s.SelectWindow(clientID0, windowID); err != nil {
 		return err
 	}
-	if err := s.publishStatusBar(); err != nil {
-		return err
-	}
-	if err := s.publishWindowLayout(); err != nil {
-		return err
-	}
-	return s.publishBindingsAndSnapshots(handoff)
+	return s.rebindOutputsAndPublishLayout(handoff)
 }
 
 func (s *Session) commandSplit(c *Connection, direction SplitDirection) error {
@@ -393,19 +373,16 @@ func (s *Session) commandSplit(c *Connection, direction SplitDirection) error {
 		return err
 	}
 	s.ResizeAll(clientState.TerminalCols, clientState.TerminalRows)
-	if err := s.publishWindowLayout(); err != nil {
-		return err
-	}
 	s.startPane(newPane)
-	if err := s.publishBindingsAndSnapshots(handoff); err != nil {
+	if err := s.rebindOutputsAndPublishLayout(handoff); err != nil {
 		return err
 	}
 	return nil
 }
 
 func (s *Session) commandSwapPane(direction PaneSwapDirection) error {
-	bindings, _ := s.RenderBindings(clientID0)
-	if len(bindings) < 2 {
+	window, _ := s.ActiveWindow(clientID0)
+	if window == nil || len(window.Layout.PaneIDs()) < 2 {
 		return nil
 	}
 	handoff := s.beginOutputHandoff()
@@ -417,10 +394,45 @@ func (s *Session) commandSwapPane(direction PaneSwapDirection) error {
 		return s.publishVisibleSnapshots(handoff)
 	}
 	s.resizeSessionToClient(clientState)
-	if err := s.publishWindowLayout(); err != nil {
+	return s.rebindOutputsAndPublishLayout(handoff)
+}
+
+func (s *Session) commandFocusPaneDirection(direction byte) error {
+	window, _ := s.ActiveWindow(clientID0)
+	if window == nil {
+		return nil
+	}
+	zoomed := window.Zoomed
+	var handoff *outputHandoff
+	if zoomed {
+		handoff = s.beginOutputHandoff()
+	}
+	_, clientState, err := s.FocusPaneDirection(clientID0, direction)
+	if err != nil {
 		return err
 	}
-	return s.publishBindingsAndSnapshots(handoff)
+	if !zoomed {
+		return s.publishWindowLayout()
+	}
+	s.resizeSessionToClient(clientState)
+	return s.rebindOutputsAndPublishLayout(handoff)
+}
+
+func (s *Session) commandToggleZoom() error {
+	window, _ := s.ActiveWindow(clientID0)
+	if window == nil || len(window.Layout.PaneIDs()) <= 1 {
+		return nil
+	}
+	handoff := s.beginOutputHandoff()
+	_, clientState, changed, err := s.ToggleZoom(clientID0)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return s.publishVisibleSnapshots(handoff)
+	}
+	s.resizeSessionToClient(clientState)
+	return s.rebindOutputsAndPublishLayout(handoff)
 }
 
 func (s *Session) commandResizePane(direction PaneResizeDirection, amount int) error {
@@ -437,29 +449,19 @@ func (s *Session) commandResizePane(direction PaneResizeDirection, amount int) e
 		return s.publishVisibleSnapshots(handoff)
 	}
 	s.resizeSessionToClient(clientState)
-	if err := s.publishWindowLayout(); err != nil {
-		return err
-	}
-	return s.publishBindingsAndSnapshots(handoff)
+	return s.rebindOutputsAndPublishLayout(handoff)
 }
 
 func (s *Session) commandEnterHistory() error {
-	pane, clientState := s.ActivePane(clientID0)
-	if pane == nil || clientState == nil {
+	pane, _ := s.ActivePane(clientID0)
+	if pane == nil {
 		return nil
 	}
-	if s.IsHistoryPane(clientID0, pane.ID) {
+	if pane.isHistoryMode() {
 		return nil
 	}
-	handoff := s.beginOutputHandoff()
-	snapshot, err := pane.captureHistorySnapshot()
-	if err != nil {
-		return err
-	}
-	if err := s.InstallHistoryView(clientID0, pane.ID, snapshot); err != nil {
-		return err
-	}
-	return s.publishBindingsAndSnapshots(handoff)
+	_, err := pane.enterHistoryMode()
+	return err
 }
 
 func (s *Session) commandClosePane(c *Connection) error {
@@ -477,93 +479,9 @@ func (s *Session) commandClosePaneNow(c *Connection) error {
 		s.shutdownNow()
 		return nil
 	}
-	if err := s.publishStatusBar(); err != nil {
-		return err
-	}
 	if window != nil && clientState != nil {
 		s.resizeSessionToClient(clientState)
-		if err := s.publishWindowLayout(); err != nil {
-			return err
-		}
-		return s.publishBindingsAndSnapshots(handoff)
+		return s.rebindOutputsAndPublishLayout(handoff)
 	}
-	return nil
-}
-
-func (s *Session) handleHistoryInput(pane *Pane, data []byte) error {
-	for len(data) > 0 {
-		direction, count, exit, consumed := decodeHistoryInput(data)
-		if consumed <= 0 {
-			consumed = 1
-		}
-		data = data[min(consumed, len(data)):]
-		if exit {
-			handoff := s.beginOutputHandoff()
-			if bindings, ok := s.exitHistoryAndRebuild(clientID0, pane.ID); ok {
-				return s.finishOutputHandoff(handoff, bindings)
-			}
-			return nil
-		}
-		if count < 0 {
-			if s.jumpHistory(clientID0, pane.ID, count == -1) {
-				window := s.windowForPane(pane.ID)
-				view := s.HistoryView(clientID0, pane.ID)
-				if window != nil && view != nil {
-					if err := s.sendHistorySnapshotSerialized(pane, view); err != nil {
-						return err
-					}
-				}
-			}
-			continue
-		}
-		for i := 0; i < count; i++ {
-			move, ok := s.moveHistory(clientID0, pane.ID, direction)
-			if !ok {
-				return nil
-			}
-			if !move.Changed {
-				break
-			}
-			if err := s.emitHistoryMove(pane, move); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func decodeHistoryInput(data []byte) (direction, count int, exit bool, consumed int) {
-	if len(data) == 0 {
-		return 0, 0, false, 0
-	}
-	switch data[0] {
-	case 'q', 0x03, 0x1b:
-		if len(data) >= 3 && data[0] == 0x1b && data[1] == '[' {
-			switch data[2] {
-			case 'A':
-				return -1, 1, false, 3
-			case 'B':
-				return 1, 1, false, 3
-			case '5', '6':
-				if len(data) >= 4 && data[3] == '~' {
-					direction = -1
-					if data[2] == '6' {
-						direction = 1
-					}
-					return direction, 12, false, 4
-				}
-			}
-		}
-		return 0, 0, true, 1
-	case 0x15:
-		return -1, 6, false, 1
-	case 0x04:
-		return 1, 6, false, 1
-	case 'g':
-		return 0, -1, false, 1
-	case 'G':
-		return 0, -2, false, 1
-	default:
-		return 0, 0, false, 1
-	}
+	return s.publishStatusBar()
 }

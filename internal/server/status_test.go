@@ -148,6 +148,22 @@ func TestRenameSessionPromptUpdatesStatusName(t *testing.T) {
 	}
 }
 
+func TestZoomedWindowStatusIncludesZFlag(t *testing.T) {
+	s := NewSession(0)
+	client := s.NewClient(0)
+	client.TerminalCols, client.TerminalRows = 80, 23
+	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash", terminal: newTerminal(80, 23)}, 0)
+	if _, _, err := s.SplitFocusedPane(0, &Pane{ID: s.AddPaneID(), Title: "logs", terminal: newTerminal(80, 23)}, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	statusClient := newStatusTestClient()
+	s.attachConnection(testConnection(nil, nil, &statusClient.wire))
+	if err := s.commandToggleZoom(); err != nil {
+		t.Fatal(err)
+	}
+	assertStatusText(t, statusClient.read(t), "[0] 0:bash*Z ")
+}
+
 func runStatusEvent(t *testing.T, handler *Connection, event serverInputEvent) error {
 	t.Helper()
 	_, err := handler.Session.handleServerInputEvent(handler, event)

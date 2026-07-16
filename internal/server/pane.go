@@ -36,6 +36,8 @@ type Pane struct {
 	done         chan struct{}
 	stopping     atomic.Bool
 	startupInput []byte
+	viewMode     atomic.Uint32
+	historyView  *paneHistoryView
 
 	// Held exclusively by the pane main goroutine. A lease contains the actual
 	// QUIC stream and is physically returned before another pane receives it.
@@ -60,15 +62,45 @@ type paneRequest struct {
 }
 
 type paneCommand struct {
-	attach  *OutputLease
-	live    bool
+	attach  *paneOutputAttach
 	detach  io.Writer
 	release *paneOutputRelease
-	refresh func(*renderOutput) error
 	apply   func(*renderOutput) error
 	resize  *paneResize
-	history chan<- *HistorySnapshot
+	history *paneHistoryRequest
 	done    chan error
+}
+
+type paneOutputAttach struct {
+	Lease          *OutputLease
+	LayoutRevision uint64
+	Refresh        func(*renderOutput) error
+}
+
+type paneViewMode uint32
+
+const (
+	paneViewLive paneViewMode = iota
+	paneViewHistory
+)
+
+type paneHistoryAction uint8
+
+const (
+	paneHistoryEnter paneHistoryAction = iota + 1
+	paneHistoryInput
+	paneHistoryExit
+)
+
+type paneHistoryRequest struct {
+	Action paneHistoryAction
+	Data   []byte
+	Result chan<- paneHistoryResult
+}
+
+type paneHistoryResult struct {
+	Changed bool
+	Err     error
 }
 
 type paneResize struct {
