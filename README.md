@@ -241,7 +241,8 @@ prompt. Press `Ctrl+B`, then `,` to rename the current window.
 
 After a live QUIC connection drops, the client keeps the last confirmed
 terminal contents, replaces the client-visible status bar with an orange
-reconnecting indicator, and drops input while disconnected. It first retries
+reconnecting indicator with a `Press Ctrl+C to exit` hint, and drops other
+input while disconnected. It first retries
 the pinned QUIC resume credential. If that fails, it obtains a fresh
 single-use attach token through the local control socket or the versioned SSH
 control command, as appropriate. Input resumes only after the server's layout,

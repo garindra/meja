@@ -32,6 +32,8 @@ const (
 	quicKeepAlivePeriod = 2 * time.Second
 )
 
+var errDisconnectedInterrupt = errors.New("interrupted while disconnected")
+
 type Target struct {
 	Original        string
 	Username        string
@@ -155,6 +157,9 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
+	clientCtx, cancelClient := context.WithCancelCause(ctx)
+	defer cancelClient(nil)
+
 	streamErrs := make(chan error, 32)
 	renderLog := cfg.Stderr
 	if cfg.RenderDiagnosticsLogPath != "" {
@@ -181,7 +186,7 @@ func Run(ctx context.Context, cfg Config) error {
 		rectangularScroll: true,
 	}
 	ui.dropConnectionEvents.Store(false)
-	go ui.renderLoop(ctx, streamErrs)
+	go ui.renderLoop(clientCtx, streamErrs)
 	ui.emit(sizeEvent{cols: int(cols), rows: int(rows)})
 
 	var terminalMu sync.Mutex
@@ -228,19 +233,16 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}()
 
-	copyCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	clientDone := make(chan error, 1)
 	var input atomic.Pointer[inputDestination]
 
 	ui.beginConnection(false, time.Now())
-	live, err := openConnection(ctx, bootstrap, hostname, cols, rows, cfg, "", 0, ui, enterTerminal)
+	live, err := openConnection(clientCtx, bootstrap, hostname, cols, rows, cfg, "", 0, ui, enterTerminal)
 	if err != nil {
 		return err
 	}
 	input.Store(live.inputDestination())
-	go forwardInput(copyCtx, cfg.Stdin, &input, ui, streamErrs, clientDone)
-	go forwardResize(copyCtx, cfg.Stdin, &input, ui, streamErrs)
+	go forwardInput(clientCtx, cfg.Stdin, &input, ui, streamErrs, cancelClient)
+	go forwardResize(clientCtx, cfg.Stdin, &input, ui, streamErrs)
 
 	for {
 		select {
@@ -248,34 +250,34 @@ func Run(ctx context.Context, cfg Config) error {
 			ui.stopConnection()
 			clearInputDestination(&input, live.inputFrames)
 			live.destroy()
-			ui.sync(ctx)
+			ui.sync(clientCtx)
 			if result.graceful {
 				return nil
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if clientCtx.Err() != nil {
+				return clientExitError(clientCtx)
 			}
 			lastContact := live.lastContactTime()
 			ui.markDisconnected(lastContact)
 			resumeToken, generation := live.resumeToken, live.generation
 			backoff := 100 * time.Millisecond
 			for {
-				if err := waitReconnect(ctx, backoff); err != nil {
-					return err
+				if err := waitReconnect(clientCtx, backoff); err != nil {
+					return clientExitError(clientCtx)
 				}
 				ui.beginConnection(true, lastContact)
-				candidate, reconnectErr := openConnection(ctx, bootstrap, hostname, cols, rows, cfg, resumeToken, generation, ui, nil)
+				candidate, reconnectErr := openConnection(clientCtx, bootstrap, hostname, cols, rows, cfg, resumeToken, generation, ui, nil)
 				if reconnectErr != nil {
 					fallbackCfg := cfg
 					fallbackCfg.SessionID = bootstrap.SessionID
 					fallbackCfg.SessionTarget = fmt.Sprintf("%d", bootstrap.SessionID)
 					fallbackCfg.Stderr = io.Discard
-					fallback, fallbackErr := fetchBootstrap(ctx, fallbackCfg)
+					fallback, fallbackErr := fetchBootstrap(clientCtx, fallbackCfg)
 					if fallbackErr == nil {
-						fallbackHost, hostErr := resolveConnectionHostname(ctx, cfg)
+						fallbackHost, hostErr := resolveConnectionHostname(clientCtx, cfg)
 						if hostErr == nil {
 							ui.beginConnection(true, lastContact)
-							candidate, reconnectErr = openConnection(ctx, fallback, fallbackHost, cols, rows, cfg, "", 0, ui, nil)
+							candidate, reconnectErr = openConnection(clientCtx, fallback, fallbackHost, cols, rows, cfg, "", 0, ui, nil)
 							if reconnectErr == nil {
 								bootstrap, hostname = fallback, fallbackHost
 							}
@@ -292,22 +294,25 @@ func Run(ctx context.Context, cfg Config) error {
 					backoff *= 2
 				}
 			}
-		case err := <-clientDone:
-			clearInputDestination(&input, live.inputFrames)
-			live.destroy()
-			return err
 		case err := <-streamErrs:
 			if err != nil {
 				clearInputDestination(&input, live.inputFrames)
 				live.destroy()
 				return err
 			}
-		case <-ctx.Done():
+		case <-clientCtx.Done():
 			clearInputDestination(&input, live.inputFrames)
 			live.destroy()
-			return ctx.Err()
+			return clientExitError(clientCtx)
 		}
 	}
+}
+
+func clientExitError(ctx context.Context) error {
+	if errors.Is(context.Cause(ctx), errDisconnectedInterrupt) {
+		return nil
+	}
+	return ctx.Err()
 }
 
 type inputDestination struct {
@@ -345,22 +350,22 @@ func sendCurrentInputEncoded[T any](current *atomic.Pointer[inputDestination], m
 	return sendCurrentInput(current, protocol.Frame{Type: msgType, Payload: payload})
 }
 
-func sendCurrentPredictedInput(current *atomic.Pointer[inputDestination], ui *runtimeState, data []byte) error {
+func sendCurrentPredictedInput(current *atomic.Pointer[inputDestination], ui *runtimeState, data []byte) (bool, error) {
 	destination := current.Load()
 	if destination == nil {
-		return nil
+		return false, nil
 	}
 	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: data})
 	if err != nil {
-		return err
+		return true, err
 	}
 	ui.emit(localInputEvent{data: append([]byte(nil), data...)})
 	select {
 	case destination.frames <- protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}:
-		return nil
+		return true, nil
 	case <-destination.done:
 		ui.emit(inputPredictionResetEvent{})
-		return nil
+		return true, nil
 	}
 }
 
@@ -789,16 +794,22 @@ func isTerminalQUICClose(err error) bool {
 		(applicationErr.ErrorCode == 0 || applicationErr.ErrorCode == protocol.SessionReplacedErrorCode)
 }
 
-func forwardInput(ctx context.Context, stdin *os.File, input *atomic.Pointer[inputDestination], ui *runtimeState, errs chan<- error, done chan<- error) {
+func forwardInput(ctx context.Context, stdin *os.File, input *atomic.Pointer[inputDestination], ui *runtimeState, errs chan<- error, cancel context.CancelCauseFunc) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := stdin.Read(buf)
 		if n > 0 {
-			if sendErr := sendCurrentPredictedInput(input, ui, append([]byte(nil), buf[:n]...)); sendErr != nil {
+			data := append([]byte(nil), buf[:n]...)
+			connected, sendErr := sendCurrentPredictedInput(input, ui, data)
+			if sendErr != nil {
 				if ctx.Err() != nil {
 					return
 				}
 				errs <- sendErr
+				return
+			}
+			if !connected && bytes.IndexByte(data, 0x03) >= 0 {
+				cancel(errDisconnectedInterrupt)
 				return
 			}
 		}
@@ -1370,12 +1381,16 @@ func (s *scanoutState) setReconnecting(reconnecting bool, lastContact, now time.
 		return
 	}
 	seconds := max(0, int(now.Sub(lastContact)/time.Second))
-	message := []rune("meja is reconnecting... [Last contact " + strconv.Itoa(seconds) + " seconds ago]")
+	message := []rune(" Reconnecting... Press Ctrl+C to exit [Last contact " + strconv.Itoa(seconds) + " seconds ago]")
 	if len(message) > s.cols {
 		message = message[:s.cols]
 	}
 	writeCursorPosition(&s.ansi, max(1, s.rows), 1)
-	s.ansi.WriteString(sgrForStyle(protocol.Style{FG: protocol.Color{Mode: "rgb", R: 255, G: 165, B: 0}, BG: protocol.Color{Mode: "default"}}))
+	// Keep the reconnect indicator readable as a full-width orange bar.
+	s.ansi.WriteString(sgrForStyle(protocol.Style{
+		FG: protocol.Color{Mode: "indexed", Index: 0},
+		BG: protocol.Color{Mode: "rgb", R: 255, G: 165, B: 0},
+	}))
 	s.ansi.WriteString(string(message))
 	for i := len(message); i < s.cols; i++ {
 		s.ansi.WriteByte(' ')

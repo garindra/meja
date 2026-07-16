@@ -259,14 +259,12 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 
 	inputFrames := make(chan protocol.Frame, 8)
 	errs := make(chan error, 1)
-	done := make(chan error, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 	var input atomic.Pointer[inputDestination]
 	input.Store(&inputDestination{frames: inputFrames, done: ctx.Done()})
 	ui := &runtimeState{events: make(chan renderEvent, 1)}
-	go forwardInput(ctx, stdinR, &input, ui, errs, done)
+	go forwardInput(ctx, stdinR, &input, ui, errs, cancel)
 
 	if _, err := stdinW.Write([]byte("abc")); err != nil {
 		t.Fatalf("stdin write = %v", err)
@@ -277,12 +275,6 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 	case err := <-errs:
 		t.Fatalf("forwardInput() error = %v", err)
 	case <-time.After(20 * time.Millisecond):
-	}
-
-	select {
-	case err := <-done:
-		t.Fatalf("forwardInput() unexpected done = %v", err)
-	default:
 	}
 
 	select {
@@ -325,6 +317,39 @@ func TestInputRouterDropsInputWhileDisconnected(t *testing.T) {
 	}
 }
 
+func TestCtrlCExitsWhileDisconnected(t *testing.T) {
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() = %v", err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	var input atomic.Pointer[inputDestination]
+	ui := &runtimeState{events: make(chan renderEvent, 1)}
+	errs := make(chan error, 1)
+	go forwardInput(ctx, stdinR, &input, ui, errs, cancel)
+
+	if _, err := stdinW.Write([]byte{0x03}); err != nil {
+		t.Fatalf("stdin write = %v", err)
+	}
+	select {
+	case <-ctx.Done():
+		if !errors.Is(context.Cause(ctx), errDisconnectedInterrupt) {
+			t.Fatalf("cancellation cause = %v", context.Cause(ctx))
+		}
+		if err := clientExitError(ctx); err != nil {
+			t.Fatalf("clientExitError() = %v, want nil", err)
+		}
+	case err := <-errs:
+		t.Fatalf("forwardInput() error = %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("Ctrl+C did not stop the disconnected client")
+	}
+}
+
 func TestInputRoutesAfterConnectionDestinationIsInstalled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -356,7 +381,7 @@ func TestDroppedPredictedInputQueuesResetAfterLocalEvent(t *testing.T) {
 	var input atomic.Pointer[inputDestination]
 	input.Store(&inputDestination{frames: frames, done: done})
 	ui := &runtimeState{events: make(chan renderEvent, 2)}
-	if err := sendCurrentPredictedInput(&input, ui, []byte("a")); err != nil {
+	if _, err := sendCurrentPredictedInput(&input, ui, []byte("a")); err != nil {
 		t.Fatal(err)
 	}
 	if event := <-ui.events; event.(localInputEvent).data[0] != 'a' {
@@ -397,7 +422,8 @@ func TestStoppedConnectionEventsAreDropped(t *testing.T) {
 	go ui.renderLoop(ctx, errs)
 	ui.emit(sizeEvent{cols: 80, rows: 24})
 	ui.beginConnection(true, time.Now())
-	waitForBufferText(t, &stdout, "meja is reconnecting")
+	waitForBufferText(t, &stdout, " Reconnecting")
+	waitForBufferText(t, &stdout, "Press Ctrl+C to exit")
 	ui.stopConnection()
 	before := stdout.Len()
 	ui.emit(layoutEvent{layout: testSnapshotLayout(11)})
@@ -437,9 +463,9 @@ func TestStatusFullRefreshClearsReconnectIndicator(t *testing.T) {
 	go ui.renderLoop(ctx, errs)
 	ui.emit(sizeEvent{cols: 80, rows: 24})
 	ui.beginConnection(true, time.Now())
-	waitForBufferText(t, &stdout, "meja is reconnecting")
+	waitForBufferText(t, &stdout, " Reconnecting")
 	ui.emit(paneFrameEvent{slot: protocol.StatusRenderSlot, frame: renderFrame{
-		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}}}},
+		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 88, B: 170}}}},
 		spans: []paintSpan{
 			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: ' ', fillColumns: 80},
 			{kind: paintText, styleID: 1, cellWidth: 1, text: []byte("ready")},
@@ -450,7 +476,7 @@ func TestStatusFullRefreshClearsReconnectIndicator(t *testing.T) {
 	stdout.mu.Lock()
 	output := stdout.String()
 	stdout.mu.Unlock()
-	lastReconnect := strings.LastIndex(output, "meja is reconnecting")
+	lastReconnect := strings.LastIndex(output, " Reconnecting")
 	if lastReconnect < 0 || !strings.Contains(output[lastReconnect:], "ready") {
 		t.Fatalf("reconnect indicator was not replaced after connection became usable: %q", output)
 	}
@@ -460,7 +486,7 @@ func TestLayoutActivationPreservesStatusRow(t *testing.T) {
 	s := newScanoutState(true)
 	s.cols, s.rows = 12, 4
 	status := renderFrame{
-		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}}}},
+		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 88, B: 170}}}},
 		spans: []paintSpan{
 			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: ' ', fillColumns: 12},
 			{kind: paintText, styleID: 1, cellWidth: 1, text: []byte("1:shell*")},
@@ -540,10 +566,10 @@ func TestReconnectStateIsLocalToRuntime(t *testing.T) {
 	ui1.emit(sizeEvent{cols: 80, rows: 24})
 	ui2.emit(sizeEvent{cols: 80, rows: 24})
 	ui1.beginConnection(true, time.Now())
-	waitForBufferText(t, &first, "meja is reconnecting")
+	waitForBufferText(t, &first, " Reconnecting")
 	time.Sleep(20 * time.Millisecond)
 	second.mu.Lock()
-	leaked := strings.Contains(second.String(), "meja is reconnecting")
+	leaked := strings.Contains(second.String(), " Reconnecting")
 	second.mu.Unlock()
 	if leaked {
 		t.Fatal("reconnect state leaked to an independent runtime")
@@ -575,6 +601,17 @@ func TestSGRForStyleRendersAdvertisedAttributes(t *testing.T) {
 	})
 	if got != "\x1b[0;1;2;5;3;4;7;8;39;49m" {
 		t.Fatalf("attribute SGR=%q", got)
+	}
+}
+
+func TestReconnectIndicatorUsesBlackTextOnOrangeBackground(t *testing.T) {
+	state := newScanoutState(true)
+	state.cols, state.rows = 80, 24
+	state.setReconnecting(true, time.Now(), time.Now())
+
+	out := string(state.takeANSI())
+	if !strings.Contains(out, "\x1b[0;30;48;2;255;165;0m") {
+		t.Fatalf("reconnect style = %q, want black text on orange background", out)
 	}
 }
 

@@ -97,7 +97,7 @@ func (s *Session) runStatusOutput() {
 }
 
 func renderStatusModel(output *renderOutput, model statusModel, full bool) error {
-	normal := protocol.Style{FG: protocol.Color{Mode: "default"}, BG: protocol.Color{Mode: "rgb", R: 42, G: 99, B: 158}}
+	normal := protocol.Style{FG: protocol.Color{Mode: "default"}, BG: protocol.Color{Mode: "rgb", R: 42, G: 88, B: 170}}
 	prompt := protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 0}, BG: protocol.Color{Mode: "indexed", Index: 3}}
 	if full {
 		if err := installStyle(output, statusNormalStyleID, normal); err != nil {

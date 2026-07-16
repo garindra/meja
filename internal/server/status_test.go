@@ -26,6 +26,9 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	}
 	status := statusClient.read(t)
 	assertStatusText(t, status, "(rename-window) bash")
+	if got := status.Styles[statusNormalStyleID].BG; got != (protocol.Color{Mode: "rgb", R: 42, G: 88, B: 170}) {
+		t.Fatalf("normal status background = %#v", got)
+	}
 	if got := status.Styles[statusPromptStyleID]; got.FG != (protocol.Color{Mode: "indexed", Index: 0}) || got.BG != (protocol.Color{Mode: "indexed", Index: 3}) {
 		t.Fatalf("prompt style = %#v", got)
 	}
