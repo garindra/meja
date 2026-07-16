@@ -2,15 +2,20 @@ package terminal
 
 import "unicode/utf8"
 
+const (
+	maxCSISequenceBytes  = 256
+	maxTerminalStyles    = 4096
+	initialStyleCapacity = 32
+)
+
 type Update struct {
-	DirtyRows     map[int]struct{}
-	DirtySpans    map[int]DirtySpan
+	DirtySpans    []DirtySpan
 	ScrollDelta   int
 	FullRedraw    bool
-	DefinedStyles map[uint32]Style
 	CursorChanged bool
 	VisibleChange bool
 	Replies       [][]byte
+	trackDamage   bool
 }
 
 type DirtySpan struct {
@@ -26,7 +31,6 @@ type Row struct {
 type TerminalState struct {
 	Cols                  int
 	Rows                  int
-	Cells                 []Cell
 	GridRows              []Row
 	CursorX               int
 	CursorY               int
@@ -52,9 +56,12 @@ type TerminalState struct {
 	LastPrintedRune       rune
 	LastPrintedValid      bool
 
-	styleByID   map[uint32]Style
-	styleToID   map[Style]uint32
-	nextStyleID uint32
+	styleByID     []Style
+	styleToID     map[Style]uint32
+	nextStyleID   uint32
+	cachedStyle   Style
+	cachedStyleID uint32
+	historyStart  int
 }
 
 type screenBuffer struct {
@@ -101,13 +108,16 @@ type reflowRow struct {
 }
 
 func New(cols, rows int) *TerminalState {
+	styles := make([]Style, 1, initialStyleCapacity)
+	styles[0] = DefaultStyle
 	t := &TerminalState{
 		Cols:          cols,
 		Rows:          rows,
 		CurrentStyle:  DefaultStyle,
+		cachedStyle:   DefaultStyle,
 		CursorVisible: true,
-		styleByID:     map[uint32]Style{0: DefaultStyle},
-		styleToID:     map[Style]uint32{DefaultStyle: 0},
+		styleByID:     styles,
+		styleToID:     make(map[Style]uint32, initialStyleCapacity),
 		nextStyleID:   1,
 		ScrollBottom:  rows - 1,
 		HistoryLimit:  2000,
@@ -115,12 +125,12 @@ func New(cols, rows int) *TerminalState {
 		G0Charset:     'B',
 		G1Charset:     'B',
 	}
+	t.styleToID[DefaultStyle] = 0
 	t.TabStops = defaultTabStops(cols)
 	t.GridRows = make([]Row, rows)
 	for row := range t.GridRows {
 		t.GridRows[row] = blankRow(cols, 0)
 	}
-	t.syncCellsFromRows()
 	return t
 }
 
@@ -148,10 +158,10 @@ func (t *TerminalState) Resize(cols, rows int) {
 	next.TabStops = resizedTabStops(t.TabStops, t.Cols, cols)
 	next.LastPrintedRune = t.LastPrintedRune
 	next.LastPrintedValid = t.LastPrintedValid
-	next.styleByID = cloneStyleMap(t.styleByID)
+	next.styleByID = cloneStyles(t.styleByID)
 	next.styleToID = cloneStyleIDMap(t.styleToID)
 	next.nextStyleID = t.nextStyleID
-	next.History = cloneRows(t.History)
+	next.History = t.cloneHistoryRows()
 	next.HistoryLimit = t.HistoryLimit
 
 	lines := t.collectLogicalLines()
@@ -195,7 +205,6 @@ func (t *TerminalState) Resize(cols, rows int) {
 		}
 	}
 	next.clampCursor()
-	next.syncCellsFromRows()
 	*t = *next
 }
 
@@ -204,7 +213,6 @@ func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 	p := t.Primary
 	primary := New(t.Cols, t.Rows)
 	primary.GridRows = cloneRows(p.Rows)
-	primary.syncCellsFromRows()
 	primary.CursorX = p.CursorX
 	primary.CursorY = p.CursorY
 	primary.CurrentStyle = p.CurrentStyle
@@ -215,9 +223,9 @@ func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 	primary.ScrollBottom = p.ScrollBottom
 	primary.LastPrintedRune = p.LastPrintedRune
 	primary.LastPrintedValid = p.LastPrintedValid
-	primary.History = cloneRows(t.History)
+	primary.History = t.cloneHistoryRows()
 	primary.HistoryLimit = t.HistoryLimit
-	primary.styleByID = cloneStyleMap(t.styleByID)
+	primary.styleByID = cloneStyles(t.styleByID)
 	primary.styleToID = cloneStyleIDMap(t.styleToID)
 	primary.nextStyleID = t.nextStyleID
 	primary.Resize(cols, rows)
@@ -235,17 +243,24 @@ func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 	t.ScrollTop = 0
 	t.ScrollBottom = rows - 1
 	t.clampCursor()
-	t.syncCellsFromRows()
 	t.History = primary.History
+	t.historyStart = 0
 	t.Primary = &screenBuffer{Rows: cloneRows(primary.GridRows), CursorX: primary.CursorX, CursorY: primary.CursorY, CurrentStyle: primary.CurrentStyle, CursorVisible: primary.CursorVisible, WrapPending: primary.wrapPending, SavedCursor: primary.SavedCursor, ScrollTop: primary.ScrollTop, ScrollBottom: primary.ScrollBottom, LastPrintedRune: primary.LastPrintedRune, LastPrintedValid: primary.LastPrintedValid, G0Charset: p.G0Charset, G1Charset: p.G1Charset, ActiveCharset: p.ActiveCharset}
 }
 
 func (t *TerminalState) SnapshotStyles() []protocolStyleDef {
 	out := make([]protocolStyleDef, 0, len(t.styleByID))
 	for id, style := range t.styleByID {
-		out = append(out, protocolStyleDef{ID: id, Style: style})
+		out = append(out, protocolStyleDef{ID: uint32(id), Style: style})
 	}
 	return out
+}
+
+func (t *TerminalState) LookupStyle(id uint32) (Style, bool) {
+	if uint64(id) >= uint64(len(t.styleByID)) {
+		return Style{}, false
+	}
+	return t.styleByID[id], true
 }
 
 type protocolStyleDef struct {
@@ -254,25 +269,47 @@ type protocolStyleDef struct {
 }
 
 func (t *TerminalState) Apply(data []byte) Update {
-	update := Update{
-		DirtyRows:     map[int]struct{}{},
-		DirtySpans:    map[int]DirtySpan{},
-		DefinedStyles: map[uint32]Style{},
+	var update Update
+	update.Reset(t.Rows)
+	t.ApplyInto(data, &update)
+	return update
+}
+
+func (t *TerminalState) ApplyInto(data []byte, update *Update) {
+	if update.trackDamage {
+		update.ensureRows(t.Rows)
 	}
+	t.syncCurrentStyleID()
 	for len(data) > 0 {
 		if t.Parser.state != parserText && (data[0] == 0x18 || data[0] == 0x1a) {
 			t.Parser.state = parserText
 			t.Parser.csiBuf = t.Parser.csiBuf[:0]
-			t.Parser.oscBuf = t.Parser.oscBuf[:0]
 			data = data[1:]
 			continue
 		}
 		switch t.Parser.state {
 		case parserText:
+			if len(t.Parser.utf8Buf) == 0 && data[0] >= utf8.RuneSelf && invalidUTF8Lead(data[0]) {
+				end := 1
+				for end < len(data) && invalidUTF8Lead(data[end]) {
+					end++
+				}
+				data = data[end:]
+				continue
+			}
 			if len(t.Parser.utf8Buf) > 0 || data[0] >= 0x80 {
 				var consumed int
-				consumed, update = t.consumeUTF8(data, update)
+				consumed = t.consumeUTF8(data, update)
 				data = data[consumed:]
+				continue
+			}
+			if data[0] >= 0x20 && data[0] <= 0x7e && t.activeCharset() != '0' {
+				end := 1
+				for end < len(data) && data[end] >= 0x20 && data[end] <= 0x7e {
+					end++
+				}
+				t.putASCII(data[:end], update)
+				data = data[end:]
 				continue
 			}
 			b := data[0]
@@ -289,7 +326,7 @@ func (t *TerminalState) Apply(data []byte) Update {
 				if t.wrapPending {
 					t.CursorX = 0
 				}
-				t.lineFeed(&update)
+				t.lineFeed(update)
 				t.wrapPending = false
 				update.CursorChanged = true
 			case '\b':
@@ -309,7 +346,7 @@ func (t *TerminalState) Apply(data []byte) Update {
 			case 0x07:
 			default:
 				if b >= 0x20 && b <= 0x7e {
-					t.putRune(t.translateByte(b), &update)
+					t.putRune(t.translateByte(b), update)
 				}
 			}
 		case parserESC:
@@ -319,7 +356,6 @@ func (t *TerminalState) Apply(data []byte) Update {
 				t.Parser.csiBuf = t.Parser.csiBuf[:0]
 			case ']':
 				t.Parser.state = parserOSC
-				t.Parser.oscBuf = t.Parser.oscBuf[:0]
 			case 'P':
 				t.Parser.state = parserDCS
 			case '7':
@@ -329,16 +365,16 @@ func (t *TerminalState) Apply(data []byte) Update {
 				t.restoreCursor()
 				t.Parser.state = parserText
 			case 'M':
-				t.reverseIndex(&update)
+				t.reverseIndex(update)
 				t.Parser.state = parserText
 			case 'D':
-				t.lineFeed(&update)
+				t.lineFeed(update)
 				t.wrapPending = false
 				update.CursorChanged = true
 				t.Parser.state = parserText
 			case 'E':
 				t.CursorX = 0
-				t.lineFeed(&update)
+				t.lineFeed(update)
 				t.wrapPending = false
 				update.CursorChanged = true
 				t.Parser.state = parserText
@@ -380,11 +416,26 @@ func (t *TerminalState) Apply(data []byte) Update {
 		case parserCSI:
 			b := data[0]
 			data = data[1:]
+			if len(t.Parser.csiBuf) == maxCSISequenceBytes {
+				t.Parser.csiBuf = t.Parser.csiBuf[:0]
+				if b >= 0x40 && b <= 0x7e {
+					t.Parser.state = parserText
+				} else {
+					t.Parser.state = parserCSIDiscard
+				}
+				continue
+			}
 			t.Parser.csiBuf = append(t.Parser.csiBuf, b)
 			if b >= 0x40 && b <= 0x7e {
-				t.executeCSI(string(t.Parser.csiBuf), &update)
+				t.executeCSI(t.Parser.csiBuf, update)
 				t.Parser.state = parserText
 				t.Parser.csiBuf = t.Parser.csiBuf[:0]
+			}
+		case parserCSIDiscard:
+			b := data[0]
+			data = data[1:]
+			if b >= 0x40 && b <= 0x7e {
+				t.Parser.state = parserText
 			}
 		case parserOSC:
 			b := data[0]
@@ -392,21 +443,16 @@ func (t *TerminalState) Apply(data []byte) Update {
 			switch b {
 			case 0x07:
 				t.Parser.state = parserText
-				t.Parser.oscBuf = t.Parser.oscBuf[:0]
 			case 0x1b:
 				t.Parser.state = parserOSCESC
-			default:
-				t.Parser.oscBuf = append(t.Parser.oscBuf, b)
 			}
 		case parserOSCESC:
 			b := data[0]
 			data = data[1:]
 			if b == '\\' {
 				t.Parser.state = parserText
-				t.Parser.oscBuf = t.Parser.oscBuf[:0]
 				continue
 			}
-			t.Parser.oscBuf = append(t.Parser.oscBuf, 0x1b, b)
 			t.Parser.state = parserOSC
 		case parserDCS:
 			b := data[0]
@@ -424,24 +470,90 @@ func (t *TerminalState) Apply(data []byte) Update {
 			}
 		}
 	}
-	return update
 }
 
-func (t *TerminalState) consumeUTF8(data []byte, update Update) (int, Update) {
+func (t *TerminalState) putASCII(data []byte, update *Update) {
+	if t.Cols == 0 || t.Rows == 0 {
+		return
+	}
+	if t.InsertMode {
+		for _, b := range data {
+			t.putRune(rune(b), update)
+		}
+		return
+	}
+	styleID := t.currentStyleID()
+	for len(data) > 0 {
+		if t.wrapPending {
+			t.wrapPending = false
+			if t.AutoWrap {
+				t.setRowWrapped(t.CursorY, true)
+				t.CursorX = 0
+				t.wrapLine(update)
+			}
+		}
+		start := t.CursorX
+		count := min(len(data), t.Cols-start)
+		end := start + count
+		cells := t.GridRows[t.CursorY].Cells
+		dirtyStart, dirtyEnd := start, end
+		if start > 0 && cells[start].Width == 0 && cells[start-1].Width == 2 {
+			cells[start-1] = blankCell(styleID)
+			dirtyStart--
+		}
+		if end < t.Cols && cells[end-1].Width == 2 {
+			cells[end] = blankCell(styleID)
+			dirtyEnd++
+		}
+		t.setRowWrapped(t.CursorY, false)
+		for column, b := range data[:count] {
+			cells[start+column] = Cell{Rune: rune(b), StyleID: styleID, Width: 1}
+		}
+		update.markDirty(t.CursorY, dirtyStart, dirtyEnd, t.Cols)
+		t.LastPrintedRune = rune(data[count-1])
+		t.LastPrintedValid = true
+		if end == t.Cols {
+			t.CursorX = t.Cols - 1
+			t.wrapPending = t.AutoWrap
+		} else {
+			t.CursorX = end
+		}
+		data = data[count:]
+	}
+	update.CursorChanged = true
+}
+
+func invalidUTF8Lead(b byte) bool {
+	return b >= utf8.RuneSelf && (b < 0xc2 || b > 0xf4)
+}
+
+func (t *TerminalState) consumeUTF8(data []byte, update *Update) int {
+	if len(t.Parser.utf8Buf) == 0 {
+		r, size := utf8.DecodeRune(data)
+		if r != utf8.RuneError || size != 1 {
+			t.putRune(r, update)
+			return size
+		}
+		if utf8.FullRune(data) {
+			return 1
+		}
+		t.Parser.utf8Buf = append(t.Parser.utf8Buf, data...)
+		return len(data)
+	}
 	for i := 0; i < len(data); i++ {
 		t.Parser.utf8Buf = append(t.Parser.utf8Buf, data[i])
 		if utf8.FullRune(t.Parser.utf8Buf) {
 			r, size := utf8.DecodeRune(t.Parser.utf8Buf)
 			if r == utf8.RuneError && size == 1 {
 				t.Parser.utf8Buf = t.Parser.utf8Buf[:0]
-				return i + 1, update
+				return i + 1
 			}
-			t.putRune(r, &update)
+			t.putRune(r, update)
 			t.Parser.utf8Buf = t.Parser.utf8Buf[:0]
-			return i + 1, update
+			return i + 1
 		}
 	}
-	return len(data), update
+	return len(data)
 }
 
 func (t *TerminalState) putRune(r rune, update *Update) {
@@ -456,7 +568,10 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 			t.wrapLine(update)
 		}
 	}
-	cellWidth := int(runeCellWidth(r))
+	cellWidth := 1
+	if r >= utf8.RuneSelf {
+		cellWidth = int(runeCellWidth(r))
+	}
 	if cellWidth > t.Cols {
 		cellWidth = 1
 	}
@@ -470,10 +585,7 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 			t.CursorX = t.Cols - 1
 		}
 	}
-	styleID, added := t.styleID(t.CurrentStyle)
-	if added {
-		update.DefinedStyles[styleID] = t.CurrentStyle
-	}
+	styleID := t.currentStyleID()
 	writtenColumn := t.CursorX
 	if t.InsertMode {
 		t.insertChars(cellWidth, styleID)
@@ -485,7 +597,6 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 	}
 	t.LastPrintedRune = r
 	t.LastPrintedValid = true
-	t.syncRowToCells(t.CursorY)
 	update.markDirty(t.CursorY, dirtyStart, dirtyEnd, t.Cols)
 	if t.CursorX+cellWidth == t.Cols {
 		t.CursorX = t.Cols - 1
@@ -517,18 +628,23 @@ func (t *TerminalState) clearGlyphsForWrite(row, start, cellWidth int, styleID u
 	return dirtyStart, dirtyEnd
 }
 
-func (t *TerminalState) executeCSI(seq string, update *Update) {
-	if seq == "" {
+func (t *TerminalState) executeCSI(seq []byte, update *Update) {
+	if len(seq) == 0 {
 		return
 	}
-	parsed := parseCSISequence(seq)
+	var parsed CSISequence
+	if !parseCSISequence(seq, &parsed) {
+		return
+	}
+	params := parsed.Params[:parsed.ParamCount]
+	intermediates := parsed.Intermediates[:parsed.IntermediateCount]
 	switch parsed.PrivatePrefix {
 	case '?':
 		switch parsed.Final {
 		case 'h':
-			t.setPrivateModes(parsed.Params, true, update)
+			t.setPrivateModes(params, true, update)
 		case 'l':
-			t.setPrivateModes(parsed.Params, false, update)
+			t.setPrivateModes(params, false, update)
 		default:
 			logUnsupportedf("unsupported private CSI ?%s", seq)
 		}
@@ -542,37 +658,38 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 	switch parsed.Final {
 	case 'A':
 		t.breakWrapChainAt(t.CursorY)
-		t.CursorY -= max1(parsed.Params, 1)
+		t.CursorY -= max1(params, 1)
 	case 'B':
 		t.breakWrapChainAt(t.CursorY)
-		t.CursorY += max1(parsed.Params, 1)
+		t.CursorY += max1(params, 1)
 	case 'C':
-		t.CursorX += max1(parsed.Params, 1)
+		t.CursorX += max1(params, 1)
 	case 'D':
-		t.CursorX -= max1(parsed.Params, 1)
+		t.CursorX -= max1(params, 1)
 	case 'H', 'f':
 		t.breakWrapChainAt(t.CursorY)
-		row := paramOr(parsed.Params, 0, 1) - 1
-		col := paramOr(parsed.Params, 1, 1) - 1
+		row := paramOr(params, 0, 1) - 1
+		col := paramOr(params, 1, 1) - 1
 		if t.OriginMode {
 			row += t.ScrollTop
 			row = min(max(row, t.ScrollTop), t.ScrollBottom)
 		}
 		t.CursorY, t.CursorX = row, col
 	case 'G':
-		t.CursorX = paramOr(parsed.Params, 0, 1) - 1
+		t.CursorX = paramOr(params, 0, 1) - 1
 	case 'd':
 		t.breakWrapChainAt(t.CursorY)
-		row := paramOr(parsed.Params, 0, 1) - 1
+		row := paramOr(params, 0, 1) - 1
 		if t.OriginMode {
 			row += t.ScrollTop
 			row = min(max(row, t.ScrollTop), t.ScrollBottom)
 		}
 		t.CursorY = row
 	case 'J':
-		mode := paramOr(parsed.Params, 0, 0)
+		mode := paramOr(params, 0, 0)
 		if mode == 3 {
 			t.History = nil
+			t.historyStart = 0
 		} else {
 			t.breakAllWrapChains()
 			t.eraseDisplay(mode)
@@ -580,39 +697,33 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 		}
 	case 'K':
 		t.breakWrapChainAt(t.CursorY)
-		start, end := t.eraseLine(paramOr(parsed.Params, 0, 0))
+		start, end := t.eraseLine(paramOr(params, 0, 0))
 		update.markDirty(t.CursorY, start, end, t.Cols)
 	case 'X':
 		t.breakWrapChainAt(t.CursorY)
-		start, end := t.eraseChars(max1(parsed.Params, 1))
+		start, end := t.eraseChars(max1(params, 1))
 		update.markDirty(t.CursorY, start, end, t.Cols)
 	case 'P':
 		t.breakWrapChainAt(t.CursorY)
-		styleID, added := t.styleID(t.CurrentStyle)
-		if added {
-			update.DefinedStyles[styleID] = t.CurrentStyle
-		}
-		t.deleteChars(max1(parsed.Params, 1), styleID)
+		styleID := t.currentStyleID()
+		t.deleteChars(max1(params, 1), styleID)
 		update.markDirty(t.CursorY, t.CursorX, t.Cols, t.Cols)
 	case '@':
 		t.breakWrapChainAt(t.CursorY)
-		styleID, added := t.styleID(t.CurrentStyle)
-		if added {
-			update.DefinedStyles[styleID] = t.CurrentStyle
-		}
-		t.insertChars(max1(parsed.Params, 1), styleID)
+		styleID := t.currentStyleID()
+		t.insertChars(max1(params, 1), styleID)
 		update.markDirty(t.CursorY, t.CursorX, t.Cols, t.Cols)
 	case 'L':
-		styleID := t.eraseStyleID(update)
-		t.insertLines(max1(parsed.Params, 1), styleID)
+		styleID := t.eraseStyleID()
+		t.insertLines(max1(params, 1), styleID)
 		update.FullRedraw = true
 	case 'M':
-		styleID := t.eraseStyleID(update)
-		t.deleteLines(max1(parsed.Params, 1), styleID)
+		styleID := t.eraseStyleID()
+		t.deleteLines(max1(params, 1), styleID)
 		update.FullRedraw = true
 	case 'S':
-		count := min(max1(parsed.Params, 1), t.ScrollBottom-t.ScrollTop+1)
-		styleID := t.eraseStyleID(update)
+		count := min(max1(params, 1), t.ScrollBottom-t.ScrollTop+1)
+		styleID := t.eraseStyleID()
 		for range count {
 			t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
 		}
@@ -625,8 +736,8 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 			update.markDirty(row, 0, t.Cols, t.Cols)
 		}
 	case 'T':
-		count := min(max1(parsed.Params, 1), t.ScrollBottom-t.ScrollTop+1)
-		styleID := t.eraseStyleID(update)
+		count := min(max1(params, 1), t.ScrollBottom-t.ScrollTop+1)
+		styleID := t.eraseStyleID()
 		for range count {
 			t.scrollDownRegion(t.ScrollTop, t.ScrollBottom, styleID)
 		}
@@ -639,11 +750,11 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 			update.markDirty(row, 0, t.Cols, t.Cols)
 		}
 	case 'Z':
-		for range max1(parsed.Params, 1) {
+		for range max1(params, 1) {
 			t.CursorX = t.previousTabStop(t.CursorX)
 		}
 	case 'g':
-		switch paramOr(parsed.Params, 0, 0) {
+		switch paramOr(params, 0, 0) {
 		case 0:
 			t.clearTabStop(t.CursorX)
 		case 3:
@@ -651,31 +762,31 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 		}
 	case 'b':
 		if t.LastPrintedValid {
-			for count := 0; count < max1(parsed.Params, 1); count++ {
+			for count := 0; count < max1(params, 1); count++ {
 				t.putRune(t.LastPrintedRune, update)
 			}
 		}
 	case 'r':
-		t.setScrollRegion(parsed.Params)
+		t.setScrollRegion(params)
 		t.CursorX = 0
 		t.CursorY = 0
 		if t.OriginMode {
 			t.CursorY = t.ScrollTop
 		}
 	case 's':
-		if len(parsed.Params) != 0 || len(parsed.Intermediates) != 0 {
+		if len(params) != 0 || len(intermediates) != 0 {
 			logUnsupportedf("unsupported CSI %s", seq)
 			return
 		}
 		t.saveCursor()
 	case 'u':
-		if len(parsed.Params) != 0 || len(parsed.Intermediates) != 0 {
+		if len(params) != 0 || len(intermediates) != 0 {
 			logUnsupportedf("unsupported CSI %s", seq)
 			return
 		}
 		t.restoreCursor()
 	case 'n':
-		if len(parsed.Params) == 1 && parsed.Params[0] == 6 {
+		if len(params) == 1 && params[0] == 6 {
 			row := t.CursorY + 1
 			if t.OriginMode {
 				row -= t.ScrollTop
@@ -689,10 +800,10 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 		update.Replies = append(update.Replies, []byte("\x1b[?1;0c"))
 		return
 	case 'm':
-		t.applySGR(parsed.Params, update)
+		t.applySGR(params, update)
 	case 'h', 'l':
 		set := parsed.Final == 'h'
-		for _, mode := range parsed.Params {
+		for _, mode := range params {
 			switch mode {
 			case 4:
 				t.InsertMode = set
@@ -701,7 +812,7 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 			}
 		}
 	case 'p':
-		if len(parsed.Intermediates) == 1 && parsed.Intermediates[0] == '!' {
+		if len(intermediates) == 1 && intermediates[0] == '!' {
 			t.softReset()
 			update.CursorChanged = true
 			update.VisibleChange = true
@@ -719,6 +830,7 @@ func (t *TerminalState) executeCSI(seq string, update *Update) {
 }
 
 func (t *TerminalState) applySGR(params []int, update *Update) {
+	defer t.syncCurrentStyleID()
 	if len(params) == 0 {
 		params = []int{0}
 	}
@@ -805,7 +917,7 @@ func (t *TerminalState) applySGR(params []int, update *Update) {
 }
 
 func (t *TerminalState) eraseDisplay(mode int) {
-	styleID, _ := t.styleID(t.CurrentStyle)
+	styleID := t.currentStyleID()
 	switch mode {
 	case 1:
 		for row := 0; row <= t.CursorY; row++ {
@@ -818,7 +930,6 @@ func (t *TerminalState) eraseDisplay(mode int) {
 	case 2:
 		for row := range t.GridRows {
 			t.GridRows[row] = blankRow(t.Cols, styleID)
-			t.syncRowToCells(row)
 		}
 	default:
 		for row := t.CursorY; row < t.Rows; row++ {
@@ -832,7 +943,7 @@ func (t *TerminalState) eraseDisplay(mode int) {
 }
 
 func (t *TerminalState) eraseLine(mode int) (int, int) {
-	styleID, _ := t.styleID(t.CurrentStyle)
+	styleID := t.currentStyleID()
 	switch mode {
 	case 1:
 		t.fillRow(t.CursorY, 0, t.CursorX+1, styleID)
@@ -847,7 +958,7 @@ func (t *TerminalState) eraseLine(mode int) (int, int) {
 }
 
 func (t *TerminalState) eraseChars(n int) (int, int) {
-	styleID, _ := t.styleID(t.CurrentStyle)
+	styleID := t.currentStyleID()
 	end := t.CursorX + n
 	if end > t.Cols {
 		end = t.Cols
@@ -857,7 +968,7 @@ func (t *TerminalState) eraseChars(n int) (int, int) {
 }
 
 func (u *Update) markDirty(row, start, end, cols int) {
-	if row < 0 || start >= end || cols <= 0 {
+	if u == nil || !u.trackDamage || u.FullRedraw || row < 0 || row >= len(u.DirtySpans) || start >= end || cols <= 0 {
 		return
 	}
 	if start < 0 {
@@ -869,15 +980,8 @@ func (u *Update) markDirty(row, start, end, cols int) {
 	if start >= end {
 		return
 	}
-	if u.DirtyRows == nil {
-		u.DirtyRows = map[int]struct{}{}
-	}
-	if u.DirtySpans == nil {
-		u.DirtySpans = map[int]DirtySpan{}
-	}
-	u.DirtyRows[row] = struct{}{}
-	span, ok := u.DirtySpans[row]
-	if !ok {
+	span := u.DirtySpans[row]
+	if span.End == 0 {
 		u.DirtySpans[row] = DirtySpan{Start: start, End: end}
 		return
 	}
@@ -891,6 +995,9 @@ func (u *Update) markDirty(row, start, end, cols int) {
 }
 
 func (u *Update) recordScroll(delta, rows int) {
+	if u == nil || !u.trackDamage {
+		return
+	}
 	if delta == 0 || (u.ScrollDelta != 0 && (u.ScrollDelta < 0) != (delta < 0)) {
 		u.FullRedraw = true
 		u.ScrollDelta = 0
@@ -899,18 +1006,16 @@ func (u *Update) recordScroll(delta, rows int) {
 	if u.FullRedraw {
 		return
 	}
-	shiftedRows := make(map[int]struct{}, len(u.DirtyRows))
-	shiftedSpans := make(map[int]DirtySpan, len(u.DirtySpans))
-	for row, span := range u.DirtySpans {
-		row += delta
-		if row < 0 || row >= rows {
-			continue
-		}
-		shiftedRows[row] = struct{}{}
-		shiftedSpans[row] = span
+	rows = min(rows, len(u.DirtySpans))
+	if delta < 0 {
+		shift := min(-delta, rows)
+		copy(u.DirtySpans[:rows-shift], u.DirtySpans[shift:rows])
+		clear(u.DirtySpans[rows-shift : rows])
+	} else {
+		shift := min(delta, rows)
+		copy(u.DirtySpans[shift:rows], u.DirtySpans[:rows-shift])
+		clear(u.DirtySpans[:shift])
 	}
-	u.DirtyRows = shiftedRows
-	u.DirtySpans = shiftedSpans
 	u.ScrollDelta += delta
 	if u.ScrollDelta < -rows {
 		u.ScrollDelta = -rows
@@ -920,27 +1025,20 @@ func (u *Update) recordScroll(delta, rows int) {
 }
 
 func (u *Update) Merge(next Update, rows int) {
-	if u.DirtyRows == nil {
-		u.DirtyRows = make(map[int]struct{})
-	}
-	if u.DirtySpans == nil {
-		u.DirtySpans = make(map[int]DirtySpan)
-	}
-	if u.DefinedStyles == nil {
-		u.DefinedStyles = make(map[uint32]Style)
-	}
+	u.trackDamage = true
+	u.ensureRows(rows)
 	if next.FullRedraw {
 		u.FullRedraw = true
 		u.ScrollDelta = 0
 	} else if next.ScrollDelta != 0 {
 		u.recordScroll(next.ScrollDelta, rows)
 	}
-	for row := range next.DirtyRows {
-		u.DirtyRows[row] = struct{}{}
-	}
 	for row, span := range next.DirtySpans {
-		current, ok := u.DirtySpans[row]
-		if !ok {
+		if row >= rows || span.End == 0 {
+			continue
+		}
+		current := u.DirtySpans[row]
+		if current.End == 0 {
 			u.DirtySpans[row] = span
 			continue
 		}
@@ -952,11 +1050,51 @@ func (u *Update) Merge(next Update, rows int) {
 		}
 		u.DirtySpans[row] = current
 	}
-	for id, style := range next.DefinedStyles {
-		u.DefinedStyles[id] = style
-	}
 	u.CursorChanged = u.CursorChanged || next.CursorChanged
 	u.VisibleChange = u.VisibleChange || next.VisibleChange
+}
+
+func (u *Update) ensureRows(rows int) {
+	if rows < 0 {
+		rows = 0
+	}
+	if cap(u.DirtySpans) < rows {
+		u.DirtySpans = make([]DirtySpan, rows)
+	} else {
+		u.DirtySpans = u.DirtySpans[:rows]
+	}
+}
+
+func (u *Update) Reset(rows int) {
+	u.ResetFor(rows, true)
+}
+
+func (u *Update) ResetFor(rows int, trackDamage bool) {
+	u.trackDamage = trackDamage
+	if trackDamage {
+		u.ensureRows(rows)
+		clear(u.DirtySpans)
+	} else {
+		u.DirtySpans = u.DirtySpans[:0]
+	}
+	u.ScrollDelta = 0
+	u.FullRedraw = false
+	u.CursorChanged = false
+	u.VisibleChange = false
+	u.Replies = u.Replies[:0]
+}
+
+func (u *Update) HasDamage() bool {
+	for _, span := range u.DirtySpans {
+		if span.End != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *Update) HasRenderChange() bool {
+	return u.FullRedraw || u.ScrollDelta != 0 || u.CursorChanged || u.VisibleChange || u.HasDamage()
 }
 
 func (t *TerminalState) fillRow(row, start, end int, styleID uint32) {
@@ -973,21 +1111,21 @@ func (t *TerminalState) fillRow(row, start, end int, styleID uint32) {
 	for col := start; col < end; col++ {
 		t.GridRows[row].Cells[col] = blankCell(styleID)
 	}
-	t.syncRowToCells(row)
 }
 
 func (t *TerminalState) scrollUpRegion(top, bottom int, styleID uint32) {
 	if top < 0 || bottom >= len(t.GridRows) || top > bottom {
 		return
 	}
+	recycled := t.GridRows[top]
 	if !t.Alternate && top == 0 && bottom == len(t.GridRows)-1 {
-		t.appendHistoryRow(t.GridRows[0])
+		recycled = t.rotateHistoryRow(recycled)
 	}
 	copy(t.GridRows[top:bottom], t.GridRows[top+1:bottom+1])
-	t.GridRows[bottom] = blankRow(t.Cols, styleID)
+	clearRow(&recycled, styleID)
+	t.GridRows[bottom] = recycled
 	t.breakWrapChainAt(top)
 	t.breakWrapChainAt(bottom)
-	t.syncCellsFromRows()
 }
 
 func (t *TerminalState) enterAlternateScreen() {
@@ -1001,6 +1139,8 @@ func (t *TerminalState) enterAlternateScreen() {
 	}
 	t.CursorX, t.CursorY = 0, 0
 	t.CurrentStyle = DefaultStyle
+	t.cachedStyle = DefaultStyle
+	t.cachedStyleID = 0
 	t.CursorVisible = true
 	t.wrapPending = false
 	t.SavedCursor = SavedCursor{}
@@ -1008,7 +1148,6 @@ func (t *TerminalState) enterAlternateScreen() {
 	t.ScrollBottom = t.Rows - 1
 	t.LastPrintedValid = false
 	t.Alternate = true
-	t.syncCellsFromRows()
 }
 
 func (t *TerminalState) exitAlternateScreen() {
@@ -1020,6 +1159,7 @@ func (t *TerminalState) exitAlternateScreen() {
 	t.CursorX = p.CursorX
 	t.CursorY = p.CursorY
 	t.CurrentStyle = p.CurrentStyle
+	t.syncCurrentStyleID()
 	t.CursorVisible = p.CursorVisible
 	t.wrapPending = p.WrapPending
 	t.SavedCursor = p.SavedCursor
@@ -1033,25 +1173,52 @@ func (t *TerminalState) exitAlternateScreen() {
 	t.Alternate = false
 	t.Primary = nil
 	t.clampCursor()
-	t.syncCellsFromRows()
 }
 
-func (t *TerminalState) appendHistoryRow(row Row) {
+func (t *TerminalState) rotateHistoryRow(row Row) Row {
 	if t.HistoryLimit <= 0 {
-		return
+		return row
 	}
-	copyRow := Row{Cells: append([]Cell(nil), row.Cells...), WrapsNext: row.WrapsNext}
+	if len(t.History) > t.HistoryLimit {
+		ordered := t.orderedHistoryRows()
+		t.History = ordered[len(ordered)-t.HistoryLimit:]
+		t.historyStart = 0
+	} else if t.historyStart != 0 && len(t.History) < t.HistoryLimit {
+		t.History = t.orderedHistoryRows()
+		t.historyStart = 0
+	}
 	if len(t.History) >= t.HistoryLimit {
-		copy(t.History, t.History[len(t.History)-t.HistoryLimit+1:])
-		t.History = t.History[:t.HistoryLimit-1]
+		index := t.historyStart
+		recycled := t.History[index]
+		t.History[index] = row
+		t.historyStart = (t.historyStart + 1) % len(t.History)
+		return recycled
 	}
-	t.History = append(t.History, copyRow)
+	t.History = append(t.History, row)
+	return Row{Cells: make([]Cell, len(row.Cells))}
 }
 
 func (t *TerminalState) SnapshotRows() (history, primary []Row) {
-	history = cloneRows(t.History)
+	history = t.cloneHistoryRows()
 	primary = cloneRows(t.GridRows)
 	return history, primary
+}
+
+func (t *TerminalState) cloneHistoryRows() []Row {
+	out := make([]Row, len(t.History))
+	for i := range out {
+		row := t.History[(t.historyStart+i)%len(t.History)]
+		out[i] = Row{Cells: append([]Cell(nil), row.Cells...), WrapsNext: row.WrapsNext}
+	}
+	return out
+}
+
+func (t *TerminalState) orderedHistoryRows() []Row {
+	out := make([]Row, len(t.History))
+	for i := range out {
+		out[i] = t.History[(t.historyStart+i)%len(t.History)]
+	}
+	return out
 }
 
 func cloneRows(rows []Row) []Row {
@@ -1066,11 +1233,12 @@ func (t *TerminalState) scrollDownRegion(top, bottom int, styleID uint32) {
 	if top < 0 || bottom >= len(t.GridRows) || top > bottom {
 		return
 	}
+	recycled := t.GridRows[bottom]
 	copy(t.GridRows[top+1:bottom+1], t.GridRows[top:bottom])
-	t.GridRows[top] = blankRow(t.Cols, styleID)
+	clearRow(&recycled, styleID)
+	t.GridRows[top] = recycled
 	t.breakWrapChainAt(top)
 	t.breakWrapChainAt(bottom)
-	t.syncCellsFromRows()
 }
 
 func (t *TerminalState) reverseIndex(update *Update) {
@@ -1081,7 +1249,7 @@ func (t *TerminalState) reverseIndex(update *Update) {
 		update.CursorChanged = true
 		return
 	}
-	styleID := t.eraseStyleID(update)
+	styleID := t.eraseStyleID()
 	t.scrollDownRegion(t.ScrollTop, t.ScrollBottom, styleID)
 	delta := t.fullViewportScrollDelta(1)
 	update.recordScroll(delta, t.Rows)
@@ -1112,6 +1280,7 @@ func (t *TerminalState) restoreCursor() {
 	t.CursorX = t.SavedCursor.X
 	t.CursorY = t.SavedCursor.Y
 	t.CurrentStyle = t.SavedCursor.Style
+	t.syncCurrentStyleID()
 	t.wrapPending = t.SavedCursor.WrapPending
 	t.OriginMode = t.SavedCursor.OriginMode
 	t.G0Charset = t.SavedCursor.G0Charset
@@ -1152,7 +1321,6 @@ func (t *TerminalState) deleteChars(n int, styleID uint32) {
 		row[i] = blankCell(styleID)
 	}
 	t.normalizeRow(t.CursorY)
-	t.syncRowToCells(t.CursorY)
 }
 
 func (t *TerminalState) insertChars(n int, styleID uint32) {
@@ -1168,7 +1336,6 @@ func (t *TerminalState) insertChars(n int, styleID uint32) {
 		row[i] = blankCell(styleID)
 	}
 	t.normalizeRow(t.CursorY)
-	t.syncRowToCells(t.CursorY)
 }
 
 func (t *TerminalState) insertLines(n int, styleID uint32) {
@@ -1176,12 +1343,13 @@ func (t *TerminalState) insertLines(n int, styleID uint32) {
 		return
 	}
 	n = min(n, t.ScrollBottom-t.CursorY+1)
-	copy(t.GridRows[t.CursorY+n:t.ScrollBottom+1], t.GridRows[t.CursorY:t.ScrollBottom+1-n])
-	for row := t.CursorY; row < t.CursorY+n; row++ {
-		t.GridRows[row] = blankRow(t.Cols, styleID)
+	for range n {
+		recycled := t.GridRows[t.ScrollBottom]
+		copy(t.GridRows[t.CursorY+1:t.ScrollBottom+1], t.GridRows[t.CursorY:t.ScrollBottom])
+		clearRow(&recycled, styleID)
+		t.GridRows[t.CursorY] = recycled
 	}
 	t.breakAllWrapChains()
-	t.syncCellsFromRows()
 }
 
 func (t *TerminalState) deleteLines(n int, styleID uint32) {
@@ -1189,12 +1357,13 @@ func (t *TerminalState) deleteLines(n int, styleID uint32) {
 		return
 	}
 	n = min(n, t.ScrollBottom-t.CursorY+1)
-	copy(t.GridRows[t.CursorY:t.ScrollBottom+1-n], t.GridRows[t.CursorY+n:t.ScrollBottom+1])
-	for row := t.ScrollBottom + 1 - n; row <= t.ScrollBottom; row++ {
-		t.GridRows[row] = blankRow(t.Cols, styleID)
+	for range n {
+		recycled := t.GridRows[t.CursorY]
+		copy(t.GridRows[t.CursorY:t.ScrollBottom], t.GridRows[t.CursorY+1:t.ScrollBottom+1])
+		clearRow(&recycled, styleID)
+		t.GridRows[t.ScrollBottom] = recycled
 	}
 	t.breakAllWrapChains()
-	t.syncCellsFromRows()
 }
 
 func (t *TerminalState) setPrivateModes(modes []int, enabled bool, update *Update) {
@@ -1246,6 +1415,8 @@ func (t *TerminalState) setPrivateModes(modes []int, enabled bool, update *Updat
 
 func (t *TerminalState) softReset() {
 	t.CurrentStyle = DefaultStyle
+	t.cachedStyle = DefaultStyle
+	t.cachedStyleID = 0
 	t.CursorVisible = true
 	t.InsertMode = false
 	t.OriginMode = false
@@ -1315,10 +1486,7 @@ func (t *TerminalState) previousTabStop(column int) int {
 }
 
 func (t *TerminalState) translateByte(b byte) rune {
-	charset := t.G0Charset
-	if t.ActiveCharset == 1 {
-		charset = t.G1Charset
-	}
+	charset := t.activeCharset()
 	if charset != '0' {
 		return rune(b)
 	}
@@ -1326,6 +1494,13 @@ func (t *TerminalState) translateByte(b byte) rune {
 		return translated
 	}
 	return rune(b)
+}
+
+func (t *TerminalState) activeCharset() byte {
+	if t.ActiveCharset == 1 {
+		return t.G1Charset
+	}
+	return t.G0Charset
 }
 
 var decSpecialGraphics = map[byte]rune{
@@ -1372,7 +1547,7 @@ func itoa(v int) string {
 func (t *TerminalState) lineFeed(update *Update) {
 	t.breakWrapChainAt(t.CursorY)
 	if t.CursorY == t.ScrollBottom {
-		styleID := t.eraseStyleID(update)
+		styleID := t.eraseStyleID()
 		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
 		delta := t.fullViewportScrollDelta(-1)
 		update.recordScroll(delta, t.Rows)
@@ -1388,7 +1563,7 @@ func (t *TerminalState) lineFeed(update *Update) {
 
 func (t *TerminalState) wrapLine(update *Update) {
 	if t.CursorY == t.ScrollBottom {
-		styleID := t.eraseStyleID(update)
+		styleID := t.eraseStyleID()
 		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
 		delta := t.fullViewportScrollDelta(-1)
 		update.recordScroll(delta, t.Rows)
@@ -1402,12 +1577,8 @@ func (t *TerminalState) wrapLine(update *Update) {
 	}
 }
 
-func (t *TerminalState) eraseStyleID(update *Update) uint32 {
-	styleID, added := t.styleID(t.CurrentStyle)
-	if added {
-		update.DefinedStyles[styleID] = t.CurrentStyle
-	}
-	return styleID
+func (t *TerminalState) eraseStyleID() uint32 {
+	return t.currentStyleID()
 }
 
 func (t *TerminalState) fullViewportScrollDelta(delta int) int {
@@ -1421,11 +1592,27 @@ func (t *TerminalState) styleID(style Style) (uint32, bool) {
 	if id, ok := t.styleToID[style]; ok {
 		return id, false
 	}
+	if len(t.styleByID) >= maxTerminalStyles {
+		return 0, false
+	}
 	id := t.nextStyleID
 	t.nextStyleID++
 	t.styleToID[style] = id
-	t.styleByID[id] = style
+	t.styleByID = append(t.styleByID, style)
 	return id, true
+}
+
+func (t *TerminalState) currentStyleID() uint32 {
+	return t.cachedStyleID
+}
+
+func (t *TerminalState) syncCurrentStyleID() {
+	if t.CurrentStyle == t.cachedStyle {
+		return
+	}
+	id, _ := t.styleID(t.CurrentStyle)
+	t.cachedStyle = t.CurrentStyle
+	t.cachedStyleID = id
 }
 
 func (t *TerminalState) clampCursor() {
@@ -1557,34 +1744,22 @@ func (t *TerminalState) breakAllWrapChains() {
 	}
 }
 
-func (t *TerminalState) syncCellsFromRows() {
-	t.Cells = make([]Cell, t.Cols*t.Rows)
-	for row := 0; row < t.Rows; row++ {
-		copy(t.Cells[row*t.Cols:(row+1)*t.Cols], t.GridRows[row].Cells)
-	}
-}
-
-func (t *TerminalState) syncRowToCells(row int) {
-	if row < 0 || row >= t.Rows || len(t.Cells) != t.Cols*t.Rows {
-		t.syncCellsFromRows()
-		return
-	}
-	copy(t.Cells[row*t.Cols:(row+1)*t.Cols], t.GridRows[row].Cells)
-}
-
 func blankRow(cols int, styleID uint32) Row {
 	row := Row{Cells: make([]Cell, cols)}
-	for i := range row.Cells {
-		row.Cells[i] = blankCell(styleID)
-	}
+	clearRow(&row, styleID)
 	return row
 }
 
-func cloneStyleMap(in map[uint32]Style) map[uint32]Style {
-	out := make(map[uint32]Style, len(in))
-	for k, v := range in {
-		out[k] = v
+func clearRow(row *Row, styleID uint32) {
+	for i := range row.Cells {
+		row.Cells[i] = blankCell(styleID)
 	}
+	row.WrapsNext = false
+}
+
+func cloneStyles(in []Style) []Style {
+	out := make([]Style, len(in), max(initialStyleCapacity, len(in)))
+	copy(out, in)
 	return out
 }
 

@@ -1,8 +1,8 @@
 package terminal
 
-import (
-	"strconv"
-	"strings"
+const (
+	maxCSIParams        = 32
+	maxCSIIntermediates = 2
 )
 
 type parserState int
@@ -12,6 +12,7 @@ const (
 	parserESC
 	parserESCCharset
 	parserCSI
+	parserCSIDiscard
 	parserOSC
 	parserOSCESC
 	parserDCS
@@ -22,7 +23,6 @@ type Parser struct {
 	state         parserState
 	csiBuf        []byte
 	utf8Buf       []byte
-	oscBuf        []byte
 	charsetTarget int
 }
 
@@ -31,28 +31,25 @@ func (p *Parser) clone() Parser {
 		state:         p.state,
 		csiBuf:        append([]byte(nil), p.csiBuf...),
 		utf8Buf:       append([]byte(nil), p.utf8Buf...),
-		oscBuf:        append([]byte(nil), p.oscBuf...),
 		charsetTarget: p.charsetTarget,
 	}
 	return next
 }
 
 type CSISequence struct {
-	PrivatePrefix byte
-	Params        []int
-	Intermediates []byte
-	Final         byte
+	PrivatePrefix     byte
+	Final             byte
+	Params            [maxCSIParams]int
+	ParamCount        int
+	Intermediates     [maxCSIIntermediates]byte
+	IntermediateCount int
 }
 
-func parseCSIParams(raw string) []int {
-	return parseDelimitedParams(raw)
-}
-
-func parseCSISequence(raw string) CSISequence {
-	if raw == "" {
-		return CSISequence{}
+func parseCSISequence(raw []byte, seq *CSISequence) bool {
+	if len(raw) == 0 {
+		return false
 	}
-	seq := CSISequence{Final: raw[len(raw)-1]}
+	*seq = CSISequence{Final: raw[len(raw)-1]}
 	body := raw[:len(raw)-1]
 	if len(body) > 0 {
 		switch body[0] {
@@ -70,33 +67,37 @@ func parseCSISequence(raw string) CSISequence {
 		}
 		break
 	}
-	paramText := body[:paramEnd]
-	if paramText != "" {
-		seq.Params = parseDelimitedParams(paramText)
+	if paramEnd > 0 {
+		count := 0
+		value := 0
+		overflow := false
+		for i := 0; i <= paramEnd; i++ {
+			if i < paramEnd && body[i] != ';' {
+				digit := int(body[i] - '0')
+				if value > (int(^uint(0)>>1)-digit)/10 {
+					overflow = true
+				} else if !overflow {
+					value = value*10 + digit
+				}
+				continue
+			}
+			if count == len(seq.Params) {
+				return false
+			}
+			if overflow {
+				value = 0
+			}
+			seq.Params[count] = value
+			count++
+			value, overflow = 0, false
+		}
+		seq.ParamCount = count
 	}
 	if paramEnd < len(body) {
-		seq.Intermediates = []byte(body[paramEnd:])
-	}
-	return seq
-}
-
-func parseDelimitedParams(raw string) []int {
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ";")
-	out := make([]int, 0, len(parts))
-	for _, part := range parts {
-		if part == "" {
-			out = append(out, 0)
-			continue
+		if len(body)-paramEnd > len(seq.Intermediates) {
+			return false
 		}
-		n, err := strconv.Atoi(part)
-		if err != nil {
-			out = append(out, 0)
-			continue
-		}
-		out = append(out, n)
+		seq.IntermediateCount = copy(seq.Intermediates[:], body[paramEnd:])
 	}
-	return out
+	return true
 }

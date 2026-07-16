@@ -51,6 +51,42 @@ func TestRenderOutputPublishesOnePhysicalBatchAtPresent(t *testing.T) {
 	}
 }
 
+func TestRenderOutputRetainsOnlyBoundedScratchBuffer(t *testing.T) {
+	output := newRenderOutput(io.Discard)
+	if err := output.present(); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.pending) != 0 || cap(output.pending) == 0 || cap(output.pending) > maxRetainedRenderBuffer {
+		t.Fatalf("small render buffer len=%d cap=%d", len(output.pending), cap(output.pending))
+	}
+
+	output.pending = make([]byte, maxRetainedRenderBuffer+1)
+	if err := output.commit(); err != nil {
+		t.Fatal(err)
+	}
+	if output.pending != nil {
+		t.Fatalf("oversized render buffer was retained with cap=%d", cap(output.pending))
+	}
+}
+
+func TestPaneOutputRateLimiterAllowsBurstThenLimitsSustainedOutput(t *testing.T) {
+	start := time.Unix(1, 0)
+	limiter := newPaneOutputRateLimiter(start)
+	if delay := limiter.reserve(start, paneOutputBurstBytes); delay != 0 {
+		t.Fatalf("initial burst delay = %v, want 0", delay)
+	}
+	halfSecondBytes := paneOutputBytesPerSecond / 2
+	if delay := limiter.reserve(start, halfSecondBytes); delay != 500*time.Millisecond {
+		t.Fatalf("first sustained delay = %v, want 500ms", delay)
+	}
+	if delay := limiter.reserve(start.Add(500*time.Millisecond), halfSecondBytes); delay != 500*time.Millisecond {
+		t.Fatalf("second sustained delay = %v, want 500ms", delay)
+	}
+	if delay := limiter.reserve(start.Add(1500*time.Millisecond), paneOutputBurstBytes); delay != 0 {
+		t.Fatalf("refilled burst delay = %v, want 0", delay)
+	}
+}
+
 type countingBuffer struct {
 	bytes.Buffer
 	writes int
@@ -753,18 +789,17 @@ func TestChineseTerminalOutputUsesWidthTwoDisplayCommand(t *testing.T) {
 func TestMergedDamageMovesWithLaterScroll(t *testing.T) {
 	aggregate := terminal.Update{}
 	aggregate.Merge(terminal.Update{
-		DirtyRows:  map[int]struct{}{1: {}},
-		DirtySpans: map[int]terminal.DirtySpan{1: {Start: 0, End: 3}},
+		DirtySpans: []terminal.DirtySpan{{}, {Start: 0, End: 3}, {}},
 	}, 3)
 	aggregate.Merge(terminal.Update{ScrollDelta: -1}, 3)
 
 	if aggregate.ScrollDelta != -1 {
 		t.Fatalf("scroll delta = %d, want -1", aggregate.ScrollDelta)
 	}
-	if _, ok := aggregate.DirtySpans[0]; !ok {
+	if aggregate.DirtySpans[0].End == 0 {
 		t.Fatalf("damage was not shifted with scroll: %#v", aggregate.DirtySpans)
 	}
-	if _, ok := aggregate.DirtySpans[1]; ok {
+	if aggregate.DirtySpans[1].End != 0 {
 		t.Fatalf("old damage row survived scroll: %#v", aggregate.DirtySpans)
 	}
 }
@@ -781,6 +816,45 @@ func TestDisplayWireMeasurement(t *testing.T) {
 	actual := append(append([]byte(nil), output.pending...), byte(protocol.DisplayOpcodePresent))
 	conceptual := conceptualFramedDisplaySize(t, actual)
 	t.Logf("TUI-like batch commands=%d before_framed=%d after_display=%d savings=%d", len(decodePendingCommands(t, output.pending)), conceptual, len(actual), conceptual-len(actual))
+}
+
+func BenchmarkPaneOutputHotPath(b *testing.B) {
+	pane := &Pane{terminal: terminal.New(80, 24)}
+	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
+	pane.terminal.Apply(bytes.Repeat([]byte{'w'}, 80*(pane.terminal.Rows+pane.terminal.HistoryLimit)))
+	output := newRenderOutput(io.Discard)
+	var update terminal.Update
+	update.Reset(pane.terminal.Rows)
+	pane.terminal.ApplyInto(chunk, &update)
+	if err := emitTerminalUpdate(output, pane, update); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(chunk)))
+	b.ResetTimer()
+	for range b.N {
+		update.Reset(pane.terminal.Rows)
+		pane.terminal.ApplyInto(chunk, &update)
+		if err := emitTerminalUpdate(output, pane, update); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkFullPaneRender(b *testing.B) {
+	pane := &Pane{terminal: terminal.New(80, 24)}
+	pane.terminal.Apply(bytes.Repeat([]byte("styled \x1b[32mtext\x1b[0m "), 200))
+	output := newRenderOutput(io.Discard)
+	if err := sendFullRender(output, pane); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := sendFullRender(output, pane); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func decodePendingCommands(tb testing.TB, data []byte) []protocol.DisplayCommand {

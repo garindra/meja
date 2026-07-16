@@ -3,7 +3,6 @@ package server
 import (
 	"fmt"
 	"io"
-	"sort"
 	"sync"
 	"time"
 
@@ -16,9 +15,36 @@ import (
 var ptyReadBuffers = sync.Pool{New: func() any { return make([]byte, 32*1024) }}
 
 const (
-	renderIdleFlush   = time.Millisecond
-	renderMaxBatchAge = 10 * time.Millisecond
+	renderIdleFlush          = time.Millisecond
+	renderMaxBatchAge        = 16 * time.Millisecond
+	maxRetainedRenderBuffer  = 64 << 10
+	paneOutputBytesPerSecond = 8 << 20
+	paneOutputBurstBytes     = 1 << 20
 )
+
+type paneOutputRateLimiter struct {
+	tokens float64
+	last   time.Time
+}
+
+func newPaneOutputRateLimiter(now time.Time) paneOutputRateLimiter {
+	return paneOutputRateLimiter{tokens: paneOutputBurstBytes, last: now}
+}
+
+func (l *paneOutputRateLimiter) reserve(now time.Time, bytes int) time.Duration {
+	if bytes <= 0 {
+		return 0
+	}
+	if elapsed := now.Sub(l.last); elapsed > 0 {
+		l.tokens = min(float64(paneOutputBurstBytes), l.tokens+elapsed.Seconds()*paneOutputBytesPerSecond)
+	}
+	l.last = now
+	l.tokens -= float64(bytes)
+	if l.tokens >= 0 {
+		return 0
+	}
+	return time.Duration(-l.tokens / paneOutputBytesPerSecond * float64(time.Second))
+}
 
 func (p *Pane) attachOutput(lease *OutputLease, refresh func(*renderOutput) error) error {
 	return p.attachOutputMode(lease, true, refresh)
@@ -100,10 +126,30 @@ func (p *Pane) sendRenderCommand(command paneCommand) error {
 
 func relayPTYOutput(pane *Pane) {
 	defer close(pane.ptyOutput)
+	limiter := newPaneOutputRateLimiter(time.Now())
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		buf := ptyReadBuffers.Get().([]byte)
 		n, err := pane.PTY.Read(buf)
 		if n > 0 {
+			if delay := limiter.reserve(time.Now(), n); delay > 0 {
+				if timer == nil {
+					timer = time.NewTimer(delay)
+				} else {
+					timer.Reset(delay)
+				}
+				select {
+				case <-timer.C:
+				case <-pane.done:
+					ptyReadBuffers.Put(buf[:cap(buf)])
+					return
+				}
+			}
 			select {
 			case pane.ptyOutput <- buf[:n]:
 			case <-pane.done:
@@ -150,30 +196,44 @@ func (pane *Pane) run() {
 			}
 		}
 	}
+	defer func() {
+		stop(idle)
+		stop(maxAge)
+	}()
+	arm := func(timer **time.Timer, channel *<-chan time.Time, duration time.Duration) {
+		if *timer == nil {
+			*timer = time.NewTimer(duration)
+		} else {
+			stop(*timer)
+			(*timer).Reset(duration)
+		}
+		*channel = (*timer).C
+	}
+	disarm := func(timer *time.Timer, channel *<-chan time.Time) {
+		stop(timer)
+		*channel = nil
+	}
 	flush := func() {
 		if !pending {
 			return
 		}
-		stop(idle)
-		stop(maxAge)
-		idle, idleC, maxAge, maxC = nil, nil, nil, nil
-		current := aggregate
-		aggregate = terminal.Update{}
+		disarm(idle, &idleC)
+		disarm(maxAge, &maxC)
 		pending = false
 		if output != nil && liveOutput {
-			if err := emitTerminalUpdate(output, pane, current); err != nil {
+			if err := emitTerminalUpdate(output, pane, aggregate); err != nil {
 				output = nil
 				pane.outputLease = nil
 			}
 		}
+		aggregate.Reset(pane.terminal.Rows)
 	}
 	for {
 		select {
 		case command := <-pane.commands:
-			stop(idle)
-			stop(maxAge)
-			idle, idleC, maxAge, maxC = nil, nil, nil, nil
-			aggregate = terminal.Update{}
+			disarm(idle, &idleC)
+			disarm(maxAge, &maxC)
+			aggregate.Reset(pane.terminal.Rows)
 			pending = false
 			if command.release != nil {
 				lease := pane.outputLease
@@ -232,24 +292,31 @@ func (pane *Pane) run() {
 				flush()
 				return
 			}
-			update := pane.terminal.Apply(data)
+			trackDamage := output != nil && liveOutput
+			if !pending {
+				aggregate.ResetFor(pane.terminal.Rows, trackDamage)
+			}
+			pane.terminal.ApplyInto(data, &aggregate)
 			ptyReadBuffers.Put(data[:cap(data)])
-			for _, reply := range update.Replies {
+			for _, reply := range aggregate.Replies {
 				if err := pane.sendOwnedInput(reply); err != nil {
 					return
 				}
 			}
-			update.Replies = nil
+			aggregate.Replies = aggregate.Replies[:0]
 			pane.publishTerminalMetadata()
-			aggregate.Merge(update, pane.terminal.Rows)
+			if !trackDamage {
+				aggregate.ResetFor(pane.terminal.Rows, false)
+				continue
+			}
+			if !pending && !aggregate.HasRenderChange() {
+				continue
+			}
 			if !pending {
 				pending = true
-				maxAge = time.NewTimer(renderMaxBatchAge)
-				maxC = maxAge.C
+				arm(&maxAge, &maxC, renderMaxBatchAge)
 			}
-			stop(idle)
-			idle = time.NewTimer(renderIdleFlush)
-			idleC = idle.C
+			arm(&idle, &idleC, renderIdleFlush)
 		case <-idleC:
 			flush()
 		case <-maxC:
@@ -335,46 +402,7 @@ func emitTerminalUpdate(output *renderOutput, pane *Pane, update terminal.Update
 	if update.FullRedraw {
 		return sendFullRender(output, pane)
 	}
-	rows := make([]int, 0, len(update.DirtySpans))
-	for row := range update.DirtySpans {
-		rows = append(rows, row)
-	}
-	sort.Ints(rows)
-	runs := make([]displayCellRun, 0, len(rows))
-	for _, row := range rows {
-		span := update.DirtySpans[row]
-		start := row*pane.terminal.Cols + span.Start
-		end := row*pane.terminal.Cols + span.End
-		runs = append(runs, displayCellRun{Row: row, Column: span.Start, Cells: append([]protocol.Cell(nil), pane.terminal.Cells[start:end]...)})
-	}
-	neededStyles := make(map[uint32]struct{})
-	for id := range update.DefinedStyles {
-		neededStyles[id] = struct{}{}
-	}
-	for _, run := range runs {
-		for _, cell := range run.Cells {
-			neededStyles[cell.StyleID] = struct{}{}
-		}
-	}
-	styleByID := make(map[uint32]protocol.Style)
-	for _, def := range pane.terminal.SnapshotStyles() {
-		styleByID[def.ID] = def.Style
-	}
-	styleIDs := make([]int, 0, len(neededStyles))
-	for id := range neededStyles {
-		styleIDs = append(styleIDs, int(id))
-	}
-	sort.Ints(styleIDs)
-	styles := make([]protocol.StyleDefinition, 0, len(styleIDs))
-	for _, rawID := range styleIDs {
-		id := uint32(rawID)
-		style, ok := styleByID[id]
-		if !ok {
-			return fmt.Errorf("terminal style %d is undefined", id)
-		}
-		styles = append(styles, protocol.StyleDefinition{ID: id, Style: style})
-	}
-	if len(styles) == 0 && len(runs) == 0 && !update.CursorChanged && !update.VisibleChange {
+	if !update.HasDamage() && !update.CursorChanged && !update.VisibleChange {
 		if update.ScrollDelta == 0 {
 			return nil
 		}
@@ -384,14 +412,14 @@ func emitTerminalUpdate(output *renderOutput, pane *Pane, update terminal.Update
 			return err
 		}
 	}
-	for _, def := range styles {
-		if err := installStyle(output, def.ID, def.Style); err != nil {
-			return err
+	compiler := newLiveDisplayCompiler(output, pane.terminal)
+	for row := 0; row < pane.terminal.Rows; row++ {
+		span := update.DirtySpans[row]
+		if span.End == 0 {
+			continue
 		}
-	}
-	compiler := newDisplayCompiler(output, styleByID)
-	for _, run := range runs {
-		if err := compiler.writeCells(run.Row, run.Column, run.Cells); err != nil {
+		cells := pane.terminal.GridRows[row].Cells[span.Start:span.End]
+		if err := compiler.writeCells(row, span.Start, cells); err != nil {
 			return err
 		}
 	}
@@ -404,18 +432,9 @@ func emitTerminalUpdate(output *renderOutput, pane *Pane, update terminal.Update
 }
 
 func sendFullRender(output *renderOutput, pane *Pane) error {
-	styleDefs := pane.terminal.SnapshotStyles()
-	styleByID := make(map[uint32]protocol.Style, len(styleDefs))
-	for _, def := range styleDefs {
-		styleByID[def.ID] = def.Style
-		if err := installStyle(output, def.ID, def.Style); err != nil {
-			return err
-		}
-	}
-	compiler := newDisplayCompiler(output, styleByID)
+	compiler := newLiveDisplayCompiler(output, pane.terminal)
 	for row := 0; row < pane.terminal.Rows; row++ {
-		start := row * pane.terminal.Cols
-		if err := compiler.writeCells(row, 0, pane.terminal.Cells[start:start+pane.terminal.Cols]); err != nil {
+		if err := compiler.writeCells(row, 0, pane.terminal.GridRows[row].Cells); err != nil {
 			return err
 		}
 	}
@@ -476,11 +495,12 @@ func installStyle(output *renderOutput, id uint32, style protocol.Style) error {
 type renderOutput struct {
 	stream          io.Writer
 	pending         []byte
+	textScratch     []byte
 	installedStyles map[uint32]protocol.Style
 }
 
 func newRenderOutput(stream ...io.Writer) *renderOutput {
-	output := &renderOutput{stream: io.Discard, installedStyles: make(map[uint32]protocol.Style)}
+	output := &renderOutput{stream: io.Discard, installedStyles: make(map[uint32]protocol.Style, 32)}
 	if len(stream) > 0 {
 		output.stream = stream[0]
 	}
@@ -504,8 +524,13 @@ func (o *renderOutput) commit() error {
 		return nil
 	}
 	data := o.pending
-	o.pending = nil
-	return writeAll(o.stream, data)
+	err := writeAll(o.stream, data)
+	if cap(data) <= maxRetainedRenderBuffer {
+		o.pending = data[:0]
+	} else {
+		o.pending = nil
+	}
+	return err
 }
 
 func (o *renderOutput) present() error {

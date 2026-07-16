@@ -20,7 +20,6 @@ func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {
 		historyTestRow("end "),
 	}
 	pane.terminal.CursorY = 2
-	pane.terminal.Cells = append(append(append([]protocol.Cell{}, pane.terminal.GridRows[0].Cells...), pane.terminal.GridRows[1].Cells...), pane.terminal.GridRows[2].Cells...)
 
 	snapshot := captureTerminalHistorySnapshot(pane.terminal)
 	pane.terminal.History[0].Cells[0].Rune = 'X'

@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"bytes"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -15,7 +16,7 @@ func TestCanonicalDefaultStyleOwnsIDZero(t *testing.T) {
 	}
 	term.CurrentStyle = Style{Bold: true}
 	term.Apply([]byte("x"))
-	if term.Cells[0].StyleID == protocol.CanonicalDefaultStyleID {
+	if term.GridRows[0].Cells[0].StyleID == protocol.CanonicalDefaultStyleID {
 		t.Fatal("dynamic style reused canonical style ID 0")
 	}
 }
@@ -24,7 +25,7 @@ func TestFragmentedCSIAndCursorPositioning(t *testing.T) {
 	term := New(5, 2)
 	term.Apply([]byte("abc\x1b[2"))
 	term.Apply([]byte("D!"))
-	if got := string([]rune{term.Cells[0].Rune, term.Cells[1].Rune, term.Cells[2].Rune}); got != "a!c" {
+	if got := rowString(term, 0, 3); got != "a!c" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -44,8 +45,8 @@ func TestFragmentedUTF8(t *testing.T) {
 	term := New(5, 1)
 	term.Apply([]byte{0xe2, 0x82})
 	term.Apply([]byte{0xac})
-	if term.Cells[0].Rune != '€' {
-		t.Fatalf("Rune = %q, want €", term.Cells[0].Rune)
+	if term.GridRows[0].Cells[0].Rune != '€' {
+		t.Fatalf("Rune = %q, want €", term.GridRows[0].Cells[0].Rune)
 	}
 }
 
@@ -85,7 +86,7 @@ func TestChineseRuneWrapsBeforeLastColumn(t *testing.T) {
 func TestCROverwrite(t *testing.T) {
 	term := New(5, 1)
 	term.Apply([]byte("10%\r30%"))
-	got := string([]rune{term.Cells[0].Rune, term.Cells[1].Rune, term.Cells[2].Rune})
+	got := rowString(term, 0, 3)
 	if got != "30%" {
 		t.Fatalf("got %q", got)
 	}
@@ -94,8 +95,8 @@ func TestCROverwrite(t *testing.T) {
 func TestLFScrollAtBottom(t *testing.T) {
 	term := New(3, 2)
 	term.Apply([]byte("aaa\nbbb\nccc"))
-	row0 := string([]rune{term.Cells[0].Rune, term.Cells[1].Rune, term.Cells[2].Rune})
-	row1 := string([]rune{term.Cells[3].Rune, term.Cells[4].Rune, term.Cells[5].Rune})
+	row0 := rowString(term, 0, 3)
+	row1 := rowString(term, 1, 3)
 	if row0 != "bbb" || row1 != "ccc" {
 		t.Fatalf("rows = %q / %q", row0, row1)
 	}
@@ -108,11 +109,236 @@ func TestFullPrimaryScrollCapturesBoundedHistory(t *testing.T) {
 	if len(term.History) != 2 {
 		t.Fatalf("history rows = %d, want 2", len(term.History))
 	}
-	if got := cellsString(term.History[0].Cells); got != "aaa" {
+	history, _ := term.SnapshotRows()
+	if got := cellsString(history[0].Cells); got != "aaa" {
 		t.Fatalf("oldest retained history row = %q, want aaa", got)
 	}
-	if got := cellsString(term.History[1].Cells); got != "bbb" {
+	if got := cellsString(history[1].Cells); got != "bbb" {
 		t.Fatalf("newest retained history row = %q, want bbb", got)
+	}
+}
+
+func TestSustainedAutowrapReusesTerminalStorage(t *testing.T) {
+	term := New(8, 3)
+	term.HistoryLimit = 4
+	term.Apply(bytes.Repeat([]byte{'x'}, 8*(term.Rows+term.HistoryLimit+1)))
+
+	rows := make(map[*Cell]struct{}, term.Rows+term.HistoryLimit)
+	for _, row := range term.GridRows {
+		rows[&row.Cells[0]] = struct{}{}
+	}
+	for _, row := range term.History {
+		rows[&row.Cells[0]] = struct{}{}
+	}
+	if len(rows) != term.Rows+term.HistoryLimit {
+		t.Fatalf("row buffers alias before reuse: got %d, want %d", len(rows), term.Rows+term.HistoryLimit)
+	}
+
+	term.Apply(bytes.Repeat([]byte{'y'}, 8*100))
+	for _, row := range append(append([]Row(nil), term.GridRows...), term.History...) {
+		if _, ok := rows[&row.Cells[0]]; !ok {
+			t.Fatal("scroll allocated a new row buffer after history reached its limit")
+		}
+	}
+}
+
+func TestHistoryRingSnapshotPreservesChronologicalOrder(t *testing.T) {
+	term := New(3, 2)
+	term.HistoryLimit = 3
+	term.Apply([]byte("000\r\n111\r\n222\r\n333\r\n444\r\n555\r\n"))
+	history, _ := term.SnapshotRows()
+	if len(history) != 3 {
+		t.Fatalf("history rows = %d, want 3", len(history))
+	}
+	for i, want := range []string{"222", "333", "444"} {
+		if got := cellsString(history[i].Cells); got != want {
+			t.Fatalf("history[%d] = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestApplyIntoAccumulatesChunkedDamage(t *testing.T) {
+	chunked := New(4, 2)
+	var update Update
+	update.Reset(chunked.Rows)
+	chunked.ApplyInto([]byte("abcd"), &update)
+	chunked.ApplyInto([]byte("efgh"), &update)
+
+	whole := New(4, 2)
+	want := whole.Apply([]byte("abcdefgh"))
+	for row := range chunked.GridRows {
+		if got, expected := cellsString(chunked.GridRows[row].Cells), cellsString(whole.GridRows[row].Cells); got != expected {
+			t.Fatalf("row %d = %q, want %q", row, got, expected)
+		}
+	}
+	if update.ScrollDelta != want.ScrollDelta || update.FullRedraw != want.FullRedraw || update.CursorChanged != want.CursorChanged {
+		t.Fatalf("chunked update = %#v, whole update = %#v", update, want)
+	}
+	for row := range update.DirtySpans {
+		if update.DirtySpans[row] != want.DirtySpans[row] {
+			t.Fatalf("damage row %d = %#v, want %#v", row, update.DirtySpans[row], want.DirtySpans[row])
+		}
+	}
+}
+
+func TestApplyIntoCanSkipDamageTracking(t *testing.T) {
+	term := New(4, 1)
+	var update Update
+	update.ResetFor(term.Rows, false)
+	term.ApplyInto([]byte("data"), &update)
+	if len(update.DirtySpans) != 0 || update.HasDamage() {
+		t.Fatalf("detached update retained damage: %#v", update.DirtySpans)
+	}
+	if got := rowString(term, 0, 4); got != "data" {
+		t.Fatalf("detached parsing row = %q", got)
+	}
+}
+
+func TestOversizedCSIDiscardedAndParserRecovers(t *testing.T) {
+	term := New(4, 1)
+	input := append([]byte("\x1b["), bytes.Repeat([]byte{'1'}, maxCSISequenceBytes+100)...)
+	input = append(input, 'm', 'O', 'K')
+	term.Apply(input)
+	if got := rowString(term, 0, 4); got != "OK  " {
+		t.Fatalf("row after oversized CSI = %q, want parser to recover", got)
+	}
+	if len(term.Parser.csiBuf) != 0 || term.Parser.state != parserText {
+		t.Fatalf("parser retained oversized CSI: state=%d bytes=%d", term.Parser.state, len(term.Parser.csiBuf))
+	}
+}
+
+func TestCSIAtBufferLimitConsumesItsFinalByte(t *testing.T) {
+	term := New(4, 1)
+	input := append([]byte("\x1b["), bytes.Repeat([]byte{'1'}, maxCSISequenceBytes)...)
+	input = append(input, 'm', 'O', 'K')
+	term.Apply(input)
+	if got := rowString(term, 0, 4); got != "OK  " {
+		t.Fatalf("row after CSI at buffer limit = %q", got)
+	}
+}
+
+func TestOSCContentIsNotRetained(t *testing.T) {
+	term := New(4, 1)
+	term.Apply(append([]byte("\x1b]"), bytes.Repeat([]byte{'x'}, 1<<20)...))
+	if term.Parser.state != parserOSC {
+		t.Fatalf("parser state = %d, want OSC awaiting terminator", term.Parser.state)
+	}
+	term.Apply([]byte("\aOK"))
+	if got := rowString(term, 0, 4); got != "OK  " {
+		t.Fatalf("row after OSC terminator = %q", got)
+	}
+}
+
+func TestTerminalStyleTableIsBounded(t *testing.T) {
+	term := New(1, 1)
+	for i := 0; i < maxTerminalStyles+100; i++ {
+		term.styleID(Style{FG: protocol.Color{Mode: "rgb", R: uint8(i >> 16), G: uint8(i >> 8), B: uint8(i)}})
+	}
+	if got := len(term.styleByID); got != maxTerminalStyles {
+		t.Fatalf("style table size = %d, want %d", got, maxTerminalStyles)
+	}
+}
+
+func TestTerminalStyleTablePreallocatesCommonCapacity(t *testing.T) {
+	term := New(1, 1)
+	if cap(term.styleByID) < initialStyleCapacity {
+		t.Fatalf("style capacity = %d, want at least %d", cap(term.styleByID), initialStyleCapacity)
+	}
+	first := &term.styleByID[0]
+	for i := 1; i < initialStyleCapacity; i++ {
+		term.styleID(Style{FG: protocol.Color{Mode: "indexed", Index: uint8(i)}})
+	}
+	if &term.styleByID[0] != first {
+		t.Fatal("ordinary style growth reallocated the preallocated style table")
+	}
+}
+
+func TestBulkASCIIMatchesBytewiseParsing(t *testing.T) {
+	bulk := New(6, 3)
+	bytewise := New(6, 3)
+	prefix := []byte("界界\r\nabcdefghi\x1b[2;2H")
+	bulk.Apply(prefix)
+	bytewise.Apply(prefix)
+	data := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+	bulk.Apply(data)
+	for _, b := range data {
+		bytewise.Apply([]byte{b})
+	}
+	bulkHistory, bulkPrimary := bulk.SnapshotRows()
+	bytewiseHistory, bytewisePrimary := bytewise.SnapshotRows()
+	if !reflect.DeepEqual(bulk.GridRows, bytewise.GridRows) || !reflect.DeepEqual(bulkHistory, bytewiseHistory) || !reflect.DeepEqual(bulkPrimary, bytewisePrimary) {
+		t.Fatal("bulk ASCII parsing produced different screen or history rows")
+	}
+	if bulk.CursorX != bytewise.CursorX || bulk.CursorY != bytewise.CursorY || bulk.wrapPending != bytewise.wrapPending || bulk.LastPrintedRune != bytewise.LastPrintedRune || bulk.LastPrintedValid != bytewise.LastPrintedValid {
+		t.Fatalf("bulk cursor state = (%d,%d,%v,%q,%v), bytewise = (%d,%d,%v,%q,%v)", bulk.CursorX, bulk.CursorY, bulk.wrapPending, bulk.LastPrintedRune, bulk.LastPrintedValid, bytewise.CursorX, bytewise.CursorY, bytewise.wrapPending, bytewise.LastPrintedRune, bytewise.LastPrintedValid)
+	}
+}
+
+func BenchmarkSustainedAutowrap(b *testing.B) {
+	term := New(80, 24)
+	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
+	term.Apply(bytes.Repeat([]byte{'w'}, 80*(term.Rows+term.HistoryLimit)))
+	var update Update
+	update.Reset(term.Rows)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(chunk)))
+	b.ResetTimer()
+	for range b.N {
+		update.Reset(term.Rows)
+		term.ApplyInto(chunk, &update)
+	}
+}
+
+func BenchmarkDetachedBinaryParsing(b *testing.B) {
+	term := New(80, 24)
+	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
+	term.Apply(bytes.Repeat([]byte{'w'}, 80*(term.Rows+term.HistoryLimit)))
+	var update Update
+	update.ResetFor(term.Rows, false)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(chunk)))
+	b.ResetTimer()
+	for range b.N {
+		update.ResetFor(term.Rows, false)
+		term.ApplyInto(chunk, &update)
+	}
+}
+
+func BenchmarkDetachedRandomParsing(b *testing.B) {
+	term := New(80, 24)
+	chunk := make([]byte, 32<<10)
+	state := uint32(0x12345678)
+	for i := range chunk {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		chunk[i] = byte(state)
+	}
+	term.Apply(bytes.Repeat([]byte{'w'}, 80*(term.Rows+term.HistoryLimit)))
+	var update Update
+	update.ResetFor(term.Rows, false)
+	term.ApplyInto(chunk, &update)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(chunk)))
+	b.ResetTimer()
+	for range b.N {
+		update.ResetFor(term.Rows, false)
+		term.ApplyInto(chunk, &update)
+	}
+}
+
+func BenchmarkBoundedCSIParsing(b *testing.B) {
+	term := New(80, 24)
+	chunk := bytes.Repeat([]byte("\x1b[31mX\x1b[0m"), (32<<10)/11)
+	var update Update
+	update.Reset(term.Rows)
+	term.ApplyInto(chunk, &update)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(chunk)))
+	b.ResetTimer()
+	for range b.N {
+		update.Reset(term.Rows)
+		term.ApplyInto(chunk, &update)
 	}
 }
 
@@ -148,7 +374,7 @@ func TestFullViewportLineFeedReportsScrollAndNewRowDamage(t *testing.T) {
 	if update.ScrollDelta != -1 {
 		t.Fatalf("scroll delta = %d, want -1", update.ScrollDelta)
 	}
-	if len(update.DirtySpans) != 1 {
+	if update.DirtySpans[0].End != 0 || update.DirtySpans[1].End == 0 {
 		t.Fatalf("dirty spans = %#v, want only newly exposed row", update.DirtySpans)
 	}
 	if got, want := update.DirtySpans[1], (DirtySpan{Start: 0, End: 3}); got != want {
@@ -214,14 +440,14 @@ func TestEraseLine(t *testing.T) {
 	term := New(5, 1)
 	term.Apply([]byte("hello"))
 	update := term.Apply([]byte("\x1b[3G\x1b[K"))
-	got := string([]rune{term.Cells[0].Rune, term.Cells[1].Rune, term.Cells[2].Rune, term.Cells[3].Rune, term.Cells[4].Rune})
+	got := rowString(term, 0, 5)
 	if got != "he   " {
 		t.Fatalf("got %q", got)
 	}
 	if update.FullRedraw {
 		t.Fatal("erase line forced a full redraw")
 	}
-	if _, ok := update.DirtyRows[0]; !ok {
+	if update.DirtySpans[0].End == 0 {
 		t.Fatal("erase line did not mark its row dirty")
 	}
 	if got, want := update.DirtySpans[0], (DirtySpan{Start: 2, End: 5}); got != want {
@@ -236,9 +462,11 @@ func TestClearErasesEntireCanonicalGrid(t *testing.T) {
 	if !update.FullRedraw {
 		t.Fatal("clear did not request full redraw")
 	}
-	for i, cell := range term.Cells {
-		if cell.Rune != ' ' {
-			t.Fatalf("cell %d survived clear: %#v", i, cell)
+	for row := range term.GridRows {
+		for column, cell := range term.GridRows[row].Cells {
+			if cell.Rune != ' ' {
+				t.Fatalf("cell %d,%d survived clear: %#v", row, column, cell)
+			}
 		}
 	}
 }
@@ -298,10 +526,7 @@ func TestEraseCharsMarksOnlyCurrentRowDirty(t *testing.T) {
 	if update.FullRedraw {
 		t.Fatal("erase characters forced a full redraw")
 	}
-	if len(update.DirtyRows) != 1 {
-		t.Fatalf("erase characters dirty rows = %#v", update.DirtyRows)
-	}
-	if _, ok := update.DirtyRows[0]; !ok {
+	if update.DirtySpans[0].End == 0 || update.DirtySpans[1].End != 0 {
 		t.Fatal("erase characters did not mark its row dirty")
 	}
 	if got, want := update.DirtySpans[0], (DirtySpan{Start: 1, End: 3}); got != want {
@@ -347,11 +572,8 @@ func TestDeleteCharactersUsesCurrentBackground(t *testing.T) {
 
 func TestSGRAndReverseVideo(t *testing.T) {
 	term := New(2, 1)
-	update := term.Apply([]byte("\x1b[1;38;2;1;2;3;7mA"))
-	if len(update.DefinedStyles) == 0 {
-		t.Fatal("expected style definition")
-	}
-	cell := term.Cells[0]
+	term.Apply([]byte("\x1b[1;38;2;1;2;3;7mA"))
+	cell := term.GridRows[0].Cells[0]
 	style := term.styleByID[cell.StyleID]
 	if !style.Bold || !style.Reverse || style.FG.Mode != "rgb" || style.FG.R != 1 {
 		t.Fatalf("style = %#v", style)
@@ -683,13 +905,10 @@ func TestScrollUpDownCommandsAndDamage(t *testing.T) {
 
 func TestScrollCommandsUseCurrentBackgroundForExposedRows(t *testing.T) {
 	term := New(3, 2)
-	update := term.Apply([]byte("abc\r\ndef\x1b[44m\x1b[S"))
+	term.Apply([]byte("abc\r\ndef\x1b[44m\x1b[S"))
 	style := term.styleByID[term.GridRows[1].Cells[0].StyleID]
 	if style.BG.Mode != "indexed" || style.BG.Index != 4 {
 		t.Fatalf("scrolled blank style=%#v", style)
-	}
-	if len(update.DefinedStyles) == 0 {
-		t.Fatal("scroll did not publish newly used erase style")
 	}
 }
 
@@ -819,7 +1038,7 @@ func TestSoftAndHardReset(t *testing.T) {
 func rowString(term *TerminalState, row, count int) string {
 	runes := make([]rune, 0, count)
 	for i := 0; i < count; i++ {
-		r := term.Cells[row*term.Cols+i].Rune
+		r := term.GridRows[row].Cells[i].Rune
 		if r == 0 {
 			r = ' '
 		}

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"unicode/utf8"
 
 	"github.com/garindra/meja/internal/protocol"
@@ -20,14 +21,31 @@ type displayCompiler struct {
 	styleValid    bool
 	styleID       uint32
 	textScratch   []byte
-	styles        map[uint32]protocol.Style
+	styles        displayStyleSource
+	installStyles bool
+}
+
+type displayStyleSource interface {
+	LookupStyle(uint32) (protocol.Style, bool)
+}
+
+type displayStyleMap map[uint32]protocol.Style
+
+func (m displayStyleMap) LookupStyle(id uint32) (protocol.Style, bool) {
+	style, ok := m[id]
+	return style, ok
 }
 
 func newDisplayCompiler(output *renderOutput, styles map[uint32]protocol.Style) *displayCompiler {
-	return &displayCompiler{output: output, styles: styles, textScratch: make([]byte, 0, 64)}
+	return &displayCompiler{output: output, styles: displayStyleMap(styles), textScratch: output.textScratch[:0]}
+}
+
+func newLiveDisplayCompiler(output *renderOutput, styles displayStyleSource) *displayCompiler {
+	return &displayCompiler{output: output, styles: styles, textScratch: output.textScratch[:0], installStyles: true}
 }
 
 func (d *displayCompiler) writeCells(row, column int, cells []protocol.Cell) error {
+	defer func() { d.output.textScratch = d.textScratch[:0] }()
 	for i := 0; i < len(cells); {
 		cell := cells[i]
 		if cell.Width == 0 {
@@ -127,8 +145,8 @@ func (d *displayCompiler) blankStylesEquivalent(leftID, rightID uint32) bool {
 	if leftID == rightID {
 		return true
 	}
-	left, leftOK := d.styles[leftID]
-	right, rightOK := d.styles[rightID]
+	left, leftOK := d.styles.LookupStyle(leftID)
+	right, rightOK := d.styles.LookupStyle(rightID)
 	if !leftOK || !rightOK || left.Underline || right.Underline {
 		return false
 	}
@@ -162,6 +180,15 @@ func (d *displayCompiler) moveTo(row, column int) error {
 func (d *displayCompiler) selectStyle(styleID uint32) error {
 	if d.styleValid && d.styleID == styleID {
 		return nil
+	}
+	if d.installStyles {
+		style, ok := d.styles.LookupStyle(styleID)
+		if !ok {
+			return fmt.Errorf("terminal style %d is undefined", styleID)
+		}
+		if err := installStyle(d.output, styleID, style); err != nil {
+			return err
+		}
 	}
 	if err := d.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: styleID}); err != nil {
 		return err
