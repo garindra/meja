@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/garindra/meja/internal/protocol"
-	"github.com/garindra/meja/internal/server/terminal"
 )
 
 func TestTranslateApplicationCursor(t *testing.T) {
@@ -64,7 +63,7 @@ func TestServerRecognizesSwapPanePrefixes(t *testing.T) {
 func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	s := NewSession(1)
 	s.NewClient(0)
-	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash", terminal: terminal.New(80, 24)}, 0)
+	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash", terminal: newTerminal(80, 24)}, 0)
 	var input bytes.Buffer
 	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: []byte{0x02, 'd', 0x02, 'd'}})
 	if err != nil {
@@ -190,7 +189,7 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	pane := &Pane{ID: s.AddPaneID(), PTY: writer, terminal: terminal.New(80, 23), Title: "bash"}
+	pane := &Pane{ID: s.AddPaneID(), PTY: writer, terminal: newTerminal(80, 23), Title: "bash"}
 	window, _ := s.CreateWindow(pane, 0)
 	if _, err := s.BeginRenameWindowPrompt(0); err != nil {
 		t.Fatal(err)
@@ -236,7 +235,7 @@ func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	pane := &Pane{ID: s.AddPaneID(), PTY: writer, terminal: terminal.New(80, 23), Title: "bash"}
+	pane := &Pane{ID: s.AddPaneID(), PTY: writer, terminal: newTerminal(80, 23), Title: "bash"}
 	s.CreateWindow(pane, 0)
 
 	want := []byte("你好，世界")
@@ -292,9 +291,9 @@ func TestServerOwnsLastAndRelativeWindowSelection(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
 	client.TerminalCols, client.TerminalRows = 80, 23
-	first := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 23)}
+	first := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 23)}
 	window1, _ := s.CreateWindow(first, 0)
-	second := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 23)}
+	second := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 23)}
 	window2, _ := s.CreateWindow(second, 0)
 	if got, ok := s.LastWindowID(0); !ok || got != window1.ID {
 		t.Fatalf("LastWindowID() = %d, %v; want %d, true", got, ok, window1.ID)
@@ -314,9 +313,9 @@ func TestServerGeometricFocusHandlesPaneZero(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
 	client.TerminalCols, client.TerminalRows = 80, 23
-	top := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 23)}
+	top := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 23)}
 	s.CreateWindow(top, 0)
-	bottom := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 23)}
+	bottom := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 23)}
 	if _, _, err := s.SplitFocusedPane(0, bottom, SplitHorizontal); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
@@ -330,13 +329,13 @@ func TestDirectionalFocusRemembersPositionAcrossUnevenPanes(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
 	client.TerminalCols, client.TerminalRows = 80, 24
-	left := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 24)}
+	left := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
 	s.CreateWindow(left, 0)
-	topRight := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 24)}
+	topRight := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
 	if _, _, err := s.SplitFocusedPane(0, topRight, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
-	bottomRight := &Pane{ID: s.AddPaneID(), terminal: terminal.New(80, 24)}
+	bottomRight := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
 	if _, _, err := s.SplitFocusedPane(0, bottomRight, SplitHorizontal); err != nil {
 		t.Fatal(err)
 	}

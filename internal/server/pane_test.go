@@ -9,8 +9,6 @@ import (
 	"slices"
 	"testing"
 	"time"
-
-	"github.com/garindra/meja/internal/server/terminal"
 )
 
 func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
@@ -20,7 +18,7 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 	}
 	defer reader.Close()
 
-	pane := &Pane{ID: 1, PTY: writer, terminal: terminal.New(8, 3)}
+	pane := &Pane{ID: 1, PTY: writer, terminal: newTerminal(8, 3)}
 	pane.initializeRuntime()
 	go pane.run()
 	writeFailed := make(chan error, 1)
@@ -75,7 +73,7 @@ func TestPaneStartupInputWaitsForInitialOutputToSettle(t *testing.T) {
 	pane := &Pane{
 		ID:           1,
 		PTY:          writer,
-		terminal:     terminal.New(16, 3),
+		terminal:     newTerminal(16, 3),
 		startupInput: []byte("vi mnt.sh"),
 	}
 	pane.initializeRuntime()
@@ -174,7 +172,7 @@ func TestResolveStartingDirectoryRejectsAmbiguousOrInvalidPaths(t *testing.T) {
 }
 
 func TestPaneResizeRunsOnPaneMainLoop(t *testing.T) {
-	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
+	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
 	pane.initializeRuntime()
 	go pane.run()
 	defer func() {

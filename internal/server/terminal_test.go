@@ -1,4 +1,4 @@
-package terminal
+package server
 
 import (
 	"bytes"
@@ -10,7 +10,7 @@ import (
 )
 
 func TestCanonicalDefaultStyleOwnsIDZero(t *testing.T) {
-	term := New(4, 1)
+	term := newTerminal(4, 1)
 	if term.styleByID[protocol.CanonicalDefaultStyleID] != protocol.CanonicalDefaultStyle() {
 		t.Fatalf("style 0=%#v, want canonical default", term.styleByID[protocol.CanonicalDefaultStyleID])
 	}
@@ -22,7 +22,7 @@ func TestCanonicalDefaultStyleOwnsIDZero(t *testing.T) {
 }
 
 func TestFragmentedCSIAndCursorPositioning(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.Apply([]byte("abc\x1b[2"))
 	term.Apply([]byte("D!"))
 	if got := rowString(term, 0, 3); got != "a!c" {
@@ -31,7 +31,7 @@ func TestFragmentedCSIAndCursorPositioning(t *testing.T) {
 }
 
 func TestResizePreservesIncrementalParserAndSavedCursor(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.CursorX, term.CursorY = 4, 1
 	term.Apply([]byte("\x1b7\x1b[2"))
 	term.Resize(8, 3)
@@ -42,7 +42,7 @@ func TestResizePreservesIncrementalParserAndSavedCursor(t *testing.T) {
 }
 
 func TestFragmentedUTF8(t *testing.T) {
-	term := New(5, 1)
+	term := newTerminal(5, 1)
 	term.Apply([]byte{0xe2, 0x82})
 	term.Apply([]byte{0xac})
 	if term.GridRows[0].Cells[0].Rune != '€' {
@@ -51,7 +51,7 @@ func TestFragmentedUTF8(t *testing.T) {
 }
 
 func TestChineseRuneOccupiesTwoCells(t *testing.T) {
-	term := New(5, 1)
+	term := newTerminal(5, 1)
 	encoded := []byte("界")
 	term.Apply(encoded[:1])
 	term.Apply(encoded[1:2])
@@ -72,7 +72,7 @@ func TestChineseRuneOccupiesTwoCells(t *testing.T) {
 }
 
 func TestChineseRuneWrapsBeforeLastColumn(t *testing.T) {
-	term := New(4, 2)
+	term := newTerminal(4, 2)
 	term.Apply([]byte("abc界"))
 
 	if term.GridRows[1].Cells[0].Rune != '界' || term.GridRows[1].Cells[0].Width != 2 {
@@ -84,7 +84,7 @@ func TestChineseRuneWrapsBeforeLastColumn(t *testing.T) {
 }
 
 func TestCROverwrite(t *testing.T) {
-	term := New(5, 1)
+	term := newTerminal(5, 1)
 	term.Apply([]byte("10%\r30%"))
 	got := rowString(term, 0, 3)
 	if got != "30%" {
@@ -93,7 +93,7 @@ func TestCROverwrite(t *testing.T) {
 }
 
 func TestLFScrollAtBottom(t *testing.T) {
-	term := New(3, 2)
+	term := newTerminal(3, 2)
 	term.Apply([]byte("aaa\nbbb\nccc"))
 	row0 := rowString(term, 0, 3)
 	row1 := rowString(term, 1, 3)
@@ -103,7 +103,7 @@ func TestLFScrollAtBottom(t *testing.T) {
 }
 
 func TestFullPrimaryScrollCapturesBoundedHistory(t *testing.T) {
-	term := New(3, 2)
+	term := newTerminal(3, 2)
 	term.HistoryLimit = 2
 	term.Apply([]byte("aaa\nbbb\nccc\nddd"))
 	if len(term.History) != 2 {
@@ -119,7 +119,7 @@ func TestFullPrimaryScrollCapturesBoundedHistory(t *testing.T) {
 }
 
 func TestSustainedAutowrapReusesTerminalStorage(t *testing.T) {
-	term := New(8, 3)
+	term := newTerminal(8, 3)
 	term.HistoryLimit = 4
 	term.Apply(bytes.Repeat([]byte{'x'}, 8*(term.Rows+term.HistoryLimit+1)))
 
@@ -143,7 +143,7 @@ func TestSustainedAutowrapReusesTerminalStorage(t *testing.T) {
 }
 
 func TestHistoryRingSnapshotPreservesChronologicalOrder(t *testing.T) {
-	term := New(3, 2)
+	term := newTerminal(3, 2)
 	term.HistoryLimit = 3
 	term.Apply([]byte("000\r\n111\r\n222\r\n333\r\n444\r\n555\r\n"))
 	history, _ := term.SnapshotRows()
@@ -158,13 +158,13 @@ func TestHistoryRingSnapshotPreservesChronologicalOrder(t *testing.T) {
 }
 
 func TestApplyIntoAccumulatesChunkedDamage(t *testing.T) {
-	chunked := New(4, 2)
+	chunked := newTerminal(4, 2)
 	var update Update
 	update.Reset(chunked.Rows)
 	chunked.ApplyInto([]byte("abcd"), &update)
 	chunked.ApplyInto([]byte("efgh"), &update)
 
-	whole := New(4, 2)
+	whole := newTerminal(4, 2)
 	want := whole.Apply([]byte("abcdefgh"))
 	for row := range chunked.GridRows {
 		if got, expected := cellsString(chunked.GridRows[row].Cells), cellsString(whole.GridRows[row].Cells); got != expected {
@@ -182,7 +182,7 @@ func TestApplyIntoAccumulatesChunkedDamage(t *testing.T) {
 }
 
 func TestApplyIntoCanSkipDamageTracking(t *testing.T) {
-	term := New(4, 1)
+	term := newTerminal(4, 1)
 	var update Update
 	update.ResetFor(term.Rows, false)
 	term.ApplyInto([]byte("data"), &update)
@@ -195,7 +195,7 @@ func TestApplyIntoCanSkipDamageTracking(t *testing.T) {
 }
 
 func TestOversizedCSIDiscardedAndParserRecovers(t *testing.T) {
-	term := New(4, 1)
+	term := newTerminal(4, 1)
 	input := append([]byte("\x1b["), bytes.Repeat([]byte{'1'}, maxCSISequenceBytes+100)...)
 	input = append(input, 'm', 'O', 'K')
 	term.Apply(input)
@@ -208,7 +208,7 @@ func TestOversizedCSIDiscardedAndParserRecovers(t *testing.T) {
 }
 
 func TestCSIAtBufferLimitConsumesItsFinalByte(t *testing.T) {
-	term := New(4, 1)
+	term := newTerminal(4, 1)
 	input := append([]byte("\x1b["), bytes.Repeat([]byte{'1'}, maxCSISequenceBytes)...)
 	input = append(input, 'm', 'O', 'K')
 	term.Apply(input)
@@ -218,7 +218,7 @@ func TestCSIAtBufferLimitConsumesItsFinalByte(t *testing.T) {
 }
 
 func TestOSCContentIsNotRetained(t *testing.T) {
-	term := New(4, 1)
+	term := newTerminal(4, 1)
 	term.Apply(append([]byte("\x1b]"), bytes.Repeat([]byte{'x'}, 1<<20)...))
 	if term.Parser.state != parserOSC {
 		t.Fatalf("parser state = %d, want OSC awaiting terminator", term.Parser.state)
@@ -230,7 +230,7 @@ func TestOSCContentIsNotRetained(t *testing.T) {
 }
 
 func TestTerminalStyleTableIsBounded(t *testing.T) {
-	term := New(1, 1)
+	term := newTerminal(1, 1)
 	for i := 0; i < maxTerminalStyles+100; i++ {
 		term.styleID(Style{FG: protocol.Color{Mode: "rgb", R: uint8(i >> 16), G: uint8(i >> 8), B: uint8(i)}})
 	}
@@ -240,7 +240,7 @@ func TestTerminalStyleTableIsBounded(t *testing.T) {
 }
 
 func TestTerminalStyleTablePreallocatesCommonCapacity(t *testing.T) {
-	term := New(1, 1)
+	term := newTerminal(1, 1)
 	if cap(term.styleByID) < initialStyleCapacity {
 		t.Fatalf("style capacity = %d, want at least %d", cap(term.styleByID), initialStyleCapacity)
 	}
@@ -254,8 +254,8 @@ func TestTerminalStyleTablePreallocatesCommonCapacity(t *testing.T) {
 }
 
 func TestBulkASCIIMatchesBytewiseParsing(t *testing.T) {
-	bulk := New(6, 3)
-	bytewise := New(6, 3)
+	bulk := newTerminal(6, 3)
+	bytewise := newTerminal(6, 3)
 	prefix := []byte("界界\r\nabcdefghi\x1b[2;2H")
 	bulk.Apply(prefix)
 	bytewise.Apply(prefix)
@@ -275,7 +275,7 @@ func TestBulkASCIIMatchesBytewiseParsing(t *testing.T) {
 }
 
 func BenchmarkSustainedAutowrap(b *testing.B) {
-	term := New(80, 24)
+	term := newTerminal(80, 24)
 	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
 	term.Apply(bytes.Repeat([]byte{'w'}, 80*(term.Rows+term.HistoryLimit)))
 	var update Update
@@ -290,7 +290,7 @@ func BenchmarkSustainedAutowrap(b *testing.B) {
 }
 
 func BenchmarkDetachedBinaryParsing(b *testing.B) {
-	term := New(80, 24)
+	term := newTerminal(80, 24)
 	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
 	term.Apply(bytes.Repeat([]byte{'w'}, 80*(term.Rows+term.HistoryLimit)))
 	var update Update
@@ -305,7 +305,7 @@ func BenchmarkDetachedBinaryParsing(b *testing.B) {
 }
 
 func BenchmarkDetachedRandomParsing(b *testing.B) {
-	term := New(80, 24)
+	term := newTerminal(80, 24)
 	chunk := make([]byte, 32<<10)
 	state := uint32(0x12345678)
 	for i := range chunk {
@@ -328,7 +328,7 @@ func BenchmarkDetachedRandomParsing(b *testing.B) {
 }
 
 func BenchmarkBoundedCSIParsing(b *testing.B) {
-	term := New(80, 24)
+	term := newTerminal(80, 24)
 	chunk := bytes.Repeat([]byte("\x1b[31mX\x1b[0m"), (32<<10)/11)
 	var update Update
 	update.Reset(term.Rows)
@@ -343,7 +343,7 @@ func BenchmarkBoundedCSIParsing(b *testing.B) {
 }
 
 func TestPartialScrollRegionDoesNotAppendHistory(t *testing.T) {
-	term := New(4, 4)
+	term := newTerminal(4, 4)
 	term.Apply([]byte("1111\n2222\n3333\n4444"))
 	before := len(term.History)
 	term.Apply([]byte("\x1b[2;3r"))
@@ -355,7 +355,7 @@ func TestPartialScrollRegionDoesNotAppendHistory(t *testing.T) {
 }
 
 func TestLFWithoutScrollDoesNotForceFullRedraw(t *testing.T) {
-	term := New(3, 2)
+	term := newTerminal(3, 2)
 	update := term.Apply([]byte("a\n"))
 	if update.FullRedraw {
 		t.Fatal("newline without scroll forced full redraw")
@@ -363,7 +363,7 @@ func TestLFWithoutScrollDoesNotForceFullRedraw(t *testing.T) {
 }
 
 func TestFullViewportLineFeedReportsScrollAndNewRowDamage(t *testing.T) {
-	term := New(3, 2)
+	term := newTerminal(3, 2)
 	term.Apply([]byte("aaa\r\nbbb"))
 
 	update := term.Apply([]byte("\r\nccc"))
@@ -383,7 +383,7 @@ func TestFullViewportLineFeedReportsScrollAndNewRowDamage(t *testing.T) {
 }
 
 func TestBareLineFeedReportsStyledExposedRow(t *testing.T) {
-	term := New(3, 2)
+	term := newTerminal(3, 2)
 	term.Apply([]byte("aaa\r\nbbb\x1b[44m"))
 
 	update := term.Apply([]byte("\n"))
@@ -401,7 +401,7 @@ func TestBareLineFeedReportsStyledExposedRow(t *testing.T) {
 }
 
 func TestLineFeedOutsideScrollRegionStaysWithinGrid(t *testing.T) {
-	term := New(4, 4)
+	term := newTerminal(4, 4)
 	term.Apply([]byte("\x1b[2;3r\x1b[4;1H\nX"))
 	if term.CursorY != 3 || term.GridRows[3].Cells[0].Rune != 'X' {
 		t.Fatalf("cursor=%d,%d row=%q", term.CursorX, term.CursorY, rowString(term, 3, 4))
@@ -409,7 +409,7 @@ func TestLineFeedOutsideScrollRegionStaysWithinGrid(t *testing.T) {
 }
 
 func TestPartialRegionLineFeedStillRequiresFullRedraw(t *testing.T) {
-	term := New(4, 4)
+	term := newTerminal(4, 4)
 	term.Apply([]byte("\x1b[2;3r\x1b[3;1H"))
 
 	update := term.Apply([]byte("\n"))
@@ -420,7 +420,7 @@ func TestPartialRegionLineFeedStillRequiresFullRedraw(t *testing.T) {
 }
 
 func TestPrintableOutputTracksDirtyColumnSpan(t *testing.T) {
-	term := New(10, 1)
+	term := newTerminal(10, 1)
 	term.CursorX = 4
 	update := term.Apply([]byte("l"))
 	if got, want := update.DirtySpans[0], (DirtySpan{Start: 4, End: 5}); got != want {
@@ -429,7 +429,7 @@ func TestPrintableOutputTracksDirtyColumnSpan(t *testing.T) {
 }
 
 func TestPrintableOutputMergesDirtyColumnSpans(t *testing.T) {
-	term := New(10, 1)
+	term := newTerminal(10, 1)
 	update := term.Apply([]byte("abc"))
 	if got, want := update.DirtySpans[0], (DirtySpan{Start: 0, End: 3}); got != want {
 		t.Fatalf("dirty span = %#v, want %#v", got, want)
@@ -437,7 +437,7 @@ func TestPrintableOutputMergesDirtyColumnSpans(t *testing.T) {
 }
 
 func TestEraseLine(t *testing.T) {
-	term := New(5, 1)
+	term := newTerminal(5, 1)
 	term.Apply([]byte("hello"))
 	update := term.Apply([]byte("\x1b[3G\x1b[K"))
 	got := rowString(term, 0, 5)
@@ -456,7 +456,7 @@ func TestEraseLine(t *testing.T) {
 }
 
 func TestClearErasesEntireCanonicalGrid(t *testing.T) {
-	term := New(8, 3)
+	term := newTerminal(8, 3)
 	term.Apply([]byte("first\nsecond\nthird"))
 	update := term.Apply([]byte("\x1b[H\x1b[2J\x1b[3J"))
 	if !update.FullRedraw {
@@ -472,7 +472,7 @@ func TestClearErasesEntireCanonicalGrid(t *testing.T) {
 }
 
 func TestAlternateScreenRestoresPrimaryGrid(t *testing.T) {
-	term := New(8, 3)
+	term := newTerminal(8, 3)
 	term.Apply([]byte("prompt"))
 	term.Apply([]byte("\x1b[?1049hTUI data"))
 	if !term.Alternate {
@@ -492,7 +492,7 @@ func TestAlternateScreenRestoresPrimaryGrid(t *testing.T) {
 }
 
 func TestAlternateResizePreservesPrimary(t *testing.T) {
-	term := New(8, 3)
+	term := newTerminal(8, 3)
 	term.Apply([]byte("primary"))
 	term.Apply([]byte("\x1b[?1049hTUI"))
 	term.Resize(12, 4)
@@ -503,7 +503,7 @@ func TestAlternateResizePreservesPrimary(t *testing.T) {
 }
 
 func TestApplicationCursorMode(t *testing.T) {
-	term := New(8, 3)
+	term := newTerminal(8, 3)
 	term.Apply([]byte("\x1b[?1h"))
 	if !term.ApplicationCursorKeys {
 		t.Fatal("application cursor mode not enabled")
@@ -519,7 +519,7 @@ func TestApplicationCursorMode(t *testing.T) {
 }
 
 func TestEraseCharsMarksOnlyCurrentRowDirty(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.Apply([]byte("hello"))
 	term.CursorX = 1
 	update := term.Apply([]byte("\x1b[2X"))
@@ -535,7 +535,7 @@ func TestEraseCharsMarksOnlyCurrentRowDirty(t *testing.T) {
 }
 
 func TestInsertCharactersShiftsExistingTextRight(t *testing.T) {
-	term := New(12, 1)
+	term := newTerminal(12, 1)
 	term.Apply([]byte("abcdef\r\x1b[3C\x1b[3@zzz"))
 	if got := cellsString(term.GridRows[0].Cells[:9]); got != "abczzzdef" {
 		t.Fatalf("inserted text=%q", got)
@@ -543,7 +543,7 @@ func TestInsertCharactersShiftsExistingTextRight(t *testing.T) {
 }
 
 func TestRepeatPrecedingCharacterPreservesStyle(t *testing.T) {
-	term := New(8, 1)
+	term := newTerminal(8, 1)
 	update := term.Apply([]byte("\x1b[44m \x1b[6b"))
 	if update.FullRedraw {
 		t.Fatal("REP forced full redraw")
@@ -557,7 +557,7 @@ func TestRepeatPrecedingCharacterPreservesStyle(t *testing.T) {
 }
 
 func TestDeleteCharactersUsesCurrentBackground(t *testing.T) {
-	term := New(8, 1)
+	term := newTerminal(8, 1)
 	term.Apply([]byte("abcdefgh\r\x1b[44m\x1b[3P"))
 	if got := cellsString(term.GridRows[0].Cells); got != "defgh   " {
 		t.Fatalf("DCH row=%q", got)
@@ -571,7 +571,7 @@ func TestDeleteCharactersUsesCurrentBackground(t *testing.T) {
 }
 
 func TestSGRAndReverseVideo(t *testing.T) {
-	term := New(2, 1)
+	term := newTerminal(2, 1)
 	term.Apply([]byte("\x1b[1;38;2;1;2;3;7mA"))
 	cell := term.GridRows[0].Cells[0]
 	style := term.styleByID[cell.StyleID]
@@ -581,7 +581,7 @@ func TestSGRAndReverseVideo(t *testing.T) {
 }
 
 func TestOSCIsConsumedAndNotPrinted(t *testing.T) {
-	term := New(32, 1)
+	term := newTerminal(32, 1)
 	term.Apply([]byte("\x1b]0;garindra@garindra-ubuntu: ~\x07garindra@garindra-ubuntu:~$ "))
 	got := rowString(term, 0, 28)
 	want := "garindra@garindra-ubuntu:~$ "
@@ -591,7 +591,7 @@ func TestOSCIsConsumedAndNotPrinted(t *testing.T) {
 }
 
 func TestOSCSTTerminatorIsConsumed(t *testing.T) {
-	term := New(8, 1)
+	term := newTerminal(8, 1)
 	term.Apply([]byte("\x1b]0;title\x1b\\prompt"))
 	got := rowString(term, 0, 6)
 	if got != "prompt" {
@@ -600,7 +600,7 @@ func TestOSCSTTerminatorIsConsumed(t *testing.T) {
 }
 
 func TestDCSAndUTF8DesignationAreConsumed(t *testing.T) {
-	term := New(8, 1)
+	term := newTerminal(8, 1)
 	term.Apply([]byte("\x1b%G\x1bP$qm\x1b\\prompt"))
 	if got := rowString(term, 0, 6); got != "prompt" {
 		t.Fatalf("control strings leaked into display: %q", got)
@@ -608,7 +608,7 @@ func TestDCSAndUTF8DesignationAreConsumed(t *testing.T) {
 }
 
 func TestCANAndSUBCancelIncompleteControlSequences(t *testing.T) {
-	term := New(4, 1)
+	term := newTerminal(4, 1)
 	term.Apply([]byte("\x1b[31\x18\x1b[1\x1aOK"))
 	if got := rowString(term, 0, 2); got != "OK" {
 		t.Fatalf("canceled controls leaked into display: %q", got)
@@ -616,7 +616,7 @@ func TestCANAndSUBCancelIncompleteControlSequences(t *testing.T) {
 }
 
 func TestCharsetDesignationIsConsumedAndNotPrinted(t *testing.T) {
-	term := New(8, 1)
+	term := newTerminal(8, 1)
 	term.Apply([]byte("\x1b(Bprompt"))
 	got := rowString(term, 0, 6)
 	if got != "prompt" {
@@ -625,7 +625,7 @@ func TestCharsetDesignationIsConsumedAndNotPrinted(t *testing.T) {
 }
 
 func TestResizePreservesVisibleContent(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.Apply([]byte("hello\nworld"))
 
 	term.Resize(5, 2)
@@ -646,7 +646,7 @@ func TestResizePreservesVisibleContent(t *testing.T) {
 }
 
 func TestResizeShrinksByReflowingRows(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.Apply([]byte("abcde\nvwxyz"))
 
 	term.Resize(3, 4)
@@ -665,7 +665,7 @@ func TestResizeShrinksByReflowingRows(t *testing.T) {
 }
 
 func TestResizeShrinkKeepsBottomContentVisible(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.Apply([]byte("hello\nworld"))
 
 	term.Resize(3, 2)
@@ -678,7 +678,7 @@ func TestResizeShrinkKeepsBottomContentVisible(t *testing.T) {
 }
 
 func TestAutoWrapMarksWrapsNext(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.Apply([]byte("abcdef"))
 	if !term.GridRows[0].WrapsNext {
 		t.Fatal("row 0 should wrap into row 1")
@@ -689,7 +689,7 @@ func TestAutoWrapMarksWrapsNext(t *testing.T) {
 }
 
 func TestLFCreatesHardBoundary(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.Apply([]byte("abc\n"))
 	if term.GridRows[0].WrapsNext {
 		t.Fatal("newline should not leave soft-wrap metadata behind")
@@ -697,7 +697,7 @@ func TestLFCreatesHardBoundary(t *testing.T) {
 }
 
 func TestCRDoesNotCreateFalseWrapChain(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.Apply([]byte("abcdef"))
 	if !term.GridRows[0].WrapsNext {
 		t.Fatal("expected initial soft wrap")
@@ -709,7 +709,7 @@ func TestCRDoesNotCreateFalseWrapChain(t *testing.T) {
 }
 
 func TestResizeShrinkAndGrowRestoresSoftWrappedChain(t *testing.T) {
-	term := New(8, 2)
+	term := newTerminal(8, 2)
 	term.Apply([]byte("abcdefghijkl"))
 	term.Resize(4, 4)
 	if got := rowString(term, 0, 4); got != "abcd" {
@@ -730,10 +730,10 @@ func TestResizeShrinkAndGrowRestoresSoftWrappedChain(t *testing.T) {
 
 func TestUnsupportedCSIIsLogged(t *testing.T) {
 	var buf bytes.Buffer
-	SetDebugLogger(&buf)
-	defer SetDebugLogger(nil)
+	setTerminalDebugLogger(&buf)
+	defer setTerminalDebugLogger(nil)
 
-	term := New(5, 1)
+	term := newTerminal(5, 1)
 	term.Apply([]byte("\x1b[1v"))
 
 	if got := buf.String(); !strings.Contains(got, "unsupported CSI 1v") {
@@ -742,7 +742,7 @@ func TestUnsupportedCSIIsLogged(t *testing.T) {
 }
 
 func TestSaveRestoreCursorAndStyle(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.CursorX = 2
 	term.CursorY = 1
 	term.CurrentStyle = Style{Bold: true}
@@ -757,7 +757,7 @@ func TestSaveRestoreCursorAndStyle(t *testing.T) {
 }
 
 func TestDeleteChars(t *testing.T) {
-	term := New(5, 1)
+	term := newTerminal(5, 1)
 	term.Apply([]byte("abcde"))
 	term.CursorX = 1
 	term.Apply([]byte("\x1b[1P"))
@@ -767,7 +767,7 @@ func TestDeleteChars(t *testing.T) {
 }
 
 func TestScrollRegionLineFeedScrollsWithinMargins(t *testing.T) {
-	term := New(4, 4)
+	term := newTerminal(4, 4)
 	term.Apply([]byte("1111\n2222\n3333\n4444"))
 	term.Apply([]byte("\x1b[2;3r"))
 	term.CursorY = 2
@@ -785,7 +785,7 @@ func TestScrollRegionLineFeedScrollsWithinMargins(t *testing.T) {
 }
 
 func TestReverseIndexAtTopMarginScrollsDown(t *testing.T) {
-	term := New(4, 4)
+	term := newTerminal(4, 4)
 	term.Apply([]byte("1111\n2222\n3333\n4444"))
 	term.Apply([]byte("\x1b[2;3r"))
 	term.CursorY = 1
@@ -799,7 +799,7 @@ func TestReverseIndexAtTopMarginScrollsDown(t *testing.T) {
 }
 
 func TestDSRReply(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.CursorX = 2
 	term.CursorY = 1
 	update := term.Apply([]byte("\x1b[6n"))
@@ -809,7 +809,7 @@ func TestDSRReply(t *testing.T) {
 }
 
 func TestDECSpecialGraphicsG0AndFragmentedDesignation(t *testing.T) {
-	term := New(8, 1)
+	term := newTerminal(8, 1)
 	term.Apply([]byte("\x1b("))
 	term.Apply([]byte("0lqkxmqj"))
 	term.Apply([]byte("\x1b(Bq"))
@@ -819,7 +819,7 @@ func TestDECSpecialGraphicsG0AndFragmentedDesignation(t *testing.T) {
 }
 
 func TestDECSpecialGraphicsG1SelectedByShiftOut(t *testing.T) {
-	term := New(8, 1)
+	term := newTerminal(8, 1)
 	term.Apply([]byte("\x1b)0\x0elqk\x0fq"))
 	if got := rowString(term, 0, 4); got != "┌─┐q" {
 		t.Fatalf("G1 graphics row = %q", got)
@@ -827,7 +827,7 @@ func TestDECSpecialGraphicsG1SelectedByShiftOut(t *testing.T) {
 }
 
 func TestCursorSaveRestoreIncludesCharset(t *testing.T) {
-	term := New(4, 1)
+	term := newTerminal(4, 1)
 	term.Apply([]byte("\x1b(0\x1b7\x1b(B\x1b8q"))
 	if got := term.GridRows[0].Cells[0].Rune; got != '─' {
 		t.Fatalf("restored charset rendered %q", got)
@@ -835,7 +835,7 @@ func TestCursorSaveRestoreIncludesCharset(t *testing.T) {
 }
 
 func TestIndexNextLineAndReverseIndex(t *testing.T) {
-	term := New(4, 3)
+	term := newTerminal(4, 3)
 	term.Apply([]byte("a\x1bDb\x1bEc"))
 	if term.CursorX != 1 || term.CursorY != 2 || term.GridRows[1].Cells[1].Rune != 'b' || term.GridRows[2].Cells[0].Rune != 'c' {
 		t.Fatalf("IND/NEL state cursor=%d,%d rows=%q/%q", term.CursorX, term.CursorY, rowString(term, 1, 4), rowString(term, 2, 4))
@@ -843,7 +843,7 @@ func TestIndexNextLineAndReverseIndex(t *testing.T) {
 }
 
 func TestVerticalTabAndFormFeedActAsLineFeed(t *testing.T) {
-	term := New(4, 3)
+	term := newTerminal(4, 3)
 	term.Apply([]byte("a\vb\fc"))
 	if term.CursorY != 2 || term.GridRows[1].Cells[1].Rune != 'b' || term.GridRows[2].Cells[2].Rune != 'c' {
 		t.Fatalf("VT/FF cursor=%d,%d rows=%q/%q", term.CursorX, term.CursorY, rowString(term, 1, 4), rowString(term, 2, 4))
@@ -851,7 +851,7 @@ func TestVerticalTabAndFormFeedActAsLineFeed(t *testing.T) {
 }
 
 func TestTabStopsHTSTBCCBTAndResize(t *testing.T) {
-	term := New(20, 1)
+	term := newTerminal(20, 1)
 	term.Apply([]byte("\t"))
 	if term.CursorX != 8 {
 		t.Fatalf("default tab cursor=%d", term.CursorX)
@@ -878,7 +878,7 @@ func TestTabStopsHTSTBCCBTAndResize(t *testing.T) {
 }
 
 func TestInsertDeleteLinesWithinScrollRegion(t *testing.T) {
-	term := New(4, 4)
+	term := newTerminal(4, 4)
 	term.Apply([]byte("1111\r\n2222\r\n3333\r\n4444"))
 	term.Apply([]byte("\x1b[2;3r\x1b[2;1H\x1b[L"))
 	if got := []string{rowString(term, 0, 4), rowString(term, 1, 4), rowString(term, 2, 4), rowString(term, 3, 4)}; strings.Join(got, "/") != "1111/    /2222/4444" {
@@ -891,7 +891,7 @@ func TestInsertDeleteLinesWithinScrollRegion(t *testing.T) {
 }
 
 func TestScrollUpDownCommandsAndDamage(t *testing.T) {
-	term := New(4, 3)
+	term := newTerminal(4, 3)
 	term.Apply([]byte("1111\r\n2222\r\n3333"))
 	update := term.Apply([]byte("\x1b[S"))
 	if update.ScrollDelta != -1 || update.FullRedraw || rowString(term, 0, 4) != "2222" {
@@ -904,7 +904,7 @@ func TestScrollUpDownCommandsAndDamage(t *testing.T) {
 }
 
 func TestScrollCommandsUseCurrentBackgroundForExposedRows(t *testing.T) {
-	term := New(3, 2)
+	term := newTerminal(3, 2)
 	term.Apply([]byte("abc\r\ndef\x1b[44m\x1b[S"))
 	style := term.styleByID[term.GridRows[1].Cells[0].StyleID]
 	if style.BG.Mode != "indexed" || style.BG.Index != 4 {
@@ -913,7 +913,7 @@ func TestScrollCommandsUseCurrentBackgroundForExposedRows(t *testing.T) {
 }
 
 func TestOriginModePositionsRelativeToMargins(t *testing.T) {
-	term := New(8, 6)
+	term := newTerminal(8, 6)
 	term.Apply([]byte("\x1b[2;5r\x1b[?6h\x1b[2;3H"))
 	if term.CursorX != 2 || term.CursorY != 2 {
 		t.Fatalf("origin CUP cursor=%d,%d", term.CursorX, term.CursorY)
@@ -929,7 +929,7 @@ func TestOriginModePositionsRelativeToMargins(t *testing.T) {
 }
 
 func TestAutowrapAndInsertModes(t *testing.T) {
-	term := New(5, 2)
+	term := newTerminal(5, 2)
 	term.Apply([]byte("\x1b[?7labcdef"))
 	if term.CursorY != 0 || rowString(term, 0, 5) != "abcdf" {
 		t.Fatalf("disabled autowrap cursor=%d,%d row=%q", term.CursorX, term.CursorY, rowString(term, 0, 5))
@@ -941,7 +941,7 @@ func TestAutowrapAndInsertModes(t *testing.T) {
 }
 
 func TestInsertModePreservesWideCellIntegrity(t *testing.T) {
-	term := New(6, 1)
+	term := newTerminal(6, 1)
 	term.Apply([]byte("界ab\r\x1b[4hZ"))
 	if got := rowString(term, 0, 5); got != "Z界 ab" {
 		t.Fatalf("wide insert row=%q", got)
@@ -953,7 +953,7 @@ func TestInsertModePreservesWideCellIntegrity(t *testing.T) {
 
 func TestCSIAndDECCursorSaveRestore(t *testing.T) {
 	for _, sequences := range [][2]string{{"\x1b[s", "\x1b[u"}, {"\x1b7", "\x1b8"}} {
-		term := New(5, 2)
+		term := newTerminal(5, 2)
 		term.CursorX, term.CursorY = 3, 1
 		term.Apply([]byte(sequences[0]))
 		term.CursorX, term.CursorY = 0, 0
@@ -965,7 +965,7 @@ func TestCSIAndDECCursorSaveRestore(t *testing.T) {
 }
 
 func TestParameterizedCSISIsNotMistakenForCursorSave(t *testing.T) {
-	term := New(8, 2)
+	term := newTerminal(8, 2)
 	term.CursorX, term.CursorY = 3, 1
 	term.Apply([]byte("\x1b[1;7s")) // DECSLRM when horizontal-margin mode is enabled.
 	term.CursorX, term.CursorY = 0, 0
@@ -976,7 +976,7 @@ func TestParameterizedCSISIsNotMistakenForCursorSave(t *testing.T) {
 }
 
 func TestDEC1048And1049CursorAndCharsetSemantics(t *testing.T) {
-	term := New(8, 2)
+	term := newTerminal(8, 2)
 	term.CursorX, term.CursorY = 3, 1
 	term.Apply([]byte("\x1b[?1048h\x1b[H\x1b[?1048l"))
 	if term.CursorX != 3 || term.CursorY != 1 {
@@ -992,7 +992,7 @@ func TestDEC1048And1049CursorAndCharsetSemantics(t *testing.T) {
 }
 
 func TestDECCursorSaveRestoreIncludesOriginMode(t *testing.T) {
-	term := New(8, 6)
+	term := newTerminal(8, 6)
 	term.Apply([]byte("\x1b[2;5r\x1b[?6h\x1b[3;2H\x1b7\x1b[?6l\x1b8"))
 	if !term.OriginMode || term.CursorX != 1 || term.CursorY != 3 {
 		t.Fatalf("restored origin=%v cursor=%d,%d", term.OriginMode, term.CursorX, term.CursorY)
@@ -1000,7 +1000,7 @@ func TestDECCursorSaveRestoreIncludesOriginMode(t *testing.T) {
 }
 
 func TestSGRDimBlinkInvisibleAndResets(t *testing.T) {
-	term := New(4, 1)
+	term := newTerminal(4, 1)
 	term.Apply([]byte("\x1b[1;2;5;8mA\x1b[22;25;28mB"))
 	first := term.styleByID[term.GridRows[0].Cells[0].StyleID]
 	second := term.styleByID[term.GridRows[0].Cells[1].StyleID]
@@ -1013,7 +1013,7 @@ func TestSGRDimBlinkInvisibleAndResets(t *testing.T) {
 }
 
 func TestED3ClearsOnlyHistory(t *testing.T) {
-	term := New(4, 2)
+	term := newTerminal(4, 2)
 	term.Apply([]byte("1111\r\n2222\r\n3333"))
 	before := rowString(term, 0, 4) + rowString(term, 1, 4)
 	update := term.Apply([]byte("\x1b[3J"))
@@ -1023,7 +1023,7 @@ func TestED3ClearsOnlyHistory(t *testing.T) {
 }
 
 func TestSoftAndHardReset(t *testing.T) {
-	term := New(4, 2)
+	term := newTerminal(4, 2)
 	term.HistoryLimit = 17
 	term.Apply([]byte("text\x1b[?6h\x1b[4h\x1b[!p"))
 	if term.OriginMode || term.InsertMode || !term.AutoWrap || rowString(term, 0, 4) != "text" {

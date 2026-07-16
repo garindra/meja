@@ -9,7 +9,6 @@ import (
 	"github.com/creack/pty"
 
 	"github.com/garindra/meja/internal/protocol"
-	"github.com/garindra/meja/internal/server/terminal"
 )
 
 var ptyReadBuffers = sync.Pool{New: func() any { return make([]byte, 32*1024) }}
@@ -186,7 +185,7 @@ func (pane *Pane) run() {
 	defer close(pane.mainDone)
 	var output *renderOutput
 	liveOutput := false
-	var aggregate terminal.Update
+	var aggregate Update
 	var idle, maxAge *time.Timer
 	var idleC, maxC <-chan time.Time
 	var startupIdle *time.Timer
@@ -433,7 +432,7 @@ func styleDefinitionsMap(defs []protocol.StyleDefinition) map[uint32]protocol.St
 	return styles
 }
 
-func emitTerminalUpdate(output *renderOutput, pane *Pane, update terminal.Update) error {
+func emitTerminalUpdate(output *renderOutput, pane *Pane, update Update) error {
 	if update.FullRedraw {
 		return sendFullRender(output, pane)
 	}

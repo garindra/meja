@@ -1,4 +1,4 @@
-package terminal
+package server
 
 const (
 	maxCSIParams        = 32

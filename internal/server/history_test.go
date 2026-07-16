@@ -5,16 +5,15 @@ import (
 	"testing"
 
 	"github.com/garindra/meja/internal/protocol"
-	"github.com/garindra/meja/internal/server/terminal"
 )
 
 func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {
-	pane := &Pane{ID: 0, terminal: terminal.New(4, 3)}
-	pane.terminal.History = []terminal.Row{
+	pane := &Pane{ID: 0, terminal: newTerminal(4, 3)}
+	pane.terminal.History = []Row{
 		historyTestRow("old1"),
 		historyTestRow("old2"),
 	}
-	pane.terminal.GridRows = []terminal.Row{
+	pane.terminal.GridRows = []Row{
 		historyTestRow("live"),
 		historyTestRow("mid "),
 		historyTestRow("end "),
@@ -50,9 +49,9 @@ func TestClientRetainsHistoryViewsForMultiplePanes(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
 	client.TerminalCols, client.TerminalRows = 8, 4
-	pane0 := &Pane{ID: s.AddPaneID(), terminal: terminal.New(8, 4)}
+	pane0 := &Pane{ID: s.AddPaneID(), terminal: newTerminal(8, 4)}
 	s.CreateWindow(pane0, 0)
-	pane1 := &Pane{ID: s.AddPaneID(), terminal: terminal.New(8, 4)}
+	pane1 := &Pane{ID: s.AddPaneID(), terminal: newTerminal(8, 4)}
 	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
@@ -77,7 +76,7 @@ func TestControlCExitsHistoryInputMode(t *testing.T) {
 	}
 }
 
-func historyTestRow(text string) terminal.Row {
+func historyTestRow(text string) Row {
 	cells := make([]protocol.Cell, 4)
 	for i := range cells {
 		cells[i] = protocol.Cell{Rune: ' ', Width: 1}
@@ -88,5 +87,5 @@ func historyTestRow(text string) terminal.Row {
 		}
 		cells[i].Rune = r
 	}
-	return terminal.Row{Cells: cells, WrapsNext: strings.HasSuffix(text, "\\")}
+	return Row{Cells: cells, WrapsNext: strings.HasSuffix(text, "\\")}
 }

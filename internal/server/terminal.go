@@ -1,12 +1,67 @@
-package terminal
+package server
 
-import "unicode/utf8"
+import (
+	"fmt"
+	"io"
+	"sync"
+	"unicode/utf8"
+
+	"github.com/garindra/meja/internal/protocol"
+	"golang.org/x/text/width"
+)
 
 const (
 	maxCSISequenceBytes  = 256
 	maxTerminalStyles    = 4096
 	initialStyleCapacity = 32
 )
+
+type Cell = protocol.Cell
+type Style = protocol.Style
+type Color = protocol.Color
+
+var DefaultStyle = protocol.CanonicalDefaultStyle()
+
+var debugLogger struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func setTerminalDebugLogger(w io.Writer) {
+	debugLogger.mu.Lock()
+	defer debugLogger.mu.Unlock()
+	debugLogger.w = w
+}
+
+func logUnsupportedf(format string, args ...any) {
+	debugLogger.mu.Lock()
+	defer debugLogger.mu.Unlock()
+	if debugLogger.w == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(debugLogger.w, "meja terminal: "+format+"\n", args...)
+}
+
+func blankCell(styleID uint32) Cell {
+	return Cell{Rune: ' ', StyleID: styleID, Width: 1}
+}
+
+func colorIndexed(idx int) Color {
+	return Color{Mode: "indexed", Index: uint8(idx)}
+}
+
+func colorRGB(r, g, b int) Color {
+	return Color{Mode: "rgb", R: uint8(r), G: uint8(g), B: uint8(b)}
+}
+
+func runeCellWidth(r rune) uint8 {
+	switch width.LookupRune(r).Kind() {
+	case width.EastAsianWide, width.EastAsianFullwidth:
+		return 2
+	default:
+		return 1
+	}
+}
 
 type Update struct {
 	DirtySpans    []DirtySpan
@@ -107,7 +162,7 @@ type reflowRow struct {
 	cursorCol  int
 }
 
-func New(cols, rows int) *TerminalState {
+func newTerminal(cols, rows int) *TerminalState {
 	styles := make([]Style, 1, initialStyleCapacity)
 	styles[0] = DefaultStyle
 	t := &TerminalState{
@@ -142,7 +197,7 @@ func (t *TerminalState) Resize(cols, rows int) {
 		t.resizeWhileAlternate(cols, rows)
 		return
 	}
-	next := New(cols, rows)
+	next := newTerminal(cols, rows)
 	next.CurrentStyle = t.CurrentStyle
 	next.CursorVisible = t.CursorVisible
 	next.Parser = t.Parser.clone()
@@ -211,7 +266,7 @@ func (t *TerminalState) Resize(cols, rows int) {
 func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 	oldCols := t.Cols
 	p := t.Primary
-	primary := New(t.Cols, t.Rows)
+	primary := newTerminal(t.Cols, t.Rows)
 	primary.GridRows = cloneRows(p.Rows)
 	primary.CursorX = p.CursorX
 	primary.CursorY = p.CursorY
@@ -1432,7 +1487,7 @@ func (t *TerminalState) softReset() {
 
 func (t *TerminalState) reset() {
 	cols, rows, historyLimit := t.Cols, t.Rows, t.HistoryLimit
-	*t = *New(cols, rows)
+	*t = *newTerminal(cols, rows)
 	t.HistoryLimit = historyLimit
 }
 
@@ -1784,20 +1839,6 @@ func max1(params []int, def int) int {
 		return def
 	}
 	return v
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func trimTrailingBlankCells(cells []Cell) []Cell {

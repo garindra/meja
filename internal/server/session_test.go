@@ -9,7 +9,6 @@ import (
 	"github.com/quic-go/quic-go"
 
 	"github.com/garindra/meja/internal/protocol"
-	"github.com/garindra/meja/internal/server/terminal"
 )
 
 type recordingQUICConnection struct {
@@ -80,8 +79,8 @@ func TestResizeRebuildsVisualRenderBindings(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
 	client.TerminalCols, client.TerminalRows = 16, 4
-	first := &Pane{ID: 2, terminal: terminal.New(16, 4)}
-	second := &Pane{ID: 1, terminal: terminal.New(16, 4)}
+	first := &Pane{ID: 2, terminal: newTerminal(16, 4)}
+	second := &Pane{ID: 1, terminal: newTerminal(16, 4)}
 	s.NextPaneID = 3
 	s.CreateWindow(first, 0)
 	window := s.Windows[client.ActiveWindowID]
@@ -443,9 +442,9 @@ func TestCreateWindowSizePrefersClientDimensionsOverSplitPane(t *testing.T) {
 	client.TerminalCols = 120
 	client.TerminalRows = 39
 
-	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash", terminal: terminal.New(120, 39)}
+	pane0 := &Pane{ID: s.AddPaneID(), Title: "bash", terminal: newTerminal(120, 39)}
 	s.CreateWindow(pane0, 0)
-	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs", terminal: terminal.New(59, 39)}
+	pane1 := &Pane{ID: s.AddPaneID(), Title: "logs", terminal: newTerminal(59, 39)}
 	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}

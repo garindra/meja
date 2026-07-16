@@ -13,8 +13,6 @@ import (
 	"syscall"
 
 	"github.com/creack/pty"
-
-	"github.com/garindra/meja/internal/server/terminal"
 )
 
 // Pane owns a child process, PTY, terminal emulator, and its four enduring
@@ -28,7 +26,7 @@ type Pane struct {
 	Launch  PaneLaunch
 	Root    Identity
 
-	terminal     *terminal.TerminalState
+	terminal     *TerminalState
 	metadata     atomic.Pointer[paneTerminalMetadata]
 	ptyOutput    chan []byte
 	ptyInput     chan []byte
@@ -188,7 +186,7 @@ func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
 		PTY:      ptmx,
 		Process:  cmd,
 		User:     unixUser,
-		terminal: terminal.New(int(request.Cols), int(request.Rows)),
+		terminal: newTerminal(int(request.Cols), int(request.Rows)),
 		Title:    paneTitle(shell, request.Command),
 		Launch: PaneLaunch{
 			Shell:         shell,

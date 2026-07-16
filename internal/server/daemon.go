@@ -21,7 +21,6 @@ import (
 
 	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
-	"github.com/garindra/meja/internal/server/terminal"
 )
 
 const attachTTL = 2 * time.Minute
@@ -90,7 +89,7 @@ func (d *Daemon) post(run func()) {
 func Run(ctx context.Context, cfg Config) error {
 	serverCtx, stop := context.WithCancel(context.Background())
 	defer stop()
-	terminal.SetDebugLogger(cfg.TerminalDebugLog)
+	setTerminalDebugLogger(cfg.TerminalDebugLog)
 	socket := cfg.ControlPath
 	if socket == "" {
 		var err error

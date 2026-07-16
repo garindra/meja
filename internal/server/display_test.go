@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/garindra/meja/internal/protocol"
-	"github.com/garindra/meja/internal/server/terminal"
 )
 
 func TestDisplayCompilerUsesSpecializedTextAndFill(t *testing.T) {
@@ -117,7 +116,7 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 	client := session.NewClient(0)
 	client.TerminalCols = 8
 	client.TerminalRows = 3
-	pane := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 3)}
+	pane := &Pane{ID: session.AddPaneID(), terminal: newTerminal(8, 3)}
 	session.CreateWindow(pane, 0)
 	var wire bytes.Buffer
 	state := session
@@ -133,7 +132,7 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 }
 
 func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
-	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
+	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
 	handler := &Connection{Session: NewSession(0)}
 	output := startTestPaneLoop(handler.Session, pane)
 	defer close(output)
@@ -188,7 +187,7 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 }
 
 func TestOldStreamCleanupDoesNotDetachReplacement(t *testing.T) {
-	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
+	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
 	handler := &Connection{Session: NewSession(0)}
 	output := startTestPaneLoop(handler.Session, pane)
 	defer close(output)
@@ -217,7 +216,7 @@ func TestOldStreamCleanupDoesNotDetachReplacement(t *testing.T) {
 }
 
 func TestPaneRendererCanAttachReplacementAfterWriteFailure(t *testing.T) {
-	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
+	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
 	handler := &Connection{Session: NewSession(0)}
 	output := startTestPaneLoop(handler.Session, pane)
 	defer close(output)
@@ -253,8 +252,8 @@ func TestOutputHandoffAttachesEachReleasedSlotImmediately(t *testing.T) {
 	client := session.NewClient(0)
 	client.TerminalCols = 16
 	client.TerminalRows = 4
-	first := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 4)}
-	second := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 4)}
+	first := &Pane{ID: session.AddPaneID(), terminal: newTerminal(8, 4)}
+	second := &Pane{ID: session.AddPaneID(), terminal: newTerminal(8, 4)}
 	session.CreateWindow(first, 0)
 	if _, _, err := session.SplitFocusedPane(0, second, SplitVertical); err != nil {
 		t.Fatal(err)
@@ -304,7 +303,7 @@ func TestOutputHandoffAttachesReplacementAfterNilRelease(t *testing.T) {
 	client := session.NewClient(0)
 	client.TerminalCols = 16
 	client.TerminalRows = 4
-	pane := &Pane{ID: session.AddPaneID(), terminal: terminal.New(16, 4)}
+	pane := &Pane{ID: session.AddPaneID(), terminal: newTerminal(16, 4)}
 	session.CreateWindow(pane, 0)
 	updates := startTestPaneLoop(session, pane)
 	defer close(updates)
@@ -505,7 +504,7 @@ func TestExitedOnlyPaneDestroysSession(t *testing.T) {
 }
 
 func startTestPaneRenderer(handler *Connection, id uint64, cols, rows int) (*Pane, chan []byte) {
-	pane := &Pane{ID: id, terminal: terminal.New(cols, rows)}
+	pane := &Pane{ID: id, terminal: newTerminal(cols, rows)}
 	return pane, startTestPaneLoop(handler.Session, pane)
 }
 
@@ -516,7 +515,7 @@ func startTestPaneLoop(state *Session, pane *Pane) chan []byte {
 }
 
 func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
-	pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
+	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
 	handler := &Connection{Session: NewSession(0)}
 	output := startTestPaneLoop(handler.Session, pane)
 	defer close(output)
@@ -550,7 +549,7 @@ func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
 
 func TestPaneReleaseAcknowledgesRendererExit(t *testing.T) {
 	for attempt := 0; attempt < 100; attempt++ {
-		pane := &Pane{ID: 1, terminal: terminal.New(8, 3)}
+		pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
 		handler := &Connection{Session: NewSession(0)}
 		output := startTestPaneLoop(handler.Session, pane)
 		released := make(chan *OutputLease, 1)
@@ -712,7 +711,7 @@ func TestColoredEraseInstallsReferencedStyle(t *testing.T) {
 	client := session.NewClient(0)
 	client.TerminalCols = 8
 	client.TerminalRows = 3
-	pane := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 3)}
+	pane := &Pane{ID: session.AddPaneID(), terminal: newTerminal(8, 3)}
 	session.CreateWindow(pane, 0)
 	output := newRenderOutput()
 	update := pane.terminal.Apply([]byte("\x1b[44m\x1b[2K"))
@@ -737,7 +736,7 @@ func TestBottomEdgeOutputEmitsScrollBeforeNewRow(t *testing.T) {
 	client := session.NewClient(0)
 	client.TerminalCols = 3
 	client.TerminalRows = 3
-	pane := &Pane{ID: session.AddPaneID(), terminal: terminal.New(3, 2)}
+	pane := &Pane{ID: session.AddPaneID(), terminal: newTerminal(3, 2)}
 	session.CreateWindow(pane, 0)
 	pane.terminal.Apply([]byte("aaa\r\nbbb"))
 	update := pane.terminal.Apply([]byte("\r\nccc"))
@@ -770,7 +769,7 @@ func TestChineseTerminalOutputUsesWidthTwoDisplayCommand(t *testing.T) {
 	client := session.NewClient(0)
 	client.TerminalCols = 8
 	client.TerminalRows = 2
-	pane := &Pane{ID: session.AddPaneID(), terminal: terminal.New(8, 1)}
+	pane := &Pane{ID: session.AddPaneID(), terminal: newTerminal(8, 1)}
 	session.CreateWindow(pane, 0)
 	update := pane.terminal.Apply([]byte("界"))
 
@@ -787,11 +786,11 @@ func TestChineseTerminalOutputUsesWidthTwoDisplayCommand(t *testing.T) {
 }
 
 func TestMergedDamageMovesWithLaterScroll(t *testing.T) {
-	aggregate := terminal.Update{}
-	aggregate.Merge(terminal.Update{
-		DirtySpans: []terminal.DirtySpan{{}, {Start: 0, End: 3}, {}},
+	aggregate := Update{}
+	aggregate.Merge(Update{
+		DirtySpans: []DirtySpan{{}, {Start: 0, End: 3}, {}},
 	}, 3)
-	aggregate.Merge(terminal.Update{ScrollDelta: -1}, 3)
+	aggregate.Merge(Update{ScrollDelta: -1}, 3)
 
 	if aggregate.ScrollDelta != -1 {
 		t.Fatalf("scroll delta = %d, want -1", aggregate.ScrollDelta)
@@ -819,11 +818,11 @@ func TestDisplayWireMeasurement(t *testing.T) {
 }
 
 func BenchmarkPaneOutputHotPath(b *testing.B) {
-	pane := &Pane{terminal: terminal.New(80, 24)}
+	pane := &Pane{terminal: newTerminal(80, 24)}
 	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
 	pane.terminal.Apply(bytes.Repeat([]byte{'w'}, 80*(pane.terminal.Rows+pane.terminal.HistoryLimit)))
 	output := newRenderOutput(io.Discard)
-	var update terminal.Update
+	var update Update
 	update.Reset(pane.terminal.Rows)
 	pane.terminal.ApplyInto(chunk, &update)
 	if err := emitTerminalUpdate(output, pane, update); err != nil {
@@ -842,7 +841,7 @@ func BenchmarkPaneOutputHotPath(b *testing.B) {
 }
 
 func BenchmarkFullPaneRender(b *testing.B) {
-	pane := &Pane{terminal: terminal.New(80, 24)}
+	pane := &Pane{terminal: newTerminal(80, 24)}
 	pane.terminal.Apply(bytes.Repeat([]byte("styled \x1b[32mtext\x1b[0m "), 200))
 	output := newRenderOutput(io.Discard)
 	if err := sendFullRender(output, pane); err != nil {

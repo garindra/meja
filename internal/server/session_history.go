@@ -6,11 +6,10 @@ import (
 	"strconv"
 
 	"github.com/garindra/meja/internal/protocol"
-	"github.com/garindra/meja/internal/server/terminal"
 )
 
 type HistorySnapshot struct {
-	Rows          []terminal.Row
+	Rows          []Row
 	Styles        []protocol.StyleDefinition
 	Cols          int
 	ViewportRows  int
@@ -36,7 +35,7 @@ type historyMove struct {
 	Changed    bool
 }
 
-func captureTerminalHistorySnapshot(state *terminal.TerminalState) *HistorySnapshot {
+func captureTerminalHistorySnapshot(state *TerminalState) *HistorySnapshot {
 	history, primary := state.SnapshotRows()
 	cols, rows := state.Cols, state.Rows
 	projected := projectHistoryRows(history, cols)
@@ -94,11 +93,11 @@ func (p *Pane) captureHistorySnapshot() (*HistorySnapshot, error) {
 	}
 }
 
-func projectHistoryRows(rows []terminal.Row, cols int) []terminal.Row {
+func projectHistoryRows(rows []Row, cols int) []Row {
 	if cols <= 0 {
 		return nil
 	}
-	var out []terminal.Row
+	var out []Row
 	var chain []protocol.Cell
 	flush := func() {
 		if len(chain) == 0 {
@@ -130,8 +129,8 @@ func projectHistoryRows(rows []terminal.Row, cols int) []terminal.Row {
 	return out
 }
 
-func normalizeRows(rows []terminal.Row, cols int) []terminal.Row {
-	out := make([]terminal.Row, len(rows))
+func normalizeRows(rows []Row, cols int) []Row {
+	out := make([]Row, len(rows))
 	for i, src := range rows {
 		out[i] = blankHistoryRow(cols)
 		copy(out[i].Cells, src.Cells[:min(len(src.Cells), cols)])
@@ -140,8 +139,8 @@ func normalizeRows(rows []terminal.Row, cols int) []terminal.Row {
 	return out
 }
 
-func blankHistoryRow(cols int) terminal.Row {
-	row := terminal.Row{Cells: make([]protocol.Cell, cols)}
+func blankHistoryRow(cols int) Row {
+	row := Row{Cells: make([]protocol.Cell, cols)}
 	for i := range row.Cells {
 		row.Cells[i] = protocol.Cell{Rune: ' ', Width: 1}
 	}
