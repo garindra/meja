@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/garindra/meja/internal/control"
 	"github.com/garindra/meja/internal/protocol"
+	"github.com/garindra/meja/internal/theme"
 )
 
 const (
@@ -985,12 +987,16 @@ func (s *scanoutState) acceptLayout(layout protocol.WindowLayout) (bool, error) 
 		return false, nil
 	}
 	if layout.LayoutRevision == s.layout.LayoutRevision && s.layout.LayoutRevision != 0 {
-		if layout.FocusedPaneID != s.layout.FocusedPaneID {
+		focusChanged := layout.FocusedPaneID != s.layout.FocusedPaneID
+		if focusChanged {
 			if _, err := s.resetPrediction(); err != nil {
 				return false, err
 			}
 		}
 		s.layout = layout
+		if focusChanged {
+			s.emitLayoutBorders(layout)
+		}
 		s.selectAuthoritativeCursor()
 		s.emitActiveCursor()
 		return true, nil
@@ -1158,12 +1164,26 @@ func (s *scanoutState) clearContentRows() {
 }
 
 func (s *scanoutState) emitLayoutBorders(layout protocol.WindowLayout) {
-	s.ansi.WriteString(sgrForStyle(protocol.CanonicalDefaultStyle()))
+	inactiveStyle := protocol.CanonicalDefaultStyle()
+	activeStyle := inactiveStyle
+	activeStyle.FG = theme.AccentColor()
+	focusedBorders := focusedPaneBorderCells(layout.Panes, layout.FocusedPaneID)
+	active := false
+	s.ansi.WriteString(sgrForStyle(inactiveStyle))
 	for row := 0; row < max(0, s.rows-1); row++ {
 		for column := 0; column < s.cols; column++ {
 			r := paneBorderRune(layout.Panes, column, row)
 			if r == 0 {
 				continue
+			}
+			_, focused := focusedBorders[borderPoint{column: column, row: row}]
+			if focused != active {
+				if focused {
+					s.ansi.WriteString(sgrForStyle(activeStyle))
+				} else {
+					s.ansi.WriteString(sgrForStyle(inactiveStyle))
+				}
+				active = focused
 			}
 			writeCursorPosition(&s.ansi, row+1, column+1)
 			s.ansi.WriteRune(r)
@@ -1554,30 +1574,241 @@ func writeCursorPosition(buf *bytes.Buffer, row, col int) {
 }
 
 func paneBorderRune(placements []protocol.PanePlacement, column, row int) rune {
-	var left, right, above, below bool
-	for _, placement := range placements {
-		rect := placement.Rect
-		if row >= rect.Y && row < rect.Y+rect.Height {
-			left = left || rect.X+rect.Width == column
-			right = right || rect.X == column+1
-		}
-		if column >= rect.X && column < rect.X+rect.Width {
-			above = above || rect.Y+rect.Height == row
-			below = below || rect.Y == row+1
-		}
+	if !isPaneWireCell(placements, column, row) {
+		return 0
 	}
-	vertical := left && right
-	horizontal := above && below
+	up := isPaneWireCell(placements, column, row-1)
+	down := isPaneWireCell(placements, column, row+1)
+	left := isPaneWireCell(placements, column-1, row)
+	right := isPaneWireCell(placements, column+1, row)
 	switch {
-	case vertical && horizontal:
+	case up && down && left && right:
 		return '┼'
-	case vertical:
+	case up && down && right:
+		return '├'
+	case up && down && left:
+		return '┤'
+	case left && right && down:
+		return '┬'
+	case left && right && up:
+		return '┴'
+	case down && right:
+		return '┌'
+	case down && left:
+		return '┐'
+	case up && right:
+		return '└'
+	case up && left:
+		return '┘'
+	case up || down:
 		return '│'
-	case horizontal:
+	case left || right:
+		return '─'
+	case paneAt(placements, column-1, row) && paneAt(placements, column+1, row):
+		return '│'
+	case paneAt(placements, column, row-1) && paneAt(placements, column, row+1):
 		return '─'
 	default:
 		return 0
 	}
+}
+
+func isPaneWireCell(placements []protocol.PanePlacement, column, row int) bool {
+	if len(placements) == 0 {
+		return false
+	}
+	minX, minY := placements[0].Rect.X, placements[0].Rect.Y
+	maxX := placements[0].Rect.X + placements[0].Rect.Width
+	maxY := placements[0].Rect.Y + placements[0].Rect.Height
+	for _, placement := range placements[1:] {
+		minX = min(minX, placement.Rect.X)
+		minY = min(minY, placement.Rect.Y)
+		maxX = max(maxX, placement.Rect.X+placement.Rect.Width)
+		maxY = max(maxY, placement.Rect.Y+placement.Rect.Height)
+	}
+	return column >= minX && column < maxX && row >= minY && row < maxY &&
+		!paneAt(placements, column, row)
+}
+
+func paneAt(placements []protocol.PanePlacement, column, row int) bool {
+	for _, placement := range placements {
+		rect := placement.Rect
+		if column >= rect.X && column < rect.X+rect.Width &&
+			row >= rect.Y && row < rect.Y+rect.Height {
+			return true
+		}
+	}
+	return false
+}
+
+type borderPoint struct {
+	column int
+	row    int
+}
+
+func focusedPaneBorderCells(placements []protocol.PanePlacement, focusedPaneID uint64) map[borderPoint]struct{} {
+	borders := paneBorderCells(placements)
+	focused := borders[focusedPaneID]
+	if len(focused) == 0 {
+		return nil
+	}
+	for paneID, candidate := range borders {
+		if paneID == focusedPaneID || !sameBorderCells(focused, candidate) {
+			continue
+		}
+		return splitAmbiguousBorder(placements, focusedPaneID, paneID, focused)
+	}
+	return focused
+}
+
+func paneBorderCells(placements []protocol.PanePlacement) map[uint64]map[borderPoint]struct{} {
+	borders := make(map[uint64]map[borderPoint]struct{}, len(placements))
+	add := func(paneID uint64, point borderPoint) {
+		if borders[paneID] == nil {
+			borders[paneID] = make(map[borderPoint]struct{})
+		}
+		borders[paneID][point] = struct{}{}
+	}
+	for i := range placements {
+		for j := i + 1; j < len(placements); j++ {
+			first, second := placements[i], placements[j]
+			if second.Rect.X+second.Rect.Width == first.Rect.X-1 {
+				first, second = second, first
+			}
+			if first.Rect.X+first.Rect.Width == second.Rect.X-1 {
+				start := max(first.Rect.Y, second.Rect.Y)
+				end := min(first.Rect.Y+first.Rect.Height, second.Rect.Y+second.Rect.Height)
+				for row := start; row < end; row++ {
+					point := borderPoint{column: first.Rect.X + first.Rect.Width, row: row}
+					add(first.PaneID, point)
+					add(second.PaneID, point)
+				}
+			}
+
+			first, second = placements[i], placements[j]
+			if second.Rect.Y+second.Rect.Height == first.Rect.Y-1 {
+				first, second = second, first
+			}
+			if first.Rect.Y+first.Rect.Height == second.Rect.Y-1 {
+				start := max(first.Rect.X, second.Rect.X)
+				end := min(first.Rect.X+first.Rect.Width, second.Rect.X+second.Rect.Width)
+				for column := start; column < end; column++ {
+					point := borderPoint{column: column, row: first.Rect.Y + first.Rect.Height}
+					add(first.PaneID, point)
+					add(second.PaneID, point)
+				}
+			}
+		}
+	}
+	for row := 0; row < layoutBottom(placements); row++ {
+		for column := 0; column < layoutRight(placements); column++ {
+			point := borderPoint{column: column, row: row}
+			if paneBorderRune(placements, column, row) == 0 || borderClaimed(borders, point) {
+				continue
+			}
+			for paneID, cells := range borders {
+				if adjacentBorderClaimed(cells, point) {
+					add(paneID, point)
+				}
+			}
+		}
+	}
+	return borders
+}
+
+func layoutRight(placements []protocol.PanePlacement) int {
+	right := 0
+	for _, placement := range placements {
+		right = max(right, placement.Rect.X+placement.Rect.Width)
+	}
+	return right
+}
+
+func layoutBottom(placements []protocol.PanePlacement) int {
+	bottom := 0
+	for _, placement := range placements {
+		bottom = max(bottom, placement.Rect.Y+placement.Rect.Height)
+	}
+	return bottom
+}
+
+func borderClaimed(borders map[uint64]map[borderPoint]struct{}, point borderPoint) bool {
+	for _, cells := range borders {
+		if _, ok := cells[point]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func adjacentBorderClaimed(cells map[borderPoint]struct{}, point borderPoint) bool {
+	for _, adjacent := range [...]borderPoint{
+		{column: point.column - 1, row: point.row},
+		{column: point.column + 1, row: point.row},
+		{column: point.column, row: point.row - 1},
+		{column: point.column, row: point.row + 1},
+	} {
+		if _, ok := cells[adjacent]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func sameBorderCells(first, second map[borderPoint]struct{}) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for point := range first {
+		if _, ok := second[point]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func splitAmbiguousBorder(placements []protocol.PanePlacement, focusedPaneID, otherPaneID uint64, border map[borderPoint]struct{}) map[borderPoint]struct{} {
+	var focused, other *protocol.PanePlacement
+	for i := range placements {
+		switch placements[i].PaneID {
+		case focusedPaneID:
+			focused = &placements[i]
+		case otherPaneID:
+			other = &placements[i]
+		}
+	}
+	if focused == nil || other == nil {
+		return border
+	}
+	vertical := focused.Rect.X != other.Rect.X
+	firstHalf := focused.Rect.X < other.Rect.X
+	if !vertical {
+		firstHalf = focused.Rect.Y < other.Rect.Y
+	}
+	ordered := make([]borderPoint, 0, len(border))
+	for point := range border {
+		ordered = append(ordered, point)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if vertical {
+			if ordered[i].row != ordered[j].row {
+				return ordered[i].row < ordered[j].row
+			}
+			return ordered[i].column < ordered[j].column
+		}
+		if ordered[i].column != ordered[j].column {
+			return ordered[i].column < ordered[j].column
+		}
+		return ordered[i].row < ordered[j].row
+	})
+	result := make(map[borderPoint]struct{}, (len(ordered)+1)/2)
+	for index, point := range ordered {
+		if (firstHalf && index*2 < len(ordered)) ||
+			(!firstHalf && (index+1)*2 > len(ordered)) {
+			result[point] = struct{}{}
+		}
+	}
+	return result
 }
 
 func sgrForStyle(style protocol.Style) string {
