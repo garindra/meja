@@ -382,7 +382,6 @@ type Session struct {
 	Clients map[uint64]*ClientState
 
 	NextWindowID       uint64
-	NextWindowIndex    int
 	NextPaneID         uint64
 	NextLayoutRevision uint64
 
@@ -713,8 +712,7 @@ func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *Client
 	}
 	windowID := s.NextWindowID
 	s.NextWindowID++
-	displayIndex := s.NextWindowIndex
-	s.NextWindowIndex++
+	displayIndex := s.lowestAvailableWindowDisplayIndex()
 	window := &Window{
 		ID:             windowID,
 		DisplayIndex:   displayIndex,
@@ -772,6 +770,18 @@ func (s *Session) AddPaneID() uint64 {
 	id := s.NextPaneID
 	s.NextPaneID++
 	return id
+}
+
+func (s *Session) lowestAvailableWindowDisplayIndex() int {
+	used := make(map[int]struct{}, len(s.Windows))
+	for _, window := range s.Windows {
+		used[window.DisplayIndex] = struct{}{}
+	}
+	for index := 0; ; index++ {
+		if _, ok := used[index]; !ok {
+			return index
+		}
+	}
 }
 
 func (s *Session) ActivePane(clientID uint64) (*Pane, *ClientState) {

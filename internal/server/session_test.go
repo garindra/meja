@@ -841,25 +841,23 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	first, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "one"}, 0)
 	second, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "two"}, 0)
 	third, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "three"}, 0)
-	if first.DisplayIndex != 0 || second.DisplayIndex != 1 || third.DisplayIndex != 2 {
-		t.Fatalf("initial display indices = %d, %d, %d", first.DisplayIndex, second.DisplayIndex, third.DisplayIndex)
+	fourth, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "four"}, 0)
+	if first.DisplayIndex != 0 || second.DisplayIndex != 1 || third.DisplayIndex != 2 || fourth.DisplayIndex != 3 {
+		t.Fatalf("initial display indices = %d, %d, %d, %d", first.DisplayIndex, second.DisplayIndex, third.DisplayIndex, fourth.DisplayIndex)
 	}
 
-	if _, _, err := s.SelectWindow(0, first.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, _, _, _, err := s.CloseWindow(0, first.ID); err != nil {
+	if _, _, _, _, _, _, err := s.CloseWindow(0, second.ID); err != nil {
 		t.Fatal(err)
 	}
 	statuses := s.WindowStatuses(0)
-	if len(statuses) != 2 || statuses[0].Index != 1 || statuses[1].Index != 2 {
-		t.Fatalf("statuses after deleting display index 0 = %#v", statuses)
+	if len(statuses) != 3 || statuses[0].Index != 0 || statuses[1].Index != 2 || statuses[2].Index != 3 {
+		t.Fatalf("statuses after deleting display index 1 = %#v", statuses)
 	}
-	if got, ok := s.WindowIDByIndex(0); ok || got != 0 {
+	if got, ok := s.WindowIDByIndex(1); ok || got != 0 {
 		t.Fatalf("deleted display index lookup = %d, %v", got, ok)
 	}
-	if got, ok := s.WindowIDByIndex(2); !ok || got != third.ID {
-		t.Fatalf("display index 2 lookup = %d, %v; want %d, true", got, ok, third.ID)
+	if got, ok := s.WindowIDByIndex(3); !ok || got != fourth.ID {
+		t.Fatalf("display index 3 lookup = %d, %v; want %d, true", got, ok, fourth.ID)
 	}
 	s.ConsumeInputByte(0, 0x02)
 	event := s.ConsumeInputByte(0, '2')
@@ -867,12 +865,12 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 		t.Fatalf("numeric selection event = %#v", event)
 	}
 
-	fourth, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "four"}, 0)
-	if fourth.DisplayIndex != 3 {
-		t.Fatalf("new window display index = %d, want 3", fourth.DisplayIndex)
+	fifth, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "five"}, 0)
+	if fifth.DisplayIndex != 1 {
+		t.Fatalf("new window display index = %d, want 1", fifth.DisplayIndex)
 	}
-	if got, ok := s.WindowIDByIndex(3); !ok || got != fourth.ID {
-		t.Fatalf("display index 3 lookup = %d, %v; want %d, true", got, ok, fourth.ID)
+	if got, ok := s.WindowIDByIndex(1); !ok || got != fifth.ID {
+		t.Fatalf("display index 1 lookup = %d, %v; want %d, true", got, ok, fifth.ID)
 	}
 	if _, _, err := s.SelectWindow(0, third.ID); err != nil {
 		t.Fatal(err)

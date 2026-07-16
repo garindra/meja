@@ -567,7 +567,6 @@ func (s *Session) restoreSnapshot(snapshot PersistedSession, mode restoreCommand
 		s.Name = snapshot.Name
 		s.NextPaneID = maxPaneID + 1
 		s.NextWindowID = uint64(len(snapshot.Windows) + 1)
-		s.NextWindowIndex = len(snapshot.Windows)
 		for _, restored := range panes {
 			s.Panes[restored.pane.ID] = restored.pane
 		}
