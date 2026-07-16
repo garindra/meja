@@ -236,12 +236,12 @@ first server stream is permanently bound to the one-row status surface; the
 remaining eight are movable pane render slots. Stream roles come from their
 QUIC stream ordinals, and every surface uses the same display-command codec.
 
-Press `Ctrl+B`, then `$` to rename the current session using the status-bar
-prompt. Press `Ctrl+B`, then `,` to rename the current window.
+Press `Ctrl+b`, then `$` to rename the current session using the status-bar
+prompt. Press `Ctrl+b`, then `,` to rename the current window.
 
 After a live QUIC connection drops, the client keeps the last confirmed
 terminal contents, replaces the client-visible status bar with an orange
-reconnecting indicator with a `Press Ctrl+C to exit` hint, and drops other
+reconnecting indicator with a `Press Ctrl+c to exit` hint, and drops other
 input while disconnected. It first retries
 the pinned QUIC resume credential. If that fails, it obtains a fresh
 single-use attach token through the local control socket or the versioned SSH
