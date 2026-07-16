@@ -2,28 +2,10 @@ package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
-
-	"github.com/garindra/meja/internal/protocol"
 )
-
-func fetchBootstrap(ctx context.Context, cfg Config) (protocol.CommandBootstrap, error) {
-	result, err := executeCommand(ctx, cfg)
-	if err != nil {
-		return protocol.CommandBootstrap{}, err
-	}
-	bootstrap, err := consumeCommandResult(cfg, result)
-	if err != nil {
-		return protocol.CommandBootstrap{}, err
-	}
-	if bootstrap == nil {
-		return protocol.CommandBootstrap{}, errors.New("command did not attach a session")
-	}
-	return *bootstrap, nil
-}
 
 func resolveConnectionHostname(ctx context.Context, cfg Config) (string, error) {
 	if cfg.Local {

@@ -183,7 +183,7 @@ func (s *Session) shutdownNow() {
 	s.stopping = true
 	s.ended = true
 	s.attachToken = nil
-	s.resumeTokens = nil
+	s.resumeToken = nil
 	connection := s.connection
 	s.connection = nil
 	// A ListenAddr listener closes established connections immediately. Send
@@ -333,7 +333,7 @@ func (s *Session) beginAttachment() (string, uint64, error) {
 		}
 		s.generation++
 		generation = s.generation
-		s.resumeTokens = map[string]uint64{encoded: generation}
+		s.resumeToken = token
 		issued = true
 		return nil
 	})
@@ -344,30 +344,21 @@ func (s *Session) beginAttachment() (string, uint64, error) {
 }
 
 func (s *Session) resumeAttachment(encoded string, generation uint64) (string, uint64, error) {
-	token, err := protocol.NewAuthToken()
-	if err != nil {
-		return "", 0, err
-	}
-	nextToken := protocol.EncodeAuthToken(token)
-	var nextGeneration uint64
-	issued := false
-	err = s.coordinate(func() error {
+	accepted := false
+	err := s.coordinate(func() error {
 		if s.stopping {
 			return fmt.Errorf("session resume rejected")
 		}
-		if current, ok := s.resumeTokens[encoded]; !ok || current != generation || generation != s.generation {
+		if generation != s.generation || !protocol.EqualAuthToken(encoded, s.resumeToken) {
 			return fmt.Errorf("session resume rejected")
 		}
-		s.generation++
-		nextGeneration = s.generation
-		s.resumeTokens = map[string]uint64{nextToken: nextGeneration}
-		issued = true
+		accepted = true
 		return nil
 	})
-	if err == nil && !issued {
+	if err == nil && !accepted {
 		err = fmt.Errorf("session resume rejected")
 	}
-	return nextToken, nextGeneration, err
+	return encoded, generation, err
 }
 
 // Session is the authority for one persistent terminal workspace. Its actor
@@ -387,7 +378,7 @@ type Session struct {
 	attachToken           []byte
 	attachExpires         time.Time
 	attachConsumed        bool
-	resumeTokens          map[string]uint64
+	resumeToken           []byte
 	generation            uint64
 	daemon                *Daemon
 	port                  uint16
@@ -511,7 +502,6 @@ func NewSession(id uint64) *Session {
 		Panes:               map[uint64]*Pane{},
 		Clients:             map[uint64]*ClientState{},
 		NextWindowID:        1,
-		resumeTokens:        map[string]uint64{},
 		operations:          make(chan sessionOperation, 64),
 		operationsDone:      make(chan struct{}),
 		statusCommands:      make(chan statusCommand, 64),

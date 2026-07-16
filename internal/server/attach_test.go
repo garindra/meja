@@ -100,6 +100,31 @@ func TestDaemonRejectsExpiredAttachToken(t *testing.T) {
 	}
 }
 
+func TestSessionReusesReconnectCredential(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	bootstrap, _, err := d.executeSessionOperation("create-session", commandSessionTarget{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := d.sessions[bootstrap.SessionID]
+	if err := s.consumeAttachToken(bootstrap.AttachToken); err != nil {
+		t.Fatal(err)
+	}
+	token, generation, err := s.beginAttachment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		resumedToken, resumedGeneration, err := s.resumeAttachment(token, generation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resumedToken != token || resumedGeneration != generation {
+			t.Fatalf("resume credential = (%q, %d), want (%q, %d)", resumedToken, resumedGeneration, token, generation)
+		}
+	}
+}
+
 func TestDaemonListsSessionIDsInOrder(t *testing.T) {
 	d := &Daemon{sessions: map[uint64]*Session{9: {}, 2: {}, 4: {}}}
 	_, ids, err := d.executeSessionOperation("list-sessions", commandSessionTarget{})

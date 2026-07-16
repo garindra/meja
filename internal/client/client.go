@@ -276,22 +276,6 @@ func Run(ctx context.Context, cfg Config) error {
 				}
 				ui.beginConnection(true, lastContact)
 				candidate, reconnectErr := openConnection(clientCtx, bootstrap, hostname, cols, rows, cfg, resumeToken, generation, ui, nil)
-				if reconnectErr != nil {
-					fallbackCfg := cfg
-					fallbackCfg.CommandArgs = []string{"attach-session", "-t", fmt.Sprintf("%d", bootstrap.SessionID)}
-					fallbackCfg.Stderr = io.Discard
-					fallback, fallbackErr := fetchBootstrap(clientCtx, fallbackCfg)
-					if fallbackErr == nil {
-						fallbackHost, hostErr := resolveConnectionHostname(clientCtx, cfg)
-						if hostErr == nil {
-							ui.beginConnection(true, lastContact)
-							candidate, reconnectErr = openConnection(clientCtx, fallback, fallbackHost, cols, rows, cfg, "", 0, ui, nil)
-							if reconnectErr == nil {
-								bootstrap, hostname = fallback, fallbackHost
-							}
-						}
-					}
-				}
 				if reconnectErr == nil {
 					live = candidate
 					ui.beginConnection(false, lastContact)

@@ -175,7 +175,8 @@ SubjectPublicKeyInfo.
 
 Local connections skip SSH entirely. They send the same command request directly
 to the protected Unix command socket and connect to the QUIC server through
-`127.0.0.1`. Local reconnects also use the command socket directly.
+`127.0.0.1`. Once attached, local and remote reconnects go directly to the
+session's QUIC listener without consulting SSH or the command socket again.
 
 The protected command socket is selected by `-L` or `-S`; the socket directory is
 mode 0700 and the socket is mode 0600. Session IDs increase from 1 for the
@@ -202,8 +203,8 @@ The first QUIC management message is the versioned session attachment
 `{sessionId, attachToken}`. The token is random, expiry-bound, listener-bound,
 constant-time compared, and atomically consumed after a successful match.
 After attachment the daemon issues a session-scoped resume credential and
-generation. Replacement connections rotate that credential and fence the old
-generation.
+generation. The credential remains stable for the attachment lifetime, so a
+replacement connection can authenticate directly without returning to SSH.
 
 Meja uses 1200-byte initial QUIC packets so the handshake fits paths with a
 1280-byte IP MTU without depending on fragmentation.
