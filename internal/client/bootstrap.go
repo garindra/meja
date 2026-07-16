@@ -16,6 +16,13 @@ func fetchBootstrap(ctx context.Context, cfg Config) (control.Bootstrap, error) 
 		if err != nil {
 			return control.Bootstrap{}, err
 		}
+		if cfg.RestoreTarget != "" {
+			executable, err := control.CurrentExecutable()
+			if err != nil {
+				return control.Bootstrap{}, err
+			}
+			return control.StartRestoreSession(ctx, executable, cfg.SocketSelector, cfg.RestoreTarget, cfg.RestoreCommands)
+		}
 		if target := configSessionTarget(cfg); target != "" {
 			return control.ConnectSession(ctx, socket, target)
 		}
@@ -33,7 +40,13 @@ func fetchRemoteBootstrap(ctx context.Context, cfg Config) (control.Bootstrap, e
 	if remotePath == "" {
 		remotePath = "meja"
 	}
-	command, err := controllerCommand(remotePath, cfg.SocketSelector, configSessionTarget(cfg), cfg.SessionName)
+	var command string
+	var err error
+	if cfg.RestoreTarget != "" {
+		command, err = restoreControllerCommand(remotePath, cfg.SocketSelector, cfg.RestoreTarget, cfg.RestoreCommands)
+	} else {
+		command, err = controllerCommand(remotePath, cfg.SocketSelector, configSessionTarget(cfg), cfg.SessionName)
+	}
 	if err != nil {
 		return control.Bootstrap{}, err
 	}
@@ -68,6 +81,22 @@ func fetchRemoteBootstrap(ctx context.Context, cfg Config) (control.Bootstrap, e
 		return control.Bootstrap{}, err
 	}
 	return bootstrap, nil
+}
+
+func restoreControllerCommand(remotePath string, selector control.SocketSelector, name, commandMode string) (string, error) {
+	if err := control.ValidateSessionName(name); err != nil {
+		return "", err
+	}
+	switch commandMode {
+	case "prepare", "skip", "run":
+	default:
+		return "", fmt.Errorf("invalid restore command mode %q", commandMode)
+	}
+	command, err := controllerCommandPrefix(remotePath, selector)
+	if err != nil {
+		return "", err
+	}
+	return command + " __control-v1 restore-session " + control.ShellQuote(name) + " " + control.ShellQuote(commandMode), nil
 }
 
 func resolveConnectionHostname(ctx context.Context, cfg Config) (string, error) {

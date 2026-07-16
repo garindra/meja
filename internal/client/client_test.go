@@ -97,6 +97,17 @@ func TestControllerCommandQuotesSessionNames(t *testing.T) {
 	}
 }
 
+func TestRestoreControllerCommandIncludesProfileNameAndMode(t *testing.T) {
+	command, err := restoreControllerCommand("/opt/meja", control.SocketSelector{Profile: "dev"}, "my work", "prepare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "'/opt/meja' '-L' 'dev' __control-v1 restore-session 'my work' 'prepare'"
+	if command != want {
+		t.Fatalf("command = %q, want %q", command, want)
+	}
+}
+
 func TestSSHCommandErrorIncludesRemoteStderr(t *testing.T) {
 	err := sshCommandError("SSH bootstrap failed", io.EOF, "bash: meja: command not found\n")
 	want := "SSH bootstrap failed: EOF: bash: meja: command not found"

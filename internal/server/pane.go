@@ -25,20 +25,32 @@ type Pane struct {
 	Process *exec.Cmd
 	User    *user.User
 	Title   string
+	Launch  PaneLaunch
+	Root    Identity
 
-	terminal   *terminal.TerminalState
-	metadata   atomic.Pointer[paneTerminalMetadata]
-	ptyOutput  chan []byte
-	ptyInput   chan []byte
-	commands   chan paneCommand
-	mainDone   chan struct{}
-	writerDone chan struct{}
-	done       chan struct{}
-	stopping   atomic.Bool
+	terminal     *terminal.TerminalState
+	metadata     atomic.Pointer[paneTerminalMetadata]
+	ptyOutput    chan []byte
+	ptyInput     chan []byte
+	commands     chan paneCommand
+	mainDone     chan struct{}
+	writerDone   chan struct{}
+	done         chan struct{}
+	stopping     atomic.Bool
+	startupInput []byte
 
 	// Held exclusively by the pane main goroutine. A lease contains the actual
 	// QUIC stream and is physically returned before another pane receives it.
 	outputLease *OutputLease
+}
+
+// PaneLaunch is the immutable recipe used to create a pane. RequestedArgv is
+// empty for an interactive shell pane.
+type PaneLaunch struct {
+	Shell         string   `json:"shell"`
+	RequestedArgv []string `json:"requestedArgv"`
+	ResolvedPath  string   `json:"resolvedPath"`
+	Cwd           string   `json:"cwd"`
 }
 
 type paneRequest struct {
@@ -166,6 +178,10 @@ func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
 	if err != nil {
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
+	root := Identity{PID: cmd.Process.Pid}
+	if identity, err := identifyProcess(cmd.Process.Pid); err == nil {
+		root = identity
+	}
 
 	return &Pane{
 		ID:       paneID,
@@ -174,6 +190,13 @@ func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
 		User:     unixUser,
 		terminal: terminal.New(int(request.Cols), int(request.Rows)),
 		Title:    paneTitle(shell, request.Command),
+		Launch: PaneLaunch{
+			Shell:         shell,
+			RequestedArgv: append([]string(nil), request.Command...),
+			ResolvedPath:  cmd.Path,
+			Cwd:           cmd.Dir,
+		},
+		Root: root,
 	}, nil
 }
 

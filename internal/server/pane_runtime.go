@@ -17,6 +17,8 @@ var ptyReadBuffers = sync.Pool{New: func() any { return make([]byte, 32*1024) }}
 const (
 	renderIdleFlush          = time.Millisecond
 	renderMaxBatchAge        = 16 * time.Millisecond
+	startupInputIdle         = 25 * time.Millisecond
+	startupInputMaxWait      = 500 * time.Millisecond
 	maxRetainedRenderBuffer  = 64 << 10
 	paneOutputBytesPerSecond = 8 << 20
 	paneOutputBurstBytes     = 1 << 20
@@ -187,6 +189,16 @@ func (pane *Pane) run() {
 	var aggregate terminal.Update
 	var idle, maxAge *time.Timer
 	var idleC, maxC <-chan time.Time
+	var startupIdle *time.Timer
+	var startupIdleC <-chan time.Time
+	startupInput := pane.startupInput
+	pane.startupInput = nil
+	var startupMax *time.Timer
+	var startupMaxC <-chan time.Time
+	if len(startupInput) > 0 {
+		startupMax = time.NewTimer(startupInputMaxWait)
+		startupMaxC = startupMax.C
+	}
 	pending := false
 	stop := func(timer *time.Timer) {
 		if timer != nil && !timer.Stop() {
@@ -199,6 +211,8 @@ func (pane *Pane) run() {
 	defer func() {
 		stop(idle)
 		stop(maxAge)
+		stop(startupIdle)
+		stop(startupMax)
 	}()
 	arm := func(timer **time.Timer, channel *<-chan time.Time, duration time.Duration) {
 		if *timer == nil {
@@ -212,6 +226,16 @@ func (pane *Pane) run() {
 	disarm := func(timer *time.Timer, channel *<-chan time.Time) {
 		stop(timer)
 		*channel = nil
+	}
+	flushStartupInput := func() error {
+		if len(startupInput) == 0 {
+			return nil
+		}
+		disarm(startupIdle, &startupIdleC)
+		disarm(startupMax, &startupMaxC)
+		input := startupInput
+		startupInput = nil
+		return pane.sendOwnedInput(input)
 	}
 	flush := func() {
 		if !pending {
@@ -297,6 +321,9 @@ func (pane *Pane) run() {
 				aggregate.ResetFor(pane.terminal.Rows, trackDamage)
 			}
 			pane.terminal.ApplyInto(data, &aggregate)
+			if len(startupInput) > 0 {
+				arm(&startupIdle, &startupIdleC, startupInputIdle)
+			}
 			ptyReadBuffers.Put(data[:cap(data)])
 			for _, reply := range aggregate.Replies {
 				if err := pane.sendOwnedInput(reply); err != nil {
@@ -319,6 +346,14 @@ func (pane *Pane) run() {
 			arm(&idle, &idleC, renderIdleFlush)
 		case <-idleC:
 			flush()
+		case <-startupIdleC:
+			if err := flushStartupInput(); err != nil {
+				return
+			}
+		case <-startupMaxC:
+			if err := flushStartupInput(); err != nil {
+				return
+			}
 		case <-maxC:
 			flush()
 		case <-pane.done:

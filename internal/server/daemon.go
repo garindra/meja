@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -36,16 +37,17 @@ type Config struct {
 // registry access is serialized by requests; control handlers query it and
 // then query Sessions separately, so neither actor waits on the other.
 type Daemon struct {
-	logMu     sync.Mutex
-	requests  chan daemonRequest
-	nextID    uint64
-	sessions  map[uint64]*Session
-	names     map[string]*Session
-	tlsConfig *tls.Config
-	certHash  string
-	serverCtx context.Context
-	stop      context.CancelFunc
-	stderr    io.Writer
+	logMu       sync.Mutex
+	requests    chan daemonRequest
+	nextID      uint64
+	sessions    map[uint64]*Session
+	names       map[string]*Session
+	tlsConfig   *tls.Config
+	certHash    string
+	serverCtx   context.Context
+	stop        context.CancelFunc
+	stderr      io.Writer
+	snapshotDir string
 }
 
 type daemonRequest struct {
@@ -107,7 +109,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13}
-	d := &Daemon{requests: make(chan daemonRequest, 64), nextID: 1, sessions: make(map[uint64]*Session), names: make(map[string]*Session), tlsConfig: tlsConfig, certHash: hash, serverCtx: serverCtx, stop: stop, stderr: cfg.Stderr}
+	d := &Daemon{requests: make(chan daemonRequest, 64), nextID: 1, sessions: make(map[uint64]*Session), names: make(map[string]*Session), tlsConfig: tlsConfig, certHash: hash, serverCtx: serverCtx, stop: stop, stderr: cfg.Stderr, snapshotDir: snapshotDirectory(socket)}
 	actorCtx, stopActor := context.WithCancel(context.Background())
 	go d.runRequests(actorCtx)
 	defer func() {
@@ -127,6 +129,10 @@ func Run(ctx context.Context, cfg Config) error {
 		stop()
 	}
 	return err
+}
+
+func snapshotDirectory(controlPath string) string {
+	return filepath.Join(filepath.Dir(controlPath), "snapshots")
 }
 
 func (d *Daemon) logSessionAttached(sessionID uint64) {
@@ -201,6 +207,21 @@ func (d *Daemon) handleControl(operation string, target control.SessionTarget) (
 		sort.Slice(sessions, func(i, j int) bool { return sessions[i].ID < sessions[j].ID })
 		return control.Bootstrap{}, sessions, 0, nil
 	}
+	restoreMode, restoring := restoreModeForOperation(operation)
+	var restoreSnapshot PersistedSession
+	if restoring {
+		if target.ID != 0 || target.Name == "" {
+			return control.Bootstrap{}, nil, 0, errors.New("restore requires a session name")
+		}
+		if err := control.ValidateSessionName(target.Name); err != nil {
+			return control.Bootstrap{}, nil, 0, err
+		}
+		var err error
+		restoreSnapshot, err = readPersistedSession(filepath.Join(d.snapshotDir, target.Name+".json"), target.Name)
+		if err != nil {
+			return control.Bootstrap{}, nil, 0, err
+		}
+	}
 	var s *Session
 	var operationErr error
 	created := false
@@ -226,6 +247,7 @@ func (d *Daemon) handleControl(operation string, target control.SessionTarget) (
 			}
 			s = newSession(d.nextID, target.Name)
 			s.daemon = d
+			s.startAutosave(d.snapshotDir)
 			port, encodedToken, expires, operationErr = s.startQUIC(d.serverCtx, d.tlsConfig)
 			if operationErr != nil {
 				_ = s.shutdown()
@@ -244,6 +266,30 @@ func (d *Daemon) handleControl(operation string, target control.SessionTarget) (
 			if s == nil {
 				operationErr = control.ErrSessionUnavailable
 			}
+		case "restore-session-prepare", "restore-session-skip", "restore-session-run":
+			if d.sessionByName(target.Name) != nil {
+				operationErr = fmt.Errorf("session %q already exists; attach to it instead", target.Name)
+				return
+			}
+			if d.nextID == 0 {
+				operationErr = errors.New("session ID exhausted")
+				return
+			}
+			s = newSession(d.nextID, restoreSnapshot.Name)
+			s.daemon = d
+			s.startAutosave(d.snapshotDir)
+			port, encodedToken, expires, operationErr = s.startQUIC(d.serverCtx, d.tlsConfig)
+			if operationErr == nil {
+				operationErr = s.restoreSnapshot(restoreSnapshot, restoreMode)
+			}
+			if operationErr != nil {
+				_ = s.shutdown()
+				return
+			}
+			d.sessions[d.nextID] = s
+			d.reserveSessionName(s, restoreSnapshot.Name)
+			d.nextID++
+			created = true
 		default:
 			operationErr = errors.New("unsupported control operation")
 		}
@@ -326,22 +372,81 @@ func (d *Daemon) validateSessionRename(state *Session, name string) error {
 
 // requestSessionRename is deliberately one-way. The Session actor never waits
 // on the Daemon actor; the Daemon posts the accepted/rejected result back.
-func (d *Daemon) requestSessionRename(state *Session, name string) {
+func (d *Daemon) requestSessionRename(state *Session, currentName, name string) {
+	run := func() { d.prepareSessionRename(state, currentName, name) }
 	if d.requests == nil {
-		err := d.validateSessionRename(state, name)
-		if err == nil {
-			d.reserveSessionName(state, name)
-		}
-		_ = state.finishSessionRename(name, err == nil)
+		run()
 		return
 	}
-	d.post(func() {
+	d.post(run)
+}
+
+func (d *Daemon) prepareSessionRename(state *Session, currentName, name string) {
+	if err := d.validateSessionRename(state, name); err != nil {
+		d.deliverSessionResult(state, func() error { return state.finishSessionRename(name, false) })
+		return
+	}
+	if currentName != name {
+		exists, err := snapshotFileExists(d.snapshotDir, name)
+		if err != nil {
+			d.logf("meja server: check snapshot before renaming session %d: %v\n", state.ID, err)
+			d.deliverSessionResult(state, func() error { return state.finishSessionRename(name, false) })
+			return
+		}
+		if exists {
+			label := fmt.Sprintf("snapshot %q exists; overwrite? (y/N) ", name)
+			d.deliverSessionResult(state, func() error {
+				_, err := state.beginConfirmationPrompt(clientID0, label, func(result promptResult) error {
+					if !result.Accepted {
+						return state.publishStatusBar()
+					}
+					d.confirmSessionRename(state, name)
+					return state.publishStatusBar()
+				})
+				if err != nil {
+					return err
+				}
+				return state.publishStatusBar()
+			})
+			return
+		}
+	}
+	d.reserveSessionName(state, name)
+	d.deliverSessionResult(state, func() error { return state.finishSessionRename(name, true) })
+}
+
+func (d *Daemon) confirmSessionRename(state *Session, name string) {
+	run := func() {
 		err := d.validateSessionRename(state, name)
 		if err == nil {
 			d.reserveSessionName(state, name)
 		}
-		state.post(func() error { return state.finishSessionRename(name, err == nil) })
-	})
+		d.deliverSessionResult(state, func() error { return state.finishSessionRename(name, err == nil) })
+	}
+	if d.requests == nil {
+		run()
+		return
+	}
+	d.post(run)
+}
+
+func (d *Daemon) deliverSessionResult(state *Session, run func() error) {
+	if d.requests == nil {
+		_ = run()
+		return
+	}
+	state.post(run)
+}
+
+func snapshotFileExists(snapshotDir, name string) (bool, error) {
+	_, err := os.Stat(filepath.Join(snapshotDir, name+".json"))
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (d *Daemon) reserveSessionName(state *Session, name string) {

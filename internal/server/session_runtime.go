@@ -11,6 +11,7 @@ import (
 
 func (s *Session) startPane(pane *Pane) {
 	pane.initializeRuntime()
+	s.startProcessNameMonitor()
 	go pane.run()
 	go relayPTYOutput(pane)
 	go runPTYWriter(pane, func(error) {
@@ -294,6 +295,13 @@ func (s *Session) commandBeginRenameSessionPrompt() error {
 }
 
 func (s *Session) handlePromptEvent(c *Connection, event serverInputEvent) error {
+	if event.PromptKind == PromptKindConfirm &&
+		(event.PromptAction == PromptActionSubmit || event.PromptAction == PromptActionCancel) {
+		return s.resolvePrompt(clientID0, promptResult{
+			Accepted: event.PromptAction == PromptActionSubmit && event.PromptText == "y",
+			Text:     event.PromptText,
+		})
+	}
 	switch event.PromptAction {
 	case PromptActionChanged, PromptActionCancel:
 		return s.publishStatusBar()
@@ -307,7 +315,7 @@ func (s *Session) handlePromptEvent(c *Connection, event serverInputEvent) error
 			if c.Daemon == nil {
 				return s.finishSessionRename(event.PromptText, true)
 			}
-			c.Daemon.requestSessionRename(s, event.PromptText)
+			c.Daemon.requestSessionRename(s, s.Name, event.PromptText)
 			return s.publishStatusBar()
 		default:
 			return fmt.Errorf("unsupported prompt kind %d", event.PromptKind)

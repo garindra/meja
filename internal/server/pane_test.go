@@ -65,6 +65,55 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 	<-pane.writerDone
 }
 
+func TestPaneStartupInputWaitsForInitialOutputToSettle(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	pane := &Pane{
+		ID:           1,
+		PTY:          writer,
+		terminal:     terminal.New(16, 3),
+		startupInput: []byte("vi mnt.sh"),
+	}
+	pane.initializeRuntime()
+	go pane.run()
+	writeFailed := make(chan error, 1)
+	go runPTYWriter(pane, func(err error) { writeFailed <- err })
+	defer func() {
+		close(pane.ptyOutput)
+		<-pane.mainDone
+		pane.stop()
+		<-pane.writerDone
+	}()
+
+	prompt := ptyReadBuffers.Get().([]byte)
+	n := copy(prompt, "user@host:~$ ")
+	pane.ptyOutput <- prompt[:n]
+
+	got := make([]byte, len("vi mnt.sh"))
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(reader, got)
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case err := <-writeFailed:
+		t.Fatalf("PTY writer failed: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for startup input")
+	}
+	if string(got) != "vi mnt.sh" {
+		t.Fatalf("startup input = %q", got)
+	}
+}
+
 func TestBuildEnvPreservesUTF8Locale(t *testing.T) {
 	t.Setenv("LANG", "zh_CN.UTF-8")
 	t.Setenv("LC_ALL", "")

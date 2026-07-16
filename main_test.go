@@ -146,6 +146,31 @@ func TestUnrecognizedFirstWordRoutesToRemoteConnect(t *testing.T) {
 	}
 }
 
+func TestRestoreAcceptsRemoteHostSuffix(t *testing.T) {
+	stdin, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	var stdout, stderr bytes.Buffer
+	err = run(context.Background(), []string{"restore", "-t", "work", "--commands=prepare", "prod"}, stdin, &stdout, &stderr)
+	if _, isUsageError := err.(usageError); isUsageError {
+		t.Fatalf("remote restore suffix was rejected by CLI parsing: %v", err)
+	}
+}
+
+func TestRestoreRejectsUnknownCommandMode(t *testing.T) {
+	stdin, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	err = run(context.Background(), []string{"restore", "-t", "work", "--commands=maybe"}, stdin, io.Discard, io.Discard)
+	if _, ok := err.(usageError); !ok {
+		t.Fatalf("invalid restore command mode error = %T %v", err, err)
+	}
+}
+
 func TestCommandAfterTargetRequiresSeparator(t *testing.T) {
 	if _, err := commandAfterTarget([]string{"uname"}); err == nil {
 		t.Fatal("command without -- was accepted")

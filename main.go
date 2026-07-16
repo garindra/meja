@@ -43,6 +43,7 @@ const usage = `usage:
   meja [-L profile | -S socket-path] <host> [-- command args...]
   meja [-L profile | -S socket-path] new [-s session-name] [-c directory] [options] [host] [-- command args...]
   meja [-L profile | -S socket-path] attach|a -t <session-id-or-name> [host]
+  meja [-L profile | -S socket-path] restore -t <session-name> [--commands=prepare|skip|run] [host]
   meja [-L profile | -S socket-path] ls [host]
   meja [-L profile | -S socket-path] server run|stop`
 
@@ -68,6 +69,8 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 		return runNew(ctx, selector, args[1:], stdin, stdout, stderr)
 	case "attach", "a":
 		return runAttach(ctx, selector, args[1:], stdin, stdout, stderr)
+	case "restore":
+		return runRestore(ctx, selector, args[1:], stdin, stdout, stderr)
 	case "ls":
 		return runList(ctx, selector, args[1:], stdin, stdout, stderr)
 	case "server":
@@ -236,6 +239,46 @@ func runAttach(ctx context.Context, selector control.SocketSelector, args []stri
 	return client.Run(ctx, cfg)
 }
 
+func runRestore(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var flags connectionFlags
+	flags.register(fs)
+	sessionName := fs.String("t", "", "snapshot session name")
+	commandMode := fs.String("commands", "prepare", "restore commands: prepare, skip, or run")
+	if err := fs.Parse(args); err != nil {
+		return usageError{err.Error()}
+	}
+	if *sessionName == "" {
+		return usageError{"restore requires -t <session-name>"}
+	}
+	if err := control.ValidateSessionName(*sessionName); err != nil {
+		return err
+	}
+	switch *commandMode {
+	case "prepare", "skip", "run":
+	default:
+		return usageError{"--commands must be prepare, skip, or run"}
+	}
+	remaining := fs.Args()
+	if len(remaining) > 1 {
+		return usageError{"restore accepts at most one host"}
+	}
+	cfg := flags.config(selector, stdin, stdout, stderr)
+	cfg.RestoreTarget = *sessionName
+	cfg.RestoreCommands = *commandMode
+	var err error
+	if len(remaining) == 0 {
+		cfg.Local = true
+	} else {
+		cfg.Target, err = client.ParseTarget(remaining[0])
+		if err != nil {
+			return err
+		}
+	}
+	return client.Run(ctx, cfg)
+}
+
 func runList(ctx context.Context, selector control.SocketSelector, args []string, stdin *os.File, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("ls", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -351,6 +394,19 @@ func runControl(ctx context.Context, selector control.SocketSelector, args []str
 			return err
 		}
 		bootstrap, err := control.ConnectSession(ctx, socket, args[1])
+		if err != nil {
+			return err
+		}
+		return control.WriteBootstrap(stdout, bootstrap)
+	case "restore-session":
+		if len(args) != 3 {
+			return usageError{"__control-v1 restore-session requires a session name and command mode"}
+		}
+		executable, err := control.CurrentExecutable()
+		if err != nil {
+			return err
+		}
+		bootstrap, err := control.StartRestoreSession(ctx, executable, selector, args[1], args[2])
 		if err != nil {
 			return err
 		}

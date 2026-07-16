@@ -268,6 +268,18 @@ func ConnectSession(ctx context.Context, socket, rawTarget string) (Bootstrap, e
 	return callBootstrap(ctx, socket, "connect-session", target)
 }
 
+func RestoreSession(ctx context.Context, socket, name, commandMode string) (Bootstrap, error) {
+	if err := ValidateSessionName(name); err != nil {
+		return Bootstrap{}, err
+	}
+	switch commandMode {
+	case "prepare", "skip", "run":
+	default:
+		return Bootstrap{}, fmt.Errorf("invalid restore command mode %q", commandMode)
+	}
+	return callBootstrap(ctx, socket, "restore-session-"+commandMode, SessionTarget{Name: name})
+}
+
 func callBootstrap(ctx context.Context, socket, operation string, target SessionTarget) (Bootstrap, error) {
 	reply, err := call(ctx, socket, operation, target)
 	if err != nil {
@@ -416,6 +428,36 @@ func StartSession(ctx context.Context, executable string, selector SocketSelecto
 		b, callErr := CreateSession(ctx, socket, name)
 		if callErr == nil {
 			return b, nil
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return Bootstrap{}, fmt.Errorf("%w at %s", ErrDaemonUnavailable, socket)
+}
+
+func StartRestoreSession(ctx context.Context, executable string, selector SocketSelector, name, commandMode string) (Bootstrap, error) {
+	socket, err := selector.Resolve()
+	if err != nil {
+		return Bootstrap{}, err
+	}
+	if bootstrap, callErr := RestoreSession(ctx, socket, name, commandMode); callErr == nil {
+		return bootstrap, nil
+	} else if !isUnavailable(callErr) {
+		return Bootstrap{}, callErr
+	}
+	if err := EnsureSocketDir(socket); err != nil {
+		return Bootstrap{}, err
+	}
+	if err := startDetachedServer(executable, selector); err != nil {
+		return Bootstrap{}, err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		bootstrap, callErr := RestoreSession(ctx, socket, name, commandMode)
+		if callErr == nil {
+			return bootstrap, nil
+		}
+		if !isUnavailable(callErr) {
+			return Bootstrap{}, callErr
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -582,6 +624,9 @@ func ValidateSessionName(name string) error {
 	for _, r := range name {
 		if unicode.IsControl(r) {
 			return errors.New("session name must not contain control characters")
+		}
+		if r == '/' || r == '\\' {
+			return errors.New("session name must not contain path separators")
 		}
 	}
 	return nil

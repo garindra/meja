@@ -56,6 +56,8 @@ type Config struct {
 	SessionID                uint64
 	SessionTarget            string
 	SessionName              string
+	RestoreTarget            string
+	RestoreCommands          string
 	Stdin                    *os.File
 	Stdout                   io.Writer
 	Stderr                   io.Writer
@@ -271,6 +273,8 @@ func Run(ctx context.Context, cfg Config) error {
 					fallbackCfg := cfg
 					fallbackCfg.SessionID = bootstrap.SessionID
 					fallbackCfg.SessionTarget = fmt.Sprintf("%d", bootstrap.SessionID)
+					fallbackCfg.RestoreTarget = ""
+					fallbackCfg.RestoreCommands = ""
 					fallbackCfg.Stderr = io.Discard
 					fallback, fallbackErr := fetchBootstrap(clientCtx, fallbackCfg)
 					if fallbackErr == nil {

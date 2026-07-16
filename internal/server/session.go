@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/quic-go/quic-go"
 
@@ -383,29 +386,36 @@ type Session struct {
 	NextPaneID         uint64
 	NextLayoutRevision uint64
 
-	attachToken    []byte
-	attachExpires  time.Time
-	attachConsumed bool
-	resumeTokens   map[string]uint64
-	generation     uint64
-	daemon         *Daemon
-	port           uint16
-	quicListener   *quic.Listener
-	quicCancel     context.CancelFunc
-	connection     *Connection
-	defaultCwd     string
-	operations     chan sessionOperation
-	operationsDone chan struct{}
-	statusCommands chan statusCommand
-	stopOnce       sync.Once
-	stopping       bool
-	ended          bool
+	attachToken         []byte
+	attachExpires       time.Time
+	attachConsumed      bool
+	resumeTokens        map[string]uint64
+	generation          uint64
+	daemon              *Daemon
+	port                uint16
+	quicListener        *quic.Listener
+	quicCancel          context.CancelFunc
+	connection          *Connection
+	defaultCwd          string
+	operations          chan sessionOperation
+	operationsDone      chan struct{}
+	statusCommands      chan statusCommand
+	stopOnce            sync.Once
+	processNames        ProcessObserver
+	nameMonitor         sync.Once
+	autosave            sync.Once
+	autosaveNow         chan struct{}
+	promptContinuations map[uint64]promptContinuation
+	stopping            bool
+	ended               bool
 }
 
 type Window struct {
 	ID             uint64
 	DisplayIndex   int
 	Name           string
+	AutomaticName  bool
+	ActivePaneID   uint64
 	Layout         LayoutNode
 	LayoutRevision uint64
 }
@@ -415,6 +425,7 @@ type PromptKind uint8
 const (
 	PromptKindRenameWindow PromptKind = iota + 1
 	PromptKindRenameSession
+	PromptKindConfirm
 )
 
 type PromptAction uint8
@@ -436,6 +447,13 @@ type PromptState struct {
 	pendingUTF8    []byte
 	PendingEscape  []byte
 }
+
+type promptResult struct {
+	Accepted bool
+	Text     string
+}
+
+type promptContinuation func(promptResult) error
 
 type RenderBinding struct {
 	Slot   int
@@ -475,15 +493,18 @@ func (c *ClientState) setFocusedPane(paneID uint64) {
 
 func NewSession(id uint64) *Session {
 	session := &Session{
-		ID:             id,
-		Windows:        map[uint64]*Window{},
-		Panes:          map[uint64]*Pane{},
-		Clients:        map[uint64]*ClientState{},
-		NextWindowID:   1,
-		resumeTokens:   map[string]uint64{},
-		operations:     make(chan sessionOperation, 64),
-		operationsDone: make(chan struct{}),
-		statusCommands: make(chan statusCommand, 64),
+		ID:                  id,
+		Windows:             map[uint64]*Window{},
+		Panes:               map[uint64]*Pane{},
+		Clients:             map[uint64]*ClientState{},
+		NextWindowID:        1,
+		resumeTokens:        map[string]uint64{},
+		operations:          make(chan sessionOperation, 64),
+		operationsDone:      make(chan struct{}),
+		statusCommands:      make(chan statusCommand, 64),
+		processNames:        NewProcessObserver(),
+		autosaveNow:         make(chan struct{}, 1),
+		promptContinuations: make(map[uint64]promptContinuation),
 	}
 	go session.runOperations()
 	go session.runStatusOutput()
@@ -578,10 +599,38 @@ func (s *Session) BeginRenameSessionPrompt(clientID uint64) (*PromptState, error
 	return clonePromptState(client.Prompt), nil
 }
 
+func (s *Session) beginConfirmationPrompt(clientID uint64, label string, continuation promptContinuation) (*PromptState, error) {
+	client := s.Clients[clientID]
+	if client == nil {
+		return nil, fmt.Errorf("unknown client %d", clientID)
+	}
+	client.InputState = serverInputNormal
+	client.Prompt = &PromptState{Kind: PromptKindConfirm, Label: label}
+	if continuation == nil {
+		delete(s.promptContinuations, clientID)
+	} else {
+		s.promptContinuations[clientID] = continuation
+	}
+	return clonePromptState(client.Prompt), nil
+}
+
+func (s *Session) resolvePrompt(clientID uint64, result promptResult) error {
+	continuation := s.promptContinuations[clientID]
+	delete(s.promptContinuations, clientID)
+	if continuation == nil {
+		return s.publishStatusBar()
+	}
+	return continuation(result)
+}
+
 func (s *Session) finishSessionRename(name string, accepted bool) error {
 	client := s.Clients[clientID0]
 	if accepted {
+		renamed := s.Name != name
 		s.Name = name
+		if renamed {
+			s.requestAutosave()
+		}
 		if client != nil && client.Prompt != nil && client.Prompt.Kind == PromptKindRenameSession {
 			client.Prompt = nil
 		}
@@ -589,6 +638,13 @@ func (s *Session) finishSessionRename(name string, accepted bool) error {
 		client.Prompt.Action = PromptActionNone
 	}
 	return s.publishStatusBar()
+}
+
+func (s *Session) requestAutosave() {
+	select {
+	case s.autosaveNow <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Session) SessionName() string {
@@ -617,8 +673,9 @@ func (s *Session) ensureClientFocusLocked(client *ClientState) {
 		window = s.Windows[ids[0]]
 		client.ActiveWindowID = window.ID
 	}
+	window.ActivePaneID = windowActivePaneID(window)
 	if !windowHasPane(window, client.FocusedPaneID) {
-		client.setFocusedPane(windowPrimaryPaneID(window))
+		client.setFocusedPane(window.ActivePaneID)
 	}
 }
 
@@ -646,6 +703,8 @@ func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *Client
 		ID:             windowID,
 		DisplayIndex:   displayIndex,
 		Name:           pane.Title,
+		AutomaticName:  true,
+		ActivePaneID:   pane.ID,
 		Layout:         &PaneLayout{PaneID: pane.ID},
 		LayoutRevision: s.nextLayoutRevisionLocked(),
 	}
@@ -743,11 +802,15 @@ func (s *Session) SelectWindow(clientID, windowID uint64) (*Window, *ClientState
 
 func (s *Session) selectWindowLocked(client *ClientState, window *Window) {
 	if client.ActiveWindowID != window.ID {
+		if previous := s.Windows[client.ActiveWindowID]; previous != nil && windowHasPane(previous, client.FocusedPaneID) {
+			previous.ActivePaneID = client.FocusedPaneID
+		}
 		client.LastWindowID = client.ActiveWindowID
 		client.HasLastWindow = client.LastWindowID != 0
 	}
 	client.ActiveWindowID = window.ID
-	client.setFocusedPane(windowPrimaryPaneID(window))
+	window.ActivePaneID = windowActivePaneID(window)
+	client.setFocusedPane(window.ActivePaneID)
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	s.rebuildBindingsLocked(client, window)
 }
@@ -759,6 +822,7 @@ func (s *Session) RenameWindow(windowID uint64, name string) (*Window, error) {
 	}
 	// Empty names are valid; normal status projection remains well-formed.
 	window.Name = name
+	window.AutomaticName = false
 	return cloneWindow(window), nil
 }
 
@@ -774,6 +838,7 @@ func (s *Session) FocusPane(clientID, paneID uint64) (*Window, *ClientState, err
 	if !windowHasPane(window, paneID) {
 		return nil, nil, fmt.Errorf("pane %d not visible in window %d", paneID, window.ID)
 	}
+	window.ActivePaneID = paneID
 	client.setFocusedPane(paneID)
 	return cloneWindow(window), cloneClientState(client), nil
 }
@@ -803,6 +868,7 @@ func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitD
 	s.Panes[pane.ID] = pane
 	window.Layout = updated
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	window.ActivePaneID = pane.ID
 	client.setFocusedPane(pane.ID)
 	s.rebuildBindingsLocked(client, window)
 	return cloneWindow(window), cloneClientState(client), nil
@@ -889,7 +955,8 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 		ids := s.windowIDsLocked()
 		nextWindow := s.Windows[ids[0]]
 		c.ActiveWindowID = nextWindow.ID
-		c.setFocusedPane(windowPrimaryPaneID(nextWindow))
+		nextWindow.ActivePaneID = windowActivePaneID(nextWindow)
+		c.setFocusedPane(nextWindow.ActivePaneID)
 		s.rebuildBindingsLocked(c, nextWindow)
 		return closedPane, cloneWindow(nextWindow), cloneClientState(c), true, closedWindowID, false, nil
 	}
@@ -901,6 +968,7 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 	delete(s.Panes, c.FocusedPaneID)
 	window.Layout = updated
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	window.ActivePaneID = nextFocusedPaneID
 	c.setFocusedPane(nextFocusedPaneID)
 	s.rebuildBindingsLocked(c, window)
 	return closedPane, cloneWindow(window), cloneClientState(c), false, 0, false, nil
@@ -934,8 +1002,12 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 		}
 		owner.Layout = updated
 		owner.LayoutRevision = s.nextLayoutRevisionLocked()
+		if owner.ActivePaneID == paneID {
+			owner.ActivePaneID = nextFocusedPaneID
+		}
+		owner.ActivePaneID = windowActivePaneID(owner)
 		if c.ActiveWindowID == owner.ID && c.FocusedPaneID == paneID {
-			c.setFocusedPane(nextFocusedPaneID)
+			c.setFocusedPane(owner.ActivePaneID)
 		}
 	} else {
 		delete(s.Windows, owner.ID)
@@ -945,7 +1017,9 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 		if c.ActiveWindowID == owner.ID {
 			ids := s.windowIDsLocked()
 			c.ActiveWindowID = ids[0]
-			c.setFocusedPane(windowPrimaryPaneID(s.Windows[ids[0]]))
+			nextWindow := s.Windows[ids[0]]
+			nextWindow.ActivePaneID = windowActivePaneID(nextWindow)
+			c.setFocusedPane(nextWindow.ActivePaneID)
 		}
 	}
 	active := s.Windows[c.ActiveWindowID]
@@ -988,7 +1062,8 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	ids := s.windowIDsLocked()
 	nextWindow := s.Windows[ids[0]]
 	c.ActiveWindowID = nextWindow.ID
-	c.setFocusedPane(windowPrimaryPaneID(nextWindow))
+	nextWindow.ActivePaneID = windowActivePaneID(nextWindow)
+	c.setFocusedPane(nextWindow.ActivePaneID)
 	s.rebuildBindingsLocked(c, nextWindow)
 	pane = s.Panes[c.FocusedPaneID]
 	return closed, closedPanes, cloneWindow(nextWindow), pane, cloneClientState(c), false, nil
@@ -1130,7 +1205,7 @@ func (s *Session) rebuildBindingsLocked(client *ClientState, window *Window) {
 
 func (s *Session) UpdatePaneTitle(paneID uint64, title string) *Window {
 	for _, window := range s.Windows {
-		if windowHasPane(window, paneID) {
+		if window.AutomaticName && windowHasPane(window, paneID) {
 			window.Name = title
 			return cloneWindow(window)
 		}
@@ -1325,9 +1400,164 @@ func cloneWindow(window *Window) *Window {
 		ID:             window.ID,
 		DisplayIndex:   window.DisplayIndex,
 		Name:           window.Name,
+		AutomaticName:  window.AutomaticName,
+		ActivePaneID:   window.ActivePaneID,
 		Layout:         window.Layout,
 		LayoutRevision: window.LayoutRevision,
 	}
+}
+
+const processNameRefreshInterval = time.Second
+
+type processNameInput struct {
+	windowID uint64
+	paneID   uint64
+	pane     *Pane
+	anchor   Anchor
+}
+
+func (s *Session) startProcessNameMonitor() {
+	s.nameMonitor.Do(func() {
+		go s.runProcessNameMonitor()
+	})
+}
+
+func (s *Session) runProcessNameMonitor() {
+	refresh := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), processNameRefreshInterval)
+		defer cancel()
+		_ = s.refreshAutomaticWindowNames(ctx, s.processNames)
+	}
+	refresh()
+	ticker := time.NewTicker(processNameRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			refresh()
+		case <-s.operationsDone:
+			return
+		}
+	}
+}
+
+// refreshAutomaticWindowNames observes processes outside the Session actor,
+// then posts only validated name changes back through that actor. The status
+// goroutine continues to receive ordinary immutable status models.
+func (s *Session) refreshAutomaticWindowNames(ctx context.Context, observer ProcessObserver) error {
+	if observer == nil {
+		observer = NewProcessObserver()
+	}
+	var inputs []processNameInput
+	if err := s.coordinate(func() error {
+		inputs = make([]processNameInput, 0, len(s.Windows))
+		for _, window := range s.Windows {
+			if window == nil || !window.AutomaticName {
+				continue
+			}
+			paneID := windowActivePaneID(window)
+			pane := s.Panes[paneID]
+			if pane == nil || pane.Root.PID <= 0 {
+				continue
+			}
+			inputs = append(inputs, processNameInput{
+				windowID: window.ID,
+				paneID:   paneID,
+				pane:     pane,
+				anchor: Anchor{
+					Key: PaneKey{
+						SessionID: s.ID,
+						PaneID:    paneID,
+					},
+					Root:        pane.Root,
+					PTY:         pane.PTY,
+					RootIsShell: len(pane.Launch.RequestedArgv) == 0,
+				},
+			})
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil || len(inputs) == 0 {
+		return err
+	}
+	sort.Slice(inputs, func(i, j int) bool { return inputs[i].windowID < inputs[j].windowID })
+	anchors := make([]Anchor, len(inputs))
+	for index := range inputs {
+		anchors[index] = inputs[index].anchor
+	}
+	observations := observer.Observe(ctx, anchors)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	return s.coordinate(func() error {
+		changed := false
+		for _, input := range inputs {
+			window := s.Windows[input.windowID]
+			if window == nil || !window.AutomaticName || windowActivePaneID(window) != input.paneID ||
+				s.Panes[input.paneID] != input.pane || input.pane.Root != input.anchor.Root {
+				continue
+			}
+			name := observationWindowName(observations[input.anchor.Key])
+			if name != "" && name != window.Name {
+				window.Name = name
+				changed = true
+			}
+		}
+		if changed {
+			return s.publishStatusBar()
+		}
+		return nil
+	})
+}
+
+func windowActivePaneID(window *Window) uint64 {
+	if window == nil {
+		return 0
+	}
+	if windowHasPane(window, window.ActivePaneID) {
+		return window.ActivePaneID
+	}
+	return windowPrimaryPaneID(window)
+}
+
+func observationWindowName(observation ProcessObservation) string {
+	var observed *ObservedProcess
+	switch observation.Status {
+	case StatusDetected:
+		observed = observation.Candidate
+	case StatusShellOwned:
+		observed = observation.Root
+	default:
+		return ""
+	}
+	if observed == nil {
+		return ""
+	}
+	name := observed.Name
+	if name == "" && observed.Exe != "" {
+		name = filepath.Base(strings.TrimSuffix(observed.Exe, " (deleted)"))
+	}
+	if name == "" && len(observed.Argv) > 0 {
+		name = filepath.Base(observed.Argv[0])
+	}
+	return cleanProcessName(name)
+}
+
+func cleanProcessName(name string) string {
+	runes := make([]rune, 0, len(name))
+	for _, current := range strings.ToValidUTF8(name, "�") {
+		if unicode.IsControl(current) {
+			continue
+		}
+		runes = append(runes, current)
+		if len(runes) == 64 {
+			break
+		}
+	}
+	return strings.TrimSpace(string(runes))
 }
 
 func clonePromptState(prompt *PromptState) *PromptState {

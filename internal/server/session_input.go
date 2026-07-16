@@ -124,6 +124,9 @@ func consumeInputByteLocked(client *ClientState, b byte) serverInputEvent {
 
 func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
 	prompt := client.Prompt
+	if prompt.Kind == PromptKindConfirm {
+		return consumeConfirmationByteLocked(client, b)
+	}
 	if len(prompt.PendingEscape) > 0 {
 		return consumePromptEscapeByteLocked(client, b)
 	}
@@ -166,6 +169,21 @@ func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
 		}
 		prompt.Action = PromptActionChanged
 		event.PromptAction = PromptActionChanged
+	}
+	return event
+}
+
+func consumeConfirmationByteLocked(client *ClientState, b byte) serverInputEvent {
+	prompt := client.Prompt
+	event := serverInputEvent{Command: serverCommandPrompt, PromptKind: prompt.Kind}
+	switch b {
+	case 'y', 'Y':
+		event.PromptAction = PromptActionSubmit
+		event.PromptText = "y"
+		client.Prompt = nil
+	case 'n', 'N', '\r', '\n', 0x03, 0x1b:
+		event.PromptAction = PromptActionCancel
+		client.Prompt = nil
 	}
 	return event
 }
@@ -418,6 +436,7 @@ func (s *Session) FocusPaneDirection(clientID uint64, direction byte) (*Window, 
 	}
 	if best != nil {
 		client.FocusedPaneID = best.placement.PaneID
+		window.ActivePaneID = best.placement.PaneID
 		if direction == 'A' || direction == 'B' {
 			client.FocusX2 = clampToRectAxis(client.FocusX2, best.placement.Rect.X, best.placement.Rect.Width)
 			client.FocusY2 = rectCenterY2(best.placement.Rect)

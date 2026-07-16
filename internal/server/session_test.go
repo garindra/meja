@@ -384,6 +384,39 @@ func TestSelectingWindowAdvancesItsLayoutRevision(t *testing.T) {
 	}
 }
 
+func TestSelectingWindowRestoresItsLastActivePane(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	left := &Pane{ID: s.AddPaneID(), Title: "left"}
+	firstWindow, _ := s.CreateWindow(left, 0)
+	right := &Pane{ID: s.AddPaneID(), Title: "right"}
+	if _, _, err := s.SplitFocusedPane(0, right, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	secondWindow, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "second"}, 0)
+
+	selected, client, err := s.SelectWindow(0, firstWindow.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.FocusedPaneID != right.ID || selected.ActivePaneID != right.ID {
+		t.Fatalf("first selection focused=%d active=%d, want %d", client.FocusedPaneID, selected.ActivePaneID, right.ID)
+	}
+	if _, _, err := s.FocusPane(0, left.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.SelectWindow(0, secondWindow.ID); err != nil {
+		t.Fatal(err)
+	}
+	selected, client, err = s.SelectWindow(0, firstWindow.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.FocusedPaneID != left.ID || selected.ActivePaneID != left.ID {
+		t.Fatalf("second selection focused=%d active=%d, want %d", client.FocusedPaneID, selected.ActivePaneID, left.ID)
+	}
+}
+
 func TestWindowLayoutCarriesRenderSlots(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
@@ -546,5 +579,131 @@ func TestSessionReplacementCloseIsNotLoggable(t *testing.T) {
 	}
 	if isSessionReplacedClose(errors.New("read input frame: connection lost")) {
 		t.Fatal("ordinary connection error was recognized as session replacement")
+	}
+}
+
+type fixedProcessObserver map[PaneKey]ProcessObservation
+
+func (o fixedProcessObserver) Observe(_ context.Context, anchors []Anchor) map[PaneKey]ProcessObservation {
+	observations := make(map[PaneKey]ProcessObservation, len(anchors))
+	for _, anchor := range anchors {
+		if observation, ok := o[anchor.Key]; ok {
+			observations[anchor.Key] = observation
+		}
+	}
+	return observations
+}
+
+func TestRefreshAutomaticWindowNamesUsesEachWindowProcess(t *testing.T) {
+	session := NewSession(12)
+	t.Cleanup(session.stopOperations)
+	firstPane := &Pane{
+		ID:     1,
+		Title:  "bash",
+		Root:   Identity{PID: 101, BirthToken: 1001},
+		Launch: PaneLaunch{Shell: "/bin/bash"},
+	}
+	secondPane := &Pane{
+		ID:    2,
+		Title: "bash",
+		Root:  Identity{PID: 102, BirthToken: 1002},
+		Launch: PaneLaunch{
+			Shell:         "/bin/bash",
+			RequestedArgv: []string{"nvim", "notes.txt"},
+		},
+	}
+	var firstWindow, secondWindow *Window
+	if err := session.coordinate(func() error {
+		firstWindow, _ = session.CreateWindow(firstPane, clientID0)
+		secondWindow, _ = session.CreateWindow(secondPane, clientID0)
+		session.SetClientSize(clientID0, 80, 23)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	firstRoot := ObservedProcess{Identity: firstPane.Root, Name: "bash"}
+	secondRoot := ObservedProcess{Identity: secondPane.Root, Name: "nvim"}
+	observer := fixedProcessObserver{
+		{SessionID: session.ID, PaneID: firstPane.ID}: {
+			Key:    PaneKey{SessionID: session.ID, PaneID: firstPane.ID},
+			Status: StatusShellOwned,
+			Root:   &firstRoot,
+		},
+		{SessionID: session.ID, PaneID: secondPane.ID}: {
+			Key:       PaneKey{SessionID: session.ID, PaneID: secondPane.ID},
+			Status:    StatusDetected,
+			Root:      &secondRoot,
+			Candidate: &secondRoot,
+		},
+	}
+	if err := session.refreshAutomaticWindowNames(context.Background(), observer); err != nil {
+		t.Fatal(err)
+	}
+
+	var firstCurrent, secondCurrent *Window
+	if err := session.coordinate(func() error {
+		firstCurrent = cloneWindow(session.Windows[firstWindow.ID])
+		secondCurrent = cloneWindow(session.Windows[secondWindow.ID])
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if firstCurrent.Name != "bash" || !firstCurrent.AutomaticName {
+		t.Fatalf("first window=%#v", firstCurrent)
+	}
+	if secondCurrent.Name != "nvim" || !secondCurrent.AutomaticName {
+		t.Fatalf("second window=%#v", secondCurrent)
+	}
+}
+
+func TestManualWindowNameIsNotOverwrittenByProcessRefresh(t *testing.T) {
+	session := NewSession(13)
+	t.Cleanup(session.stopOperations)
+	pane := &Pane{
+		ID:     1,
+		Title:  "bash",
+		Root:   Identity{PID: 101, BirthToken: 1001},
+		Launch: PaneLaunch{Shell: "/bin/bash"},
+	}
+	var window *Window
+	if err := session.coordinate(func() error {
+		window, _ = session.CreateWindow(pane, clientID0)
+		session.SetClientSize(clientID0, 80, 23)
+		_, err := session.RenameWindow(window.ID, "work")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	process := ObservedProcess{Identity: pane.Root, Name: "top"}
+	observer := fixedProcessObserver{
+		{SessionID: session.ID, PaneID: pane.ID}: {
+			Status:    StatusDetected,
+			Candidate: &process,
+		},
+	}
+	if err := session.refreshAutomaticWindowNames(context.Background(), observer); err != nil {
+		t.Fatal(err)
+	}
+	var current *Window
+	if err := session.coordinate(func() error {
+		current = cloneWindow(session.Windows[window.ID])
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if current.Name != "work" || current.AutomaticName {
+		t.Fatalf("manual window name changed: %#v", current)
+	}
+}
+
+func TestObservationWindowNameIgnoresAmbiguousJobsAndSanitizesNames(t *testing.T) {
+	if got := observationWindowName(ProcessObservation{Status: StatusAmbiguous}); got != "" {
+		t.Fatalf("ambiguous name=%q", got)
+	}
+	process := ObservedProcess{Name: "\n nv\tim\x00"}
+	if got := observationWindowName(ProcessObservation{Status: StatusDetected, Candidate: &process}); got != "nvim" {
+		t.Fatalf("sanitized name=%q", got)
 	}
 }

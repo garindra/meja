@@ -49,6 +49,14 @@ func TestParseSessionIDRejectsNonCanonicalValues(t *testing.T) {
 	}
 }
 
+func TestSessionNameRejectsPathSeparators(t *testing.T) {
+	for _, name := range []string{"../work", "folder/work", `folder\work`} {
+		if err := ValidateSessionName(name); err == nil {
+			t.Fatalf("ValidateSessionName(%q) accepted a path separator", name)
+		}
+	}
+}
+
 func TestTokenComparisonIsEncodingStrict(t *testing.T) {
 	token := make([]byte, 32)
 	if !EqualToken(EncodeToken(token), token) {
