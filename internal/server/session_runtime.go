@@ -465,7 +465,16 @@ func (s *Session) commandEnterHistory() error {
 }
 
 func (s *Session) commandClosePane(c *Connection) error {
-	return s.commandClosePaneNow(c)
+	_, err := s.beginConfirmationPrompt(clientID0, "kill-pane? (y/N) ", func(result promptResult) error {
+		if !result.Accepted {
+			return s.publishStatusBar()
+		}
+		return s.commandClosePaneNow(c)
+	})
+	if err != nil {
+		return err
+	}
+	return s.publishStatusBar()
 }
 
 func (s *Session) commandClosePaneNow(c *Connection) error {

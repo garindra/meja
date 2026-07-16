@@ -70,6 +70,57 @@ func TestServerRecognizesToggleZoomPrefix(t *testing.T) {
 	}
 }
 
+func TestClosePanePromptsBeforeKilling(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	first := &Pane{ID: s.AddPaneID(), Title: "first"}
+	s.CreateWindow(first, 0)
+	second := &Pane{ID: s.AddPaneID(), Title: "second"}
+	if _, _, err := s.SplitFocusedPane(0, second, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	handler := &Connection{Session: s}
+
+	s.ConsumeInputByte(0, 0x02)
+	event := s.ConsumeInputByte(0, 'x')
+	if event.Command != serverCommandClosePane {
+		t.Fatalf("close-pane event = %#v", event)
+	}
+	if _, err := s.handleServerInputEvent(handler, event); err != nil {
+		t.Fatal(err)
+	}
+	prompt := s.ActivePrompt(0)
+	if prompt == nil || prompt.Kind != PromptKindConfirm || prompt.Label != "kill-pane? (y/N) " {
+		t.Fatalf("close-pane confirmation prompt = %#v", prompt)
+	}
+	if s.Pane(second.ID) == nil {
+		t.Fatal("pane was killed before confirmation")
+	}
+
+	if _, err := s.handleServerInputEvent(handler, s.ConsumeInputByte(0, '\r')); err != nil {
+		t.Fatal(err)
+	}
+	if s.ActivePrompt(0) != nil || s.Pane(second.ID) == nil {
+		t.Fatalf("default-No confirmation changed pane state: prompt=%#v pane=%#v", s.ActivePrompt(0), s.Pane(second.ID))
+	}
+
+	s.ConsumeInputByte(0, 0x02)
+	event = s.ConsumeInputByte(0, 'x')
+	if _, err := s.handleServerInputEvent(handler, event); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.handleServerInputEvent(handler, s.ConsumeInputByte(0, 'y')); err != nil {
+		t.Fatal(err)
+	}
+	if s.ActivePrompt(0) != nil || s.Pane(second.ID) != nil {
+		t.Fatalf("confirmed pane close did not complete: prompt=%#v pane=%#v", s.ActivePrompt(0), s.Pane(second.ID))
+	}
+	got, _ := s.ActivePane(0)
+	if got != first {
+		t.Fatalf("active pane after close = %#v, want %#v", got, first)
+	}
+}
+
 func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	s := NewSession(1)
 	s.NewClient(0)

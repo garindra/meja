@@ -150,7 +150,7 @@ the command key. Normal typing continues to go to the focused pane.
 | `Ctrl+b`, `z` | Toggle the focused pane between its split position and the full window. |
 | `Ctrl+b`, `{` | Swap the focused pane with the previous pane. |
 | `Ctrl+b`, `}` | Swap the focused pane with the next pane. |
-| `Ctrl+b`, `x` | Close the focused pane. Closing the final pane ends the session. |
+| `Ctrl+b`, `x` | Ask for confirmation, then close the focused pane. Closing the final pane ends the session. |
 
 Each window supports up to eight visible panes.
 Pane sizes are stored as part of the window layout and are included in named
@@ -175,8 +175,8 @@ splitting, swapping, or closing the zoomed pane first leaves zoom mode.
 
 Rename prompts appear in the status bar. Type the new name, use Backspace or
 Delete to remove characters, press Enter to save, or press Escape or `Ctrl+c`
-to cancel. If Meja asks before overwriting an existing snapshot, press `y` to
-confirm; `n`, Enter, Escape, or `Ctrl+c` cancels.
+to cancel. Confirmation prompts use `y` to confirm; `n`, Enter, Escape, or
+`Ctrl+c` cancels.
 
 ### History mode
 
