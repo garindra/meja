@@ -244,6 +244,7 @@ func registeredCommands() []commandDefinition {
 		{name: "kill-server", execute: daemonCommand(handleDaemonKillServerCommand)},
 		{name: "server", execute: daemonCommand(handleLegacyDaemonServerCommand)},
 		{name: "new-window", aliases: []string{"neww"}, execute: sessionCommand(sessionTarget, handleNewWindowCommand)},
+		{name: "next-layout", execute: sessionCommand(sessionTarget, handleNextLayoutCommand)},
 		{name: "split-window", aliases: []string{"splitw"}, execute: sessionCommand(sessionTarget, handleSplitWindowCommand)},
 		{name: "detach-client", aliases: []string{"detach"}, execute: sessionCommand(sessionTarget, handleDetachClientCommand)},
 		{name: "next-window", aliases: []string{"next"}, execute: sessionCommand(sessionTarget, handleNextWindowCommand)},
@@ -502,6 +503,13 @@ func handleNewWindowCommand(s *Session, c *ClientInstance, args []string) (bool,
 		return false, err
 	}
 	return false, s.commandCreateWindow(c)
+}
+
+func handleNextLayoutCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
+	if err := requireNoCommandArgs("next-layout", args); err != nil {
+		return false, err
+	}
+	return false, s.commandNextLayout()
 }
 
 func handleSplitWindowCommand(s *Session, c *ClientInstance, args []string) (bool, error) {

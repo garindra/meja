@@ -142,6 +142,7 @@ the command key. Normal typing continues to go to the focused pane.
 | `Ctrl+b`, `Ctrl+b` | Send a literal `Ctrl+b` to the focused pane. |
 | `Ctrl+b`, `d` | Detach while leaving the session running. |
 | `Ctrl+b`, `c` | Create a new window. |
+| `Ctrl+b`, `Space` | Cycle through preset pane layouts. |
 | `Ctrl+b`, `%` | Split the focused pane left/right. |
 | `Ctrl+b`, `"` | Split the focused pane top/bottom. |
 | `Ctrl+b`, `↑` / `↓` / `←` / `→` | Focus the pane in that direction. |

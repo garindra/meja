@@ -577,13 +577,14 @@ func (s *Session) restoreSnapshot(snapshot PersistedSession, mode restoreCommand
 			windowID := uint64(index + 1)
 			s.NextLayoutRevision++
 			s.Windows[windowID] = &Window{
-				ID:             windowID,
-				DisplayIndex:   index,
-				Name:           persistedWindow.Name,
-				AutomaticName:  persistedWindow.AutomaticName,
-				ActivePaneID:   persistedWindow.ActivePane,
-				Layout:         restoreLayout(persistedWindow.Layout),
-				LayoutRevision: s.NextLayoutRevision,
+				ID:               windowID,
+				DisplayIndex:     index,
+				Name:             persistedWindow.Name,
+				AutomaticName:    persistedWindow.AutomaticName,
+				ActivePaneID:     persistedWindow.ActivePane,
+				Layout:           restoreLayout(persistedWindow.Layout),
+				LayoutRevision:   s.NextLayoutRevision,
+				layoutCycleIndex: layoutPresetCustom,
 			}
 		}
 		client := s.ensureClientLocked(clientID0)

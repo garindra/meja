@@ -64,6 +64,7 @@ func TestEveryPrefixBindingExpandsToCanonicalCommandArgs(t *testing.T) {
 		argv []string
 	}{
 		{'c', []string{"new-window"}},
+		{' ', []string{"next-layout"}},
 		{'%', []string{"split-window", "-h"}},
 		{'"', []string{"split-window", "-v"}},
 		{'d', []string{"detach-client"}},

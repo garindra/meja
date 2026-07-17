@@ -344,6 +344,23 @@ func (s *Session) commandSplit(c *ClientInstance, direction SplitDirection) erro
 	return nil
 }
 
+func (s *Session) commandNextLayout() error {
+	window, _ := s.ActiveWindow(clientID0)
+	if window == nil || len(window.Layout.PaneIDs()) <= 1 {
+		return nil
+	}
+	handoff := s.beginOutputHandoff()
+	_, clientState, changed, err := s.CycleWindowLayout(clientID0)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return s.publishVisibleSnapshots(handoff)
+	}
+	s.resizeSessionToClient(clientState)
+	return s.rebindOutputsAndPublishLayout(handoff)
+}
+
 func (s *Session) commandSwapPane(direction PaneSwapDirection) error {
 	window, _ := s.ActiveWindow(clientID0)
 	if window == nil || len(window.Layout.PaneIDs()) < 2 {

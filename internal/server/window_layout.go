@@ -46,6 +46,18 @@ const (
 	ResizePaneRight
 )
 
+const (
+	layoutPresetEvenHorizontal = iota
+	layoutPresetEvenVertical
+	layoutPresetMainHorizontal
+	layoutPresetMainVertical
+	layoutPresetTiled
+	layoutPresetCount
+	layoutPresetCustom = -1
+)
+
+const mainLayoutRatio uint16 = 600
+
 func (p *PaneLayout) Compute(rect Rect) []PanePlacement {
 	return []PanePlacement{{PaneID: p.PaneID, Rect: rect}}
 }
@@ -127,6 +139,93 @@ func (s *SplitLayout) PaneIDs() []uint64 {
 	out := append([]uint64{}, s.First.PaneIDs()...)
 	out = append(out, s.Second.PaneIDs()...)
 	return out
+}
+
+func buildPresetLayout(paneIDs []uint64, focusedPaneID uint64, preset int) LayoutNode {
+	if len(paneIDs) == 0 {
+		return nil
+	}
+	if len(paneIDs) == 1 {
+		return &PaneLayout{PaneID: paneIDs[0]}
+	}
+
+	switch preset {
+	case layoutPresetEvenVertical:
+		return balancedPaneLayout(paneIDs, SplitHorizontal)
+	case layoutPresetMainHorizontal:
+		main, rest := mainAndRestPaneIDs(paneIDs, focusedPaneID)
+		return &SplitLayout{
+			Direction: SplitHorizontal,
+			Ratio:     mainLayoutRatio,
+			First:     &PaneLayout{PaneID: main},
+			Second:    balancedPaneLayout(rest, SplitVertical),
+		}
+	case layoutPresetMainVertical:
+		main, rest := mainAndRestPaneIDs(paneIDs, focusedPaneID)
+		return &SplitLayout{
+			Direction: SplitVertical,
+			Ratio:     mainLayoutRatio,
+			First:     &PaneLayout{PaneID: main},
+			Second:    balancedPaneLayout(rest, SplitHorizontal),
+		}
+	case layoutPresetTiled:
+		return tiledPaneLayout(paneIDs)
+	default:
+		return balancedPaneLayout(paneIDs, SplitVertical)
+	}
+}
+
+func balancedPaneLayout(paneIDs []uint64, direction SplitDirection) LayoutNode {
+	nodes := make([]LayoutNode, len(paneIDs))
+	for i, paneID := range paneIDs {
+		nodes[i] = &PaneLayout{PaneID: paneID}
+	}
+	return balancedLayout(nodes, direction)
+}
+
+func balancedLayout(nodes []LayoutNode, direction SplitDirection) LayoutNode {
+	if len(nodes) == 0 {
+		return nil
+	}
+	if len(nodes) == 1 {
+		return nodes[0]
+	}
+	middle := len(nodes) / 2
+	return &SplitLayout{
+		Direction: direction,
+		Ratio:     uint16(middle * 1000 / len(nodes)),
+		First:     balancedLayout(nodes[:middle], direction),
+		Second:    balancedLayout(nodes[middle:], direction),
+	}
+}
+
+func mainAndRestPaneIDs(paneIDs []uint64, focusedPaneID uint64) (uint64, []uint64) {
+	main := paneIDs[0]
+	mainIndex := 0
+	for i, paneID := range paneIDs {
+		if paneID == focusedPaneID {
+			main = paneID
+			mainIndex = i
+			break
+		}
+	}
+	ordered := make([]uint64, 0, len(paneIDs)-1)
+	ordered = append(ordered, paneIDs[:mainIndex]...)
+	ordered = append(ordered, paneIDs[mainIndex+1:]...)
+	return main, ordered
+}
+
+func tiledPaneLayout(paneIDs []uint64) LayoutNode {
+	columns := 1
+	for columns*columns < len(paneIDs) {
+		columns++
+	}
+	rows := make([]LayoutNode, 0, (len(paneIDs)+columns-1)/columns)
+	for start := 0; start < len(paneIDs); start += columns {
+		end := min(start+columns, len(paneIDs))
+		rows = append(rows, balancedPaneLayout(paneIDs[start:end], SplitVertical))
+	}
+	return balancedLayout(rows, SplitHorizontal)
 }
 
 type resizeCandidate struct {

@@ -69,6 +69,8 @@ func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) server
 			return serverInputEvent{Command: serverCommandLiteral, Byte: 0x02}
 		case 'c':
 			return commandInputEvent("new-window")
+		case ' ':
+			return commandInputEvent("next-layout")
 		case '%':
 			return commandInputEvent("split-window", "-h")
 		case '"':

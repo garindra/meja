@@ -238,15 +238,16 @@ type Session struct {
 }
 
 type Window struct {
-	ID             uint64
-	DisplayIndex   int
-	Name           string
-	AutomaticName  bool
-	ActivePaneID   uint64
-	Zoomed         bool
-	ZoomedPaneID   uint64
-	Layout         LayoutNode
-	LayoutRevision uint64
+	ID               uint64
+	DisplayIndex     int
+	Name             string
+	AutomaticName    bool
+	ActivePaneID     uint64
+	Zoomed           bool
+	ZoomedPaneID     uint64
+	Layout           LayoutNode
+	LayoutRevision   uint64
+	layoutCycleIndex int
 }
 
 func (w *Window) clearZoom() {
@@ -570,13 +571,14 @@ func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *Client
 	s.NextWindowID++
 	displayIndex := s.lowestAvailableWindowDisplayIndex()
 	window := &Window{
-		ID:             windowID,
-		DisplayIndex:   displayIndex,
-		Name:           pane.Title,
-		AutomaticName:  true,
-		ActivePaneID:   pane.ID,
-		Layout:         &PaneLayout{PaneID: pane.ID},
-		LayoutRevision: s.nextLayoutRevisionLocked(),
+		ID:               windowID,
+		DisplayIndex:     displayIndex,
+		Name:             pane.Title,
+		AutomaticName:    true,
+		ActivePaneID:     pane.ID,
+		Layout:           &PaneLayout{PaneID: pane.ID},
+		LayoutRevision:   s.nextLayoutRevisionLocked(),
+		layoutCycleIndex: layoutPresetCustom,
 	}
 	s.Windows[windowID] = window
 	s.Panes[pane.ID] = pane
@@ -757,6 +759,32 @@ func (s *Session) ToggleZoom(clientID uint64) (*Window, *ClientState, bool, erro
 	return cloneWindow(window), cloneClientState(client), true, nil
 }
 
+func (s *Session) CycleWindowLayout(clientID uint64) (*Window, *ClientState, bool, error) {
+	client := s.Clients[clientID]
+	if client == nil {
+		return nil, nil, false, fmt.Errorf("unknown client %d", clientID)
+	}
+	window := s.Windows[client.ActiveWindowID]
+	if window == nil {
+		return nil, nil, false, fmt.Errorf("unknown window %d", client.ActiveWindowID)
+	}
+	paneIDs := window.Layout.PaneIDs()
+	if len(paneIDs) <= 1 {
+		return cloneWindow(window), cloneClientState(client), false, nil
+	}
+
+	next := 0
+	if window.layoutCycleIndex >= 0 {
+		next = (window.layoutCycleIndex + 1) % layoutPresetCount
+	}
+	window.Layout = buildPresetLayout(paneIDs, client.FocusedPaneID, next)
+	window.layoutCycleIndex = next
+	window.clearZoom()
+	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	s.rebuildBindingsLocked(client, window)
+	return cloneWindow(window), cloneClientState(client), true, nil
+}
+
 func (s *Session) ResizeFocusedPane(clientID uint64, direction PaneResizeDirection, amount int) (*Window, *ClientState, bool, error) {
 	client := s.Clients[clientID]
 	if client == nil {
@@ -781,6 +809,7 @@ func (s *Session) ResizeFocusedPane(clientID uint64, direction PaneResizeDirecti
 	if !resized && !unzoomed {
 		return cloneWindow(window), cloneClientState(client), false, nil
 	}
+	window.layoutCycleIndex = layoutPresetCustom
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	s.rebuildBindingsLocked(client, window)
 	return cloneWindow(window), cloneClientState(client), true, nil
@@ -805,6 +834,7 @@ func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitD
 		return nil, nil, fmt.Errorf("invalid split direction %d", direction)
 	}
 	window.clearZoom()
+	window.layoutCycleIndex = layoutPresetCustom
 	updated, replaced := replacePaneWithSplit(window.Layout, client.FocusedPaneID, pane.ID, direction)
 	if !replaced {
 		return nil, nil, fmt.Errorf("focused pane %d not found in layout", client.FocusedPaneID)
@@ -851,6 +881,7 @@ func (s *Session) SwapFocusedPane(clientID uint64, direction PaneSwapDirection) 
 	if !swapLayoutPanes(window.Layout, client.FocusedPaneID, targetPaneID) {
 		return nil, nil, false, fmt.Errorf("swap panes %d and %d in window %d", client.FocusedPaneID, targetPaneID, window.ID)
 	}
+	window.layoutCycleIndex = layoutPresetCustom
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	client.setFocusedPane(client.FocusedPaneID)
 	s.rebuildBindingsLocked(client, window)
@@ -906,6 +937,7 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 	if window.Zoomed && window.ZoomedPaneID == c.FocusedPaneID {
 		window.clearZoom()
 	}
+	window.layoutCycleIndex = layoutPresetCustom
 	updated, nextFocusedPaneID, removed := removePaneFromLayout(window.Layout, c.FocusedPaneID)
 	if !removed || updated == nil {
 		return nil, nil, nil, false, 0, false, fmt.Errorf("focused pane %d not found in layout", c.FocusedPaneID)
@@ -941,6 +973,7 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 		owner.clearZoom()
 	}
 	if len(owner.Layout.PaneIDs()) > 1 {
+		owner.layoutCycleIndex = layoutPresetCustom
 		updated, nextFocusedPaneID, ok := removePaneFromLayout(owner.Layout, paneID)
 		if !ok || updated == nil {
 			return nil, nil, false, false, fmt.Errorf("pane %d not found in window %d layout", paneID, owner.ID)
@@ -1349,15 +1382,16 @@ func cloneWindow(window *Window) *Window {
 		return nil
 	}
 	return &Window{
-		ID:             window.ID,
-		DisplayIndex:   window.DisplayIndex,
-		Name:           window.Name,
-		AutomaticName:  window.AutomaticName,
-		ActivePaneID:   window.ActivePaneID,
-		Zoomed:         window.Zoomed,
-		ZoomedPaneID:   window.ZoomedPaneID,
-		Layout:         window.Layout,
-		LayoutRevision: window.LayoutRevision,
+		ID:               window.ID,
+		DisplayIndex:     window.DisplayIndex,
+		Name:             window.Name,
+		AutomaticName:    window.AutomaticName,
+		ActivePaneID:     window.ActivePaneID,
+		Zoomed:           window.Zoomed,
+		ZoomedPaneID:     window.ZoomedPaneID,
+		Layout:           window.Layout,
+		LayoutRevision:   window.LayoutRevision,
+		layoutCycleIndex: window.layoutCycleIndex,
 	}
 }
 
