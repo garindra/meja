@@ -180,6 +180,12 @@ type commandSessionInfo struct {
 	attached bool
 }
 
+type sessionOperationResult struct {
+	bootstrap protocol.CommandBootstrap
+	session   *Session
+	sessions  []commandSessionInfo
+}
+
 type commandResult struct {
 	stdout     []byte
 	stderr     []byte
@@ -208,14 +214,14 @@ func (d *Daemon) executeCommandNow(request protocol.CommandRequest) (commandResu
 	return execution.result, err
 }
 
-type sessionCommandHandler func(*Session, *Connection, []string) (bool, error)
+type sessionCommandHandler func(*Session, *ClientInstance, []string) (bool, error)
 type commandHandler func(*commandContext, []string) (commandExecution, error)
 
 type commandContext struct {
-	daemon     *Daemon
-	session    *Session
-	connection *Connection
-	request    protocol.CommandRequest
+	daemon  *Daemon
+	session *Session
+	client  *ClientInstance
+	request protocol.CommandRequest
 }
 
 type commandExecution struct {
@@ -251,6 +257,7 @@ func registeredCommands() []commandDefinition {
 		{name: "resize-pane", aliases: []string{"resizep"}, execute: sessionCommand(sessionTarget, handleResizePaneCommand)},
 		{name: "rename-window", aliases: []string{"renamew"}, execute: sessionCommand(windowTarget, handleRenameWindowCommand)},
 		{name: "rename-session", aliases: []string{"renames"}, execute: sessionCommand(sessionTarget, handleRenameSessionCommand)},
+		{name: "switch-session", execute: attachedCommand(handleSwitchSessionCommand)},
 		{name: "confirm-before", execute: attachedCommand(handleConfirmBeforeCommand)},
 		{name: "command-prompt", execute: attachedCommand(handleCommandPromptCommand)},
 	}
@@ -272,7 +279,7 @@ func resolveRegisteredCommand(name string) (commandDefinition, bool) {
 
 // executeSessionCommand is the single execution path for attached commands.
 // Prefix bindings and the status command prompt both submit argv here.
-func (s *Session) executeSessionCommand(c *Connection, argv []string) (bool, error) {
+func (s *Session) executeSessionCommand(c *ClientInstance, argv []string) (bool, error) {
 	if len(argv) == 0 {
 		return false, errors.New("missing command")
 	}
@@ -280,7 +287,7 @@ func (s *Session) executeSessionCommand(c *Connection, argv []string) (bool, err
 	if !ok {
 		return false, fmt.Errorf("unknown command %q", argv[0])
 	}
-	execution, err := command.execute(&commandContext{daemon: c.Daemon, session: s, connection: c}, argv[1:])
+	execution, err := command.execute(&commandContext{daemon: c.Daemon, session: s, client: c}, argv[1:])
 	return execution.detach, err
 }
 
@@ -305,33 +312,33 @@ func daemonCommand(run daemonCommandFunc) commandHandler {
 
 func attachedCommand(run sessionCommandHandler) commandHandler {
 	return func(ctx *commandContext, args []string) (commandExecution, error) {
-		if ctx.session == nil || ctx.connection == nil {
+		if ctx.session == nil || ctx.client == nil {
 			return commandExecution{}, errors.New("command requires an attached client")
 		}
-		detach, err := run(ctx.session, ctx.connection, args)
+		detach, err := run(ctx.session, ctx.client, args)
 		return commandExecution{detach: detach}, err
 	}
 }
 
 func sessionCommand(kind commandTargetKind, run sessionCommandHandler) commandHandler {
 	return func(ctx *commandContext, args []string) (commandExecution, error) {
-		session, connection, normalized, err := resolveSessionCommandContext(ctx, kind, args)
+		session, client, normalized, err := resolveSessionCommandContext(ctx, kind, args)
 		if err != nil {
 			return commandExecution{}, err
 		}
 		if ctx.session != session {
-			connection = nil
+			client = nil
 		}
 		var detach bool
 		execute := func() error {
-			if connection == nil {
-				connection = session.connection
-				if connection == nil {
-					connection = &Connection{Session: session, Daemon: ctx.daemon, shell: defaultShell()}
+			if client == nil {
+				client = session.clientInstance
+				if client == nil {
+					client = &ClientInstance{Daemon: ctx.daemon, shell: defaultShell()}
 				}
 			}
 			var executeErr error
-			detach, executeErr = run(session, connection, normalized)
+			detach, executeErr = run(session, client, normalized)
 			return executeErr
 		}
 		if ctx.session == session {
@@ -343,8 +350,8 @@ func sessionCommand(kind commandTargetKind, run sessionCommandHandler) commandHa
 			return commandExecution{}, err
 		}
 		if ctx.session != session && detach {
-			if connection != nil && connection.QUIC != nil {
-				_ = connection.QUIC.CloseWithError(0, "detached by command")
+			if client != nil && client.QUIC != nil {
+				_ = client.QUIC.CloseWithError(0, "detached by command")
 			}
 			detach = false
 		}
@@ -352,7 +359,7 @@ func sessionCommand(kind commandTargetKind, run sessionCommandHandler) commandHa
 	}
 }
 
-func resolveSessionCommandContext(ctx *commandContext, kind commandTargetKind, args []string) (*Session, *Connection, []string, error) {
+func resolveSessionCommandContext(ctx *commandContext, kind commandTargetKind, args []string) (*Session, *ClientInstance, []string, error) {
 	rawTarget, remaining, hasTarget, err := extractCommandTarget(args)
 	if err != nil {
 		return nil, nil, nil, err
@@ -395,7 +402,7 @@ func resolveSessionCommandContext(ctx *commandContext, kind commandTargetKind, a
 	if targetSession == nil {
 		return nil, nil, nil, errors.New("session target is required")
 	}
-	return targetSession, ctx.connection, normalized, nil
+	return targetSession, ctx.client, normalized, nil
 }
 
 func extractCommandTarget(args []string) (string, []string, bool, error) {
@@ -490,14 +497,14 @@ func requireNoCommandArgs(name string, args []string) error {
 	return nil
 }
 
-func handleNewWindowCommand(s *Session, c *Connection, args []string) (bool, error) {
+func handleNewWindowCommand(s *Session, c *ClientInstance, args []string) (bool, error) {
 	if err := requireNoCommandArgs("new-window", args); err != nil {
 		return false, err
 	}
 	return false, s.commandCreateWindow(c)
 }
 
-func handleSplitWindowCommand(s *Session, c *Connection, args []string) (bool, error) {
+func handleSplitWindowCommand(s *Session, c *ClientInstance, args []string) (bool, error) {
 	fs := commandFlagSet("split-window")
 	horizontal := fs.Bool("h", false, "split left/right")
 	vertical := fs.Bool("v", false, "split top/bottom")
@@ -514,14 +521,39 @@ func handleSplitWindowCommand(s *Session, c *Connection, args []string) (bool, e
 	return false, s.commandSplit(c, direction)
 }
 
-func handleDetachClientCommand(_ *Session, _ *Connection, args []string) (bool, error) {
+func handleDetachClientCommand(_ *Session, _ *ClientInstance, args []string) (bool, error) {
 	if err := requireNoCommandArgs("detach-client", args); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func handleNextWindowCommand(s *Session, _ *Connection, args []string) (bool, error) {
+type sessionSwitchRequest struct {
+	rawTarget  string
+	cols, rows uint16
+}
+
+func (r *sessionSwitchRequest) Error() string { return "switch session" }
+
+func handleSwitchSessionCommand(s *Session, c *ClientInstance, args []string) (bool, error) {
+	rawTarget, remaining, hasTarget, err := extractCommandTarget(args)
+	if err != nil {
+		return false, err
+	}
+	if !hasTarget {
+		return false, errors.New("switch-session requires -t <session-target>")
+	}
+	if len(remaining) != 0 {
+		return false, errors.New("switch-session accepts only -t <session-target>")
+	}
+	var cols, rows uint16
+	if state := s.SnapshotClient(clientID0); state != nil {
+		cols, rows = state.TerminalCols, state.TerminalRows
+	}
+	return false, &sessionSwitchRequest{rawTarget: rawTarget, cols: cols, rows: rows}
+}
+
+func handleNextWindowCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	if err := requireNoCommandArgs("next-window", args); err != nil {
 		return false, err
 	}
@@ -531,7 +563,7 @@ func handleNextWindowCommand(s *Session, _ *Connection, args []string) (bool, er
 	return false, nil
 }
 
-func handlePreviousWindowCommand(s *Session, _ *Connection, args []string) (bool, error) {
+func handlePreviousWindowCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	if err := requireNoCommandArgs("previous-window", args); err != nil {
 		return false, err
 	}
@@ -541,7 +573,7 @@ func handlePreviousWindowCommand(s *Session, _ *Connection, args []string) (bool
 	return false, nil
 }
 
-func handleLastWindowCommand(s *Session, _ *Connection, args []string) (bool, error) {
+func handleLastWindowCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	if err := requireNoCommandArgs("last-window", args); err != nil {
 		return false, err
 	}
@@ -551,7 +583,7 @@ func handleLastWindowCommand(s *Session, _ *Connection, args []string) (bool, er
 	return false, nil
 }
 
-func handleSelectWindowCommand(s *Session, _ *Connection, args []string) (bool, error) {
+func handleSelectWindowCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	fs := commandFlagSet("select-window")
 	target := fs.String("t", "", "window target")
 	if err := fs.Parse(args); err != nil {
@@ -571,14 +603,14 @@ func handleSelectWindowCommand(s *Session, _ *Connection, args []string) (bool, 
 	return false, s.commandSelectWindow(id)
 }
 
-func handleKillPaneCommand(s *Session, _ *Connection, args []string) (bool, error) {
+func handleKillPaneCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	if err := requireNoCommandArgs("kill-pane", args); err != nil {
 		return false, err
 	}
 	return false, s.commandClosePaneNow()
 }
 
-func handleConfirmBeforeCommand(s *Session, c *Connection, args []string) (bool, error) {
+func handleConfirmBeforeCommand(s *Session, c *ClientInstance, args []string) (bool, error) {
 	if len(args) == 0 {
 		return false, errors.New("confirm-before requires a command")
 	}
@@ -596,7 +628,7 @@ func handleConfirmBeforeCommand(s *Session, c *Connection, args []string) (bool,
 	return false, s.publishStatusBar()
 }
 
-func handleCopyModeCommand(s *Session, _ *Connection, args []string) (bool, error) {
+func handleCopyModeCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	if err := requireNoCommandArgs("copy-mode", args); err != nil {
 		return false, err
 	}
@@ -632,7 +664,7 @@ func directionalCommandFlagSet(name string, args []string) (byte, []string, erro
 	return direction, fs.Args(), nil
 }
 
-func handleSwapPaneCommand(s *Session, _ *Connection, args []string) (bool, error) {
+func handleSwapPaneCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	direction, rest, err := directionalCommandFlagSet("swap-pane", args)
 	if err != nil {
 		return false, err
@@ -647,7 +679,7 @@ func handleSwapPaneCommand(s *Session, _ *Connection, args []string) (bool, erro
 	return false, s.commandSwapPane(swap)
 }
 
-func handleSelectPaneCommand(s *Session, _ *Connection, args []string) (bool, error) {
+func handleSelectPaneCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	direction, rest, err := directionalCommandFlagSet("select-pane", args)
 	if err != nil {
 		return false, err
@@ -658,7 +690,7 @@ func handleSelectPaneCommand(s *Session, _ *Connection, args []string) (bool, er
 	return false, s.commandFocusPaneDirection(direction)
 }
 
-func handleResizePaneCommand(s *Session, _ *Connection, args []string) (bool, error) {
+func handleResizePaneCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	fs := commandFlagSet("resize-pane")
 	up := fs.Bool("U", false, "up")
 	down := fs.Bool("D", false, "down")
@@ -699,7 +731,7 @@ func handleResizePaneCommand(s *Session, _ *Connection, args []string) (bool, er
 	return false, s.commandResizePane(direction, amount)
 }
 
-func handleRenameWindowCommand(s *Session, _ *Connection, args []string) (bool, error) {
+func handleRenameWindowCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	fs := commandFlagSet("rename-window")
 	target := fs.String("t", "", "window target")
 	if err := fs.Parse(args); err != nil {
@@ -733,7 +765,7 @@ func handleRenameWindowCommand(s *Session, _ *Connection, args []string) (bool, 
 	return false, s.publishStatusBar()
 }
 
-func handleRenameSessionCommand(s *Session, c *Connection, args []string) (bool, error) {
+func handleRenameSessionCommand(s *Session, c *ClientInstance, args []string) (bool, error) {
 	if len(args) == 0 {
 		return false, s.commandBeginRenameSessionPrompt()
 	}
@@ -747,7 +779,7 @@ func handleRenameSessionCommand(s *Session, c *Connection, args []string) (bool,
 	return false, nil
 }
 
-func handleCommandPromptCommand(s *Session, _ *Connection, args []string) (bool, error) {
+func handleCommandPromptCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	if err := requireNoCommandArgs("command-prompt", args); err != nil {
 		return false, err
 	}
@@ -839,11 +871,11 @@ func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []strin
 	if rows == 0 {
 		rows = 23
 	}
-	bootstrap, _, err := d.executeSessionOperation("create-session", commandSessionTarget{name: *name})
+	operation, err := d.executeSessionOperation("create-session", commandSessionTarget{name: *name})
 	if err != nil {
 		return commandResult{}, err
 	}
-	s := d.session(bootstrap.SessionID)
+	s := operation.session
 	if s == nil {
 		return commandResult{}, errors.New("created session is unavailable")
 	}
@@ -866,7 +898,7 @@ func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []strin
 		d.sessionExited(s)
 		return commandResult{}, err
 	}
-	return commandResult{bootstrap: &bootstrap}, nil
+	return commandResult{bootstrap: &operation.bootstrap}, nil
 }
 
 func (d *Daemon) commandAttachSession(args []string) (commandResult, error) {
@@ -882,11 +914,11 @@ func (d *Daemon) commandAttachSession(args []string) (commandResult, error) {
 	if err != nil {
 		return commandResult{}, err
 	}
-	bootstrap, _, err := d.executeSessionOperation("connect-session", parsed)
+	operation, err := d.executeSessionOperation("connect-session", parsed)
 	if err != nil {
 		return commandResult{}, err
 	}
-	return commandResult{bootstrap: &bootstrap}, nil
+	return commandResult{bootstrap: &operation.bootstrap}, nil
 }
 
 func (d *Daemon) commandRestoreSession(args []string) (commandResult, error) {
@@ -902,18 +934,18 @@ func (d *Daemon) commandRestoreSession(args []string) (commandResult, error) {
 	if *mode != "prepare" && *mode != "skip" && *mode != "run" {
 		return commandResult{}, errors.New("--commands must be prepare, skip, or run")
 	}
-	bootstrap, _, err := d.executeSessionOperation("restore-session-"+*mode, commandSessionTarget{name: *target})
+	operation, err := d.executeSessionOperation("restore-session-"+*mode, commandSessionTarget{name: *target})
 	if err != nil {
 		return commandResult{}, err
 	}
-	return commandResult{bootstrap: &bootstrap}, nil
+	return commandResult{bootstrap: &operation.bootstrap}, nil
 }
 
 func (d *Daemon) commandListSessions(args []string) (commandResult, error) {
 	if len(args) != 0 {
 		return commandResult{}, errors.New("list-sessions accepts no arguments")
 	}
-	_, sessions, err := d.executeSessionOperation("list-sessions", commandSessionTarget{})
+	operation, err := d.executeSessionOperation("list-sessions", commandSessionTarget{})
 	if err != nil {
 		return commandResult{}, err
 	}
@@ -925,7 +957,7 @@ func (d *Daemon) commandListSessions(args []string) (commandResult, error) {
 	if _, err := fmt.Fprintln(table, "ID\tNAME\tSTATUS"); err != nil {
 		return commandResult{}, err
 	}
-	for _, session := range sessions {
+	for _, session := range operation.sessions {
 		name := session.name
 		if name == "" {
 			name = "<unnamed>"
@@ -1008,7 +1040,7 @@ func isDecimal(raw string) bool {
 	return true
 }
 
-func (d *Daemon) executeSessionOperation(operation string, target commandSessionTarget) (protocol.CommandBootstrap, []commandSessionInfo, error) {
+func (d *Daemon) executeSessionOperation(operation string, target commandSessionTarget) (sessionOperationResult, error) {
 	if operation == "list-sessions" {
 		type listedSession struct {
 			id    uint64
@@ -1029,31 +1061,27 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 			}
 		}
 		sort.Slice(sessions, func(i, j int) bool { return sessions[i].id < sessions[j].id })
-		return protocol.CommandBootstrap{}, sessions, nil
+		return sessionOperationResult{sessions: sessions}, nil
 	}
 
 	restoreMode, restoring := restoreModeForOperation(operation)
 	var restoreSnapshot PersistedSession
 	if restoring {
 		if target.id != 0 || target.name == "" {
-			return protocol.CommandBootstrap{}, nil, errors.New("restore requires a session name")
+			return sessionOperationResult{}, errors.New("restore requires a session name")
 		}
 		if err := validateSessionName(target.name); err != nil {
-			return protocol.CommandBootstrap{}, nil, err
+			return sessionOperationResult{}, err
 		}
 		var err error
 		restoreSnapshot, err = readPersistedSession(filepath.Join(d.snapshotDir, target.name+".json"), target.name)
 		if err != nil {
-			return protocol.CommandBootstrap{}, nil, err
+			return sessionOperationResult{}, err
 		}
 	}
 
 	var session *Session
 	var operationErr error
-	created := false
-	var port uint16
-	var encodedToken string
-	var expires time.Time
 	d.call(func() {
 		switch operation {
 		case "create-session":
@@ -1074,15 +1102,9 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 			session = newSession(d.nextID, target.name)
 			session.daemon = d
 			session.startAutosave(d.snapshotDir)
-			port, encodedToken, expires, operationErr = session.startQUIC(d.serverCtx, d.tlsConfig)
-			if operationErr != nil {
-				_ = session.shutdown()
-				return
-			}
 			d.sessions[d.nextID] = session
 			d.reserveSessionName(session, target.name)
 			d.nextID++
-			created = true
 		case "connect-session":
 			if target.name != "" {
 				session = d.sessionByName(target.name)
@@ -1104,10 +1126,7 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 			session = newSession(d.nextID, restoreSnapshot.Name)
 			session.daemon = d
 			session.startAutosave(d.snapshotDir)
-			port, encodedToken, expires, operationErr = session.startQUIC(d.serverCtx, d.tlsConfig)
-			if operationErr == nil {
-				operationErr = session.restoreSnapshot(restoreSnapshot, restoreMode)
-			}
+			operationErr = session.restoreSnapshot(restoreSnapshot, restoreMode)
 			if operationErr != nil {
 				_ = session.shutdown()
 				return
@@ -1115,27 +1134,22 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 			d.sessions[d.nextID] = session
 			d.reserveSessionName(session, restoreSnapshot.Name)
 			d.nextID++
-			created = true
 		default:
 			operationErr = fmt.Errorf("unsupported session operation %q", operation)
 		}
 	})
 	if operationErr != nil {
-		return protocol.CommandBootstrap{}, nil, operationErr
+		return sessionOperationResult{}, operationErr
 	}
-	if !created {
-		var err error
-		port, encodedToken, expires, err = session.issueBootstrap()
-		if err != nil {
-			return protocol.CommandBootstrap{}, nil, err
-		}
+	port, encodedToken, expires, err := d.issueAttachGrant(session)
+	if err != nil {
+		return sessionOperationResult{}, err
 	}
-	return protocol.CommandBootstrap{
+	return sessionOperationResult{bootstrap: protocol.CommandBootstrap{
 		Version:        protocol.CommandBootstrapVersion,
-		SessionID:      session.ID,
 		Port:           port,
 		AttachToken:    encodedToken,
 		ExpiresAt:      expires,
 		CertSPKISHA256: d.certHash,
-	}, nil, nil
+	}, session: session}, nil
 }

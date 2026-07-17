@@ -9,6 +9,14 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
+func attachStatusTestClient(t *testing.T, s *Session, client *ClientInstance) {
+	t.Helper()
+	s.clientInstance = client
+	if err := s.attachStatusOutput(client, client.StatusOutput); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
@@ -16,13 +24,11 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	window, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, 0)
 	statusClient := newStatusTestClient()
 	state := s
-	handler := &Connection{
-		Session: state,
-	}
-	state.attachConnection(testConnection(nil, nil, &statusClient.wire))
+	handler := &ClientInstance{}
+	attachStatusTestClient(t, state, testClientInstance(nil, nil, &statusClient.wire))
 
 	s.ConsumeInputByte(0, 0x02)
-	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, ',')); err != nil {
+	if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, ',')); err != nil {
 		t.Fatal(err)
 	}
 	status := statusClient.read(t)
@@ -39,17 +45,17 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 		}
 	}
 
-	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, 'x')); err != nil {
+	if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, 'x')); err != nil {
 		t.Fatal(err)
 	}
 	statusClient.read(t)
-	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, 0x7f)); err != nil {
+	if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, 0x7f)); err != nil {
 		t.Fatal(err)
 	}
 	statusClient.read(t)
 
 	for _, b := range []byte("xy") {
-		if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, b)); err != nil {
+		if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, b)); err != nil {
 			t.Fatal(err)
 		}
 		statusClient.read(t)
@@ -58,24 +64,24 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	if consumed != 4 || len(events) != 1 || terminated {
 		t.Fatalf("delete sequence consumed=%d events=%#v", consumed, events)
 	}
-	if err := runStatusEvent(t, handler, events[0]); err != nil {
+	if err := runStatusEvent(t, s, handler, events[0]); err != nil {
 		t.Fatal(err)
 	}
 	statusClient.read(t)
 
 	for i := 0; i < len("bashx"); i++ {
-		if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, 0x7f)); err != nil {
+		if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, 0x7f)); err != nil {
 			t.Fatal(err)
 		}
 		statusClient.read(t)
 	}
 	for _, b := range []byte("zsh") {
-		if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, b)); err != nil {
+		if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, b)); err != nil {
 			t.Fatal(err)
 		}
 		statusClient.read(t)
 	}
-	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, '\r')); err != nil {
+	if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, '\r')); err != nil {
 		t.Fatal(err)
 	}
 	status = statusClient.read(t)
@@ -85,12 +91,12 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	}
 
 	s.ConsumeInputByte(0, 0x02)
-	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, ',')); err != nil {
+	if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, ',')); err != nil {
 		t.Fatal(err)
 	}
 	statusClient.read(t)
 	s.ConsumeInputByte(0, 0x1b)
-	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, 'x')); err != nil {
+	if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, 'x')); err != nil {
 		t.Fatal(err)
 	}
 	status = statusClient.read(t)
@@ -100,11 +106,11 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	}
 
 	s.ConsumeInputByte(0, 0x02)
-	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, ',')); err != nil {
+	if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, ',')); err != nil {
 		t.Fatal(err)
 	}
 	statusClient.read(t)
-	if err := runStatusEvent(t, handler, s.ConsumeInputByte(0, 0x03)); err != nil {
+	if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(0, 0x03)); err != nil {
 		t.Fatal(err)
 	}
 	status = statusClient.read(t)
@@ -120,27 +126,27 @@ func TestRenameSessionPromptUpdatesStatusName(t *testing.T) {
 	statusClient := newStatusTestClient()
 	state := s
 	d := &Daemon{sessions: map[uint64]*Session{7: state}}
-	handler := &Connection{Session: state, Daemon: d}
-	state.attachConnection(testConnection(nil, nil, &statusClient.wire))
+	handler := &ClientInstance{Daemon: d}
+	attachStatusTestClient(t, state, testClientInstance(nil, nil, &statusClient.wire))
 
 	s.ConsumeInputByte(clientID0, 0x02)
-	if err := runStatusEvent(t, handler, s.ConsumeInputByte(clientID0, '$')); err != nil {
+	if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(clientID0, '$')); err != nil {
 		t.Fatal(err)
 	}
 	assertStatusText(t, statusClient.read(t), "(rename-session) work")
 	for range "work" {
-		if err := runStatusEvent(t, handler, s.ConsumeInputByte(clientID0, 0x7f)); err != nil {
+		if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(clientID0, 0x7f)); err != nil {
 			t.Fatal(err)
 		}
 		statusClient.read(t)
 	}
 	for _, b := range []byte("dev") {
-		if err := runStatusEvent(t, handler, s.ConsumeInputByte(clientID0, b)); err != nil {
+		if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(clientID0, b)); err != nil {
 			t.Fatal(err)
 		}
 		statusClient.read(t)
 	}
-	if err := runStatusEvent(t, handler, s.ConsumeInputByte(clientID0, '\r')); err != nil {
+	if err := runStatusEvent(t, s, handler, s.ConsumeInputByte(clientID0, '\r')); err != nil {
 		t.Fatal(err)
 	}
 	assertStatusText(t, statusClient.read(t), "[dev] 0:bash* ")
@@ -158,7 +164,7 @@ func TestZoomedWindowStatusIncludesZFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 	statusClient := newStatusTestClient()
-	s.attachConnection(testConnection(nil, nil, &statusClient.wire))
+	attachStatusTestClient(t, s, testClientInstance(nil, nil, &statusClient.wire))
 	if err := s.commandToggleZoom(); err != nil {
 		t.Fatal(err)
 	}
@@ -172,8 +178,8 @@ func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 	client.TerminalCols, client.TerminalRows = 80, 23
 	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash", terminal: newTerminal(80, 23)}, clientID0)
 	statusClient := newStatusTestClient()
-	s.attachConnection(testConnection(nil, nil, &statusClient.wire))
-	handler := &Connection{Session: s}
+	attachStatusTestClient(t, s, testClientInstance(nil, nil, &statusClient.wire))
+	handler := &ClientInstance{}
 
 	if _, err := s.BeginCommandPrompt(clientID0); err != nil {
 		t.Fatal(err)
@@ -186,7 +192,7 @@ func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 	if !terminated || len(events) == 0 {
 		t.Fatalf("command prompt events=%#v terminated=%v", events, terminated)
 	}
-	if err := runStatusEvent(t, handler, events[len(events)-1]); err != nil {
+	if err := runStatusEvent(t, s, handler, events[len(events)-1]); err != nil {
 		t.Fatal(err)
 	}
 	errorStatus := statusClient.read(t)
@@ -223,9 +229,9 @@ func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 	}
 }
 
-func runStatusEvent(t *testing.T, handler *Connection, event serverInputEvent) error {
+func runStatusEvent(t *testing.T, s *Session, handler *ClientInstance, event serverInputEvent) error {
 	t.Helper()
-	_, err := handler.Session.handleServerInputEvent(handler, event)
+	_, err := s.handleServerInputEvent(handler, event)
 	return err
 }
 
@@ -307,16 +313,16 @@ func TestStatusOutputReconnectGetsBarrierlessFullRefresh(t *testing.T) {
 	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, clientID0)
 
 	first := newStatusTestClient()
-	firstConnection := testConnection(nil, nil, &first.wire)
-	s.attachConnection(firstConnection)
+	firstConnection := testClientInstance(nil, nil, &first.wire)
+	attachStatusTestClient(t, s, firstConnection)
 	if err := s.publishStatusBar(); err != nil {
 		t.Fatal(err)
 	}
 	assertStatusText(t, first.read(t), "[0] 0:bash* ")
 
 	second := newStatusTestClient()
-	secondConnection := testConnection(nil, nil, &second.wire)
-	s.attachConnection(secondConnection)
+	secondConnection := testClientInstance(nil, nil, &second.wire)
+	attachStatusTestClient(t, s, secondConnection)
 	status := second.read(t)
 	assertStatusText(t, status, "[0] 0:bash* ")
 	if _, ok := status.Styles[statusNormalStyleID]; !ok {
@@ -326,7 +332,8 @@ func TestStatusOutputReconnectGetsBarrierlessFullRefresh(t *testing.T) {
 		t.Fatal("reconnected status stream did not reinstall prompt style")
 	}
 
-	s.detachConnection(firstConnection)
+	firstConnection.detaching.Store(true)
+	s.detachClientInstance()
 	s.Name = "live"
 	if err := s.publishStatusBar(); err != nil {
 		t.Fatal(err)

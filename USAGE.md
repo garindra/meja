@@ -151,6 +151,7 @@ the command key. Normal typing continues to go to the focused pane.
 | `Ctrl+b`, `{` | Swap the focused pane with the previous pane. |
 | `Ctrl+b`, `}` | Swap the focused pane with the next pane. |
 | `Ctrl+b`, `x` | Ask for confirmation, then close the focused pane. Closing the final pane ends the session. |
+| `Ctrl+b`, `:` | Open the command prompt in the status bar. |
 
 Each window supports up to eight visible panes.
 Pane sizes are stored as part of the window layout and are included in named
@@ -161,6 +162,17 @@ milliseconds after the previous adjustment.
 Zoom keeps the underlying split layout intact. Hidden panes continue running,
 and unzoom restores their previous sizes. Focusing another pane, resizing,
 splitting, swapping, or closing the zoomed pane first leaves zoom mode.
+
+From the command prompt, move the running client to another live session
+without opening a new connection:
+
+```text
+switch-session -t <session-id-or-name>
+```
+
+The same QUIC connection, streams, and reconnect token remain in use. The
+daemon updates only this client's target-session association, which is also
+the hint used to select a session after a later network reconnect.
 
 ### Windows and names
 
@@ -302,6 +314,13 @@ meja attach -i ~/.ssh/prod_ed25519 --port 2222 -t work -h prod
 ```
 
 Attaching to a session that is already attached replaces the existing client.
+Each `meja` process authenticates independently and receives its own in-memory
+client-instance reconnect credential. A displaced client briefly shows the
+takeover reason in its status bar and exits cleanly. Network reconnection uses
+that credential directly over QUIC and never repeats SSH authentication. The
+live client-instance object is discarded when QUIC closes, while its small
+reconnect-token record and separate target-session hint remain in daemon
+memory indefinitely so it can reconnect later without SSH.
 `attach` does not start a missing server.
 
 ### `restore`

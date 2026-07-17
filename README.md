@@ -74,6 +74,10 @@ meja ls -h prod
 meja -L dev ls -h prod
 ```
 
+While attached, press `Ctrl+b`, then `:` and run
+`switch-session -t <session-id-or-name>` to move the same client connection to
+another live session.
+
 The list is headed `Active Sessions` and shows each session's numeric ID,
 name (or `<unnamed>`), and whether a client is currently attached.
 
@@ -89,9 +93,8 @@ meja -L dev kill-server
 ## Servers and sockets
 
 Each socket identifies an isolated Meja server process with its own sessions,
-session-ID sequence, and certificate. Each session owns a separate QUIC
-listener. `-L` selects a named
-profile and `-S` selects an exact socket path. They are global, mutually
+session-ID sequence, certificate, and shared QUIC listener. `-L` selects a
+named profile and `-S` selects an exact socket path. They are global, mutually
 exclusive transport options. Transport options may appear anywhere before
 `--` and are removed before the command argv is forwarded:
 
@@ -169,20 +172,20 @@ remote process resolves the selected Unix socket, starts the server if needed,
 and forwards the request without interpreting the command. Framed stdout,
 stderr, attach-bootstrap, and exit responses return on SSH stdout.
 
-The bootstrap JSON contains a numeric session ID, UDP port, expiring
-single-use attach token, and the SHA-256 hash of the daemon certificate's
-SubjectPublicKeyInfo.
+The bootstrap JSON contains a UDP port, expiring single-use attach token, and
+the SHA-256 hash of the daemon certificate's SubjectPublicKeyInfo. The attach
+token is already bound to its target session, so no session ID is exposed.
 
 Local connections skip SSH entirely. They send the same command request directly
 to the protected Unix command socket and connect to the QUIC server through
 `127.0.0.1`. Once attached, local and remote reconnects go directly to the
-session's QUIC listener without consulting SSH or the command socket again.
+daemon's QUIC listener without consulting SSH or the command socket again.
 
 The protected command socket is selected by `-L` or `-S`; the socket directory is
 mode 0700 and the socket is mode 0600. Session IDs increase from 1 for the
 lifetime of a daemon. Session names are unique within one server/socket. A
-session is destroyed when its last pane exits, which closes its QUIC listener
-and releases its UDP port.
+session is destroyed when its last pane exits. The daemon's QUIC listener and
+UDP port remain available to its other sessions and client instances.
 
 `meja kill-server` cleanly disconnects active clients as if they detached,
 gracefully stops the active daemon, and reports its PID when available. SIGINT
@@ -192,19 +195,35 @@ and SIGTERM on a foreground daemon use the same client-disconnect behavior.
 
 The daemon runs under the SSH-authenticated account, so panes naturally have
 that account's UID/GID and environment. No root credential switching is used.
-The daemon generates a self-signed TLS 1.3 certificate. When a session is
-created, it binds a UDP port in 60000–61000 that is not shared with another
-session. The client uses an internal `InsecureSkipVerify` setting only
+The daemon generates a self-signed TLS 1.3 certificate and binds one UDP port
+in 60000–61000 for all of its client instances and sessions. The client uses
+an internal `InsecureSkipVerify` setting only
 with a mandatory exact SPKI `VerifyConnection` pin from the bootstrap; there
 is no genuinely unverified production TLS mode and no CA/certificate/key setup
 is required.
 
 The first QUIC management message is the versioned session attachment
-`{sessionId, attachToken}`. The token is random, expiry-bound, listener-bound,
-constant-time compared, and atomically consumed after a successful match.
-After attachment the daemon issues a session-scoped resume credential and
-generation. The credential remains stable for the attachment lifetime, so a
-replacement connection can authenticate directly without returning to SSH.
+`{attachToken}`. The token is random, expiry-bound, daemon-bound,
+constant-time compared, and atomically consumed after a successful match. A
+successful attachment creates a daemon-owned client instance for that running
+Meja process and returns its reconnect token. The reconnect credential remains
+stable for the client-process lifetime and is kept only in memory on both
+sides; the client never needs a daemon-side client-instance or session ID.
+
+Each client instance is assigned to at most one session, and each session is
+assigned to at most one client instance. A fresh SSH-authenticated `attach`
+creates a distinct client instance and takes ownership of its requested
+session; a displaced live client shows the takeover reason briefly in its
+status bar and exits cleanly. When QUIC closes, the live client-instance object
+is discarded immediately. Its small reconnect-token and session-assignment
+record remains in daemon memory indefinitely, allowing a later reconnect to
+rebuild the client instance without SSH.
+
+The daemon owns client-instance assignment and asks a session to attach or
+detach it. The client instance owns the QUIC connection and its explicit
+management, input, status, and pane-output streams; the attached session reads
+those endpoints directly for input dispatch and graceful output handoff. A
+session never discovers its target dynamically from an incoming frame.
 
 Meja uses 1200-byte initial QUIC packets so the handshake fits paths with a
 1280-byte IP MTU without depending on fragmentation.
@@ -226,10 +245,11 @@ The server owns terminal emulation, pane state, layout, and rendering. A QUIC
 disconnect detaches the client without immediately killing the session; an
 explicit detach or remote session exit ends the attached client flow.
 
-Each connection has nine server-to-client unidirectional display streams. The
-first server stream is permanently bound to the one-row status surface; the
-remaining eight are movable pane render slots. Stream roles come from their
-QUIC stream ordinals, and every surface uses the same display-command codec.
+Each connected client instance owns nine server-to-client unidirectional
+display streams. The first server stream is permanently bound to the one-row
+status surface; the remaining eight are movable pane render slots. Stream
+roles come from their QUIC stream ordinals, and every surface uses the same
+display-command codec.
 
 Press `Ctrl+b`, then `$` to rename the current session using the status-bar
 prompt. Press `Ctrl+b`, then `,` to rename the current window.
@@ -238,7 +258,8 @@ After a live QUIC connection drops, the client keeps the last confirmed
 terminal contents, replaces the client-visible status bar with an orange
 reconnecting indicator with a `Press Ctrl+c to exit` hint, and drops other
 input while disconnected. It first retries
-the pinned QUIC resume credential. If that fails, it obtains a fresh
-single-use attach token through the local command socket or the versioned SSH
-forwarding command, as appropriate. Input resumes only after the server's layout,
-status bar, and full visible-pane renders have been applied.
+the pinned daemon endpoint using its in-memory client-instance reconnect
+credential. The reconnect loop never returns to the local command socket or
+SSH. A rejected or superseded client instance shows the terminal reason in the
+status bar briefly and exits cleanly. Input resumes only after the server's
+layout, status bar, and full visible-pane renders have been applied.

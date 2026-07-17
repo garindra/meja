@@ -2,7 +2,7 @@ package protocol
 
 const (
 	ALPN            = "meja/1"
-	ProtocolVersion = 4
+	ProtocolVersion = 6
 
 	// SessionReplacedErrorCode is a terminal QUIC application close: another
 	// client has taken ownership of the session, so the displaced client must
@@ -35,18 +35,15 @@ type StreamOpen struct {
 }
 
 type SessionAttach struct {
-	Version   int
-	SessionID uint64
-	Token     string
-	Cols      uint16
-	Rows      uint16
+	Version int
+	Token   string
+	Cols    uint16
+	Rows    uint16
 }
 
 type SessionAttachOK struct {
 	Version     int
-	SessionID   uint64
 	ResumeToken string
-	Generation  uint64
 }
 
 type SessionAttachFailed struct {
@@ -55,18 +52,13 @@ type SessionAttachFailed struct {
 
 type SessionResume struct {
 	Version     int
-	SessionID   uint64
 	ResumeToken string
-	Generation  uint64
 	Cols        uint16
 	Rows        uint16
 }
 
 type SessionResumeOK struct {
-	Version     int
-	SessionID   uint64
-	ResumeToken string
-	Generation  uint64
+	Version int
 }
 
 type InputBytes struct {

@@ -204,7 +204,7 @@ func TestSessionRenameConfirmsBeforeOverwritingSnapshot(t *testing.T) {
 		names:       map[string]*Session{"current": session},
 		snapshotDir: directory,
 	}
-	connection := &Connection{Session: session, Daemon: d}
+	connection := &ClientInstance{Daemon: d}
 
 	d.requestSessionRename(session, "current", "work")
 	prompt := session.ActivePrompt(clientID0)
@@ -305,11 +305,11 @@ func TestDaemonRestoresSnapshotWindowsLayoutsAndPanes(t *testing.T) {
 	if _, err := writeSessionSnapshot(d.snapshotDir, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	bootstrap, _, err := d.executeSessionOperation("restore-session-skip", commandSessionTarget{name: "work"})
+	bootstrap, err := d.executeSessionOperation("restore-session-skip", commandSessionTarget{name: "work"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := d.sessions[bootstrap.SessionID]
+	session := bootstrap.session
 	var panes []*Pane
 	if err := session.coordinate(func() error {
 		if session.Name != "work" || len(session.Windows) != 1 || len(session.Panes) != 2 {

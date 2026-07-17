@@ -57,11 +57,11 @@ func TestStaleControllerCannotRunSessionOperation(t *testing.T) {
 	state := &Session{
 		operations: make(chan sessionOperation),
 	}
-	state.connection = &Connection{managementOut: current}
+	state.clientInstance = &ClientInstance{managementOut: current}
 	go state.runOperations()
-	Connection := &Connection{Session: state, managementOut: stale}
+	client := &ClientInstance{managementOut: stale}
 	run := false
-	if err := state.coordinateConnection(Connection, func() error {
+	if err := state.coordinateClientInstance(client, func() error {
 		run = true
 		return nil
 	}); err != nil {

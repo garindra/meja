@@ -15,7 +15,7 @@ import (
 
 const (
 	CommandProtocolVersion  = 1
-	CommandBootstrapVersion = 2
+	CommandBootstrapVersion = 3
 	CommandMaxFrameSize     = 4 << 20
 	CommandOutputChunkSize  = 32 << 10
 	DefaultUDPMin           = 60000
@@ -31,7 +31,6 @@ const (
 
 type CommandBootstrap struct {
 	Version        int       `json:"version"`
-	SessionID      uint64    `json:"sessionId"`
 	Port           uint16    `json:"port"`
 	AttachToken    string    `json:"attachToken"`
 	ExpiresAt      time.Time `json:"expiresAt"`
@@ -135,8 +134,8 @@ func (b CommandBootstrap) Validate(now time.Time) error {
 	if b.Version != CommandBootstrapVersion {
 		return fmt.Errorf("unsupported bootstrap version %d", b.Version)
 	}
-	if b.SessionID == 0 || b.Port < DefaultUDPMin || b.Port > DefaultUDPMax {
-		return errors.New("invalid bootstrap session or port")
+	if b.Port < DefaultUDPMin || b.Port > DefaultUDPMax {
+		return errors.New("invalid bootstrap port")
 	}
 	if b.ExpiresAt.IsZero() || !b.ExpiresAt.After(now) {
 		return errors.New("bootstrap has expired")

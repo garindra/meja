@@ -644,8 +644,8 @@ func TestSessionReplacementIsTerminal(t *testing.T) {
 	}
 	done := make(chan connectionResult, 1)
 	managementLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), &runtimeState{}, done, nil)
-	if result := <-done; !result.graceful || result.err != nil {
-		t.Fatalf("replacement result = %#v, want graceful terminal result", result)
+	if result := <-done; !result.graceful || result.err != nil || result.terminalMessage != "session attached elsewhere" {
+		t.Fatalf("replacement result = %#v, want graceful terminal result with status message", result)
 	}
 	if isTerminalQUICClose(&quic.ApplicationError{ErrorCode: 1, ErrorMessage: "transport failure"}) {
 		t.Fatal("ordinary application error was treated as terminal")
@@ -722,6 +722,17 @@ func TestReconnectIndicatorUsesBlackTextOnOrangeBackground(t *testing.T) {
 	out := string(state.takeANSI())
 	if !strings.Contains(out, "\x1b[0;30;48;2;255;165;0m") {
 		t.Fatalf("reconnect style = %q, want black text on orange background", out)
+	}
+}
+
+func TestTerminalStatusUsesBottomStatusBar(t *testing.T) {
+	state := newScanoutState(true)
+	state.cols, state.rows = 80, 24
+	state.setTerminalStatus("session taken over by another client")
+
+	out := string(state.takeANSI())
+	if !strings.Contains(out, "session taken over by another client") || !strings.Contains(out, "\x1b[24;1H") {
+		t.Fatalf("terminal status output = %q", out)
 	}
 }
 

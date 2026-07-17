@@ -9,6 +9,67 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
+func (s *Session) readInput(client *ClientInstance, decoder *protocol.Decoder, done chan<- error) {
+	s.readInputFrames(client, decoder, done)
+}
+
+func (s *Session) readInputFrames(client *ClientInstance, decoder *protocol.Decoder, done chan<- error) {
+	for {
+		frame, err := decoder.ReadFrame()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				done <- nil
+				return
+			}
+			done <- fmt.Errorf("read input frame: %w", err)
+			return
+		}
+		switch frame.Type {
+		case protocol.MsgInputBytes:
+			msg, err := protocol.DecodeInputBytes(frame.Payload)
+			if err != nil {
+				done <- err
+				return
+			}
+			var detach, stopped bool
+			if err := s.coordinate(func() error {
+				if s.clientInstance != client {
+					return nil
+				}
+				var processErr error
+				detach, processErr = s.handleInputBytes(client, msg.Data)
+				stopped = s.stopping
+				return processErr
+			}); err != nil {
+				done <- err
+				return
+			}
+			if detach || stopped {
+				done <- nil
+				return
+			}
+		case protocol.MsgResizePane:
+			msg, err := protocol.DecodeResizePane(frame.Payload)
+			if err != nil {
+				done <- err
+				return
+			}
+			if err := s.coordinate(func() error {
+				if s.clientInstance != client {
+					return nil
+				}
+				return s.resizeClient(client, msg.Cols, msg.Rows)
+			}); err != nil {
+				done <- err
+				return
+			}
+		default:
+			done <- fmt.Errorf("unexpected input frame %d", frame.Type)
+			return
+		}
+	}
+}
+
 func (s *Session) startPane(pane *Pane) {
 	pane.initializeRuntime()
 	s.startProcessNameMonitor()
@@ -80,75 +141,7 @@ func (s *Session) resizeSessionToClient(clientState *ClientState) {
 	}
 }
 
-// readInput is session-owned: it reads the physical input stream directly and
-// turns its frames into session behavior. Connection only owns the stream
-// handle across connection setup and replacement.
-func (s *Session) readInput(c *Connection, done chan<- error) {
-	s.readInputFrames(c, protocol.NewDecoder(c.Input, protocol.DefaultMaxFrameSize), done)
-}
-
-func (s *Session) readInputFrames(c *Connection, decoder *protocol.Decoder, done chan<- error) {
-	for {
-		frame, err := decoder.ReadFrame()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				done <- nil
-				return
-			}
-			done <- fmt.Errorf("read input frame: %w", err)
-			return
-		}
-		switch frame.Type {
-		case protocol.MsgInputBytes:
-			msg, err := protocol.DecodeInputBytes(frame.Payload)
-			if err != nil {
-				done <- err
-				return
-			}
-			var detach, stopped bool
-			if err := s.coordinate(func() error {
-				if s.connection != c {
-					return nil
-				}
-				var processErr error
-				detach, processErr = s.handleInputBytes(c, msg.Data)
-				stopped = s.stopping
-				return processErr
-			}); err != nil {
-				done <- err
-				return
-			}
-			if detach {
-				done <- nil
-				return
-			}
-			if stopped {
-				done <- nil
-				return
-			}
-		case protocol.MsgResizePane:
-			msg, err := protocol.DecodeResizePane(frame.Payload)
-			if err != nil {
-				done <- err
-				return
-			}
-			if err := s.coordinate(func() error {
-				if s.connection != c {
-					return nil
-				}
-				return s.resizeClient(c, msg.Cols, msg.Rows)
-			}); err != nil {
-				done <- err
-				return
-			}
-		default:
-			done <- fmt.Errorf("unexpected input frame %d", frame.Type)
-			return
-		}
-	}
-}
-
-func (s *Session) handleInputBytes(c *Connection, data []byte) (bool, error) {
+func (s *Session) handleInputBytes(c *ClientInstance, data []byte) (bool, error) {
 	pane, _ := s.ActivePane(clientID0)
 	if pane != nil && s.InputIsNormal(clientID0) && !pane.isHistoryMode() &&
 		bytes.IndexByte(data, 0x02) < 0 && (!pane.UsesApplicationCursorKeys() || bytes.IndexByte(data, 0x1b) < 0) {
@@ -197,7 +190,7 @@ func (s *Session) handleInputBytes(c *Connection, data []byte) (bool, error) {
 	return false, nil
 }
 
-func (s *Session) resizeClient(c *Connection, cols, rows uint16) error {
+func (s *Session) resizeClient(c *ClientInstance, cols, rows uint16) error {
 	handoff := s.beginOutputHandoff()
 	if err := s.exitAllPaneHistoryModes(); err != nil {
 		return err
@@ -213,7 +206,7 @@ func (s *Session) resizeClient(c *Connection, cols, rows uint16) error {
 	return s.publishVisibleSnapshots(handoff)
 }
 
-func (s *Session) handleServerInputEvent(c *Connection, event serverInputEvent) (bool, error) {
+func (s *Session) handleServerInputEvent(c *ClientInstance, event serverInputEvent) (bool, error) {
 	switch event.Command {
 	case serverCommandNone:
 		return false, nil
@@ -254,7 +247,7 @@ func (s *Session) commandBeginRenameSessionPrompt() error {
 	return s.publishStatusBar()
 }
 
-func (s *Session) handlePromptEvent(c *Connection, event serverInputEvent) (bool, error) {
+func (s *Session) handlePromptEvent(c *ClientInstance, event serverInputEvent) (bool, error) {
 	if event.PromptKind == PromptKindConfirm &&
 		(event.PromptAction == PromptActionSubmit || event.PromptAction == PromptActionCancel) {
 		return false, s.resolvePrompt(clientID0, promptResult{
@@ -279,6 +272,10 @@ func (s *Session) handlePromptEvent(c *Connection, event serverInputEvent) (bool
 				if err == nil {
 					return detach, nil
 				}
+				var request *sessionSwitchRequest
+				if errors.As(err, &request) {
+					return false, request
+				}
 			}
 			if err != nil {
 				s.showStatusMessage(clientID0, err.Error())
@@ -293,7 +290,7 @@ func (s *Session) handlePromptEvent(c *Connection, event serverInputEvent) (bool
 	}
 }
 
-func (s *Session) commandCreateWindow(c *Connection) error {
+func (s *Session) commandCreateWindow(c *ClientInstance) error {
 	handoff := s.beginOutputHandoff()
 	cols, rows, err := s.createWindowSize()
 	if err != nil {
@@ -318,7 +315,7 @@ func (s *Session) commandSelectWindow(windowID uint64) error {
 	return s.rebindOutputsAndPublishLayout(handoff)
 }
 
-func (s *Session) commandSplit(c *Connection, direction SplitDirection) error {
+func (s *Session) commandSplit(c *ClientInstance, direction SplitDirection) error {
 	activePane, clientState := s.ActivePane(clientID0)
 	if activePane == nil || clientState == nil {
 		return nil

@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"slices"
@@ -129,7 +130,7 @@ func TestClosePanePromptsBeforeKilling(t *testing.T) {
 	if _, _, err := s.SplitFocusedPane(0, second, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
-	handler := &Connection{Session: s}
+	handler := &ClientInstance{}
 
 	s.ConsumeInputByte(0, 0x02)
 	event := s.ConsumeInputByte(0, 'x')
@@ -183,11 +184,44 @@ func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	handler := &Connection{Session: s}
+	handler := &ClientInstance{}
+	s.clientInstance = handler
 	done := make(chan error, 1)
-	handler.Session.readInputFrames(handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
+	s.readInputFrames(handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSwitchSessionPromptReturnsInputHandoff(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	source := NewSession(1)
+	target := NewSession(2)
+	t.Cleanup(source.stopOperations)
+	t.Cleanup(target.stopOperations)
+	target.setSessionName("logs")
+	d.sessions[source.ID] = source
+	d.sessions[target.ID] = target
+	d.names[target.Name] = target
+	clientState := source.NewClient(clientID0)
+	clientState.TerminalCols, clientState.TerminalRows = 90, 28
+	source.CreateWindow(&Pane{ID: source.AddPaneID(), terminal: newTerminal(90, 28)}, clientID0)
+	client := &ClientInstance{Daemon: d}
+	source.clientInstance = client
+
+	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: append([]byte{0x02, ':'}, []byte("switch-session -t logs\r")...)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input bytes.Buffer
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	source.readInputFrames(client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize), done)
+	var request *sessionSwitchRequest
+	if err := <-done; !errors.As(err, &request) || request.rawTarget != "logs" {
+		t.Fatalf("input handoff = %#v, error = %v", request, err)
 	}
 }
 
@@ -338,7 +372,7 @@ func TestHandleInputBytesAppliesRepeatedPaneResize(t *testing.T) {
 		t.Fatal(err)
 	}
 	input := append([]byte{0x02}, []byte("\x1b[1;5C\x1b[1;5C")...)
-	if detach, err := s.handleInputBytes(&Connection{Session: s}, input); err != nil || detach {
+	if detach, err := s.handleInputBytes(&ClientInstance{}, input); err != nil || detach {
 		t.Fatalf("handleInputBytes() detach=%v err=%v", detach, err)
 	}
 	placements := s.Windows[client.ActiveWindowID].Layout.Compute(Rect{Width: 80, Height: 24})
@@ -456,8 +490,8 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := s
-	handler := &Connection{Session: state, managementOut: make(chan protocol.Frame, 8)}
-	state.attachConnection(handler)
+	handler := &ClientInstance{managementOut: make(chan protocol.Frame, 8)}
+	state.clientInstance = handler
 	done := make(chan error, 1)
 	state.readInputFrames(handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
 	if err := <-done; err != nil {
@@ -500,8 +534,8 @@ func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := s
-	handler := &Connection{Session: state, managementOut: make(chan protocol.Frame, 1)}
-	state.attachConnection(handler)
+	handler := &ClientInstance{managementOut: make(chan protocol.Frame, 1)}
+	state.clientInstance = handler
 	done := make(chan error, 1)
 	state.readInputFrames(handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
 	if err := <-done; err != nil {
@@ -516,6 +550,34 @@ func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("PTY input = %q, want %q", got, want)
+	}
+}
+
+func TestStaleTransportInputIsIgnoredAfterReconnect(t *testing.T) {
+	s := NewSession(0)
+	clientState := s.NewClient(clientID0)
+	clientState.TerminalCols, clientState.TerminalRows = 80, 24
+	s.CreateWindow(&Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}, clientID0)
+	client := &ClientInstance{}
+	currentClient := &ClientInstance{}
+	s.clientInstance = currentClient
+
+	payload, err := protocol.EncodeResizePane(nil, protocol.ResizePane{Cols: 40, Rows: 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input bytes.Buffer
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgResizePane, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	s.readInputFrames(client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize), done)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	clientState = s.SnapshotClient(clientID0)
+	if clientState.TerminalCols != 80 || clientState.TerminalRows != 24 {
+		t.Fatalf("stale resize changed client size to %dx%d", clientState.TerminalCols, clientState.TerminalRows)
 	}
 }
 

@@ -110,6 +110,7 @@ type reconnectEvent struct {
 	reconnecting bool
 	lastContact  time.Time
 }
+type terminalStatusEvent struct{ message string }
 type renderBarrierEvent struct{ done chan struct{} }
 
 func ParseTarget(raw string) (Target, error) {
@@ -245,7 +246,7 @@ func Run(ctx context.Context, cfg Config) error {
 	var input atomic.Pointer[inputDestination]
 
 	ui.beginConnection(false, time.Now())
-	live, err := openConnection(clientCtx, bootstrap, hostname, cols, rows, cfg, "", 0, ui, enterTerminal)
+	live, err := openConnection(clientCtx, bootstrap, hostname, cols, rows, cfg, "", ui, enterTerminal)
 	if err != nil {
 		return err
 	}
@@ -261,6 +262,11 @@ func Run(ctx context.Context, cfg Config) error {
 			live.destroy()
 			ui.sync(clientCtx)
 			if result.graceful {
+				if result.terminalMessage != "" {
+					ui.emit(terminalStatusEvent{message: result.terminalMessage})
+					ui.sync(clientCtx)
+					_ = waitReconnect(clientCtx, 2*time.Second)
+				}
 				return nil
 			}
 			if clientCtx.Err() != nil {
@@ -268,19 +274,26 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			lastContact := live.lastContactTime()
 			ui.markDisconnected(lastContact)
-			resumeToken, generation := live.resumeToken, live.generation
+			resumeToken := live.resumeToken
 			backoff := 100 * time.Millisecond
 			for {
 				if err := waitReconnect(clientCtx, backoff); err != nil {
 					return clientExitError(clientCtx)
 				}
 				ui.beginConnection(true, lastContact)
-				candidate, reconnectErr := openConnection(clientCtx, bootstrap, hostname, cols, rows, cfg, resumeToken, generation, ui, nil)
+				candidate, reconnectErr := openConnection(clientCtx, bootstrap, hostname, cols, rows, cfg, resumeToken, ui, nil)
 				if reconnectErr == nil {
 					live = candidate
 					ui.beginConnection(false, lastContact)
 					input.Store(live.inputDestination())
 					break
+				}
+				var terminalErr *terminalAttachError
+				if errors.As(reconnectErr, &terminalErr) {
+					ui.emit(terminalStatusEvent{message: terminalErr.Error()})
+					ui.sync(clientCtx)
+					_ = waitReconnect(clientCtx, 2*time.Second)
+					return nil
 				}
 				if backoff < 2*time.Second {
 					backoff *= 2
@@ -362,8 +375,9 @@ func sendCurrentPredictedInput(current *atomic.Pointer[inputDestination], ui *ru
 }
 
 type connectionResult struct {
-	err      error
-	graceful bool
+	err             error
+	graceful        bool
+	terminalMessage string
 }
 
 type liveConnection struct {
@@ -374,7 +388,6 @@ type liveConnection struct {
 	ctx         context.Context
 	done        chan connectionResult
 	resumeToken string
-	generation  uint64
 	lastContact atomic.Int64
 	workers     sync.WaitGroup
 }
@@ -407,7 +420,11 @@ func (c *liveConnection) destroy() {
 	c.workers.Wait()
 }
 
-func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, hostname string, cols, rows uint16, cfg Config, resumeToken string, generation uint64, ui *runtimeState, onFirstManagementFrame func() error) (*liveConnection, error) {
+type terminalAttachError struct{ reason string }
+
+func (e *terminalAttachError) Error() string { return e.reason }
+
+func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, hostname string, cols, rows uint16, cfg Config, resumeToken string, ui *runtimeState, onFirstManagementFrame func() error) (*liveConnection, error) {
 	tlsConfig, err := loadTLSConfig(bootstrap.CertSPKISHA256)
 	if err != nil {
 		return nil, err
@@ -453,9 +470,9 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 		return fail(err)
 	}
 	if resumeToken == "" {
-		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, SessionID: bootstrap.SessionID, Token: bootstrap.AttachToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionAttach)
+		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, Token: bootstrap.AttachToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionAttach)
 	} else {
-		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionResume, protocol.SessionResume{Version: protocol.ProtocolVersion, SessionID: bootstrap.SessionID, ResumeToken: resumeToken, Generation: generation, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionResume)
+		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionResume, protocol.SessionResume{Version: protocol.ProtocolVersion, ResumeToken: resumeToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionResume)
 	}
 	if err != nil {
 		return fail(err)
@@ -474,15 +491,25 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 		if decodeErr != nil {
 			return fail(decodeErr)
 		}
-		live.resumeToken, live.generation = msg.ResumeToken, msg.Generation
+		if msg.Version != protocol.ProtocolVersion || msg.ResumeToken == "" {
+			return fail(errors.New("invalid session attachment response"))
+		}
+		live.resumeToken = msg.ResumeToken
 	case protocol.MsgSessionResumeOK:
 		msg, decodeErr := protocol.DecodeSessionResumeOK(attachResult.Payload)
 		if decodeErr != nil {
 			return fail(decodeErr)
 		}
-		live.resumeToken, live.generation = msg.ResumeToken, msg.Generation
+		if msg.Version != protocol.ProtocolVersion {
+			return fail(errors.New("invalid session resume response"))
+		}
+		live.resumeToken = resumeToken
 	case protocol.MsgSessionAttachFailed:
-		return fail(errors.New("session attachment rejected"))
+		msg, decodeErr := protocol.DecodeSessionAttachFailed(attachResult.Payload)
+		if decodeErr != nil {
+			return fail(decodeErr)
+		}
+		return fail(&terminalAttachError{reason: msg.Reason})
 	default:
 		return fail(fmt.Errorf("unexpected session attachment result %d", attachResult.Type))
 	}
@@ -741,7 +768,13 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- con
 		frame, err := decoder.ReadFrame()
 		if err != nil {
 			if isTerminalQUICClose(err) {
-				done <- connectionResult{graceful: true}
+				var applicationErr *quic.ApplicationError
+				_ = errors.As(err, &applicationErr)
+				message := ""
+				if applicationErr != nil && applicationErr.ErrorCode == protocol.SessionReplacedErrorCode {
+					message = applicationErr.ErrorMessage
+				}
+				done <- connectionResult{graceful: true, terminalMessage: message}
 				return
 			}
 			if errors.Is(err, io.EOF) {
@@ -1395,6 +1428,27 @@ func (s *scanoutState) setReconnecting(reconnecting bool, lastContact, now time.
 	s.emitActiveCursor()
 }
 
+func (s *scanoutState) setTerminalStatus(message string) {
+	s.reconnecting = false
+	if s.cols <= 0 {
+		return
+	}
+	text := []rune(" " + message)
+	if len(text) > s.cols {
+		text = text[:s.cols]
+	}
+	writeCursorPosition(&s.ansi, max(1, s.rows), 1)
+	s.ansi.WriteString(sgrForStyle(protocol.Style{
+		FG: protocol.Color{Mode: "indexed", Index: 15},
+		BG: protocol.Color{Mode: "indexed", Index: 1},
+	}))
+	s.ansi.WriteString(string(text))
+	for i := len(text); i < s.cols; i++ {
+		s.ansi.WriteByte(' ')
+	}
+	s.emitActiveCursor()
+}
+
 func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 	if r.renderDone != nil {
 		defer close(r.renderDone)
@@ -1424,6 +1478,14 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 			state.setReconnecting(e.reconnecting, e.lastContact, time.Now())
 			needsPresent = true
 			reason = "reconnect state"
+		case terminalStatusEvent:
+			_, err = state.resetPrediction()
+			if err != nil {
+				return false, "", err
+			}
+			state.setTerminalStatus(e.message)
+			needsPresent = true
+			reason = "terminal status"
 		case sizeEvent:
 			if state.cols != 0 && (state.cols != e.cols || state.rows != e.rows) {
 				needed, resetErr := state.resetPrediction()

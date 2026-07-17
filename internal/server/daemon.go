@@ -15,7 +15,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/quic-go/quic-go"
 
 	"github.com/garindra/meja/internal/protocol"
 )
@@ -29,21 +32,32 @@ type Config struct {
 	TerminalDebugLog io.Writer
 }
 
-// Daemon owns the server-wide session registry and name reservations. All
+// Daemon owns the server-wide session registry, client-instance registry,
+// one-to-one assignments, attach grants, and shared QUIC listener. All
 // registry access is serialized by requests; control handlers query it and
 // then query Sessions separately, so neither actor waits on the other.
 type Daemon struct {
-	logMu       sync.Mutex
-	requests    chan daemonRequest
-	nextID      uint64
-	sessions    map[uint64]*Session
-	names       map[string]*Session
-	tlsConfig   *tls.Config
-	certHash    string
-	serverCtx   context.Context
-	stop        context.CancelFunc
-	stderr      io.Writer
-	snapshotDir string
+	logMu                sync.Mutex
+	requests             chan daemonRequest
+	nextID               uint64
+	sessions             map[uint64]*Session
+	names                map[string]*Session
+	reconnectCredentials map[string]*reconnectCredential
+	// clientSessions is separate from reconnectCredentials: it is only the
+	// target-session hint consulted when rebuilding a client after reconnect.
+	clientSessions map[*reconnectCredential]uint64
+	attachments    map[uint64]*reconnectCredential
+	attachGrants   []attachGrant
+	tlsConfig      *tls.Config
+	certHash       string
+	quicMu         sync.Mutex
+	quicListener   *quic.Listener
+	quicPort       uint16
+	quicCancel     context.CancelFunc
+	serverCtx      context.Context
+	stop           context.CancelFunc
+	stderr         io.Writer
+	snapshotDir    string
 }
 
 type daemonRequest struct {
@@ -105,11 +119,26 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13}
-	d := &Daemon{requests: make(chan daemonRequest, 64), nextID: 1, sessions: make(map[uint64]*Session), names: make(map[string]*Session), tlsConfig: tlsConfig, certHash: hash, serverCtx: serverCtx, stop: stop, stderr: cfg.Stderr, snapshotDir: snapshotDirectory(socket)}
+	d := &Daemon{
+		requests:             make(chan daemonRequest, 64),
+		nextID:               1,
+		sessions:             make(map[uint64]*Session),
+		names:                make(map[string]*Session),
+		reconnectCredentials: make(map[string]*reconnectCredential),
+		clientSessions:       make(map[*reconnectCredential]uint64),
+		attachments:          make(map[uint64]*reconnectCredential),
+		tlsConfig:            tlsConfig,
+		certHash:             hash,
+		serverCtx:            serverCtx,
+		stop:                 stop,
+		stderr:               cfg.Stderr,
+		snapshotDir:          snapshotDirectory(socket),
+	}
 	actorCtx, stopActor := context.WithCancel(context.Background())
 	go d.runRequests(actorCtx)
 	defer func() {
 		d.disconnectActiveClients()
+		d.closeQUIC()
 		stopActor()
 	}()
 	go func() {
@@ -324,11 +353,16 @@ func (d *Daemon) reserveSessionName(state *Session, name string) {
 }
 
 // sessionExited is a one-way death notification. The Session has already
-// released its Connection; the Daemon only removes matching registry refs.
+// released its client instance; the Daemon only removes matching registry refs.
 func (d *Daemon) sessionExited(state *Session) {
 	remove := func() {
 		if d.sessions[state.ID] != state {
 			return
+		}
+		if credential := d.attachments[state.ID]; credential != nil {
+			delete(d.attachments, state.ID)
+			delete(d.clientSessions, credential)
+			credential.TerminalReason = "session is no longer available"
 		}
 		delete(d.sessions, state.ID)
 		d.reserveSessionName(state, "")
@@ -346,10 +380,74 @@ func (d *Daemon) session(id uint64) *Session {
 	return session
 }
 
-func (d *Daemon) activate(s *Session, connection *Connection) {
-	s.attachConnection(connection)
+func terminatePane(pane *Pane) error {
+	if pane == nil {
+		return nil
+	}
+	if pane.Process != nil && pane.Process.Process != nil {
+		_ = pane.Process.Process.Signal(syscall.SIGHUP)
+	}
+	pane.stop()
+	return nil
 }
 
-func (d *Daemon) deactivate(s *Session, connection *Connection) {
-	s.detachConnection(connection)
+func expectStreamOpen(decoder *protocol.Decoder, opener uint64, streamType string) error {
+	frame, err := decoder.ReadFrame()
+	if err != nil {
+		return fmt.Errorf("read stream opener: %w", err)
+	}
+	if frame.Type != opener {
+		return fmt.Errorf("unexpected stream opener %d", frame.Type)
+	}
+	open, err := protocol.DecodeStreamOpen(frame.Payload)
+	if err != nil {
+		return err
+	}
+	if open.StreamType != streamType {
+		return fmt.Errorf("unexpected stream type %q", open.StreamType)
+	}
+	return nil
+}
+
+func expectDecoded[T any](decoder *protocol.Decoder, msgType uint64, decode func([]byte) (T, error)) (T, error) {
+	frame, err := decoder.ReadFrame()
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	if frame.Type != msgType {
+		var zero T
+		return zero, fmt.Errorf("unexpected message type %d", frame.Type)
+	}
+	return decode(frame.Payload)
+}
+
+func sendEncoded[T any](ch chan<- protocol.Frame, msgType uint64, msg T, encode func([]byte, T) ([]byte, error)) error {
+	payload, err := encode(nil, msg)
+	if err != nil {
+		return err
+	}
+	defer func() { recover() }()
+	ch <- protocol.Frame{Type: msgType, Payload: payload}
+	return nil
+}
+
+func sendEncodedDirect[T any](w io.Writer, msgType uint64, msg T, encode func([]byte, T) ([]byte, error)) error {
+	// Kept separate from the asynchronous stream writer for pre-attachment
+	// failures, where no session state may be touched.
+	payload, err := encode(nil, msg)
+	if err != nil {
+		return err
+	}
+	return protocol.NewEncoder(w).WriteFrame(protocol.Frame{Type: msgType, Payload: payload})
+}
+
+func writeStream(stream io.Writer, frames <-chan protocol.Frame, errs chan<- error) {
+	enc := protocol.NewEncoder(stream)
+	for frame := range frames {
+		if err := enc.WriteFrame(frame); err != nil {
+			errs <- fmt.Errorf("write frame type %d: %w", frame.Type, err)
+			return
+		}
+	}
 }

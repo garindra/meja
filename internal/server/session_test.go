@@ -825,8 +825,7 @@ func TestCreateWindowSizePrefersClientDimensionsOverSplitPane(t *testing.T) {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
 
-	handler := &Connection{Session: s}
-	cols, rows, err := handler.Session.createWindowSize()
+	cols, rows, err := s.createWindowSize()
 	if err != nil {
 		t.Fatalf("createWindowSize() error = %v", err)
 	}
@@ -880,14 +879,10 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	}
 }
 
-func TestSessionShutdownCleanlyClosesConnectionBeforeCancelingQUIC(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+func TestSessionShutdownCleanlyClosesConnection(t *testing.T) {
 	closed := false
 	var closeErr error
 	connection := &recordingQUICConnection{closeWithError: func(code quic.ApplicationErrorCode, message string) error {
-		if ctx.Err() != nil {
-			closeErr = fmt.Errorf("QUIC context was canceled before the clean connection close")
-		}
 		if code != 0 || message != "" {
 			closeErr = fmt.Errorf("CloseWithError(%d, %q), want clean application close", code, message)
 		}
@@ -895,8 +890,7 @@ func TestSessionShutdownCleanlyClosesConnectionBeforeCancelingQUIC(t *testing.T)
 		return nil
 	}}
 	s := NewSession(1)
-	s.quicCancel = cancel
-	s.connection = &Connection{QUIC: connection}
+	s.clientInstance = &ClientInstance{QUIC: connection}
 
 	if err := s.shutdown(); err != nil {
 		t.Fatal(err)
@@ -907,18 +901,18 @@ func TestSessionShutdownCleanlyClosesConnectionBeforeCancelingQUIC(t *testing.T)
 	if closeErr != nil {
 		t.Fatal(closeErr)
 	}
-	if ctx.Err() == nil {
-		t.Fatal("session QUIC context was not canceled after the clean close")
-	}
 }
 
 func TestSessionClosesExistingConnectionBeforeAttachingReplacement(t *testing.T) {
 	s := NewSession(1)
-	replacement := &Connection{}
+	clientState := s.NewClient(clientID0)
+	clientState.TerminalCols, clientState.TerminalRows = 80, 24
+	s.CreateWindow(&Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}, clientID0)
+	replacement := &ClientInstance{}
 	closed := false
 	var closeErr error
-	existing := &Connection{QUIC: &recordingQUICConnection{closeWithError: func(code quic.ApplicationErrorCode, message string) error {
-		if s.connection == replacement {
+	existing := &ClientInstance{QUIC: &recordingQUICConnection{closeWithError: func(code quic.ApplicationErrorCode, message string) error {
+		if s.clientInstance == replacement {
 			closeErr = fmt.Errorf("replacement was attached before existing connection was closed")
 		}
 		if code != protocol.SessionReplacedErrorCode || message != "session attached elsewhere" {
@@ -927,9 +921,11 @@ func TestSessionClosesExistingConnectionBeforeAttachingReplacement(t *testing.T)
 		closed = true
 		return nil
 	}}}
-	s.connection = existing
+	s.clientInstance = existing
 
-	s.attachConnection(replacement)
+	if err := s.attachClientInstance(replacement, 80, 24); err != nil {
+		t.Fatal(err)
+	}
 
 	if !closed {
 		t.Fatal("existing QUIC connection was not closed")
@@ -937,8 +933,22 @@ func TestSessionClosesExistingConnectionBeforeAttachingReplacement(t *testing.T)
 	if closeErr != nil {
 		t.Fatal(closeErr)
 	}
-	if s.connection != replacement {
+	if s.clientInstance != replacement {
 		t.Fatal("replacement connection was not attached")
+	}
+}
+
+func TestStaleTransportCleanupDoesNotDetachReconnectedClientInstance(t *testing.T) {
+	s := NewSession(1)
+	stale := &ClientInstance{}
+	stale.detaching.Store(true)
+	current := &ClientInstance{}
+	s.clientInstance = current
+
+	s.detachClientInstance()
+
+	if s.clientInstance != current {
+		t.Fatal("stale transport cleanup detached the replacement transport")
 	}
 }
 

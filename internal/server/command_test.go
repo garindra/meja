@@ -26,7 +26,7 @@ func TestNewSessionCommandCreatesInitialPaneBeforeAttach(t *testing.T) {
 	if result.exitCode != 0 || result.bootstrap == nil {
 		t.Fatalf("new result = %#v", result)
 	}
-	session := d.session(result.bootstrap.SessionID)
+	session := d.sessionByName("work")
 	if session == nil || !session.HasWindows() || len(session.PanesSnapshot()) != 1 {
 		t.Fatalf("new session state = %#v", session)
 	}
@@ -56,7 +56,7 @@ func TestCommandAliasesAreResolvedByDaemon(t *testing.T) {
 		t.Fatalf("ls alias result = %#v", listed)
 	}
 	attached := d.executeCommand(protocol.CommandRequest{Args: []string{"a", "-t", "work"}})
-	if attached.exitCode != 0 || attached.bootstrap == nil || attached.bootstrap.SessionID != created.bootstrap.SessionID {
+	if attached.exitCode != 0 || attached.bootstrap == nil || attached.bootstrap.AttachToken == created.bootstrap.AttachToken {
 		t.Fatalf("attach alias result = %#v", attached)
 	}
 }
@@ -233,7 +233,7 @@ func TestCommandPromptAndPrefixUseTheSameSessionCommandEngine(t *testing.T) {
 	client.TerminalCols, client.TerminalRows = 80, 23
 	pane := &Pane{ID: s.AddPaneID(), Title: "bash", terminal: newTerminal(80, 23)}
 	window, _ := s.CreateWindow(pane, clientID0)
-	connection := &Connection{Session: s}
+	connection := &ClientInstance{}
 
 	s.ConsumeInputByte(clientID0, 0x02)
 	event := s.ConsumeInputByte(clientID0, ':')
@@ -272,7 +272,7 @@ func TestCommandPromptReportsCommandErrorsWithoutClosingInput(t *testing.T) {
 	client := s.NewClient(clientID0)
 	client.TerminalCols, client.TerminalRows = 80, 23
 	s.CreateWindow(&Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
-	connection := &Connection{Session: s}
+	connection := &ClientInstance{}
 
 	if _, err := s.executeSessionCommand(connection, []string{"command-prompt"}); err != nil {
 		t.Fatal(err)
@@ -286,6 +286,36 @@ func TestCommandPromptReportsCommandErrorsWithoutClosingInput(t *testing.T) {
 	state := s.SnapshotClient(clientID0)
 	if state.Prompt != nil || state.StatusMessage != `unknown command "not-a-command"` {
 		t.Fatalf("client after command error = %#v", state)
+	}
+}
+
+func TestSwitchSessionCommandReturnsLiveHandoffRequest(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	source := NewSession(1)
+	target := NewSession(2)
+	t.Cleanup(source.stopOperations)
+	t.Cleanup(target.stopOperations)
+	source.setSessionName("source")
+	target.setSessionName("target")
+	d.sessions[source.ID] = source
+	d.sessions[target.ID] = target
+	d.names[source.Name] = source
+	d.names[target.Name] = target
+	clientState := source.NewClient(clientID0)
+	clientState.TerminalCols, clientState.TerminalRows = 101, 37
+	client := &ClientInstance{Daemon: d}
+
+	_, err := source.executeSessionCommand(client, []string{"switch-session", "-t", "target"})
+	var request *sessionSwitchRequest
+	if !errors.As(err, &request) {
+		t.Fatalf("switch command error = %v, want handoff request", err)
+	}
+	if request.rawTarget != "target" || request.cols != 101 || request.rows != 37 {
+		t.Fatalf("switch request = %#v", request)
+	}
+
+	if _, err := source.executeSessionCommand(client, []string{"switch-session", "target"}); err == nil || err.Error() != "switch-session requires -t <session-target>" {
+		t.Fatalf("missing target flag error = %v", err)
 	}
 }
 
@@ -320,7 +350,7 @@ func TestCLIAndAttachedInvocationShareOperationalCommandHandler(t *testing.T) {
 		t.Fatalf("width after CLI resize = %d, want %d", placements[0].Rect.Width, initialLeftWidth+2)
 	}
 
-	connection := &Connection{Session: s, Daemon: d}
+	connection := &ClientInstance{Daemon: d}
 	if _, err := s.executeSessionCommand(connection, []string{"rename-window", "from-prompt"}); err != nil {
 		t.Fatal(err)
 	}

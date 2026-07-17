@@ -20,11 +20,11 @@ type statusModel struct {
 }
 
 type statusCommand struct {
-	attach     io.Writer
-	detach     bool
-	connection *Connection
-	model      *statusModel
-	done       chan error
+	attach io.Writer
+	detach bool
+	client *ClientInstance
+	model  *statusModel
+	done   chan error
 }
 
 func (s *Session) sendStatusCommand(command statusCommand) error {
@@ -45,16 +45,16 @@ func (s *Session) sendStatusCommand(command statusCommand) error {
 	}
 }
 
-func (s *Session) attachStatusOutput(connection *Connection, stream io.Writer) error {
-	return s.sendStatusCommand(statusCommand{attach: stream, connection: connection})
+func (s *Session) attachStatusOutput(client *ClientInstance, stream io.Writer) error {
+	return s.sendStatusCommand(statusCommand{attach: stream, client: client})
 }
 
-func (s *Session) detachStatusOutput(connection *Connection) error {
-	return s.sendStatusCommand(statusCommand{detach: true, connection: connection})
+func (s *Session) detachStatusOutput(client *ClientInstance) error {
+	return s.sendStatusCommand(statusCommand{detach: true, client: client})
 }
 
 func (s *Session) runStatusOutput() {
-	var connection *Connection
+	var client *ClientInstance
 	var output *renderOutput
 	initialized := false
 	var latest statusModel
@@ -65,7 +65,7 @@ func (s *Session) runStatusOutput() {
 			var err error
 			switch {
 			case command.attach != nil:
-				connection = command.connection
+				client = command.client
 				output = newRenderOutput(command.attach)
 				initialized = false
 				if hasLatest {
@@ -73,8 +73,8 @@ func (s *Session) runStatusOutput() {
 					initialized = err == nil
 				}
 			case command.detach:
-				if connection == command.connection {
-					connection = nil
+				if client == command.client {
+					client = nil
 					output = nil
 					initialized = false
 				}
@@ -263,7 +263,7 @@ func (s *Session) finishOutputHandoff(handoff *outputHandoff, bindings []RenderB
 			}
 		}
 	}
-	// A pane can already have lost its old connection's lease before a
+	// A pane can already have lost its old transport's lease before a
 	// reconnect begins. Its release then returns nil, but the handoff still
 	// completed and the replacement output for that logical slot must be
 	// attached. Wait for every release above, then attach those nil slots.

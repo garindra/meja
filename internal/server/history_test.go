@@ -69,7 +69,7 @@ func TestPanesRetainIndependentHistoryViews(t *testing.T) {
 func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	pane := &Pane{ID: 0, terminal: newTerminal(4, 2)}
 	pane.terminal.GridRows = []Row{historyTestRow("live"), historyTestRow("end ")}
-	ptyOutput := startTestPaneLoop(NewSession(0), pane)
+	ptyOutput := startTestPaneLoop(pane)
 	defer func() {
 		close(ptyOutput)
 		<-pane.mainDone
