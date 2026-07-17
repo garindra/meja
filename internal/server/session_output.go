@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/garindra/meja/internal/protocol"
 	"github.com/garindra/meja/internal/theme"
@@ -54,6 +55,14 @@ func (s *Session) detachStatusOutput(client *ClientInstance) error {
 }
 
 func (s *Session) runStatusOutput() {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = ""
+	}
+	if hostname != "" {
+		hostname = "[" + hostname + "]"
+	}
+
 	var client *ClientInstance
 	var output *renderOutput
 	initialized := false
@@ -69,7 +78,7 @@ func (s *Session) runStatusOutput() {
 				output = newRenderOutput(command.attach)
 				initialized = false
 				if hasLatest {
-					err = renderStatusModel(output, latest, true)
+					err = renderStatusModel(output, latest, hostname, true)
 					initialized = err == nil
 				}
 			case command.detach:
@@ -82,7 +91,7 @@ func (s *Session) runStatusOutput() {
 				latest = *command.model
 				hasLatest = true
 				if output != nil {
-					err = renderStatusModel(output, latest, !initialized)
+					err = renderStatusModel(output, latest, hostname, !initialized)
 					initialized = err == nil
 				}
 			}
@@ -97,8 +106,8 @@ func (s *Session) runStatusOutput() {
 	}
 }
 
-func renderStatusModel(output *renderOutput, model statusModel, full bool) error {
-	normal := protocol.Style{FG: protocol.Color{Mode: "default"}, BG: theme.AccentColor()}
+func renderStatusModel(output *renderOutput, model statusModel, hostname string, full bool) error {
+	normal := protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 15}, BG: theme.AccentColor()}
 	prompt := protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 0}, BG: protocol.Color{Mode: "indexed", Index: 3}}
 	if full {
 		if err := installStyle(output, statusNormalStyleID, normal); err != nil {
@@ -117,19 +126,41 @@ func renderStatusModel(output *renderOutput, model statusModel, full bool) error
 	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeFill, Fill: protocol.Fill{Columns: model.width, Rune: ' ', Width: 1}}); err != nil {
 		return err
 	}
-	runes := []rune(model.text)
-	if len(runes) > model.width {
-		runes = runes[:model.width]
-	}
-	if len(runes) > 0 {
+	left, right := statusLineParts(model.width, model.text, hostname)
+	if len(left) > 0 {
 		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0}); err != nil {
 			return err
 		}
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte(string(runes))}); err != nil {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte(string(left))}); err != nil {
+			return err
+		}
+	}
+	if len(right) > 0 {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: model.width - len(right)}); err != nil {
+			return err
+		}
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte(string(right))}); err != nil {
 			return err
 		}
 	}
 	return output.present()
+}
+
+func statusLineParts(width int, text, hostname string) ([]rune, []rune) {
+	if width <= 0 {
+		return nil, nil
+	}
+
+	right := []rune(hostname)
+	if len(right) > width {
+		right = right[len(right)-width:]
+	}
+	leftWidth := width - len(right)
+	left := []rune(text)
+	if len(left) > leftWidth {
+		left = left[:leftWidth]
+	}
+	return left, right
 }
 
 func (s *Session) publishStatusBar() error {

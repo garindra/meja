@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,9 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	}
 	status := statusClient.read(t)
 	assertStatusText(t, status, "(rename-window) bash")
+	if got := status.Styles[statusNormalStyleID].FG; got != (protocol.Color{Mode: "indexed", Index: 15}) {
+		t.Fatalf("normal status foreground = %#v, want white", got)
+	}
 	if got := status.Styles[statusNormalStyleID].BG; got != (protocol.Color{Mode: "rgb", R: 42, G: 88, B: 170}) {
 		t.Fatalf("normal status background = %#v", got)
 	}
@@ -309,7 +313,15 @@ func assertStatusText(t *testing.T, status testStatusBar, want string) {
 			text.WriteString(cell.Cluster)
 		}
 	}
-	if got := strings.TrimRight(text.String(), " "); strings.TrimRight(want, " ") != got {
+	got := strings.TrimRight(text.String(), " ")
+	if hostname, err := os.Hostname(); err == nil && hostname != "" {
+		suffix := "[" + hostname + "]"
+		if !strings.HasSuffix(got, suffix) {
+			t.Fatalf("status text = %q, want hostname suffix %q", got, suffix)
+		}
+		got = strings.TrimRight(strings.TrimSuffix(got, suffix), " ")
+	}
+	if strings.TrimRight(want, " ") != got {
 		t.Fatalf("status text = %q, want %q", got, strings.TrimRight(want, " "))
 	}
 }
@@ -317,7 +329,7 @@ func assertStatusText(t *testing.T, status testStatusBar, want string) {
 func TestStatusOutputReconnectGetsBarrierlessFullRefresh(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(clientID0)
-	client.TerminalCols, client.TerminalRows = 20, 3
+	client.TerminalCols, client.TerminalRows = 40, 3
 	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, clientID0)
 
 	first := newStatusTestClient()
