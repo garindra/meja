@@ -206,6 +206,14 @@ func (s *Session) publishWindowLayout() error {
 	if err != nil {
 		return err
 	}
+	client := s.clientInstance
+	if client != nil {
+		for previous := client.highestLayoutRevision.Load(); layout.LayoutRevision > previous; previous = client.highestLayoutRevision.Load() {
+			if client.highestLayoutRevision.CompareAndSwap(previous, layout.LayoutRevision) {
+				break
+			}
+		}
+	}
 	mgmtFrames := s.currentManagementFrames()
 	if mgmtFrames == nil {
 		return nil

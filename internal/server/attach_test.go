@@ -302,6 +302,62 @@ func TestLiveSwitchMovesClientAssignmentWithoutChangingReconnectToken(t *testing
 	}
 }
 
+func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	source := NewSession(1)
+	target := NewSession(2)
+	t.Cleanup(source.stopOperations)
+	t.Cleanup(target.stopOperations)
+	for _, session := range []*Session{source, target} {
+		client := session.NewClient(clientID0)
+		client.TerminalCols, client.TerminalRows = 80, 23
+		session.CreateWindow(&Pane{ID: session.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
+		session.daemon = d
+		d.sessions[session.ID] = session
+	}
+
+	credential := &reconnectCredential{EncodedToken: "stable-token"}
+	instance := newClientInstance(d, credential)
+	instance.managementOut = make(chan protocol.Frame, 8)
+	credential.Instance = instance
+	d.clientSessions[credential] = source.ID
+	d.attachments[source.ID] = credential
+
+	if err := source.attachClientInstance(instance, 80, 23); err != nil {
+		t.Fatal(err)
+	}
+	first := decodeTestWindowLayout(t, <-instance.managementOut)
+
+	switched, err := d.switchClientInstance(instance, source, "2", 80, 23)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := decodeTestWindowLayout(t, <-instance.managementOut)
+	if second.LayoutRevision <= first.LayoutRevision {
+		t.Fatalf("first switch revision = %d, want greater than %d", second.LayoutRevision, first.LayoutRevision)
+	}
+
+	if _, err := d.switchClientInstance(instance, switched, "1", 80, 23); err != nil {
+		t.Fatal(err)
+	}
+	third := decodeTestWindowLayout(t, <-instance.managementOut)
+	if third.LayoutRevision <= second.LayoutRevision {
+		t.Fatalf("second switch revision = %d, want greater than %d", third.LayoutRevision, second.LayoutRevision)
+	}
+}
+
+func decodeTestWindowLayout(t *testing.T, frame protocol.Frame) protocol.WindowLayout {
+	t.Helper()
+	if frame.Type != protocol.MsgWindowLayout {
+		t.Fatalf("management frame type = %d, want WINDOW_LAYOUT", frame.Type)
+	}
+	layout, err := protocol.DecodeWindowLayout(frame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return layout
+}
+
 func TestDaemonQUICListenerResumesByClientInstance(t *testing.T) {
 	d := newCommandTestDaemonWithActor(t)
 	d.snapshotDir = t.TempDir()

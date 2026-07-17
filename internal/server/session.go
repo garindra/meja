@@ -131,6 +131,14 @@ func (s *Session) attachClientInstance(client *ClientInstance, cols, rows uint16
 				return err
 			}
 		}
+		// Layout revisions are session-local, while the client scanout survives a
+		// live session switch and treats them as monotonic. Advance this session's
+		// counter past everything already published on the retained transport.
+		if client != nil {
+			if floor := client.highestLayoutRevision.Load(); s.NextLayoutRevision < floor {
+				s.NextLayoutRevision = floor
+			}
+		}
 		s.EnsureClient(clientID0)
 		if cols == 0 || rows == 0 {
 			pane, _ := s.ActivePane(clientID0)

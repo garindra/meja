@@ -24,7 +24,11 @@ type ClientInstance struct {
 	credential *reconnectCredential
 	detaching  atomic.Bool
 	switching  atomic.Bool
-	Daemon     *Daemon
+	// highestLayoutRevision is transport-scoped. Sessions keep their own
+	// revision counters, but a live switch retains the client-side scanout and
+	// therefore must not let the next session publish an older revision.
+	highestLayoutRevision atomic.Uint64
+	Daemon                *Daemon
 
 	QUIC         quic.Connection
 	Input        quic.Stream
