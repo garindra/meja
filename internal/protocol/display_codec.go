@@ -14,6 +14,8 @@ import (
 // [UTF-8 byte length uvarint][raw UTF-8 bytes]. WRITE_TEXT_UTF8 variants are
 // for text the server has established as width 1; this decoder intentionally
 // does not perform terminal wcwidth validation. Width-2 text uses WRITE_TEXT.
+// WRITE_CLUSTER carries exactly one opaque display cluster and its total cell
+// width; clients must not split or remeasure its UTF-8 text.
 // Style fields are flags uvarint followed by two colors, each [color kind
 // byte][kind-specific bytes].
 // DisplayOpcode values are independent from framed management message IDs.
@@ -31,6 +33,7 @@ const (
 	DisplayOpcodeFill                 DisplayOpcode = 0x08
 	DisplayOpcodeCursorUpdate         DisplayOpcode = 0x09
 	DisplayOpcodeScroll               DisplayOpcode = 0x0a
+	DisplayOpcodeWriteCluster         DisplayOpcode = 0x0b
 	DisplayOpcodePresent              DisplayOpcode = 0xff
 )
 
@@ -82,6 +85,8 @@ func (e *DisplayEncoder) AppendCommand(cmd DisplayCommand) error {
 		return e.AppendWriteTextUTF8(cmd.Text)
 	case DisplayOpcodeWriteTextUTF8Default:
 		return e.AppendWriteTextUTF8Default(cmd.Text)
+	case DisplayOpcodeWriteCluster:
+		return e.AppendWriteCluster(WriteText{CellWidth: cmd.Width, Text: cmd.Text})
 	case DisplayOpcodeFill:
 		return e.AppendFill(cmd.Fill)
 	case DisplayOpcodeCursorUpdate:
@@ -161,6 +166,19 @@ func (e *DisplayEncoder) AppendWriteTextUTF8Default(text []byte) error {
 	}
 	e.opcode(DisplayOpcodeWriteTextUTF8Default)
 	e.buf = appendText(e.buf, text)
+	return nil
+}
+
+func (e *DisplayEncoder) AppendWriteCluster(msg WriteText) error {
+	if msg.CellWidth != 1 && msg.CellWidth != 2 {
+		return ErrInvalidCellWidth
+	}
+	if len(msg.Text) == 0 || !utf8.Valid(msg.Text) {
+		return ErrInvalidRune
+	}
+	e.opcode(DisplayOpcodeWriteCluster)
+	e.buf = append(e.buf, msg.CellWidth)
+	e.buf = appendText(e.buf, msg.Text)
 	return nil
 }
 
@@ -281,7 +299,7 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 				cmd.StyleID = uint32(id)
 			}
 		}
-	case DisplayOpcodeWriteText:
+	case DisplayOpcodeWriteText, DisplayOpcodeWriteCluster:
 		cmd.Width, err = d.readByte()
 		if err == nil && cmd.Width != 1 && cmd.Width != 2 {
 			err = ErrInvalidCellWidth
@@ -336,8 +354,11 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 	if err != nil {
 		return DisplayCommand{}, d.bytesRead - start, normalizeDisplayReadError(err)
 	}
-	if cmd.Opcode == DisplayOpcodeWriteTextUTF8 || cmd.Opcode == DisplayOpcodeWriteTextUTF8Default || cmd.Opcode == DisplayOpcodeWriteText {
+	if cmd.Opcode == DisplayOpcodeWriteTextUTF8 || cmd.Opcode == DisplayOpcodeWriteTextUTF8Default || cmd.Opcode == DisplayOpcodeWriteText || cmd.Opcode == DisplayOpcodeWriteCluster {
 		if !utf8.Valid(cmd.Text) {
+			return DisplayCommand{}, d.bytesRead - start, ErrInvalidRune
+		}
+		if cmd.Opcode == DisplayOpcodeWriteCluster && len(cmd.Text) == 0 {
 			return DisplayCommand{}, d.bytesRead - start, ErrInvalidRune
 		}
 	}

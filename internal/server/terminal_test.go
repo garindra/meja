@@ -36,7 +36,7 @@ func TestResizePreservesIncrementalParserAndSavedCursor(t *testing.T) {
 	term.Apply([]byte("\x1b7\x1b[2"))
 	term.Resize(8, 3)
 	term.Apply([]byte("D!\x1b8"))
-	if term.GridRows[1].Cells[0].Rune != '!' || term.CursorX != 4 || term.CursorY != 1 {
+	if term.GridRows[1].Cells[0].Cluster != "!" || term.CursorX != 4 || term.CursorY != 1 {
 		t.Fatalf("resized parser/cursor state cursor=%d,%d row=%q", term.CursorX, term.CursorY, rowString(term, 1, 8))
 	}
 }
@@ -45,8 +45,303 @@ func TestFragmentedUTF8(t *testing.T) {
 	term := newTerminal(5, 1)
 	term.Apply([]byte{0xe2, 0x82})
 	term.Apply([]byte{0xac})
-	if term.GridRows[0].Cells[0].Rune != '€' {
-		t.Fatalf("Rune = %q, want €", term.GridRows[0].Cells[0].Rune)
+	if term.GridRows[0].Cells[0].Cluster != "€" {
+		t.Fatalf("Cluster = %q, want €", term.GridRows[0].Cells[0].Cluster)
+	}
+}
+
+func TestGraphemeClustersHaveCanonicalCellsAndWidths(t *testing.T) {
+	tests := []struct {
+		name    string
+		cluster string
+		width   uint8
+	}{
+		{name: "combining accent", cluster: "e\u0301", width: 1},
+		{name: "text heart", cluster: "❤", width: 1},
+		{name: "emoji heart", cluster: "❤️", width: 2},
+		{name: "skin tone", cluster: "👍🏽", width: 2},
+		{name: "zwj", cluster: "👩‍💻", width: 2},
+		{name: "keycap", cluster: "1️⃣", width: 2},
+		{name: "multiple marks", cluster: "e\u0301\u0323", width: 1},
+		{name: "latin stacked marks", cluster: "a\u030a\u0301", width: 1},
+		{name: "hebrew points", cluster: "שָׁ", width: 1},
+		{name: "arabic marks", cluster: "نَّ", width: 1},
+		{name: "thai tone mark", cluster: "ก้", width: 1},
+		{name: "tamil vowel sign", cluster: "நி", width: 1},
+		{name: "devanagari conjunct", cluster: "क्ष", width: 2},
+		{name: "hangul jamo", cluster: "각", width: 2},
+		{name: "cjk ideographic variation", cluster: "葛\U000e0100", width: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			term := newTerminal(8, 2)
+			term.Apply([]byte(tt.cluster + "X"))
+			anchor := term.GridRows[0].Cells[0]
+			if anchor.Cluster != tt.cluster || anchor.Width != tt.width {
+				t.Fatalf("anchor=%#v, want cluster %q width %d", anchor, tt.cluster, tt.width)
+			}
+			if tt.width == 2 && term.GridRows[0].Cells[1].Width != 0 {
+				t.Fatalf("continuation=%#v", term.GridRows[0].Cells[1])
+			}
+			if got := term.GridRows[0].Cells[tt.width].Cluster; got != "X" {
+				t.Fatalf("following cell=%q, want X", got)
+			}
+			if term.CursorX != int(tt.width)+1 {
+				t.Fatalf("cursor=%d, want %d", term.CursorX, tt.width+1)
+			}
+		})
+	}
+}
+
+func TestGraphemeChunkBoundariesDoNotChangeFinalState(t *testing.T) {
+	sequences := []string{
+		"e\u0301\u0323", "שָׁ", "نَّ", "ก้", "நி", "क्ष", "각", "葛\U000e0100",
+		"❤️", "👍🏽", "👩‍💻", "1️⃣",
+	}
+	for _, sequence := range sequences {
+		want := newTerminal(8, 2)
+		want.Apply([]byte(sequence))
+		encoded := []byte(sequence)
+		for split := 1; split < len(encoded); split++ {
+			got := newTerminal(8, 2)
+			got.Apply(encoded[:split])
+			got.Apply(encoded[split:])
+			if !reflect.DeepEqual(got.GridRows, want.GridRows) || got.CursorX != want.CursorX || got.CursorY != want.CursorY || got.wrapPending != want.wrapPending {
+				t.Fatalf("%q split %d: grid=%#v cursor=%d,%d wrap=%v; want grid=%#v cursor=%d,%d wrap=%v", sequence, split, got.GridRows, got.CursorX, got.CursorY, got.wrapPending, want.GridRows, want.CursorX, want.CursorY, want.wrapPending)
+			}
+		}
+	}
+}
+
+func TestGraphemeBytewiseAndScalarwiseStreamingMatchesAtomicInput(t *testing.T) {
+	sequences := []string{
+		"a\u030a\u0301", "שָׁ", "نَّ", "क्ष", "葛\U000e0100",
+		"1️⃣", "🇮🇳", "👩‍💻",
+	}
+	for _, sequence := range sequences {
+		t.Run(sequence, func(t *testing.T) {
+			want := newTerminal(12, 2)
+			want.Apply([]byte(sequence + "X"))
+
+			bytewise := newTerminal(12, 2)
+			for _, b := range []byte(sequence + "X") {
+				bytewise.Apply([]byte{b})
+			}
+			if !reflect.DeepEqual(bytewise.GridRows, want.GridRows) || bytewise.CursorX != want.CursorX {
+				t.Fatalf("bytewise state differs: grid=%#v cursor=%d; want grid=%#v cursor=%d", bytewise.GridRows, bytewise.CursorX, want.GridRows, want.CursorX)
+			}
+
+			scalarwise := newTerminal(12, 2)
+			for _, r := range sequence {
+				scalarwise.Apply([]byte(string(r)))
+			}
+			scalarwise.Apply([]byte("X"))
+			if !reflect.DeepEqual(scalarwise.GridRows, want.GridRows) || scalarwise.CursorX != want.CursorX {
+				t.Fatalf("scalarwise state differs: grid=%#v cursor=%d; want grid=%#v cursor=%d", scalarwise.GridRows, scalarwise.CursorX, want.GridRows, want.CursorX)
+			}
+		})
+	}
+}
+
+func TestBulkASCIILeavesOnlyItsFinalCellExtendable(t *testing.T) {
+	t.Run("combining mark", func(t *testing.T) {
+		term := newTerminal(12, 1)
+		term.Apply([]byte("fast-e"))
+		term.Apply([]byte("\u0301"))
+		if got := term.GridRows[0].Cells[5]; got.Cluster != "e\u0301" || got.Width != 1 {
+			t.Fatalf("extended final ASCII cell = %#v", got)
+		}
+		if term.CursorX != 6 {
+			t.Fatalf("cursor after combining extension = %d, want 6", term.CursorX)
+		}
+	})
+
+	t.Run("keycap promotion", func(t *testing.T) {
+		term := newTerminal(12, 1)
+		term.Apply([]byte("fast1"))
+		term.Apply([]byte("\ufe0f\u20e3"))
+		if got := term.GridRows[0].Cells[4]; got.Cluster != "1️⃣" || got.Width != 2 {
+			t.Fatalf("promoted final ASCII cell = %#v", got)
+		}
+		if continuation := term.GridRows[0].Cells[5]; continuation.Width != 0 {
+			t.Fatalf("keycap continuation = %#v", continuation)
+		}
+	})
+
+	t.Run("trailing blank closes tail", func(t *testing.T) {
+		term := newTerminal(12, 1)
+		term.Apply([]byte("e "))
+		term.Apply([]byte("\u0301"))
+		if got := term.GridRows[0].Cells[0]; got.Cluster != "e" {
+			t.Fatalf("combining mark crossed trailing blank: %#v", got)
+		}
+		if got := term.GridRows[0].Cells[2]; got.Cluster != "\u0301" || got.Width != 1 {
+			t.Fatalf("leading-mark fallback = %#v", got)
+		}
+	})
+}
+
+func TestBulkASCIIOverwriteRepairsWideClusterEdges(t *testing.T) {
+	term := newTerminal(8, 1)
+	term.Apply([]byte("界界界"))
+	term.Apply([]byte("\x1b[2Gab"))
+	want := []Cell{
+		blankCell(0),
+		{Cluster: "a", Width: 1},
+		{Cluster: "b", Width: 1},
+		blankCell(0),
+		{Cluster: "界", Width: 2},
+		{Width: 0},
+	}
+	if got := term.GridRows[0].Cells[:len(want)]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cells after edge overwrite = %#v, want %#v", got, want)
+	}
+}
+
+func TestInternationalWidthTwoClustersAreAtomicWhenContinuationIsOverwritten(t *testing.T) {
+	for _, cluster := range []string{"क्ष", "葛\U000e0100", "👩‍💻"} {
+		t.Run(cluster, func(t *testing.T) {
+			term := newTerminal(6, 1)
+			term.Apply([]byte("A" + cluster + "Z"))
+			term.Apply([]byte("\x1b[1;3HQ"))
+			if oldAnchor := term.GridRows[0].Cells[1]; oldAnchor.Cluster != "" || oldAnchor.Width != 1 {
+				t.Fatalf("old anchor was not atomically cleared: %#v", oldAnchor)
+			}
+			if replacement := term.GridRows[0].Cells[2]; replacement.Cluster != "Q" || replacement.Width != 1 {
+				t.Fatalf("continuation replacement = %#v", replacement)
+			}
+			if following := term.GridRows[0].Cells[3]; following.Cluster != "Z" {
+				t.Fatalf("following cell was damaged: %#v", following)
+			}
+		})
+	}
+}
+
+func TestIndicViramaFallbackDoesNotJoinAnotherScript(t *testing.T) {
+	term := newTerminal(6, 1)
+	term.Apply([]byte("क्A"))
+	if got := term.GridRows[0].Cells[0]; got.Cluster != "क्" || got.Width != 1 {
+		t.Fatalf("Indic anchor = %#v", got)
+	}
+	if got := term.GridRows[0].Cells[1]; got.Cluster != "A" || got.Width != 1 {
+		t.Fatalf("following Latin cell = %#v", got)
+	}
+}
+
+func TestReadlineBackspaceDeletesBedThenTeddyBearOneClusterAtATime(t *testing.T) {
+	const prompt = "P> "
+	tests := []struct {
+		name                      string
+		first, second             string
+		firstWidth, secondWidth   int
+		deleteSecond, deleteFirst string
+	}{
+		{name: "teddy then bed", first: "🧸", second: "🛏️", firstWidth: 2, secondWidth: 2, deleteSecond: "\b\x1b[K", deleteFirst: "\b\b\x1b[K"},
+		{name: "cjk then airplane", first: "界", second: "✈️", firstWidth: 2, secondWidth: 2, deleteSecond: "\b\x1b[K", deleteFirst: "\b\b\x1b[K"},
+		{name: "two promoted emoji", first: "☀️", second: "⚙️", firstWidth: 2, secondWidth: 2, deleteSecond: "\b\x1b[K", deleteFirst: "\b\x1b[K"},
+		{name: "ascii then keycap without vs16", first: "A", second: "1\u20e3", firstWidth: 1, secondWidth: 2, deleteSecond: "\b\x1b[K", deleteFirst: "\b\x1b[K"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			term := newTerminal(20, 1)
+			term.Apply([]byte(prompt + tt.first + tt.second))
+			start := len(prompt)
+			if term.CursorX != start+tt.firstWidth+tt.secondWidth {
+				t.Fatalf("cursor after input = %d", term.CursorX)
+			}
+
+			term.Apply([]byte(tt.deleteSecond))
+			if term.CursorX != start+tt.firstWidth {
+				t.Fatalf("cursor after deleting second cluster = %d, want %d", term.CursorX, start+tt.firstWidth)
+			}
+			if first := term.GridRows[0].Cells[start]; first.Cluster != tt.first || int(first.Width) != tt.firstWidth {
+				t.Fatalf("first cluster after deletion = %#v", first)
+			}
+			if second := term.GridRows[0].Cells[start+tt.firstWidth]; second.Cluster != "" || second.Width != 1 {
+				t.Fatalf("second cluster survived deletion = %#v", second)
+			}
+
+			term.Apply([]byte(tt.deleteFirst))
+			if term.CursorX != start {
+				t.Fatalf("cursor after deleting first cluster = %d, want %d", term.CursorX, start)
+			}
+			if first := term.GridRows[0].Cells[start]; first.Cluster != "" || first.Width != 1 {
+				t.Fatalf("first cluster survived deletion = %#v", first)
+			}
+		})
+	}
+}
+
+func TestBackspaceRemainsColumnBasedForNaturallyWideClusters(t *testing.T) {
+	for _, cluster := range []string{"界", "🧸", "⌚️"} {
+		t.Run(cluster, func(t *testing.T) {
+			term := newTerminal(6, 1)
+			term.Apply([]byte(cluster))
+			term.Apply([]byte("\b"))
+			if term.CursorX != 1 {
+				t.Fatalf("cursor after first BS = %d, want continuation column 1", term.CursorX)
+			}
+			term.Apply([]byte("\b"))
+			if term.CursorX != 0 {
+				t.Fatalf("cursor after second BS = %d, want anchor column 0", term.CursorX)
+			}
+		})
+	}
+}
+
+func TestCSICursorMovementCanStillAddressBedContinuation(t *testing.T) {
+	term := newTerminal(6, 1)
+	term.Apply([]byte("🛏️"))
+	term.Apply([]byte("\x1b[1D"))
+	if term.CursorX != 1 || term.GridRows[0].Cells[term.CursorX].Width != 0 {
+		t.Fatalf("CSI CUB cursor=%d cell=%#v, want continuation column", term.CursorX, term.GridRows[0].Cells[term.CursorX])
+	}
+}
+
+func TestCombiningMarkExtendsTailAcrossSGRWithoutTakingNewStyle(t *testing.T) {
+	term := newTerminal(4, 1)
+	term.Apply([]byte("e\x1b[31m\u0301X"))
+	if got := term.GridRows[0].Cells[0]; got.Cluster != "e\u0301" || got.Width != 1 || got.StyleID != 0 {
+		t.Fatalf("combined anchor=%#v", got)
+	}
+	if got := term.GridRows[0].Cells[1]; got.Cluster != "X" || got.StyleID == 0 {
+		t.Fatalf("following styled cell=%#v", got)
+	}
+}
+
+func TestVS16PromotionAtFinalColumnMatchesAtomicPlacement(t *testing.T) {
+	atomic := newTerminal(4, 2)
+	atomic.Apply([]byte("abc❤️"))
+	fragmented := newTerminal(4, 2)
+	fragmented.Apply([]byte("abc❤"))
+	fragmented.Apply([]byte("️"))
+	if !reflect.DeepEqual(fragmented.GridRows, atomic.GridRows) || fragmented.CursorX != atomic.CursorX || fragmented.CursorY != atomic.CursorY || fragmented.wrapPending != atomic.wrapPending {
+		t.Fatalf("fragmented grid=%#v cursor=%d,%d; atomic grid=%#v cursor=%d,%d", fragmented.GridRows, fragmented.CursorX, fragmented.CursorY, atomic.GridRows, atomic.CursorX, atomic.CursorY)
+	}
+}
+
+func TestVS16PromotionWithoutRoomUsesWidthDegradedAnchor(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cols    int
+		disable bool
+	}{
+		{name: "one column", cols: 1},
+		{name: "autowrap disabled", cols: 4, disable: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			term := newTerminal(tc.cols, 2)
+			if tc.disable {
+				term.AutoWrap = false
+				term.CursorX = tc.cols - 1
+			}
+			term.Apply([]byte("❤"))
+			term.Apply([]byte("️"))
+			anchor := term.GridRows[0].Cells[tc.cols-1]
+			if anchor.Cluster != "❤️" || anchor.Width != 1 {
+				t.Fatalf("degraded anchor = %#v", anchor)
+			}
+		})
 	}
 }
 
@@ -57,7 +352,7 @@ func TestChineseRuneOccupiesTwoCells(t *testing.T) {
 	term.Apply(encoded[1:2])
 	update := term.Apply(encoded[2:])
 
-	if got := term.GridRows[0].Cells[0]; got.Rune != '界' || got.Width != 2 {
+	if got := term.GridRows[0].Cells[0]; got.Cluster != "界" || got.Width != 2 {
 		t.Fatalf("leading cell = %#v, want width-two 界", got)
 	}
 	if got := term.GridRows[0].Cells[1]; got.Width != 0 {
@@ -75,7 +370,7 @@ func TestChineseRuneWrapsBeforeLastColumn(t *testing.T) {
 	term := newTerminal(4, 2)
 	term.Apply([]byte("abc界"))
 
-	if term.GridRows[1].Cells[0].Rune != '界' || term.GridRows[1].Cells[0].Width != 2 {
+	if term.GridRows[1].Cells[0].Cluster != "界" || term.GridRows[1].Cells[0].Width != 2 {
 		t.Fatalf("wrapped row = %#v", term.GridRows[1].Cells)
 	}
 	if term.CursorY != 1 || term.CursorX != 2 {
@@ -269,8 +564,8 @@ func TestBulkASCIIMatchesBytewiseParsing(t *testing.T) {
 	if !reflect.DeepEqual(bulk.GridRows, bytewise.GridRows) || !reflect.DeepEqual(bulkHistory, bytewiseHistory) || !reflect.DeepEqual(bulkPrimary, bytewisePrimary) {
 		t.Fatal("bulk ASCII parsing produced different screen or history rows")
 	}
-	if bulk.CursorX != bytewise.CursorX || bulk.CursorY != bytewise.CursorY || bulk.wrapPending != bytewise.wrapPending || bulk.LastPrintedRune != bytewise.LastPrintedRune || bulk.LastPrintedValid != bytewise.LastPrintedValid {
-		t.Fatalf("bulk cursor state = (%d,%d,%v,%q,%v), bytewise = (%d,%d,%v,%q,%v)", bulk.CursorX, bulk.CursorY, bulk.wrapPending, bulk.LastPrintedRune, bulk.LastPrintedValid, bytewise.CursorX, bytewise.CursorY, bytewise.wrapPending, bytewise.LastPrintedRune, bytewise.LastPrintedValid)
+	if bulk.CursorX != bytewise.CursorX || bulk.CursorY != bytewise.CursorY || bulk.wrapPending != bytewise.wrapPending || bulk.LastPrintedCluster != bytewise.LastPrintedCluster || bulk.LastPrintedValid != bytewise.LastPrintedValid {
+		t.Fatalf("bulk cursor state = (%d,%d,%v,%q,%v), bytewise = (%d,%d,%v,%q,%v)", bulk.CursorX, bulk.CursorY, bulk.wrapPending, bulk.LastPrintedCluster, bulk.LastPrintedValid, bytewise.CursorX, bytewise.CursorY, bytewise.wrapPending, bytewise.LastPrintedCluster, bytewise.LastPrintedValid)
 	}
 }
 
@@ -403,7 +698,7 @@ func TestBareLineFeedReportsStyledExposedRow(t *testing.T) {
 func TestLineFeedOutsideScrollRegionStaysWithinGrid(t *testing.T) {
 	term := newTerminal(4, 4)
 	term.Apply([]byte("\x1b[2;3r\x1b[4;1H\nX"))
-	if term.CursorY != 3 || term.GridRows[3].Cells[0].Rune != 'X' {
+	if term.CursorY != 3 || term.GridRows[3].Cells[0].Cluster != "X" {
 		t.Fatalf("cursor=%d,%d row=%q", term.CursorX, term.CursorY, rowString(term, 3, 4))
 	}
 }
@@ -464,7 +759,7 @@ func TestClearErasesEntireCanonicalGrid(t *testing.T) {
 	}
 	for row := range term.GridRows {
 		for column, cell := range term.GridRows[row].Cells {
-			if cell.Rune != ' ' {
+			if cell.Cluster != "" {
 				t.Fatalf("cell %d,%d survived clear: %#v", row, column, cell)
 			}
 		}
@@ -550,9 +845,24 @@ func TestRepeatPrecedingCharacterPreservesStyle(t *testing.T) {
 	}
 	for column := 0; column < 7; column++ {
 		cell := term.GridRows[0].Cells[column]
-		if cell.Rune != ' ' || term.styleByID[cell.StyleID].BG.Index != 4 {
+		if cell.Cluster != "" || term.styleByID[cell.StyleID].BG.Index != 4 {
 			t.Fatalf("column %d=%#v style=%#v", column, cell, term.styleByID[cell.StyleID])
 		}
+	}
+}
+
+func TestRepeatPrecedingCharacterRepeatsCompleteCluster(t *testing.T) {
+	for _, cluster := range []string{"e\u0301", "👩‍💻"} {
+		t.Run(cluster, func(t *testing.T) {
+			term := newTerminal(12, 1)
+			term.Apply([]byte(cluster + "\x1b[2b"))
+			width := int(clusterCellWidth(cluster))
+			for column := 0; column < width*3; column += width {
+				if cell := term.GridRows[0].Cells[column]; cell.Cluster != cluster || int(cell.Width) != width {
+					t.Fatalf("repeated cluster at column %d = %#v", column, cell)
+				}
+			}
+		})
 	}
 }
 
@@ -661,6 +971,26 @@ func TestResizeShrinksByReflowingRows(t *testing.T) {
 	}
 	if got := rowString(term, 3, 3); got != "yz " {
 		t.Fatalf("row 3 after shrink resize = %q", got)
+	}
+}
+
+func TestResizeNeverSplitsClusterAcrossRows(t *testing.T) {
+	for _, cluster := range []string{"क्ष", "葛\U000e0100", "👩‍💻"} {
+		t.Run(cluster, func(t *testing.T) {
+			term := newTerminal(5, 2)
+			term.Apply([]byte("abc" + cluster))
+
+			term.Resize(4, 3)
+			if got := rowString(term, 0, 4); got != "abc " {
+				t.Fatalf("row 0 after cluster-aware reflow = %q", got)
+			}
+			if anchor, continuation := term.GridRows[1].Cells[0], term.GridRows[1].Cells[1]; anchor.Cluster != cluster || anchor.Width != 2 || continuation.Width != 0 {
+				t.Fatalf("row 1 cluster after reflow = %#v", term.GridRows[1].Cells[:2])
+			}
+			if !term.GridRows[0].WrapsNext {
+				t.Fatal("cluster-aware reflow did not preserve the soft-wrap chain")
+			}
+		})
 	}
 }
 
@@ -829,7 +1159,7 @@ func TestDECSpecialGraphicsG1SelectedByShiftOut(t *testing.T) {
 func TestCursorSaveRestoreIncludesCharset(t *testing.T) {
 	term := newTerminal(4, 1)
 	term.Apply([]byte("\x1b(0\x1b7\x1b(B\x1b8q"))
-	if got := term.GridRows[0].Cells[0].Rune; got != '─' {
+	if got := term.GridRows[0].Cells[0].Cluster; got != "─" {
 		t.Fatalf("restored charset rendered %q", got)
 	}
 }
@@ -837,7 +1167,7 @@ func TestCursorSaveRestoreIncludesCharset(t *testing.T) {
 func TestIndexNextLineAndReverseIndex(t *testing.T) {
 	term := newTerminal(4, 3)
 	term.Apply([]byte("a\x1bDb\x1bEc"))
-	if term.CursorX != 1 || term.CursorY != 2 || term.GridRows[1].Cells[1].Rune != 'b' || term.GridRows[2].Cells[0].Rune != 'c' {
+	if term.CursorX != 1 || term.CursorY != 2 || term.GridRows[1].Cells[1].Cluster != "b" || term.GridRows[2].Cells[0].Cluster != "c" {
 		t.Fatalf("IND/NEL state cursor=%d,%d rows=%q/%q", term.CursorX, term.CursorY, rowString(term, 1, 4), rowString(term, 2, 4))
 	}
 }
@@ -845,7 +1175,7 @@ func TestIndexNextLineAndReverseIndex(t *testing.T) {
 func TestVerticalTabAndFormFeedActAsLineFeed(t *testing.T) {
 	term := newTerminal(4, 3)
 	term.Apply([]byte("a\vb\fc"))
-	if term.CursorY != 2 || term.GridRows[1].Cells[1].Rune != 'b' || term.GridRows[2].Cells[2].Rune != 'c' {
+	if term.CursorY != 2 || term.GridRows[1].Cells[1].Cluster != "b" || term.GridRows[2].Cells[2].Cluster != "c" {
 		t.Fatalf("VT/FF cursor=%d,%d rows=%q/%q", term.CursorX, term.CursorY, rowString(term, 1, 4), rowString(term, 2, 4))
 	}
 }
@@ -986,7 +1316,7 @@ func TestDEC1048And1049CursorAndCharsetSemantics(t *testing.T) {
 	term.Apply([]byte("\x1b(0"))
 	term.CursorX, term.CursorY = 4, 1
 	term.Apply([]byte("\x1b[?1049h\x1b(Balt\x1b[?1049lq"))
-	if term.Alternate || term.CursorY != 1 || term.GridRows[1].Cells[4].Rune != '─' {
+	if term.Alternate || term.CursorY != 1 || term.GridRows[1].Cells[4].Cluster != "─" {
 		t.Fatalf("1049 restore alternate=%v cursor=%d,%d row=%q charset=%q", term.Alternate, term.CursorX, term.CursorY, rowString(term, 1, 8), term.G0Charset)
 	}
 }
@@ -1036,24 +1366,26 @@ func TestSoftAndHardReset(t *testing.T) {
 }
 
 func rowString(term *TerminalState, row, count int) string {
-	runes := make([]rune, 0, count)
+	var text strings.Builder
 	for i := 0; i < count; i++ {
-		r := term.GridRows[row].Cells[i].Rune
-		if r == 0 {
-			r = ' '
+		cluster := term.GridRows[row].Cells[i].Cluster
+		if cluster == "" {
+			text.WriteByte(' ')
+		} else {
+			text.WriteString(cluster)
 		}
-		runes = append(runes, r)
 	}
-	return string(runes)
+	return text.String()
 }
 
 func cellsString(cells []Cell) string {
-	runes := make([]rune, len(cells))
-	for i, cell := range cells {
-		runes[i] = cell.Rune
-		if runes[i] == 0 {
-			runes[i] = ' '
+	var text strings.Builder
+	for _, cell := range cells {
+		if cell.Cluster == "" {
+			text.WriteByte(' ')
+		} else {
+			text.WriteString(cell.Cluster)
 		}
 	}
-	return string(runes)
+	return text.String()
 }

@@ -75,6 +75,7 @@ type paintKind uint8
 
 const (
 	paintText paintKind = iota + 1
+	paintCluster
 	paintFill
 )
 
@@ -731,6 +732,16 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 			c.column += int(width)
 		}
 		c.paintStarted = true
+	case protocol.DisplayOpcodeWriteCluster:
+		if len(command.Text) == 0 || (command.Width != 1 && command.Width != 2) {
+			return false, fmt.Errorf("invalid display cluster on slot %d", c.slot)
+		}
+		c.frame.spans = append(c.frame.spans, paintSpan{
+			kind: paintCluster, row: c.row, column: c.column,
+			styleID: c.styleID, cellWidth: command.Width, text: command.Text,
+		})
+		c.column += int(command.Width)
+		c.paintStarted = true
 	case protocol.DisplayOpcodeFill:
 		c.frame.spans = append(c.frame.spans, paintSpan{
 			kind: paintFill, row: c.row, column: c.column, styleID: c.styleID,
@@ -1282,7 +1293,7 @@ func (s *scanoutState) emitSpans(slot uint8, rect protocol.Rect, spans []paintSp
 		}
 		writeCursorPosition(&s.ansi, rect.Y+span.row+1, rect.X+span.column+1)
 		s.ansi.WriteString(sgrForStyle(style))
-		if span.kind == paintText {
+		if span.kind == paintText || span.kind == paintCluster {
 			s.ansi.Write(span.text)
 		} else {
 			for columns := 0; columns < span.fillColumns; columns += int(span.cellWidth) {
@@ -1298,41 +1309,66 @@ func applySpanToCache(cache *paneScanoutCache, span paintSpan, evidence *frameEv
 		return errors.New("paint span outside pane cache")
 	}
 	row, column := cache.row(span.row), span.column
-	write := func(r rune, width uint8) error {
-		if column+int(width) > len(row) {
-			return errors.New("paint span exceeds pane cache")
-		}
+	record := func(column int, cell protocol.Cell) {
 		position := cellPosition{row: span.row, column: column}
 		change, exists := evidence.touched[position]
 		if !exists {
 			change.before = row[column]
 		}
-		row[column] = protocol.Cell{Rune: r, StyleID: span.styleID, Width: width}
-		change.after = row[column]
+		row[column] = cell
+		change.after = cell
 		evidence.touched[position] = change
+	}
+	clearOccupant := func(column int) {
+		if column < 0 || column >= len(row) {
+			return
+		}
+		anchor := column
+		if row[column].Width == 0 && column > 0 && row[column-1].Width == 2 {
+			anchor = column - 1
+		}
+		styleID := row[anchor].StyleID
+		width := row[anchor].Width
+		record(anchor, protocol.Cell{StyleID: styleID, Width: 1})
+		if width == 2 && anchor+1 < len(row) {
+			record(anchor+1, protocol.Cell{StyleID: styleID, Width: 1})
+		}
+	}
+	write := func(cluster string, width uint8) error {
+		if cluster == " " && width == 1 {
+			cluster = ""
+		}
+		if column+int(width) > len(row) {
+			return errors.New("paint span exceeds pane cache")
+		}
+		clearOccupant(column)
+		if width == 2 {
+			clearOccupant(column + 1)
+		}
+		record(column, protocol.Cell{Cluster: cluster, StyleID: span.styleID, Width: width})
 		for n := 1; n < int(width); n++ {
-			continuation := cellPosition{row: span.row, column: column + n}
-			continuationChange, continuationExists := evidence.touched[continuation]
-			if !continuationExists {
-				continuationChange.before = row[column+n]
-			}
-			row[column+n] = protocol.Cell{StyleID: span.styleID}
-			continuationChange.after = row[column+n]
-			evidence.touched[continuation] = continuationChange
+			record(column+n, protocol.Cell{StyleID: span.styleID, Width: 0})
 		}
 		column += int(width)
 		return nil
 	}
+	if span.kind == paintCluster {
+		return write(string(span.text), span.cellWidth)
+	}
 	if span.kind == paintText {
 		for _, r := range string(span.text) {
-			if err := write(r, span.cellWidth); err != nil {
+			if err := write(string(r), span.cellWidth); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	for columns := 0; columns < span.fillColumns; columns += int(span.cellWidth) {
-		if err := write(span.fillRune, span.cellWidth); err != nil {
+		cluster := string(span.fillRune)
+		if span.fillRune == ' ' {
+			cluster = ""
+		}
+		if err := write(cluster, span.cellWidth); err != nil {
 			return err
 		}
 	}
@@ -1356,11 +1392,11 @@ func (s *scanoutState) emitCachedPane(rect protocol.Rect, cache *paneScanoutCach
 				s.ansi.WriteString(sgrForStyle(style))
 				currentStyle, hasStyle = cell.StyleID, true
 			}
-			r := cell.Rune
-			if r == 0 {
-				r = ' '
+			if cell.Cluster == "" {
+				s.ansi.WriteByte(' ')
+			} else {
+				s.ansi.WriteString(cell.Cluster)
 			}
-			s.ansi.WriteRune(r)
 		}
 	}
 	return nil
@@ -1596,7 +1632,7 @@ func defaultStyles() map[uint32]protocol.Style {
 
 func fillBlank(cells []protocol.Cell) {
 	for i := range cells {
-		cells[i] = protocol.Cell{Rune: ' ', Width: 1}
+		cells[i] = protocol.Cell{Width: 1}
 	}
 }
 

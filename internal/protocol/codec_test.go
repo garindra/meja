@@ -64,6 +64,7 @@ func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
 		{Opcode: DisplayOpcodeSetWriteStyle, StyleID: 2},
 		{Opcode: DisplayOpcodeWriteTextUTF8, Width: 1, Text: []byte("aé")},
 		{Opcode: DisplayOpcodeWriteTextUTF8Default, Width: 1, Text: []byte(" ")},
+		{Opcode: DisplayOpcodeWriteCluster, Width: 2, Text: []byte("👩‍💻")},
 		{Opcode: DisplayOpcodeFill, Fill: Fill{Columns: 3, Rune: ' ', Width: 1}},
 		{Opcode: DisplayOpcodeCursorUpdate, Cursor: CursorUpdate{Cursor: Cursor{X: 2, Y: 3}, Visible: true}},
 		{Opcode: DisplayOpcodeScroll, Delta: -1},
@@ -83,6 +84,35 @@ func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
 	}
 	if batch.LayoutRevision != 7 || !reflect.DeepEqual(batch.Commands, commands) {
 		t.Fatalf("batch=%#v want commands=%#v", batch, commands)
+	}
+}
+
+func TestDiverseClustersRoundTripAsOpaqueDisplayUnits(t *testing.T) {
+	clusters := []DisplayCommand{
+		{Opcode: DisplayOpcodeWriteCluster, Width: 1, Text: []byte("a\u030a\u0301")},
+		{Opcode: DisplayOpcodeWriteCluster, Width: 1, Text: []byte("שָׁ")},
+		{Opcode: DisplayOpcodeWriteCluster, Width: 1, Text: []byte("نَّ")},
+		{Opcode: DisplayOpcodeWriteCluster, Width: 1, Text: []byte("ก้")},
+		{Opcode: DisplayOpcodeWriteCluster, Width: 1, Text: []byte("நி")},
+		{Opcode: DisplayOpcodeWriteCluster, Width: 2, Text: []byte("क्ष")},
+		{Opcode: DisplayOpcodeWriteCluster, Width: 2, Text: []byte("葛\U000e0100")},
+	}
+	encoder := NewDisplayEncoder(nil)
+	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 19}); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range clusters {
+		if err := encoder.AppendCommand(command); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encoder.AppendPresent()
+	batch, err := NewDisplayDecoder(oneByteReader{Reader: bytes.NewReader(encoder.Bytes())}).ReadBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.LayoutRevision != 19 || !reflect.DeepEqual(batch.Commands, clusters) {
+		t.Fatalf("decoded batch = %#v, want revision 19 commands %#v", batch, clusters)
 	}
 }
 

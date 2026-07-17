@@ -306,6 +306,8 @@ func incomingRenderOpcodeName(opcode protocol.DisplayOpcode) string {
 		return "WriteTextUTF8"
 	case protocol.DisplayOpcodeWriteTextUTF8Default:
 		return "WriteTextUTF8Default"
+	case protocol.DisplayOpcodeWriteCluster:
+		return "WriteCluster"
 	case protocol.DisplayOpcodeFill:
 		return "Fill"
 	case protocol.DisplayOpcodeCursorUpdate:

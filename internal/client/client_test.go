@@ -827,6 +827,127 @@ func TestDisplayFrameCompilerExpandsWireLatches(t *testing.T) {
 	}
 }
 
+func TestDisplayFrameCompilerTreatsClusterAsOneDisplayUnit(t *testing.T) {
+	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
+	commands := []protocol.DisplayCommand{
+		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 4},
+		{Opcode: protocol.DisplayOpcodeWriteCluster, Text: []byte("👩‍💻"), Width: 2},
+		{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("X")},
+		{Opcode: protocol.DisplayOpcodePresent},
+	}
+	var frame renderFrame
+	for _, command := range commands {
+		ready, err := c.apply(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ready {
+			frame = c.frame
+		}
+	}
+	if len(frame.spans) != 2 {
+		t.Fatalf("compiled frame = %#v", frame)
+	}
+	cluster, following := frame.spans[0], frame.spans[1]
+	if cluster.kind != paintCluster || cluster.column != 0 || cluster.cellWidth != 2 || string(cluster.text) != "👩‍💻" {
+		t.Fatalf("cluster span = %#v", cluster)
+	}
+	if following.column != 2 || string(following.text) != "X" {
+		t.Fatalf("following span = %#v", following)
+	}
+}
+
+func TestClusterCacheMirrorsAnchorContinuationAndAtomicOverwrite(t *testing.T) {
+	cache := newPaneScanoutCache(4, 1)
+	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange)}
+	if err := applySpanToCache(cache, paintSpan{
+		kind: paintCluster, row: 0, column: 0, cellWidth: 2, text: []byte("👩‍💻"),
+	}, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	row := cache.row(0)
+	if row[0].Cluster != "👩‍💻" || row[0].Width != 2 || row[1].Cluster != "" || row[1].Width != 0 {
+		t.Fatalf("cached cluster = %#v", row[:2])
+	}
+
+	// Addressing the continuation column clears the complete old cluster before
+	// installing the replacement at the addressed terminal column.
+	if err := applySpanToCache(cache, paintSpan{
+		kind: paintText, row: 0, column: 1, cellWidth: 1, text: []byte("B"),
+	}, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if row[0].Cluster != "" || row[0].Width != 1 || row[1].Cluster != "B" || row[1].Width != 1 {
+		t.Fatalf("cache after continuation overwrite = %#v", row[:2])
+	}
+}
+
+func TestCachedPaneRepaintEmitsClusterOnce(t *testing.T) {
+	cache := newPaneScanoutCache(3, 1)
+	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange)}
+	for _, span := range []paintSpan{
+		{kind: paintCluster, row: 0, column: 0, cellWidth: 2, text: []byte("👩‍💻")},
+		{kind: paintText, row: 0, column: 2, cellWidth: 1, text: []byte("X")},
+	} {
+		if err := applySpanToCache(cache, span, &evidence); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := newScanoutState(false)
+	if err := s.emitCachedPane(protocol.Rect{Width: 3, Height: 1}, cache, defaultStyles()); err != nil {
+		t.Fatal(err)
+	}
+	out := string(s.takeANSI())
+	if strings.Count(out, "👩‍💻") != 1 || !strings.Contains(out, "👩‍💻X") {
+		t.Fatalf("cached repaint = %q", out)
+	}
+}
+
+func TestClientCacheAndRepaintPreserveMixedInternationalClusters(t *testing.T) {
+	clusters := []struct {
+		text  string
+		width uint8
+	}{
+		{text: "a\u030a\u0301", width: 1},
+		{text: "שָׁ", width: 1},
+		{text: "நி", width: 1},
+		{text: "क्ष", width: 2},
+		{text: "葛\U000e0100", width: 2},
+	}
+	columns := 0
+	for _, cluster := range clusters {
+		columns += int(cluster.width)
+	}
+	cache := newPaneScanoutCache(columns, 1)
+	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange)}
+	column := 0
+	var visible strings.Builder
+	for _, cluster := range clusters {
+		if err := applySpanToCache(cache, paintSpan{
+			kind: paintCluster, row: 0, column: column, cellWidth: cluster.width, text: []byte(cluster.text),
+		}, &evidence); err != nil {
+			t.Fatal(err)
+		}
+		if anchor := cache.row(0)[column]; anchor.Cluster != cluster.text || anchor.Width != cluster.width {
+			t.Fatalf("cached anchor at %d = %#v", column, anchor)
+		}
+		if cluster.width == 2 && cache.row(0)[column+1].Width != 0 {
+			t.Fatalf("cached continuation at %d = %#v", column+1, cache.row(0)[column+1])
+		}
+		column += int(cluster.width)
+		visible.WriteString(cluster.text)
+	}
+
+	s := newScanoutState(false)
+	if err := s.emitCachedPane(protocol.Rect{Width: columns, Height: 1}, cache, defaultStyles()); err != nil {
+		t.Fatal(err)
+	}
+	out := string(s.takeANSI())
+	if strings.Count(out, visible.String()) != 1 {
+		t.Fatalf("mixed cached repaint = %q, want one contiguous %q", out, visible.String())
+	}
+}
+
 func TestNativeScrollUsesRectangularMargins(t *testing.T) {
 	s := newScanoutState(true)
 	s.cols, s.rows = 12, 5

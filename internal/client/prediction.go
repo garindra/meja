@@ -351,7 +351,11 @@ func (p *inputPredictor) composedCell(cursor protocol.Cursor, view *paneScanoutC
 	for _, scope := range p.scopes {
 		for _, op := range scope.pending {
 			if op.position == cursor {
-				cell = protocol.Cell{Rune: rune(op.displayChar()), StyleID: op.styleID, Width: 1}
+				cluster := string(op.displayChar())
+				if op.displayChar() == ' ' {
+					cluster = ""
+				}
+				cell = protocol.Cell{Cluster: cluster, StyleID: op.styleID, Width: 1}
 			}
 		}
 	}
@@ -408,15 +412,14 @@ func (p *inputPredictor) collectClosedScopes() {
 }
 
 func predictionBlankCell(cell protocol.Cell) bool {
-	return cell.Width == 1 && (cell.Rune == 0 || cell.Rune == ' ')
+	return cell.Width == 1 && cell.Cluster == ""
 }
 
 func predictionCellMatches(cell protocol.Cell, b byte) bool {
-	r := cell.Rune
-	if r == 0 {
-		r = ' '
+	if b == ' ' {
+		return cell.Width == 1 && cell.Cluster == ""
 	}
-	return cell.Width == 1 && r == rune(b)
+	return cell.Width == 1 && cell.Cluster == string(b)
 }
 
 func (op predictionOperation) displayChar() byte {
@@ -469,11 +472,13 @@ func repairSpans(ops []predictionOperation, view *paneScanoutCache) []paintSpan 
 		}
 		seen[position] = struct{}{}
 		cell := view.row(position.row)[position.column]
-		r := cell.Rune
-		if r == 0 {
-			r = ' '
+		text := cell.Cluster
+		kind := paintCluster
+		if text == "" {
+			text = " "
+			kind = paintText
 		}
-		spans = append(spans, paintSpan{kind: paintText, row: position.row, column: position.column, styleID: cell.StyleID, cellWidth: 1, text: []byte(string(r))})
+		spans = append(spans, paintSpan{kind: kind, row: position.row, column: position.column, styleID: cell.StyleID, cellWidth: max(cell.Width, 1), text: []byte(text)})
 	}
 	return spans
 }

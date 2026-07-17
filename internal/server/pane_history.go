@@ -86,12 +86,8 @@ func projectHistoryRows(rows []Row, cols int) []Row {
 			out = append(out, blankHistoryRow(cols))
 			return
 		}
-		for start := 0; start < len(chain); start += cols {
-			end := min(start+cols, len(chain))
-			row := blankHistoryRow(cols)
-			copy(row.Cells, chain[start:end])
-			row.WrapsNext = end < len(chain)
-			out = append(out, row)
+		for _, projected := range (&TerminalState{}).projectLogicalLine(logicalLine{cells: chain, reflowable: true}, cols) {
+			out = append(out, Row{Cells: projected.cells, WrapsNext: projected.continued})
 		}
 		chain = nil
 	}
@@ -124,14 +120,14 @@ func normalizeRows(rows []Row, cols int) []Row {
 func blankHistoryRow(cols int) Row {
 	row := Row{Cells: make([]protocol.Cell, cols)}
 	for i := range row.Cells {
-		row.Cells[i] = protocol.Cell{Rune: ' ', Width: 1}
+		row.Cells[i] = protocol.Cell{Width: 1}
 	}
 	return row
 }
 
 func trimHistoryBlanks(cells []protocol.Cell) []protocol.Cell {
 	end := len(cells)
-	for end > 0 && (cells[end-1].Rune == 0 || cells[end-1].Rune == ' ') {
+	for end > 0 && cells[end-1].Cluster == "" && cells[end-1].Width == 1 {
 		end--
 	}
 	return cells[:end]
@@ -402,6 +398,6 @@ func overlayHistoryCounter(row []protocol.Cell, cols int, label string, styleID 
 		if start+i >= len(row) {
 			break
 		}
-		row[start+i] = protocol.Cell{Rune: r, StyleID: styleID, Width: 1}
+		row[start+i] = protocol.Cell{Cluster: string(r), StyleID: styleID, Width: 1}
 	}
 }

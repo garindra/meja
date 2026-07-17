@@ -3,11 +3,13 @@ package server
 import (
 	"fmt"
 	"io"
+	"strings"
 	"sync"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/garindra/meja/internal/protocol"
-	"golang.org/x/text/width"
+	"github.com/rivo/uniseg"
 )
 
 const (
@@ -15,6 +17,14 @@ const (
 	maxTerminalStyles    = 4096
 	initialStyleCapacity = 32
 )
+
+var printableASCIIStrings = func() [utf8.RuneSelf]string {
+	var strings [utf8.RuneSelf]string
+	for b := byte(0x20); b <= 0x7e; b++ {
+		strings[b] = string([]byte{b})
+	}
+	return strings
+}()
 
 type Cell = protocol.Cell
 type Style = protocol.Style
@@ -43,7 +53,7 @@ func logUnsupportedf(format string, args ...any) {
 }
 
 func blankCell(styleID uint32) Cell {
-	return Cell{Rune: ' ', StyleID: styleID, Width: 1}
+	return Cell{StyleID: styleID, Width: 1}
 }
 
 func colorIndexed(idx int) Color {
@@ -54,12 +64,106 @@ func colorRGB(r, g, b int) Color {
 	return Color{Mode: "rgb", R: uint8(r), G: uint8(g), B: uint8(b)}
 }
 
-func runeCellWidth(r rune) uint8 {
-	switch width.LookupRune(r).Kind() {
-	case width.EastAsianWide, width.EastAsianFullwidth:
+// clusterCellWidth is Meja's implicit server-side width policy. The grid
+// deliberately stores every printable display cluster in one or two columns.
+func clusterCellWidth(cluster string) uint8 {
+	// Generic width libraries commonly undercount standardized keycaps.
+	if strings.HasSuffix(cluster, "\u20e3") {
 		return 2
-	default:
+	}
+	// Emoji presentation selectors promote otherwise text-width bases.
+	if strings.ContainsRune(cluster, '\ufe0f') {
+		return 2
+	}
+	return clusterBaseCellWidth(cluster)
+}
+
+func clusterBaseCellWidth(cluster string) uint8 {
+	// Spacing combining marks (notably Indic vowel signs) are part of the
+	// anchor's shaping input but do not independently consume terminal cells.
+	w := 0
+	for _, r := range cluster {
+		if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r) || unicode.Is(unicode.Cf, r) {
+			continue
+		}
+		w += uniseg.StringWidth(string(r))
+	}
+	if w <= 0 {
 		return 1
+	}
+	if w >= 2 {
+		return 2
+	}
+	return 1
+}
+
+func applicationNarrowWideCluster(cell Cell) bool {
+	if cell.Width != 2 || clusterBaseCellWidth(cell.Cluster) != 1 {
+		return false
+	}
+	return strings.ContainsRune(cell.Cluster, '\ufe0f') || strings.HasSuffix(cell.Cluster, "\u20e3")
+}
+
+func isSingleGrapheme(cluster string) bool {
+	graphemes := uniseg.NewGraphemes(cluster)
+	if !graphemes.Next() {
+		return false
+	}
+	return !graphemes.Next() || isIndicConjunctCluster(cluster)
+}
+
+func isIndicConjunctCluster(cluster string) bool {
+	seenBase, seenVirama, allowLinkedBase, script := false, false, false, 0
+	for _, r := range cluster {
+		switch {
+		case unicode.IsLetter(r):
+			currentScript := indicScriptBlock(r)
+			if currentScript == 0 || (script != 0 && currentScript != script) {
+				return false
+			}
+			if seenBase && !allowLinkedBase {
+				return false
+			}
+			script = currentScript
+			seenBase = true
+			allowLinkedBase = false
+		case isIndicVirama(r):
+			if !seenBase || indicScriptBlock(r) != script {
+				return false
+			}
+			seenVirama = true
+			allowLinkedBase = true
+		case unicode.Is(unicode.Mn, r), unicode.Is(unicode.Mc, r), unicode.Is(unicode.Me, r), unicode.Is(unicode.Cf, r):
+			// Marks and join controls retain the pending virama link.
+		default:
+			return false
+		}
+	}
+	return seenBase && seenVirama
+}
+
+func indicScriptBlock(r rune) int {
+	for i, bounds := range [][2]rune{
+		{'\u0900', '\u097f'}, {'\u0980', '\u09ff'}, {'\u0a00', '\u0a7f'}, {'\u0a80', '\u0aff'},
+		{'\u0b00', '\u0b7f'}, {'\u0b80', '\u0bff'}, {'\u0c00', '\u0c7f'}, {'\u0c80', '\u0cff'},
+		{'\u0d00', '\u0d7f'}, {'\u0d80', '\u0dff'}, {'\u1000', '\u109f'}, {'\u1700', '\u177f'},
+		{'\u1780', '\u17ff'}, {'\u1a00', '\u1aaf'}, {'\ua800', '\ua82f'}, {'\ua880', '\ua8df'},
+		{'\ua930', '\ua95f'}, {'\uaa80', '\uaadf'},
+	} {
+		if r >= bounds[0] && r <= bounds[1] {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+func isIndicVirama(r rune) bool {
+	switch r {
+	case '\u094d', '\u09cd', '\u0a4d', '\u0acd', '\u0b4d', '\u0bcd', '\u0c4d', '\u0ccd', '\u0d4d', '\u0dca',
+		'\u1039', '\u1714', '\u1734', '\u17d2', '\u1a60', '\ua806', '\ua8c4', '\ua953', '\uaaf6':
+		return true
+	default:
+		return false
 	}
 }
 
@@ -108,8 +212,11 @@ type TerminalState struct {
 	G1Charset             byte
 	ActiveCharset         int
 	TabStops              []bool
-	LastPrintedRune       rune
+	LastPrintedCluster    string
 	LastPrintedValid      bool
+	tailRow               int
+	tailColumn            int
+	tailValid             bool
 
 	styleByID     []Style
 	styleToID     map[Style]uint32
@@ -120,20 +227,20 @@ type TerminalState struct {
 }
 
 type screenBuffer struct {
-	Rows             []Row
-	CursorX          int
-	CursorY          int
-	CurrentStyle     Style
-	CursorVisible    bool
-	WrapPending      bool
-	SavedCursor      SavedCursor
-	ScrollTop        int
-	ScrollBottom     int
-	LastPrintedRune  rune
-	LastPrintedValid bool
-	G0Charset        byte
-	G1Charset        byte
-	ActiveCharset    int
+	Rows               []Row
+	CursorX            int
+	CursorY            int
+	CurrentStyle       Style
+	CursorVisible      bool
+	WrapPending        bool
+	SavedCursor        SavedCursor
+	ScrollTop          int
+	ScrollBottom       int
+	LastPrintedCluster string
+	LastPrintedValid   bool
+	G0Charset          byte
+	G1Charset          byte
+	ActiveCharset      int
 }
 
 type SavedCursor struct {
@@ -190,6 +297,7 @@ func newTerminal(cols, rows int) *TerminalState {
 }
 
 func (t *TerminalState) Resize(cols, rows int) {
+	t.invalidateTail()
 	if cols == t.Cols && rows == t.Rows {
 		return
 	}
@@ -211,7 +319,7 @@ func (t *TerminalState) Resize(cols, rows int) {
 	next.G1Charset = t.G1Charset
 	next.ActiveCharset = t.ActiveCharset
 	next.TabStops = resizedTabStops(t.TabStops, t.Cols, cols)
-	next.LastPrintedRune = t.LastPrintedRune
+	next.LastPrintedCluster = t.LastPrintedCluster
 	next.LastPrintedValid = t.LastPrintedValid
 	next.styleByID = cloneStyles(t.styleByID)
 	next.styleToID = cloneStyleIDMap(t.styleToID)
@@ -228,8 +336,13 @@ func (t *TerminalState) Resize(cols, rows int) {
 		start := len(projected)
 		projected = append(projected, rowsForLine...)
 		if line.cursorHere {
-			cursorProjectedRow, cursorProjectedCol = mapCursorOffset(start, rowsForLine, line.cursorOffset, cols)
-			cursorPlaced = true
+			for row, projectedLine := range rowsForLine {
+				if projectedLine.cursorHere {
+					cursorProjectedRow, cursorProjectedCol = start+row, projectedLine.cursorCol
+					cursorPlaced = true
+					break
+				}
+			}
 		}
 	}
 
@@ -276,7 +389,7 @@ func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 	primary.SavedCursor = p.SavedCursor
 	primary.ScrollTop = p.ScrollTop
 	primary.ScrollBottom = p.ScrollBottom
-	primary.LastPrintedRune = p.LastPrintedRune
+	primary.LastPrintedCluster = p.LastPrintedCluster
 	primary.LastPrintedValid = p.LastPrintedValid
 	primary.History = t.cloneHistoryRows()
 	primary.HistoryLimit = t.HistoryLimit
@@ -300,7 +413,7 @@ func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 	t.clampCursor()
 	t.History = primary.History
 	t.historyStart = 0
-	t.Primary = &screenBuffer{Rows: cloneRows(primary.GridRows), CursorX: primary.CursorX, CursorY: primary.CursorY, CurrentStyle: primary.CurrentStyle, CursorVisible: primary.CursorVisible, WrapPending: primary.wrapPending, SavedCursor: primary.SavedCursor, ScrollTop: primary.ScrollTop, ScrollBottom: primary.ScrollBottom, LastPrintedRune: primary.LastPrintedRune, LastPrintedValid: primary.LastPrintedValid, G0Charset: p.G0Charset, G1Charset: p.G1Charset, ActiveCharset: p.ActiveCharset}
+	t.Primary = &screenBuffer{Rows: cloneRows(primary.GridRows), CursorX: primary.CursorX, CursorY: primary.CursorY, CurrentStyle: primary.CurrentStyle, CursorVisible: primary.CursorVisible, WrapPending: primary.wrapPending, SavedCursor: primary.SavedCursor, ScrollTop: primary.ScrollTop, ScrollBottom: primary.ScrollBottom, LastPrintedCluster: primary.LastPrintedCluster, LastPrintedValid: primary.LastPrintedValid, G0Charset: p.G0Charset, G1Charset: p.G1Charset, ActiveCharset: p.ActiveCharset}
 }
 
 func (t *TerminalState) SnapshotStyles() []protocolStyleDef {
@@ -373,11 +486,13 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 			case 0x1b:
 				t.Parser.state = parserESC
 			case '\r':
+				t.invalidateTail()
 				t.breakWrapChainAt(t.CursorY)
 				t.CursorX = 0
 				t.wrapPending = false
 				update.CursorChanged = true
 			case '\n', '\v', '\f':
+				t.invalidateTail()
 				if t.wrapPending {
 					t.CursorX = 0
 				}
@@ -385,12 +500,21 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 				t.wrapPending = false
 				update.CursorChanged = true
 			case '\b':
+				t.invalidateTail()
 				if t.CursorX > 0 {
 					t.CursorX--
+					if t.CursorX > 0 && t.GridRows[t.CursorY].Cells[t.CursorX].Width == 0 && applicationNarrowWideCluster(t.GridRows[t.CursorY].Cells[t.CursorX-1]) {
+						// Many applications still measure text-default emoji bases per
+						// code point and emit one BS even when VS16 made the terminal
+						// presentation two cells. Keep literal BS compatible with that
+						// convention without changing column-addressed CSI movement.
+						t.CursorX--
+					}
 				}
 				t.wrapPending = false
 				update.CursorChanged = true
 			case '\t':
+				t.invalidateTail()
 				t.CursorX = t.nextTabStop(t.CursorX)
 				t.wrapPending = false
 				update.CursorChanged = true
@@ -417,17 +541,21 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 				t.saveCursor()
 				t.Parser.state = parserText
 			case '8':
+				t.invalidateTail()
 				t.restoreCursor()
 				t.Parser.state = parserText
 			case 'M':
+				t.invalidateTail()
 				t.reverseIndex(update)
 				t.Parser.state = parserText
 			case 'D':
+				t.invalidateTail()
 				t.lineFeed(update)
 				t.wrapPending = false
 				update.CursorChanged = true
 				t.Parser.state = parserText
 			case 'E':
+				t.invalidateTail()
 				t.CursorX = 0
 				t.lineFeed(update)
 				t.wrapPending = false
@@ -437,6 +565,7 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 				t.setTabStop(t.CursorX)
 				t.Parser.state = parserText
 			case 'c':
+				t.invalidateTail()
 				t.reset()
 				update.FullRedraw = true
 				update.CursorChanged = true
@@ -528,16 +657,22 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 }
 
 func (t *TerminalState) putASCII(data []byte, update *Update) {
-	if t.Cols == 0 || t.Rows == 0 {
+	if t.Cols == 0 || t.Rows == 0 || len(data) == 0 {
 		return
 	}
 	if t.InsertMode {
 		for _, b := range data {
-			t.putRune(rune(b), update)
+			t.putASCIIByte(b, update)
 		}
 		return
 	}
+
+	// Printable ASCII always begins a new grapheme. Avoid segmentation, width
+	// lookup, per-cell damage updates, and per-byte string conversion here.
+	t.invalidateTail()
 	styleID := t.currentStyleID()
+	lastRow, lastColumn := t.CursorY, t.CursorX
+	lastByte := data[len(data)-1]
 	for len(data) > 0 {
 		if t.wrapPending {
 			t.wrapPending = false
@@ -562,11 +697,14 @@ func (t *TerminalState) putASCII(data []byte, update *Update) {
 		}
 		t.setRowWrapped(t.CursorY, false)
 		for column, b := range data[:count] {
-			cells[start+column] = Cell{Rune: rune(b), StyleID: styleID, Width: 1}
+			cluster := printableASCIIStrings[b]
+			if b == ' ' {
+				cluster = ""
+			}
+			cells[start+column] = Cell{Cluster: cluster, StyleID: styleID, Width: 1}
 		}
 		update.markDirty(t.CursorY, dirtyStart, dirtyEnd, t.Cols)
-		t.LastPrintedRune = rune(data[count-1])
-		t.LastPrintedValid = true
+		lastRow, lastColumn = t.CursorY, end-1
 		if end == t.Cols {
 			t.CursorX = t.Cols - 1
 			t.wrapPending = t.AutoWrap
@@ -574,6 +712,43 @@ func (t *TerminalState) putASCII(data []byte, update *Update) {
 			t.CursorX = end
 		}
 		data = data[count:]
+	}
+	t.LastPrintedCluster = printableASCIIStrings[lastByte]
+	t.LastPrintedValid = true
+	t.tailRow, t.tailColumn = lastRow, lastColumn
+	t.tailValid = lastByte != ' '
+	update.CursorChanged = true
+}
+
+func (t *TerminalState) putASCIIByte(b byte, update *Update) {
+	t.invalidateTail()
+	if t.wrapPending {
+		t.wrapPending = false
+		if t.AutoWrap {
+			t.setRowWrapped(t.CursorY, true)
+			t.CursorX = 0
+			t.wrapLine(update)
+		}
+	}
+	styleID := t.currentStyleID()
+	writtenColumn := t.CursorX
+	t.insertChars(1, styleID)
+	dirtyStart, dirtyEnd := t.clearGlyphsForWrite(t.CursorY, writtenColumn, 1, styleID)
+	cluster := printableASCIIStrings[b]
+	if b == ' ' {
+		cluster = ""
+	}
+	t.GridRows[t.CursorY].Cells[writtenColumn] = Cell{Cluster: cluster, StyleID: styleID, Width: 1}
+	t.LastPrintedCluster = printableASCIIStrings[b]
+	t.LastPrintedValid = true
+	t.tailRow, t.tailColumn, t.tailValid = t.CursorY, writtenColumn, b != ' '
+	update.markDirty(t.CursorY, dirtyStart, dirtyEnd, t.Cols)
+	if t.CursorX+1 == t.Cols {
+		t.CursorX = t.Cols - 1
+		t.wrapPending = t.AutoWrap
+	} else {
+		t.CursorX++
+		t.setRowWrapped(t.CursorY, false)
 	}
 	update.CursorChanged = true
 }
@@ -615,6 +790,9 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 	if t.Cols == 0 || t.Rows == 0 {
 		return
 	}
+	if t.extendTail(r, update) {
+		return
+	}
 	if t.wrapPending {
 		t.wrapPending = false
 		if t.AutoWrap {
@@ -623,10 +801,11 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 			t.wrapLine(update)
 		}
 	}
-	cellWidth := 1
-	if r >= utf8.RuneSelf {
-		cellWidth = int(runeCellWidth(r))
+	cluster := string(r)
+	if r == ' ' {
+		cluster = ""
 	}
+	cellWidth := int(clusterCellWidth(cluster))
 	if cellWidth > t.Cols {
 		cellWidth = 1
 	}
@@ -646,12 +825,13 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 		t.insertChars(cellWidth, styleID)
 	}
 	dirtyStart, dirtyEnd := t.clearGlyphsForWrite(t.CursorY, writtenColumn, cellWidth, styleID)
-	t.GridRows[t.CursorY].Cells[writtenColumn] = Cell{Rune: r, StyleID: styleID, Width: uint8(cellWidth)}
+	t.GridRows[t.CursorY].Cells[writtenColumn] = Cell{Cluster: cluster, StyleID: styleID, Width: uint8(cellWidth)}
 	for column := writtenColumn + 1; column < writtenColumn+cellWidth; column++ {
 		t.GridRows[t.CursorY].Cells[column] = Cell{StyleID: styleID, Width: 0}
 	}
-	t.LastPrintedRune = r
+	t.LastPrintedCluster = string(r)
 	t.LastPrintedValid = true
+	t.tailRow, t.tailColumn, t.tailValid = t.CursorY, writtenColumn, cluster != ""
 	update.markDirty(t.CursorY, dirtyStart, dirtyEnd, t.Cols)
 	if t.CursorX+cellWidth == t.Cols {
 		t.CursorX = t.Cols - 1
@@ -661,6 +841,85 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 		t.setRowWrapped(t.CursorY, false)
 	}
 	update.CursorChanged = true
+}
+
+func (t *TerminalState) extendTail(r rune, update *Update) bool {
+	if !t.tailValid || t.tailRow < 0 || t.tailRow >= t.Rows || t.tailColumn < 0 || t.tailColumn >= t.Cols {
+		return false
+	}
+	anchor := &t.GridRows[t.tailRow].Cells[t.tailColumn]
+	if anchor.Width == 0 || anchor.Cluster == "" {
+		t.invalidateTail()
+		return false
+	}
+	candidate := anchor.Cluster + string(r)
+	if !isSingleGrapheme(candidate) {
+		return false
+	}
+	oldWidth := int(anchor.Width)
+	newWidth := int(clusterCellWidth(candidate))
+	if newWidth > t.Cols {
+		newWidth = 1
+	}
+	styleID := anchor.StyleID
+
+	if oldWidth == 1 && newWidth == 2 && t.tailColumn+1 >= t.Cols {
+		if !t.AutoWrap {
+			// There is no two-column span available. Keep a deterministic degraded
+			// width while preserving the complete cluster text in the anchor.
+			anchor.Cluster = candidate
+			update.markDirty(t.tailRow, t.tailColumn, t.tailColumn+1, t.Cols)
+			t.LastPrintedCluster, t.LastPrintedValid = candidate, true
+			return true
+		}
+		// A provisional width-1 tail at the final column became wide. Relocate
+		// it exactly as if the complete cluster had arrived atomically.
+		t.GridRows[t.tailRow].Cells[t.tailColumn] = blankCell(styleID)
+		update.markDirty(t.tailRow, t.tailColumn, t.tailColumn+1, t.Cols)
+		t.setRowWrapped(t.tailRow, true)
+		t.CursorX = 0
+		t.CursorY = t.tailRow
+		t.wrapPending = false
+		t.wrapLine(update)
+		t.tailRow, t.tailColumn = t.CursorY, 0
+		anchor = &t.GridRows[t.tailRow].Cells[0]
+		*anchor = Cell{Cluster: candidate, StyleID: styleID, Width: 2}
+		t.GridRows[t.tailRow].Cells[1] = Cell{StyleID: styleID, Width: 0}
+		t.CursorX = 2
+		update.markDirty(t.tailRow, 0, 2, t.Cols)
+		update.CursorChanged = true
+		t.LastPrintedCluster, t.LastPrintedValid = candidate, true
+		return true
+	}
+
+	anchor.Cluster = candidate
+	anchor.Width = uint8(newWidth)
+	if oldWidth == 1 && newWidth == 2 {
+		t.clearGlyphsForWrite(t.tailRow, t.tailColumn+1, 1, styleID)
+		t.GridRows[t.tailRow].Cells[t.tailColumn+1] = Cell{StyleID: styleID, Width: 0}
+		if t.CursorY == t.tailRow && t.CursorX == t.tailColumn+1 {
+			t.CursorX++
+		}
+	} else if oldWidth == 2 && newWidth == 1 {
+		t.GridRows[t.tailRow].Cells[t.tailColumn+1] = blankCell(styleID)
+		if t.CursorY == t.tailRow && t.CursorX == t.tailColumn+2 {
+			t.CursorX--
+		}
+	}
+	t.wrapPending = t.AutoWrap && t.tailColumn+newWidth == t.Cols
+	if t.wrapPending {
+		t.CursorX = t.Cols - 1
+	}
+	update.markDirty(t.tailRow, t.tailColumn, min(t.Cols, t.tailColumn+max(oldWidth, newWidth)), t.Cols)
+	if oldWidth != newWidth {
+		update.CursorChanged = true
+	}
+	t.LastPrintedCluster, t.LastPrintedValid = candidate, true
+	return true
+}
+
+func (t *TerminalState) invalidateTail() {
+	t.tailValid = false
 }
 
 func (t *TerminalState) clearGlyphsForWrite(row, start, cellWidth int, styleID uint32) (int, int) {
@@ -693,6 +952,9 @@ func (t *TerminalState) executeCSI(seq []byte, update *Update) {
 	}
 	params := parsed.Params[:parsed.ParamCount]
 	intermediates := parsed.Intermediates[:parsed.IntermediateCount]
+	if parsed.Final != 'm' && parsed.Final != 'n' && parsed.Final != 'c' {
+		t.invalidateTail()
+	}
 	switch parsed.PrivatePrefix {
 	case '?':
 		switch parsed.Final {
@@ -817,8 +1079,12 @@ func (t *TerminalState) executeCSI(seq []byte, update *Update) {
 		}
 	case 'b':
 		if t.LastPrintedValid {
+			cluster := t.LastPrintedCluster
 			for count := 0; count < max1(params, 1); count++ {
-				t.putRune(t.LastPrintedRune, update)
+				t.invalidateTail()
+				for _, r := range cluster {
+					t.putRune(r, update)
+				}
 			}
 		}
 	case 'r':
@@ -1187,7 +1453,7 @@ func (t *TerminalState) enterAlternateScreen() {
 	if t.Alternate {
 		return
 	}
-	t.Primary = &screenBuffer{Rows: cloneRows(t.GridRows), CursorX: t.CursorX, CursorY: t.CursorY, CurrentStyle: t.CurrentStyle, CursorVisible: t.CursorVisible, WrapPending: t.wrapPending, SavedCursor: t.SavedCursor, ScrollTop: t.ScrollTop, ScrollBottom: t.ScrollBottom, LastPrintedRune: t.LastPrintedRune, LastPrintedValid: t.LastPrintedValid, G0Charset: t.G0Charset, G1Charset: t.G1Charset, ActiveCharset: t.ActiveCharset}
+	t.Primary = &screenBuffer{Rows: cloneRows(t.GridRows), CursorX: t.CursorX, CursorY: t.CursorY, CurrentStyle: t.CurrentStyle, CursorVisible: t.CursorVisible, WrapPending: t.wrapPending, SavedCursor: t.SavedCursor, ScrollTop: t.ScrollTop, ScrollBottom: t.ScrollBottom, LastPrintedCluster: t.LastPrintedCluster, LastPrintedValid: t.LastPrintedValid, G0Charset: t.G0Charset, G1Charset: t.G1Charset, ActiveCharset: t.ActiveCharset}
 	t.GridRows = make([]Row, t.Rows)
 	for row := range t.GridRows {
 		t.GridRows[row] = blankRow(t.Cols, 0)
@@ -1220,7 +1486,7 @@ func (t *TerminalState) exitAlternateScreen() {
 	t.SavedCursor = p.SavedCursor
 	t.ScrollTop = p.ScrollTop
 	t.ScrollBottom = p.ScrollBottom
-	t.LastPrintedRune = p.LastPrintedRune
+	t.LastPrintedCluster = p.LastPrintedCluster
 	t.LastPrintedValid = p.LastPrintedValid
 	t.G0Charset = p.G0Charset
 	t.G1Charset = p.G1Charset
@@ -1742,40 +2008,54 @@ func (t *TerminalState) projectLogicalLine(line logicalLine, cols int) []reflowR
 		copy(row.cells, line.cells[:min(len(line.cells), cols)])
 		return []reflowRow{row}
 	}
-	out := make([]reflowRow, 0, (len(line.cells)+cols-1)/cols)
-	for start := 0; start < len(line.cells); start += cols {
-		end := start + cols
-		if end > len(line.cells) {
-			end = len(line.cells)
-		}
-		row := reflowRow{
-			cells:     make([]Cell, cols),
-			continued: end < len(line.cells),
-		}
+	newRow := func() reflowRow {
+		row := reflowRow{cells: make([]Cell, cols)}
 		for i := range row.cells {
 			row.cells[i] = blankCell(0)
 		}
-		copy(row.cells, line.cells[start:end])
-		if line.cursorHere && line.cursorOffset >= start && line.cursorOffset <= end {
-			row.cursorHere = true
-			row.cursorCol = line.cursorOffset - start
-			if row.cursorCol >= cols {
-				row.cursorCol = cols - 1
-			}
+		return row
+	}
+	out := make([]reflowRow, 0, (len(line.cells)+cols-1)/cols)
+	row, column := newRow(), 0
+	for source := 0; source < len(line.cells); {
+		cell := line.cells[source]
+		width := 1
+		if cell.Width == 2 && source+1 < len(line.cells) && line.cells[source+1].Width == 0 {
+			width = 2
+		} else if cell.Width == 0 {
+			// Never reproduce an orphan continuation from malformed legacy state.
+			source++
+			continue
 		}
-		out = append(out, row)
+		sourceWidth := width
+		if width > cols {
+			// A one-column viewport cannot hold a two-column cluster. Preserve the
+			// text as a width-degraded one-column anchor rather than splitting it.
+			width = 1
+			cell.Width = 1
+		}
+		if column+width > cols {
+			row.continued = true
+			out = append(out, row)
+			row, column = newRow(), 0
+		}
+		row.cells[column] = cell
+		if width == 2 {
+			row.cells[column+1] = Cell{StyleID: cell.StyleID, Width: 0}
+		}
+		if line.cursorHere && line.cursorOffset >= source && line.cursorOffset < source+width {
+			row.cursorHere = true
+			row.cursorCol = column + line.cursorOffset - source
+		}
+		column += width
+		source += sourceWidth
 	}
+	if line.cursorHere && line.cursorOffset >= len(line.cells) {
+		row.cursorHere = true
+		row.cursorCol = min(column, cols-1)
+	}
+	out = append(out, row)
 	return out
-}
-
-func mapCursorOffset(start int, rows []reflowRow, offset, cols int) (int, int) {
-	if cols <= 0 || len(rows) == 0 {
-		return start, 0
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	return start + (offset / cols), offset % cols
 }
 
 func (t *TerminalState) setRowWrapped(row int, wrapped bool) {
@@ -1845,7 +2125,7 @@ func trimTrailingBlankCells(cells []Cell) []Cell {
 	end := len(cells)
 	for end > 0 {
 		cell := cells[end-1]
-		if cell.Rune != 0 && cell.Rune != ' ' {
+		if cell.Cluster != "" || cell.Width != 1 {
 			break
 		}
 		end--

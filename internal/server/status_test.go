@@ -275,12 +275,16 @@ func (c *statusTestClient) read(t *testing.T) testStatusBar {
 				c.status.Cells = append(c.status.Cells, make([]protocol.Cell, end-len(c.status.Cells))...)
 			}
 			for c.column < end {
-				c.status.Cells[c.column] = protocol.Cell{Rune: command.Fill.Rune, StyleID: c.styleID, Width: command.Fill.Width}
+				cluster := string(command.Fill.Rune)
+				if command.Fill.Rune == ' ' {
+					cluster = ""
+				}
+				c.status.Cells[c.column] = protocol.Cell{Cluster: cluster, StyleID: c.styleID, Width: command.Fill.Width}
 				c.column++
 			}
 		case protocol.DisplayOpcodeWriteTextUTF8:
 			for _, r := range string(command.Text) {
-				c.status.Cells[c.column] = protocol.Cell{Rune: r, StyleID: c.styleID, Width: 1}
+				c.status.Cells[c.column] = protocol.Cell{Cluster: string(r), StyleID: c.styleID, Width: 1}
 				c.column++
 			}
 		case protocol.DisplayOpcodePresent:
@@ -297,11 +301,15 @@ func (c *statusTestClient) read(t *testing.T) testStatusBar {
 
 func assertStatusText(t *testing.T, status testStatusBar, want string) {
 	t.Helper()
-	text := make([]rune, 0, len(status.Cells))
+	var text strings.Builder
 	for _, cell := range status.Cells {
-		text = append(text, cell.Rune)
+		if cell.Cluster == "" {
+			text.WriteByte(' ')
+		} else {
+			text.WriteString(cell.Cluster)
+		}
 	}
-	if got := strings.TrimRight(string(text), " "); strings.TrimRight(want, " ") != got {
+	if got := strings.TrimRight(text.String(), " "); strings.TrimRight(want, " ") != got {
 		t.Fatalf("status text = %q, want %q", got, strings.TrimRight(want, " "))
 	}
 }

@@ -13,7 +13,7 @@ import (
 
 func TestDisplayCompilerUsesSpecializedTextAndFill(t *testing.T) {
 	output := newRenderOutput()
-	cells := []protocol.Cell{{Rune: ' ', Width: 1}, {Rune: ' ', Width: 1}, {Rune: ' ', Width: 1}, {Rune: 'o', Width: 1}, {Rune: 'k', Width: 1}}
+	cells := []protocol.Cell{{Width: 1}, {Width: 1}, {Width: 1}, {Cluster: "o", Width: 1}, {Cluster: "k", Width: 1}}
 	if err := newDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(2, 4, cells); err != nil {
 		t.Fatal(err)
 	}
@@ -729,13 +729,73 @@ func TestDisplayCompilerDefaultOverrideDoesNotLatchStyle(t *testing.T) {
 
 func TestDisplayCompilerKeepsWidthTwoFallback(t *testing.T) {
 	output := newRenderOutput()
-	cells := []protocol.Cell{{Rune: '界', Width: 2, StyleID: 0}}
+	cells := []protocol.Cell{{Cluster: "界", Width: 2, StyleID: 0}, {Width: 0}}
 	if err := newDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
 		t.Fatal(err)
 	}
 	commands := decodePendingCommands(t, output.pending)
 	if len(commands) == 0 || commands[len(commands)-1].Opcode != protocol.DisplayOpcodeWriteText || commands[len(commands)-1].Width != 2 {
 		t.Fatalf("commands=%#v", commands)
+	}
+}
+
+func TestDisplayCompilerWritesMultiRuneClusterAtomically(t *testing.T) {
+	output := newRenderOutput()
+	cells := []protocol.Cell{{Cluster: "👩‍💻", Width: 2}, {Width: 0}, {Cluster: "X", Width: 1}}
+	if err := newDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
+		t.Fatal(err)
+	}
+	commands := decodePendingCommands(t, output.pending)
+	var cluster *protocol.DisplayCommand
+	for i := range commands {
+		if commands[i].Opcode == protocol.DisplayOpcodeWriteCluster {
+			cluster = &commands[i]
+			break
+		}
+	}
+	if cluster == nil || string(cluster.Text) != "👩‍💻" || cluster.Width != 2 {
+		t.Fatalf("commands=%#v", commands)
+	}
+	for _, command := range commands {
+		if command.Opcode == protocol.DisplayOpcodeSetWritePosition && command.Column == 2 {
+			t.Fatal("compiler unnecessarily repositioned after atomic cluster")
+		}
+	}
+}
+
+func TestDisplayCompilerPreservesRepresentativeInternationalClusters(t *testing.T) {
+	tests := []struct {
+		name    string
+		cluster string
+		width   uint8
+	}{
+		{name: "hebrew points", cluster: "שָׁ", width: 1},
+		{name: "tamil vowel sign", cluster: "நி", width: 1},
+		{name: "devanagari conjunct", cluster: "क्ष", width: 2},
+		{name: "cjk variation selector", cluster: "葛\U000e0100", width: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output := newRenderOutput()
+			cells := []protocol.Cell{{Cluster: tt.cluster, Width: tt.width}}
+			if tt.width == 2 {
+				cells = append(cells, protocol.Cell{Width: 0})
+			}
+			cells = append(cells, protocol.Cell{Cluster: "X", Width: 1})
+			if err := newDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
+				t.Fatal(err)
+			}
+			commands := decodePendingCommands(t, output.pending)
+			var clusterCommands []protocol.DisplayCommand
+			for _, command := range commands {
+				if command.Opcode == protocol.DisplayOpcodeWriteCluster {
+					clusterCommands = append(clusterCommands, command)
+				}
+			}
+			if len(clusterCommands) != 1 || string(clusterCommands[0].Text) != tt.cluster || clusterCommands[0].Width != tt.width {
+				t.Fatalf("cluster commands = %#v", clusterCommands)
+			}
+		})
 	}
 }
 
@@ -998,7 +1058,7 @@ func countOpcode(opcodes []protocol.DisplayOpcode, want protocol.DisplayOpcode) 
 func textCells(text string, styleID uint32) []protocol.Cell {
 	cells := make([]protocol.Cell, 0, len(text))
 	for _, r := range text {
-		cells = append(cells, protocol.Cell{Rune: r, StyleID: styleID, Width: 1})
+		cells = append(cells, protocol.Cell{Cluster: string(r), StyleID: styleID, Width: 1})
 	}
 	return cells
 }
@@ -1017,7 +1077,7 @@ func compilerBenchmarkRows() [][]protocol.Cell {
 				style = 3
 				r = rune('a' + col%26)
 			}
-			cells[col] = protocol.Cell{Rune: r, StyleID: style, Width: 1}
+			cells[col] = protocol.Cell{Cluster: string(r), StyleID: style, Width: 1}
 		}
 		rows[row] = cells
 	}

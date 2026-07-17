@@ -7,11 +7,12 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
-func normalizedRune(r rune) rune {
-	if r == 0 {
-		return ' '
+func displayRune(cell protocol.Cell) (rune, bool) {
+	if cell.Cluster == "" {
+		return ' ', cell.Width == 1
 	}
-	return r
+	r, size := utf8.DecodeRuneInString(cell.Cluster)
+	return r, size == len(cell.Cluster)
 }
 
 type displayCompiler struct {
@@ -55,6 +56,17 @@ func (d *displayCompiler) writeCells(row, column int, cells []protocol.Cell) err
 		if err := d.moveTo(row, column+i); err != nil {
 			return err
 		}
+		if _, singleRune := displayRune(cell); !singleRune {
+			if err := d.selectStyle(cell.StyleID); err != nil {
+				return err
+			}
+			if err := d.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteCluster, Width: cell.Width, Text: []byte(cell.Cluster)}); err != nil {
+				return err
+			}
+			d.column += int(cell.Width)
+			i += int(cell.Width)
+			continue
+		}
 		if cell.Width == 1 {
 			j := i + 1
 			for j < len(cells) && cells[j] == cell {
@@ -65,7 +77,8 @@ func (d *displayCompiler) writeCells(row, column int, cells []protocol.Cell) err
 				if err := d.selectStyle(cell.StyleID); err != nil {
 					return err
 				}
-				if err := d.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeFill, Fill: protocol.Fill{Columns: count, Rune: normalizedRune(cell.Rune), Width: 1}}); err != nil {
+				r, _ := displayRune(cell)
+				if err := d.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeFill, Fill: protocol.Fill{Columns: count, Rune: r, Width: 1}}); err != nil {
 					return err
 				}
 				d.column += count
@@ -82,6 +95,10 @@ func (d *displayCompiler) writeCells(row, column int, cells []protocol.Cell) err
 			if current.Width != width || current.Width == 0 {
 				break
 			}
+			r, singleRune := displayRune(current)
+			if !singleRune {
+				break
+			}
 			if current.StyleID != styleID {
 				end, ok := d.blankBridgeEnd(cells, i, styleID)
 				if !ok {
@@ -93,7 +110,7 @@ func (d *displayCompiler) writeCells(row, column int, cells []protocol.Cell) err
 				}
 				continue
 			}
-			d.textScratch = utf8.AppendRune(d.textScratch, normalizedRune(current.Rune))
+			d.textScratch = utf8.AppendRune(d.textScratch, r)
 			i += int(current.Width)
 		}
 		if width == 1 && styleID == 0 && (!d.styleValid || d.styleID != 0) {
@@ -123,7 +140,8 @@ func (d *displayCompiler) blankBridgeEnd(cells []protocol.Cell, start int, targe
 	checked := false
 	for end < len(cells) {
 		cell := cells[end]
-		if cell.Width != 1 || normalizedRune(cell.Rune) != ' ' {
+		r, singleRune := displayRune(cell)
+		if cell.Width != 1 || !singleRune || r != ' ' {
 			break
 		}
 		if !checked || cell.StyleID != checkedStyle {
@@ -138,7 +156,8 @@ func (d *displayCompiler) blankBridgeEnd(cells []protocol.Cell, start int, targe
 		return start, false
 	}
 	next := cells[end]
-	return end, next.Width > 0 && normalizedRune(next.Rune) != ' ' && next.StyleID == targetStyle
+	r, singleRune := displayRune(next)
+	return end, next.Width > 0 && singleRune && r != ' ' && next.StyleID == targetStyle
 }
 
 func (d *displayCompiler) blankStylesEquivalent(leftID, rightID uint32) bool {

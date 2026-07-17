@@ -208,7 +208,7 @@ func TestInputPredictorSupportsTypingAfterBackspace(t *testing.T) {
 
 func TestInputPredictorRefusesNonblankTarget(t *testing.T) {
 	cache := newPaneScanoutCache(8, 1)
-	cache.row(0)[0] = protocol.Cell{Rune: 'x', Width: 1}
+	cache.row(0)[0] = protocol.Cell{Cluster: "x", Width: 1}
 	var predictor inputPredictor
 	if result, changed := predictor.applyLocalInput([]byte("a"), testPredictionContext(), cache); changed || len(result.frame.spans) != 0 || len(predictor.pendingOperations()) != 0 {
 		t.Fatalf("nonblank prediction result=%#v changed=%v predictor=%#v", result, changed, predictor)
@@ -239,7 +239,7 @@ func TestScanoutPredictionDecoratesAuthoritativeFrame(t *testing.T) {
 	if !strings.Contains(out, "a") || !strings.Contains(out, "b") || !strings.HasSuffix(out, "\x1b[1;3H\x1b[?25h") {
 		t.Fatalf("prediction output = %q", out)
 	}
-	if got := s.caches[0].row(0)[1].Rune; got != ' ' {
+	if got := s.caches[0].row(0)[1].Cluster; got != "" {
 		t.Fatalf("prediction contaminated authoritative cache with %q", got)
 	}
 }
@@ -272,7 +272,7 @@ func TestScanoutPredictionEmitsBackspaceWithoutChangingAuthoritativeCache(t *tes
 	if !strings.Contains(out, " ") || !strings.HasSuffix(out, "\x1b[1;1H\x1b[?25h") {
 		t.Fatalf("backspace output = %q", out)
 	}
-	if got := s.caches[0].row(0)[0].Rune; got != 'a' {
+	if got := s.caches[0].row(0)[0].Cluster; got != "a" {
 		t.Fatalf("backspace changed authoritative cache to %q", got)
 	}
 }
