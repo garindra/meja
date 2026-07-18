@@ -377,7 +377,6 @@ func TestPersistenceLoopWritesOnlyAfterSessionChange(t *testing.T) {
 	session.setSessionName("changed")
 	addPersistenceTestWindow(session, 1)
 	<-session.persistenceNow
-	session.processNames = emptyProcessObserver{}
 	directory := filepath.Join(t.TempDir(), "sessions")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -483,7 +482,7 @@ func TestSessionActorPublishesOnlyPersistedStructureChanges(t *testing.T) {
 	}
 }
 
-func TestProcessObserverPublishesStableCommandsAndIgnoresLs(t *testing.T) {
+func TestMonitoredObservationsPersistStableCommandsAndIgnoreTransientCommands(t *testing.T) {
 	session := NewSession(16)
 	t.Cleanup(session.stopOperations)
 	pane := &Pane{
@@ -500,11 +499,18 @@ func TestProcessObserverPublishesStableCommandsAndIgnoresLs(t *testing.T) {
 	<-session.persistenceNow
 
 	observer := &changingProcessObserver{name: "nvim", argv: []string{"nvim", "."}, cwd: "/work"}
-	tracker := newProcessSaveTracker()
-	for range processSaveStableSamples {
-		if err := session.refreshObservedProcesses(context.Background(), observer, tracker); err != nil {
+	anchor := Anchor{Key: PaneKey{SessionID: session.ID, PaneID: pane.ID}, Root: pane.Root, PTY: pane.PTY, RootIsShell: true}
+	applyObservation := func() {
+		t.Helper()
+		observation := observer.Observe(context.Background(), []Anchor{anchor})[anchor.Key]
+		if err := session.coordinate(func() error {
+			return session.applyMonitoredProcessObservations(monitoredProcessBatch{{anchor: anchor, observation: observation}})
+		}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	for range processSaveStableSamples {
+		applyObservation()
 	}
 	select {
 	case <-session.persistenceNow:
@@ -543,9 +549,7 @@ func TestProcessObserverPublishesStableCommandsAndIgnoresLs(t *testing.T) {
 		t.Fatalf("persisted automatic window name = %q, want process-observer result", persistedName)
 	}
 	for range processSaveStableSamples {
-		if err := session.refreshObservedProcesses(context.Background(), observer, tracker); err != nil {
-			t.Fatal(err)
-		}
+		applyObservation()
 	}
 	select {
 	case <-session.persistenceNow:
@@ -555,9 +559,7 @@ func TestProcessObserverPublishesStableCommandsAndIgnoresLs(t *testing.T) {
 
 	observer.name, observer.argv = "ls", []string{"ls", "-la"}
 	for range processSaveStableSamples {
-		if err := session.refreshObservedProcesses(context.Background(), observer, tracker); err != nil {
-			t.Fatal(err)
-		}
+		applyObservation()
 	}
 	select {
 	case <-session.persistenceNow:
@@ -580,9 +582,7 @@ func TestProcessObserverPublishesStableCommandsAndIgnoresLs(t *testing.T) {
 
 	observer.name, observer.argv = "meja", []string{"meja", "save", "-t", "work", "-o", "dev.meja"}
 	for range processSaveStableSamples {
-		if err := session.refreshObservedProcesses(context.Background(), observer, tracker); err != nil {
-			t.Fatal(err)
-		}
+		applyObservation()
 	}
 	select {
 	case <-session.persistenceNow:
@@ -593,9 +593,7 @@ func TestProcessObserverPublishesStableCommandsAndIgnoresLs(t *testing.T) {
 
 	observer.name, observer.argv = "vite", []string{"vite"}
 	for range processSaveStableSamples {
-		if err := session.refreshObservedProcesses(context.Background(), observer, tracker); err != nil {
-			t.Fatal(err)
-		}
+		applyObservation()
 	}
 	select {
 	case <-session.persistenceNow:
@@ -604,11 +602,26 @@ func TestProcessObserverPublishesStableCommandsAndIgnoresLs(t *testing.T) {
 	}
 }
 
+func TestShellReturnRetainsLastMeaningfulCommandAndUpdatesCwd(t *testing.T) {
+	pane := &Pane{Launch: PaneLaunch{Cwd: "/old"}}
+	root := ObservedProcess{Cwd: "/new"}
+	got, ok := observedProcessSaveProjection(pane, ProcessObservation{
+		Status: StatusShellOwned,
+		Root:   &root,
+	}, processSaveProjection{Cwd: "/old", Command: "nvim ."})
+	if !ok {
+		t.Fatal("shell-owned observation was rejected")
+	}
+	want := processSaveProjection{Cwd: "/new", Command: "nvim ."}
+	if got != want {
+		t.Fatalf("shell return projection = %#v, want %#v", got, want)
+	}
+}
+
 func TestSessionRenameImmediatelyWritesPersistence(t *testing.T) {
 	session := NewSession(14)
 	session.setSessionName("before")
 	addPersistenceTestWindow(session, 0)
-	session.processNames = emptyProcessObserver{}
 	directory := filepath.Join(t.TempDir(), "sessions")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

@@ -56,6 +56,7 @@ type Daemon struct {
 	quicCancel            context.CancelFunc
 	serverCtx             context.Context
 	stop                  context.CancelFunc
+	processMonitor        *ProcessMonitor
 	stderr                io.Writer
 	controlPath           string
 	sessionPersistenceDir string
@@ -136,6 +137,7 @@ func Run(ctx context.Context, cfg Config) error {
 		controlPath:           socket,
 		sessionPersistenceDir: sessionPersistenceDirectory(socket),
 	}
+	d.processMonitor = NewProcessMonitor(serverCtx, nil)
 	actorCtx, stopActor := context.WithCancel(context.Background())
 	go d.runRequests(actorCtx)
 	defer func() {

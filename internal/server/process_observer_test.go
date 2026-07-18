@@ -141,6 +141,48 @@ func TestObserverClassifiesRealPTYJobs(t *testing.T) {
 	}
 }
 
+func TestProcObserverSharesSnapshotPairAcrossAnchors(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("procfs batching is Linux-specific")
+	}
+	shell := startTestShell(t)
+	second := shell.anchor
+	second.Key.PaneID++
+	scans := 0
+	observations, unstable := observeProcBatchAttempt(context.Background(), []Anchor{shell.anchor, second}, func(ctx context.Context) ([]procStat, error) {
+		scans++
+		return scanProcTable(ctx)
+	})
+	if len(unstable) != 0 {
+		t.Fatalf("stable idle shell reported unstable anchors: %#v", unstable)
+	}
+	if scans != 2 {
+		t.Fatalf("process table scans = %d, want one before/after pair", scans)
+	}
+	if len(observations) != 2 {
+		t.Fatalf("observations = %#v", observations)
+	}
+}
+
+func TestPSObserverPublishesStableForegroundProcessGroup(t *testing.T) {
+	shell := startTestShell(t)
+	anchor := shell.anchor
+	identity, err := identifyPS(shell.cmd.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor.Root = identity
+	observations := observePS(context.Background(), []Anchor{anchor})
+	observation := observations[anchor.Key]
+	want, err := foregroundProcessGroup(anchor.PTY)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.ForegroundPGID != want {
+		t.Fatalf("foreground pgid = %d, want %d; observation=%#v", observation.ForegroundPGID, want, observation)
+	}
+}
+
 type testShell struct {
 	ptmx   *os.File
 	cmd    *exec.Cmd

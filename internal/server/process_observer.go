@@ -142,111 +142,150 @@ func identifyProc(pid int) (Identity, error) {
 
 func observeProc(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObservation {
 	observations := make(map[PaneKey]ProcessObservation, len(anchors))
-	for _, anchor := range anchors {
-		observation := ProcessObservation{Key: anchor.Key, Status: StatusUnavailable}
-		for attempt := 0; attempt < observationRetries; attempt++ {
-			if err := ctx.Err(); err != nil {
-				observation.Issues = []string{err.Error()}
-				break
-			}
-			observed, err := observeAnchor(ctx, anchor)
-			if err == nil {
-				observation = observed
-				break
-			}
-			if errors.Is(err, errObservationChanged) {
-				observation = ProcessObservation{
-					Key:    anchor.Key,
-					Status: StatusUnstable,
-					Issues: []string{err.Error()},
-				}
-				continue
-			}
-			observation.Issues = []string{err.Error()}
-			break
+	pending := append([]Anchor(nil), anchors...)
+	for attempt := 0; attempt < observationRetries && len(pending) > 0; attempt++ {
+		attempted, unstable := observeProcBatchAttempt(ctx, pending, scanProcTable)
+		for key, observation := range attempted {
+			observations[key] = observation
 		}
-		observations[anchor.Key] = observation
+		pending = unstable
+	}
+	for _, anchor := range pending {
+		observations[anchor.Key] = ProcessObservation{
+			Key: anchor.Key, Status: StatusUnstable,
+			Issues: []string{errObservationChanged.Error()},
+		}
 	}
 	return observations
 }
 
-func observeAnchor(ctx context.Context, anchor Anchor) (ProcessObservation, error) {
-	observation := ProcessObservation{Key: anchor.Key, Status: StatusUnavailable}
+type preparedProcObservation struct {
+	anchor         Anchor
+	observation    ProcessObservation
+	foregroundPGID int
+	rootBefore     procStat
+	groupBefore    []procStat
+}
+
+// observeProcBatchAttempt takes one before/after process-table pair for every
+// anchor in the batch. This preserves the old stability check without paying
+// for two complete /proc scans independently for each pane.
+func observeProcBatchAttempt(ctx context.Context, anchors []Anchor, scan func(context.Context) ([]procStat, error)) (map[PaneKey]ProcessObservation, []Anchor) {
+	observations := make(map[PaneKey]ProcessObservation, len(anchors))
+	before, err := scan(ctx)
+	if err != nil {
+		for _, anchor := range anchors {
+			observations[anchor.Key] = unavailableProcObservation(anchor.Key, err)
+		}
+		return observations, nil
+	}
+	beforeByPID := indexProcStats(before)
+	prepared := make([]preparedProcObservation, 0, len(anchors))
+	var unstable []Anchor
+	for _, anchor := range anchors {
+		state, err := prepareProcObservation(anchor, before, beforeByPID)
+		if err == nil {
+			prepared = append(prepared, state)
+			continue
+		}
+		if errors.Is(err, errObservationChanged) {
+			unstable = append(unstable, anchor)
+			continue
+		}
+		observations[anchor.Key] = unavailableProcObservation(anchor.Key, err)
+	}
+	if len(prepared) == 0 {
+		return observations, unstable
+	}
+	after, err := scan(ctx)
+	if err != nil {
+		for _, state := range prepared {
+			observations[state.anchor.Key] = unavailableProcObservation(state.anchor.Key, err)
+		}
+		return observations, unstable
+	}
+	afterByPID := indexProcStats(after)
+	for _, state := range prepared {
+		rootAfter, ok := afterByPID[state.anchor.Root.PID]
+		foregroundAfter, foregroundErr := foregroundProcessGroup(state.anchor.PTY)
+		groupAfter := filterProcessGroup(after, state.rootBefore.Session, state.rootBefore.TTY, state.foregroundPGID)
+		if !ok || rootAfter.Identity != state.rootBefore.Identity ||
+			rootAfter.Session != state.rootBefore.Session || rootAfter.TTY != state.rootBefore.TTY ||
+			rootAfter.TPGID != state.foregroundPGID || foregroundErr != nil || foregroundAfter != state.foregroundPGID ||
+			!sameProcessGroup(state.groupBefore, groupAfter) {
+			unstable = append(unstable, state.anchor)
+			continue
+		}
+		observations[state.anchor.Key] = classifyPreparedProcObservation(state)
+	}
+	return observations, unstable
+}
+
+func unavailableProcObservation(key PaneKey, err error) ProcessObservation {
+	return ProcessObservation{Key: key, Status: StatusUnavailable, Issues: []string{err.Error()}}
+}
+
+func prepareProcObservation(anchor Anchor, table []procStat, byPID map[int]procStat) (preparedProcObservation, error) {
+	state := preparedProcObservation{anchor: anchor}
+	state.observation = ProcessObservation{Key: anchor.Key, Status: StatusUnavailable}
 	if anchor.PTY == nil {
-		return observation, errors.New("pane PTY is unavailable")
+		return state, errors.New("pane PTY is unavailable")
 	}
 	if anchor.Root.PID <= 0 || anchor.Root.BirthToken == 0 {
-		return observation, errors.New("pane root process identity is unavailable")
+		return state, errors.New("pane root process identity is unavailable")
 	}
-
 	foregroundPGID, err := foregroundProcessGroup(anchor.PTY)
 	if err != nil {
-		return observation, fmt.Errorf("read foreground process group: %w", err)
+		return state, fmt.Errorf("read foreground process group: %w", err)
 	}
-	rootBefore, err := readProcStat(anchor.Root.PID)
-	if err != nil {
-		return observation, fmt.Errorf("read pane root: %w", err)
+	rootBefore, ok := byPID[anchor.Root.PID]
+	if !ok {
+		return state, errors.New("read pane root: process is unavailable")
 	}
 	if rootBefore.Identity != anchor.Root {
-		return observation, errors.New("pane root process identity changed")
+		return state, errors.New("pane root process identity changed")
 	}
 	if rootBefore.TPGID != foregroundPGID {
-		return observation, errObservationChanged
+		return state, errObservationChanged
 	}
-
-	groupBefore, err := scanProcessGroup(ctx, rootBefore.Session, rootBefore.TTY, foregroundPGID)
-	if err != nil {
-		return observation, err
-	}
-	processes := make([]ObservedProcess, 0, len(groupBefore))
-	for _, stat := range groupBefore {
+	state.foregroundPGID = foregroundPGID
+	state.rootBefore = rootBefore
+	state.groupBefore = filterProcessGroup(table, rootBefore.Session, rootBefore.TTY, foregroundPGID)
+	state.observation.ForegroundPGID = foregroundPGID
+	state.observation.Processes = make([]ObservedProcess, 0, len(state.groupBefore))
+	for _, stat := range state.groupBefore {
 		process, issues, err := readProcess(stat)
 		if err != nil {
-			return observation, errObservationChanged
+			return state, errObservationChanged
 		}
-		processes = append(processes, process)
-		observation.Issues = append(observation.Issues, issues...)
+		state.observation.Processes = append(state.observation.Processes, process)
+		state.observation.Issues = append(state.observation.Issues, issues...)
 	}
-
-	rootProcess, rootIssues, err := readProcess(rootBefore)
+	rootProcess, issues, err := readProcess(rootBefore)
 	if err != nil {
-		return observation, errObservationChanged
+		return state, errObservationChanged
 	}
-	observation.Issues = append(observation.Issues, rootIssues...)
+	state.observation.Root = &rootProcess
+	state.observation.Issues = append(state.observation.Issues, issues...)
+	return state, nil
+}
 
-	rootAfter, err := readProcStat(anchor.Root.PID)
-	if err != nil || rootAfter.Identity != rootBefore.Identity ||
-		rootAfter.Session != rootBefore.Session || rootAfter.TTY != rootBefore.TTY ||
-		rootAfter.TPGID != foregroundPGID {
-		return observation, errObservationChanged
-	}
-	foregroundAfter, err := foregroundProcessGroup(anchor.PTY)
-	if err != nil || foregroundAfter != foregroundPGID {
-		return observation, errObservationChanged
-	}
-	groupAfter, err := scanProcessGroup(ctx, rootBefore.Session, rootBefore.TTY, foregroundPGID)
-	if err != nil || !sameProcessGroup(groupBefore, groupAfter) {
-		return observation, errObservationChanged
-	}
-
-	observation.ForegroundPGID = foregroundPGID
-	observation.Root = &rootProcess
-	observation.Processes = processes
-	if !anchor.RootIsShell {
+func classifyPreparedProcObservation(state preparedProcObservation) ProcessObservation {
+	observation := state.observation
+	if !state.anchor.RootIsShell {
 		observation.Status = StatusDetected
-		observation.Candidate = cloneObservedProcess(&rootProcess)
-		return observation, nil
+		observation.Candidate = cloneObservedProcess(observation.Root)
+		return observation
 	}
-
 	directChildren := make([]*ObservedProcess, 0, 2)
 	for index := range observation.Processes {
-		if observation.Processes[index].PPID == anchor.Root.PID {
+		if observation.Processes[index].PPID == state.anchor.Root.PID {
 			directChildren = append(directChildren, &observation.Processes[index])
 		}
 	}
 	switch len(directChildren) {
 	case 0:
-		if foregroundPGID == rootBefore.PGID {
+		if state.foregroundPGID == state.rootBefore.PGID {
 			observation.Status = StatusShellOwned
 		} else {
 			observation.Status = StatusAmbiguous
@@ -258,10 +297,13 @@ func observeAnchor(ctx context.Context, anchor Anchor) (ProcessObservation, erro
 	default:
 		observation.Status = StatusAmbiguous
 	}
-	return observation, nil
+	return observation
 }
 
 func foregroundProcessGroup(file *os.File) (int, error) {
+	if file == nil {
+		return 0, errors.New("pane PTY is unavailable")
+	}
 	raw, err := file.SyscallConn()
 	if err != nil {
 		return 0, err
@@ -282,12 +324,12 @@ func foregroundProcessGroup(file *os.File) (int, error) {
 	return pgid, nil
 }
 
-func scanProcessGroup(ctx context.Context, session int, tty int64, pgid int) ([]procStat, error) {
+func scanProcTable(ctx context.Context) ([]procStat, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, fmt.Errorf("scan /proc: %w", err)
 	}
-	stats := make([]procStat, 0, 4)
+	stats := make([]procStat, 0, len(entries))
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -300,12 +342,28 @@ func scanProcessGroup(ctx context.Context, session int, tty int64, pgid int) ([]
 		if err != nil {
 			continue
 		}
+		stats = append(stats, stat)
+	}
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Identity.PID < stats[j].Identity.PID })
+	return stats, nil
+}
+
+func filterProcessGroup(table []procStat, session int, tty int64, pgid int) []procStat {
+	stats := make([]procStat, 0, 4)
+	for _, stat := range table {
 		if stat.Session == session && stat.TTY == tty && stat.PGID == pgid && stat.State != 'Z' && stat.State != 'X' && stat.State != 'x' {
 			stats = append(stats, stat)
 		}
 	}
-	sort.Slice(stats, func(i, j int) bool { return stats[i].Identity.PID < stats[j].Identity.PID })
-	return stats, nil
+	return stats
+}
+
+func indexProcStats(stats []procStat) map[int]procStat {
+	indexed := make(map[int]procStat, len(stats))
+	for _, stat := range stats {
+		indexed[stat.Identity.PID] = stat
+	}
+	return indexed
 }
 
 func sameProcessGroup(first, second []procStat) bool {
@@ -489,6 +547,7 @@ func observePS(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObserva
 		return observations
 	}
 
+	foregroundBefore := sampleForegroundProcessGroups(anchors)
 	before, err := scanPS(ctx, "-ax")
 	if err != nil {
 		return unavailablePSObservations(anchors, err)
@@ -499,6 +558,7 @@ func observePS(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObserva
 	}
 	beforeByPID := indexPSProcesses(before)
 	afterByPID := indexPSProcesses(after)
+	foregroundAfter := sampleForegroundProcessGroups(anchors)
 
 	for _, anchor := range anchors {
 		observation := ProcessObservation{Key: anchor.Key, Status: StatusUnavailable}
@@ -506,6 +566,17 @@ func observePS(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObserva
 			observation.Issues = []string{err.Error()}
 			observations[anchor.Key] = observation
 			continue
+		}
+		beforeForeground := foregroundBefore[anchor.Key]
+		afterForeground := foregroundAfter[anchor.Key]
+		if beforeForeground.err == nil && afterForeground.err == nil {
+			if beforeForeground.pgid != afterForeground.pgid {
+				observation.Status = StatusUnstable
+				observation.Issues = []string{"PTY foreground process group changed during observation"}
+				observations[anchor.Key] = observation
+				continue
+			}
+			observation.ForegroundPGID = beforeForeground.pgid
 		}
 		rootBefore := beforeByPID[anchor.Root.PID]
 		rootAfter := afterByPID[anchor.Root.PID]
@@ -553,6 +624,20 @@ func observePS(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObserva
 		observations[anchor.Key] = observation
 	}
 	return observations
+}
+
+type foregroundProcessGroupSample struct {
+	pgid int
+	err  error
+}
+
+func sampleForegroundProcessGroups(anchors []Anchor) map[PaneKey]foregroundProcessGroupSample {
+	samples := make(map[PaneKey]foregroundProcessGroupSample, len(anchors))
+	for _, anchor := range anchors {
+		pgid, err := foregroundProcessGroup(anchor.PTY)
+		samples[anchor.Key] = foregroundProcessGroupSample{pgid: pgid, err: err}
+	}
+	return samples
 }
 
 func unavailablePSObservations(anchors []Anchor, err error) map[PaneKey]ProcessObservation {

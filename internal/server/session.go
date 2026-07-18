@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -67,6 +66,8 @@ func (s *Session) runOperations() {
 				s.stopOperations()
 				return
 			}
+		case batch := <-s.processObservationUpdates:
+			_ = s.applyMonitoredProcessObservations(batch)
 		case <-s.operationsDone:
 			return
 		}
@@ -102,6 +103,9 @@ func (s *Session) shutdownNow() {
 	}
 	s.stopping = true
 	s.ended = true
+	if s.processMonitor != nil {
+		s.processMonitor.DropSession(s.ID)
+	}
 	client := s.clientInstance
 	s.clientInstance = nil
 	// A session exit is terminal for its assigned client instance. Close the
@@ -234,26 +238,28 @@ type Session struct {
 	NextPaneID         uint64
 	NextLayoutRevision uint64
 
-	daemon                   *Daemon
-	clientInstance           *ClientInstance
-	rootDir                  string
-	operations               chan sessionOperation
-	operationsDone           chan struct{}
-	statusCommands           chan statusCommand
-	stopOnce                 sync.Once
-	processNames             ProcessObserver
-	nameMonitor              sync.Once
-	persistenceOnce          sync.Once
-	persistenceNow           chan struct{}
-	persistenceDone          chan struct{}
-	persistenceStarted       atomic.Bool
-	sessionPersistence       *SessionPersistence
-	obsoletePersistenceNames map[string]struct{}
-	promptContinuations      map[uint64]promptContinuation
-	nextStatusMessageID      uint64
-	statusMessageDuration    time.Duration
-	stopping                 bool
-	ended                    bool
+	daemon          *Daemon
+	clientInstance  *ClientInstance
+	rootDir         string
+	operations      chan sessionOperation
+	operationsDone  chan struct{}
+	statusCommands  chan statusCommand
+	stopOnce        sync.Once
+	processObserver ProcessObserver
+	processMonitor  *ProcessMonitor
+	processSaveCandidates     map[uint64]processSaveCandidate
+	processObservationUpdates chan monitoredProcessBatch
+	persistenceOnce           sync.Once
+	persistenceNow            chan struct{}
+	persistenceDone           chan struct{}
+	persistenceStarted        atomic.Bool
+	sessionPersistence        *SessionPersistence
+	obsoletePersistenceNames  map[string]struct{}
+	promptContinuations       map[uint64]promptContinuation
+	nextStatusMessageID       uint64
+	statusMessageDuration     time.Duration
+	stopping                  bool
+	ended                     bool
 }
 
 type Window struct {
@@ -353,19 +359,21 @@ func (c *ClientState) setFocusedPane(paneID uint64) {
 
 func NewSession(id uint64) *Session {
 	session := &Session{
-		ID:                       id,
-		Windows:                  map[uint64]*Window{},
-		Panes:                    map[uint64]*Pane{},
-		Clients:                  map[uint64]*ClientState{},
-		NextWindowID:             1,
-		operations:               make(chan sessionOperation, 64),
-		operationsDone:           make(chan struct{}),
-		statusCommands:           make(chan statusCommand, 64),
-		processNames:             NewProcessObserver(),
-		persistenceNow:           make(chan struct{}, 1),
-		persistenceDone:          make(chan struct{}),
-		obsoletePersistenceNames: make(map[string]struct{}),
-		promptContinuations:      make(map[uint64]promptContinuation),
+		ID:                        id,
+		Windows:                   map[uint64]*Window{},
+		Panes:                     map[uint64]*Pane{},
+		Clients:                   map[uint64]*ClientState{},
+		NextWindowID:              1,
+		operations:                make(chan sessionOperation, 64),
+		operationsDone:            make(chan struct{}),
+		statusCommands:            make(chan statusCommand, 64),
+		processObserver:           NewProcessObserver(),
+		processSaveCandidates:     make(map[uint64]processSaveCandidate),
+		processObservationUpdates: make(chan monitoredProcessBatch, 8),
+		persistenceNow:            make(chan struct{}, 1),
+		persistenceDone:           make(chan struct{}),
+		obsoletePersistenceNames:  make(map[string]struct{}),
+		promptContinuations:       make(map[uint64]promptContinuation),
 	}
 	go session.runOperations()
 	go session.runStatusOutput()
@@ -991,6 +999,7 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 	paneIDs := window.Layout.PaneIDs()
 	if len(paneIDs) <= 1 {
 		closedPane = s.Panes[c.FocusedPaneID]
+		s.unwatchPaneProcesses(c.FocusedPaneID)
 		delete(s.Panes, c.FocusedPaneID)
 		delete(s.Windows, window.ID)
 		windowClosed = true
@@ -1017,6 +1026,7 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 	if !removed || updated == nil {
 		return nil, nil, nil, false, 0, false, fmt.Errorf("focused pane %d not found in layout", c.FocusedPaneID)
 	}
+	s.unwatchPaneProcesses(c.FocusedPaneID)
 	delete(s.Panes, c.FocusedPaneID)
 	window.Layout = updated
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
@@ -1044,6 +1054,7 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 	if owner == nil || s.Panes[paneID] == nil {
 		return nil, cloneClientState(c), false, false, nil
 	}
+	s.unwatchPaneProcesses(paneID)
 	delete(s.Panes, paneID)
 	if owner.Zoomed && owner.ZoomedPaneID == paneID {
 		owner.clearZoom()
@@ -1107,6 +1118,7 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 		if p := s.Panes[paneID]; p != nil {
 			closedPanes = append(closedPanes, p)
 		}
+		s.unwatchPaneProcesses(paneID)
 		delete(s.Panes, paneID)
 	}
 	delete(s.Windows, windowID)
@@ -1485,16 +1497,6 @@ func visibleWindowPlacements(window *Window, rect Rect) []PanePlacement {
 	return window.Layout.Compute(rect)
 }
 
-const processNameRefreshInterval = time.Second
-
-type processNameInput struct {
-	windowID uint64
-	paneID   uint64
-	pane     *Pane
-	anchor   Anchor
-	latest   processSaveProjection
-}
-
 type processSaveProjection struct {
 	Cwd     string
 	Command string
@@ -1505,169 +1507,86 @@ type processSaveCandidate struct {
 	Samples    int
 }
 
-// processSaveTracker belongs to the process-monitor goroutine. It is the only
-// place that compares observations; the session actor receives only stable,
-// changed pane leaves.
-type processSaveTracker struct {
-	candidates map[uint64]processSaveCandidate
-}
-
-func newProcessSaveTracker() *processSaveTracker {
-	return &processSaveTracker{
-		candidates: make(map[uint64]processSaveCandidate),
-	}
-}
-
 const processSaveStableSamples = 2
 
-func (s *Session) startProcessNameMonitor() {
-	s.nameMonitor.Do(func() {
-		go s.runProcessNameMonitor()
-	})
+func (s *Session) watchPaneProcesses(pane *Pane) {
+	if pane == nil || s.processMonitor == nil {
+		return
+	}
+	anchor := Anchor{
+		Key:         PaneKey{SessionID: s.ID, PaneID: pane.ID},
+		Root:        pane.Root,
+		PTY:         pane.PTY,
+		RootIsShell: len(pane.Launch.RequestedArgv) == 0,
+	}
+	pane.processMonitor = s.processMonitor
+	pane.processKey = anchor.Key
+	s.processMonitor.Watch(s, anchor)
 }
 
-func (s *Session) runProcessNameMonitor() {
-	tracker := newProcessSaveTracker()
-	refresh := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), processNameRefreshInterval)
-		defer cancel()
-		_ = s.refreshObservedProcesses(ctx, s.processNames, tracker)
+func (s *Session) unwatchPaneProcesses(paneID uint64) {
+	if s.processMonitor != nil {
+		s.processMonitor.Unwatch(PaneKey{SessionID: s.ID, PaneID: paneID})
 	}
-	refresh()
-	ticker := time.NewTicker(processNameRefreshInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			refresh()
-		case <-s.operationsDone:
-			return
-		}
-	}
+	delete(s.processSaveCandidates, paneID)
 }
 
-// refreshAutomaticWindowNames observes processes outside the Session actor,
-// then publishes validated automatic-name and stable persisted-command changes
-// through that actor. The status goroutine continues to receive ordinary
-// immutable status models.
-func (s *Session) refreshAutomaticWindowNames(ctx context.Context, observer ProcessObserver) error {
-	return s.refreshObservedProcesses(ctx, observer, newProcessSaveTracker())
-}
-
-func (s *Session) refreshObservedProcesses(ctx context.Context, observer ProcessObserver, tracker *processSaveTracker) error {
-	if observer == nil {
-		observer = NewProcessObserver()
+// applyMonitoredProcessObservations runs on the Session actor. Monitor results
+// are advisory and may race pane removal, so every anchor is revalidated
+// against authoritative pane state before it can affect names or persistence.
+func (s *Session) applyMonitoredProcessObservations(batch monitoredProcessBatch) error {
+	if s.processSaveCandidates == nil {
+		s.processSaveCandidates = make(map[uint64]processSaveCandidate)
 	}
-	if tracker == nil {
-		tracker = newProcessSaveTracker()
+	latest := map[uint64]processSaveProjection{}
+	if s.sessionPersistence != nil {
+		latest = plannedProcessLeaves(s.sessionPersistence.Plan.Windows)
 	}
-	var inputs []processNameInput
-	if err := s.coordinate(func() error {
-		latest := map[uint64]processSaveProjection{}
-		if s.sessionPersistence != nil {
-			latest = plannedProcessLeaves(s.sessionPersistence.Plan.Windows)
-		}
-		inputs = make([]processNameInput, 0, len(s.Panes))
-		for _, window := range s.Windows {
-			if window == nil || window.Layout == nil {
-				continue
-			}
-			for _, paneID := range window.Layout.PaneIDs() {
-				pane := s.Panes[paneID]
-				if pane == nil || pane.Root.PID <= 0 {
-					continue
-				}
-				nameWindowID := uint64(0)
-				if window.AutomaticName && windowActivePaneID(window) == paneID {
-					nameWindowID = window.ID
-				}
-				inputs = append(inputs, processNameInput{
-					windowID: nameWindowID,
-					paneID:   paneID,
-					pane:     pane,
-					anchor: Anchor{
-						Key: PaneKey{
-							SessionID: s.ID,
-							PaneID:    paneID,
-						},
-						Root:        pane.Root,
-						PTY:         pane.PTY,
-						RootIsShell: len(pane.Launch.RequestedArgv) == 0,
-					},
-					latest: latest[paneID],
-				})
-			}
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil || len(inputs) == 0 {
-		return err
-	}
-	sort.Slice(inputs, func(i, j int) bool { return inputs[i].paneID < inputs[j].paneID })
-	anchors := make([]Anchor, len(inputs))
-	for index := range inputs {
-		anchors[index] = inputs[index].anchor
-	}
-	observations := observer.Observe(ctx, anchors)
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	livePanes := make(map[uint64]bool, len(inputs))
-	changed := make(map[uint64]processSaveProjection)
-	for _, input := range inputs {
-		livePanes[input.paneID] = true
-		projection, valid := observedProcessSaveProjection(input.pane, observations[input.anchor.Key], input.latest)
-		if !valid {
+	nameChanged := false
+	for _, update := range batch {
+		if update.anchor.Key.SessionID != s.ID {
 			continue
 		}
-		candidate := tracker.candidates[input.paneID]
-		if candidate.Projection == projection {
-			candidate.Samples++
-		} else {
-			candidate = processSaveCandidate{Projection: projection, Samples: 1}
+		paneID := update.anchor.Key.PaneID
+		pane := s.Panes[paneID]
+		if pane == nil || pane.Root != update.anchor.Root || pane.PTY != update.anchor.PTY {
+			continue
 		}
-		tracker.candidates[input.paneID] = candidate
-		if candidate.Samples >= processSaveStableSamples && input.latest != projection {
-			changed[input.paneID] = projection
+		projection, valid := observedProcessSaveProjection(pane, update.observation, latest[paneID])
+		if valid {
+			candidate := s.processSaveCandidates[paneID]
+			if candidate.Projection == projection {
+				candidate.Samples++
+			} else {
+				candidate = processSaveCandidate{Projection: projection, Samples: 1}
+			}
+			s.processSaveCandidates[paneID] = candidate
+			requiredSamples := processSaveStableSamples
+			if update.observation.Status == StatusShellOwned {
+				requiredSamples = 1
+			}
+			if candidate.Samples >= requiredSamples && latest[paneID] != projection {
+				s.persistObservedPaneForPersistence(paneID, projection)
+				latest[paneID] = projection
+			}
 		}
-	}
-	for paneID := range tracker.candidates {
-		if !livePanes[paneID] {
-			delete(tracker.candidates, paneID)
-		}
-	}
-
-	err := s.coordinate(func() error {
-		nameChanged := false
-		for _, input := range inputs {
-			if s.Panes[input.paneID] != input.pane || input.pane.Root != input.anchor.Root {
+		for _, window := range s.Windows {
+			if window == nil || !window.AutomaticName || windowActivePaneID(window) != paneID {
 				continue
 			}
-			observation := observations[input.anchor.Key]
-			if input.windowID != 0 {
-				window := s.Windows[input.windowID]
-				if window != nil && window.AutomaticName && windowActivePaneID(window) == input.paneID {
-					name := observationWindowName(observation)
-					if name != "" && name != window.Name {
-						window.Name = name
-						s.markWindowChangedForPersistence(window.ID)
-						nameChanged = true
-					}
-				}
+			name := observationWindowName(update.observation)
+			if name != "" && name != window.Name {
+				window.Name = name
+				s.markWindowChangedForPersistence(window.ID)
+				nameChanged = true
 			}
-			if projection, ok := changed[input.paneID]; ok {
-				s.persistObservedPaneForPersistence(input.paneID, projection)
-			}
+			break
 		}
-		if nameChanged {
-			return s.publishStatusBar()
-		}
-		return nil
-	})
-	return err
+	}
+	if nameChanged {
+		return s.publishStatusBar()
+	}
+	return nil
 }
 
 func observedProcessSaveProjection(pane *Pane, observation ProcessObservation, previous processSaveProjection) (processSaveProjection, bool) {
@@ -1684,6 +1603,7 @@ func observedProcessSaveProjection(pane *Pane, observation ProcessObservation, p
 	}
 	switch observation.Status {
 	case StatusShellOwned:
+		projection.Command = previous.Command
 		return projection, true
 	case StatusDetected:
 		if observation.Candidate == nil {

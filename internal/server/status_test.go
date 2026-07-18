@@ -237,7 +237,7 @@ func TestSuccessfulSetRootPromptRestoresNormalStatus(t *testing.T) {
 	s := NewSession(0)
 	root := t.TempDir()
 	s.rootDir = root
-	s.processNames = emptyProcessObserver{}
+	s.processObserver = emptyProcessObserver{}
 	client := s.NewClient(clientID0)
 	client.TerminalCols, client.TerminalRows = 80, 23
 	pane := &Pane{

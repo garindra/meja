@@ -169,6 +169,7 @@ func relayPTYOutput(pane *Pane) {
 		buf := ptyReadBuffers.Get().([]byte)
 		n, err := pane.PTY.Read(buf)
 		if n > 0 {
+			pane.notifyProcessActivity()
 			if delay := limiter.reserve(time.Now(), n); delay > 0 {
 				if timer == nil {
 					timer = time.NewTimer(delay)

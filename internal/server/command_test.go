@@ -534,7 +534,6 @@ window {
 	source.daemon = d
 	source.setSessionName("source")
 	source.rootDir = project
-	source.processNames = emptyProcessObserver{}
 	state := source.NewClient(clientID0)
 	state.TerminalCols, state.TerminalRows = 101, 37
 	source.CreateWindow(&Pane{
@@ -592,7 +591,7 @@ func TestContextualCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
 	s.daemon = d
 	s.setSessionName("renamed-session")
 	s.rootDir = t.TempDir()
-	s.processNames = emptyProcessObserver{}
+	s.processObserver = emptyProcessObserver{}
 	project := t.TempDir()
 	s.NewClient(clientID0)
 	s.CreateWindow(&Pane{ID: s.AddPaneID(), Launch: PaneLaunch{Cwd: project}}, clientID0)
@@ -670,7 +669,7 @@ func TestSetRootUsesObservedPaneCwdAndDoesNotMoveExistingPane(t *testing.T) {
 	}
 	s.rootDir = oldRoot
 	s.setSessionName("work")
-	s.processNames = &changingProcessObserver{name: "bash", cwd: observedCwd}
+	s.processObserver = &changingProcessObserver{name: "bash", cwd: observedCwd}
 	pane := &Pane{ID: 0, Root: Identity{PID: 100, BirthToken: 1000}, Launch: PaneLaunch{Cwd: oldRoot, Shell: "/bin/sh"}}
 	s.CreateWindow(pane, clientID0)
 	connection := &ClientInstance{}

@@ -27,22 +27,37 @@ type Pane struct {
 	Launch  PaneLaunch
 	Root    Identity
 
-	terminal     *TerminalState
-	metadata     atomic.Pointer[paneTerminalMetadata]
-	ptyOutput    chan []byte
-	ptyInput     chan []byte
-	commands     chan paneCommand
-	mainDone     chan struct{}
-	writerDone   chan struct{}
-	done         chan struct{}
-	stopping     atomic.Bool
-	startupInput []byte
-	viewMode     atomic.Uint32
-	historyView  *paneHistoryView
+	terminal               *TerminalState
+	metadata               atomic.Pointer[paneTerminalMetadata]
+	ptyOutput              chan []byte
+	ptyInput               chan []byte
+	commands               chan paneCommand
+	mainDone               chan struct{}
+	writerDone             chan struct{}
+	done                   chan struct{}
+	stopping               atomic.Bool
+	processActivityPending atomic.Bool
+	processMonitor         *ProcessMonitor
+	processKey             PaneKey
+	startupInput           []byte
+	viewMode               atomic.Uint32
+	historyView            *paneHistoryView
 
 	// Held exclusively by the pane main goroutine. A lease contains the actual
 	// QUIC stream and is physically returned before another pane receives it.
 	outputLease *OutputLease
+}
+
+// notifyProcessActivity is called directly by the PTY/input producers. The
+// atomic edge keeps a noisy pane from queueing more than one monitor message
+// until the monitor has consumed and probed that activity.
+func (p *Pane) notifyProcessActivity() {
+	if p == nil || p.processMonitor == nil || !p.processActivityPending.CompareAndSwap(false, true) {
+		return
+	}
+	if !p.processMonitor.Activity(p.processKey, &p.processActivityPending) {
+		p.processActivityPending.Store(false)
+	}
 }
 
 // PaneLaunch is the immutable recipe used to create a pane. RequestedArgv is
@@ -317,6 +332,9 @@ func (p *Pane) sendOwnedInput(data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
+	if inputMayChangeForegroundProcess(data) {
+		p.notifyProcessActivity()
+	}
 	if p.ptyInput == nil {
 		return writeAll(p.PTY, data)
 	}
@@ -328,6 +346,16 @@ func (p *Pane) sendOwnedInput(data []byte) error {
 	case <-p.done:
 		return io.ErrClosedPipe
 	}
+}
+
+func inputMayChangeForegroundProcess(data []byte) bool {
+	for _, current := range data {
+		switch current {
+		case '\r', '\n', 0x03, 0x04, 0x1a, 0x1c: // Enter, interrupt, EOF, suspend, quit.
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Pane) stop() {

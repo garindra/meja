@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -965,19 +964,7 @@ func TestSessionReplacementCloseIsNotLoggable(t *testing.T) {
 	}
 }
 
-type fixedProcessObserver map[PaneKey]ProcessObservation
-
-func (o fixedProcessObserver) Observe(_ context.Context, anchors []Anchor) map[PaneKey]ProcessObservation {
-	observations := make(map[PaneKey]ProcessObservation, len(anchors))
-	for _, anchor := range anchors {
-		if observation, ok := o[anchor.Key]; ok {
-			observations[anchor.Key] = observation
-		}
-	}
-	return observations
-}
-
-func TestRefreshAutomaticWindowNamesUsesEachWindowProcess(t *testing.T) {
+func TestMonitoredObservationsNameEachWindowFromItsActivePane(t *testing.T) {
 	session := NewSession(12)
 	t.Cleanup(session.stopOperations)
 	firstPane := &Pane{
@@ -1007,20 +994,26 @@ func TestRefreshAutomaticWindowNamesUsesEachWindowProcess(t *testing.T) {
 
 	firstRoot := ObservedProcess{Identity: firstPane.Root, Name: "bash"}
 	secondRoot := ObservedProcess{Identity: secondPane.Root, Name: "nvim"}
-	observer := fixedProcessObserver{
-		{SessionID: session.ID, PaneID: firstPane.ID}: {
-			Key:    PaneKey{SessionID: session.ID, PaneID: firstPane.ID},
-			Status: StatusShellOwned,
-			Root:   &firstRoot,
+	batch := monitoredProcessBatch{
+		{
+			anchor: Anchor{Key: PaneKey{SessionID: session.ID, PaneID: firstPane.ID}, Root: firstPane.Root, PTY: firstPane.PTY},
+			observation: ProcessObservation{
+				Key:    PaneKey{SessionID: session.ID, PaneID: firstPane.ID},
+				Status: StatusShellOwned,
+				Root:   &firstRoot,
+			},
 		},
-		{SessionID: session.ID, PaneID: secondPane.ID}: {
-			Key:       PaneKey{SessionID: session.ID, PaneID: secondPane.ID},
-			Status:    StatusDetected,
-			Root:      &secondRoot,
-			Candidate: &secondRoot,
+		{
+			anchor: Anchor{Key: PaneKey{SessionID: session.ID, PaneID: secondPane.ID}, Root: secondPane.Root, PTY: secondPane.PTY},
+			observation: ProcessObservation{
+				Key:       PaneKey{SessionID: session.ID, PaneID: secondPane.ID},
+				Status:    StatusDetected,
+				Root:      &secondRoot,
+				Candidate: &secondRoot,
+			},
 		},
 	}
-	if err := session.refreshAutomaticWindowNames(context.Background(), observer); err != nil {
+	if err := session.coordinate(func() error { return session.applyMonitoredProcessObservations(batch) }); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1040,7 +1033,7 @@ func TestRefreshAutomaticWindowNamesUsesEachWindowProcess(t *testing.T) {
 	}
 }
 
-func TestManualWindowNameIsNotOverwrittenByProcessRefresh(t *testing.T) {
+func TestMonitoredObservationDoesNotOverwriteManualWindowName(t *testing.T) {
 	session := NewSession(13)
 	t.Cleanup(session.stopOperations)
 	pane := &Pane{
@@ -1060,13 +1053,14 @@ func TestManualWindowNameIsNotOverwrittenByProcessRefresh(t *testing.T) {
 	}
 
 	process := ObservedProcess{Identity: pane.Root, Name: "top"}
-	observer := fixedProcessObserver{
-		{SessionID: session.ID, PaneID: pane.ID}: {
+	batch := monitoredProcessBatch{{
+		anchor: Anchor{Key: PaneKey{SessionID: session.ID, PaneID: pane.ID}, Root: pane.Root, PTY: pane.PTY},
+		observation: ProcessObservation{
 			Status:    StatusDetected,
 			Candidate: &process,
 		},
-	}
-	if err := session.refreshAutomaticWindowNames(context.Background(), observer); err != nil {
+	}}
+	if err := session.coordinate(func() error { return session.applyMonitoredProcessObservations(batch) }); err != nil {
 		t.Fatal(err)
 	}
 	var current *Window

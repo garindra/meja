@@ -934,7 +934,7 @@ func (s *Session) observedPaneCwd(pane *Pane) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	key := PaneKey{SessionID: s.ID, PaneID: pane.ID}
-	observations := s.processNames.Observe(ctx, []Anchor{{
+	observations := s.processObserver.Observe(ctx, []Anchor{{
 		Key:         key,
 		Root:        pane.Root,
 		PTY:         pane.PTY,
@@ -1188,7 +1188,7 @@ func (d *Daemon) commandSaveSession(request protocol.CommandRequest, args []stri
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sessionPersistenceTimeout)
 	defer cancel()
-	captured, err := session.captureSession(ctx, session.processNames)
+	captured, err := session.captureSession(ctx, session.processObserver)
 	if err != nil {
 		return commandResult{}, fmt.Errorf("capture session: %w", err)
 	}
@@ -1428,6 +1428,7 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 			}
 			session = newSession(d.nextID, target.name)
 			session.daemon = d
+			session.processMonitor = d.processMonitor
 			session.startPersistence(d.sessionPersistenceDir)
 			d.sessions[d.nextID] = session
 			d.reserveSessionName(session, target.name)
@@ -1452,6 +1453,7 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 			}
 			session = newSession(d.nextID, restored.Name)
 			session.daemon = d
+			session.processMonitor = d.processMonitor
 			session.startPersistence(d.sessionPersistenceDir)
 			operationErr = session.restoreSessionPlan(restored, target.restoreMode)
 			if operationErr != nil {

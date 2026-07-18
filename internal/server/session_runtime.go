@@ -71,7 +71,7 @@ func (s *Session) handleInputFrame(client *ClientInstance, frame protocol.Frame)
 
 func (s *Session) startPane(pane *Pane) {
 	pane.initializeRuntime()
-	s.startProcessNameMonitor()
+	s.watchPaneProcesses(pane)
 	go pane.run()
 	go relayPTYOutput(pane)
 	go runPTYWriter(pane, func(error) {
