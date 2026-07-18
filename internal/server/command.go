@@ -170,8 +170,11 @@ func serveCommandConnection(conn net.Conn, daemon *Daemon) {
 var errSessionUnavailable = errors.New("meja session unavailable")
 
 type commandSessionTarget struct {
-	id   uint64
-	name string
+	id          uint64
+	name        string
+	file        string
+	newName     string
+	restoreMode restoreCommandMode
 }
 
 type commandSessionInfo struct {
@@ -190,6 +193,7 @@ type commandResult struct {
 	stdout     []byte
 	stderr     []byte
 	bootstrap  *protocol.CommandBootstrap
+	session    *Session
 	exitCode   int
 	stopServer bool
 }
@@ -210,8 +214,63 @@ func (d *Daemon) executeCommandNow(request protocol.CommandRequest) (commandResu
 	if !ok {
 		return commandResult{}, fmt.Errorf("unknown command %q", request.Args[0])
 	}
-	execution, err := command.execute(&commandContext{daemon: d, request: request}, request.Args[1:])
-	return execution.result, err
+	ctx := &commandContext{daemon: d, request: request}
+	var handoff *contextualCommandHandoff
+	if request.CallerSessionTarget != "" && command.sessionResult {
+		prepared, err := d.prepareContextualCommandHandoff(ctx)
+		if err != nil {
+			return commandResult{}, err
+		}
+		handoff = prepared
+	}
+	execution, err := command.execute(ctx, request.Args[1:])
+	if err != nil {
+		return commandResult{}, err
+	}
+	if handoff != nil && execution.result.session != nil {
+		if err := d.handoffContextualCommand(handoff, execution.result.session); err != nil {
+			return commandResult{}, err
+		}
+		execution.result.bootstrap = nil
+	}
+	return execution.result, nil
+}
+
+type contextualCommandHandoff struct {
+	source     *Session
+	instance   *ClientInstance
+	cols, rows uint16
+}
+
+func (d *Daemon) prepareContextualCommandHandoff(ctx *commandContext) (*contextualCommandHandoff, error) {
+	source, err := resolveCommandSession(ctx, ctx.request.CallerSessionTarget)
+	if err != nil {
+		return nil, err
+	}
+	var instance *ClientInstance
+	var cols, rows uint16
+	if err := source.coordinate(func() error {
+		instance = source.clientInstance
+		if state := source.Clients[clientID0]; state != nil {
+			cols, rows = state.TerminalCols, state.TerminalRows
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if instance == nil {
+		return nil, errors.New("the invoking Meja session is no longer attached")
+	}
+	return &contextualCommandHandoff{source: source, instance: instance, cols: cols, rows: rows}, nil
+}
+
+func (d *Daemon) handoffContextualCommand(handoff *contextualCommandHandoff, target *Session) error {
+	return handoff.instance.requestSessionSwitch(&sessionSwitchRequest{
+		rawTarget: strconv.FormatUint(target.ID, 10),
+		cols:      handoff.cols,
+		rows:      handoff.rows,
+		result:    make(chan error, 1),
+	})
 }
 
 type sessionCommandHandler func(*Session, *ClientInstance, []string) (bool, error)
@@ -230,16 +289,18 @@ type commandExecution struct {
 }
 
 type commandDefinition struct {
-	name    string
-	aliases []string
-	execute commandHandler
+	name          string
+	aliases       []string
+	sessionResult bool
+	execute       commandHandler
 }
 
 func registeredCommands() []commandDefinition {
 	return []commandDefinition{
-		{name: "new-session", aliases: []string{"new"}, execute: daemonCommand(handleDaemonNewSessionCommand)},
-		{name: "attach-session", aliases: []string{"attach", "a"}, execute: daemonCommand(handleDaemonAttachSessionCommand)},
-		{name: "restore-session", aliases: []string{"restore"}, execute: daemonCommand(handleDaemonRestoreSessionCommand)},
+		{name: "new-session", aliases: []string{"new"}, sessionResult: true, execute: daemonCommand(handleDaemonNewSessionCommand)},
+		{name: "attach-session", aliases: []string{"attach", "a"}, sessionResult: true, execute: daemonCommand(handleDaemonAttachSessionCommand)},
+		{name: "restore-session", aliases: []string{"restore"}, sessionResult: true, execute: restoreCommand()},
+		{name: "save-session", aliases: []string{"save"}, execute: daemonCommand(handleDaemonSaveSessionCommand)},
 		{name: "list-sessions", aliases: []string{"ls"}, execute: daemonCommand(handleDaemonListSessionsCommand)},
 		{name: "kill-server", execute: daemonCommand(handleDaemonKillServerCommand)},
 		{name: "server", execute: daemonCommand(handleLegacyDaemonServerCommand)},
@@ -258,6 +319,7 @@ func registeredCommands() []commandDefinition {
 		{name: "resize-pane", aliases: []string{"resizep"}, execute: sessionCommand(sessionTarget, handleResizePaneCommand)},
 		{name: "rename-window", aliases: []string{"renamew"}, execute: sessionCommand(windowTarget, handleRenameWindowCommand)},
 		{name: "rename-session", aliases: []string{"renames"}, execute: sessionCommand(sessionTarget, handleRenameSessionCommand)},
+		{name: "set-root", execute: sessionCommand(sessionTarget, handleSetRootCommand)},
 		{name: "switch-session", execute: attachedCommand(handleSwitchSessionCommand)},
 		{name: "confirm-before", execute: attachedCommand(handleConfirmBeforeCommand)},
 		{name: "command-prompt", execute: attachedCommand(handleCommandPromptCommand)},
@@ -308,6 +370,48 @@ func daemonCommand(run daemonCommandFunc) commandHandler {
 		}
 		result, err := run(ctx.daemon, ctx.request, args)
 		return commandExecution{result: result}, err
+	}
+}
+
+// restoreCommand attaches when invoked by the standalone CLI, but hands the
+// existing client to the restored session when invoked through `:`.
+func restoreCommand() commandHandler {
+	return func(ctx *commandContext, args []string) (commandExecution, error) {
+		if ctx.daemon == nil {
+			return commandExecution{}, errors.New("restore requires a running daemon")
+		}
+		if ctx.session == nil {
+			result, err := ctx.daemon.commandRestoreSession(ctx.request, args)
+			return commandExecution{result: result}, err
+		}
+		if ctx.client == nil {
+			return commandExecution{}, errors.New("restore requires an attached client")
+		}
+
+		workingDirectory := ctx.session.rootDir
+		if pane, _ := ctx.session.ActivePane(clientID0); pane != nil {
+			workingDirectory = ctx.session.observedPaneCwd(pane)
+		}
+		var cols, rows uint16
+		if state := ctx.session.SnapshotClient(clientID0); state != nil {
+			cols, rows = state.TerminalCols, state.TerminalRows
+		}
+		result, err := ctx.daemon.commandRestoreSession(protocol.CommandRequest{
+			WorkingDirectory: workingDirectory,
+			TerminalCols:     cols,
+			TerminalRows:     rows,
+		}, args)
+		if err != nil {
+			return commandExecution{}, err
+		}
+		if result.session == nil {
+			return commandExecution{}, errors.New("restored session is unavailable")
+		}
+		return commandExecution{}, &sessionSwitchRequest{
+			rawTarget: strconv.FormatUint(result.session.ID, 10),
+			cols:      cols,
+			rows:      rows,
+		}
 	}
 }
 
@@ -364,6 +468,10 @@ func resolveSessionCommandContext(ctx *commandContext, kind commandTargetKind, a
 	rawTarget, remaining, hasTarget, err := extractCommandTarget(args)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if !hasTarget && ctx.session == nil && ctx.request.CallerSessionTarget != "" {
+		rawTarget = ctx.request.CallerSessionTarget
+		hasTarget = true
 	}
 	if ctx.session == nil && !hasTarget {
 		return nil, nil, nil, errors.New("command requires -t <session-target>")
@@ -469,8 +577,12 @@ func handleDaemonAttachSessionCommand(d *Daemon, _ protocol.CommandRequest, args
 	return d.commandAttachSession(args)
 }
 
-func handleDaemonRestoreSessionCommand(d *Daemon, _ protocol.CommandRequest, args []string) (commandResult, error) {
-	return d.commandRestoreSession(args)
+func handleDaemonRestoreSessionCommand(d *Daemon, request protocol.CommandRequest, args []string) (commandResult, error) {
+	return d.commandRestoreSession(request, args)
+}
+
+func handleDaemonSaveSessionCommand(d *Daemon, request protocol.CommandRequest, args []string) (commandResult, error) {
+	return d.commandSaveSession(request, args)
 }
 
 func handleDaemonListSessionsCommand(d *Daemon, _ protocol.CommandRequest, args []string) (commandResult, error) {
@@ -539,6 +651,7 @@ func handleDetachClientCommand(_ *Session, _ *ClientInstance, args []string) (bo
 type sessionSwitchRequest struct {
 	rawTarget  string
 	cols, rows uint16
+	result     chan error
 }
 
 func (r *sessionSwitchRequest) Error() string { return "switch session" }
@@ -787,6 +900,64 @@ func handleRenameSessionCommand(s *Session, c *ClientInstance, args []string) (b
 	return false, nil
 }
 
+func handleSetRootCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
+	if len(args) > 1 {
+		return false, errors.New("set-root accepts an optional path")
+	}
+	pane, _ := s.ActivePane(clientID0)
+	if pane == nil {
+		return false, errors.New("set-root requires an active pane")
+	}
+	raw := ""
+	if len(args) == 1 {
+		raw = args[0]
+	}
+	currentCwd := s.rootDir
+	if raw == "" || (!filepath.IsAbs(raw) && raw != "~" && !strings.HasPrefix(raw, "~/")) {
+		currentCwd = s.observedPaneCwd(pane)
+	}
+	if raw == "" {
+		raw = currentCwd
+	}
+	resolved, err := resolveRootDirectory(raw, currentCwd)
+	if err != nil {
+		return false, err
+	}
+	s.setRoot(resolved)
+	return false, nil
+}
+
+func (s *Session) observedPaneCwd(pane *Pane) string {
+	if pane == nil {
+		return s.rootDir
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	key := PaneKey{SessionID: s.ID, PaneID: pane.ID}
+	observations := s.processNames.Observe(ctx, []Anchor{{
+		Key:         key,
+		Root:        pane.Root,
+		PTY:         pane.PTY,
+		RootIsShell: len(pane.Launch.RequestedArgv) == 0,
+	}})
+	if observation := observations[key]; observation.Root != nil && observation.Root.Cwd != "" {
+		return observation.Root.Cwd
+	}
+	if s.sessionPersistence != nil {
+		for _, window := range s.sessionPersistence.Plan.Windows {
+			for _, persistedPane := range window.Panes {
+				if persistedPane.ID == pane.ID && persistedPane.Cwd != "" {
+					return persistedPane.Cwd
+				}
+			}
+		}
+	}
+	if pane.Launch.Cwd != "" {
+		return pane.Launch.Cwd
+	}
+	return s.rootDir
+}
+
 func handleCommandPromptCommand(s *Session, _ *ClientInstance, args []string) (bool, error) {
 	if err := requireNoCommandArgs("command-prompt", args); err != nil {
 		return false, err
@@ -858,9 +1029,9 @@ func parseCommandLine(line string) ([]string, error) {
 func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []string) (commandResult, error) {
 	fs := commandFlagSet("new-session")
 	name := fs.String("s", "", "session name")
-	var cwd string
-	fs.StringVar(&cwd, "c", "", "starting directory")
-	fs.StringVar(&cwd, "cwd", "", "starting directory")
+	var root string
+	fs.StringVar(&root, "r", "", "session root")
+	fs.StringVar(&root, "root", "", "session root")
 	if err := fs.Parse(args); err != nil {
 		return commandResult{}, err
 	}
@@ -869,8 +1040,8 @@ func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []strin
 			return commandResult{}, err
 		}
 	}
-	if cwd == "" {
-		cwd = request.WorkingDirectory
+	if root == "" {
+		root = request.WorkingDirectory
 	}
 	cols, rows := request.TerminalCols, request.TerminalRows
 	if cols == 0 {
@@ -888,11 +1059,11 @@ func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []strin
 		return commandResult{}, errors.New("created session is unavailable")
 	}
 	if err := s.coordinate(func() error {
-		resolved, err := resolveStartingDirectory(cwd)
+		resolved, err := resolveRootDirectory(root, request.WorkingDirectory)
 		if err != nil {
 			return err
 		}
-		s.defaultCwd = resolved
+		s.rootDir = resolved
 		s.EnsureClient(clientID0)
 		s.SetClientSize(clientID0, cols, rows)
 		pane, _, _, err := s.createWindow(resolved, fs.Args(), cols, rows, defaultShell())
@@ -906,7 +1077,7 @@ func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []strin
 		d.sessionExited(s)
 		return commandResult{}, err
 	}
-	return commandResult{bootstrap: &operation.bootstrap}, nil
+	return commandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
 }
 
 func (d *Daemon) commandAttachSession(args []string) (commandResult, error) {
@@ -926,27 +1097,153 @@ func (d *Daemon) commandAttachSession(args []string) (commandResult, error) {
 	if err != nil {
 		return commandResult{}, err
 	}
-	return commandResult{bootstrap: &operation.bootstrap}, nil
+	return commandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
 }
 
-func (d *Daemon) commandRestoreSession(args []string) (commandResult, error) {
+func (d *Daemon) commandRestoreSession(request protocol.CommandRequest, args []string) (commandResult, error) {
 	fs := commandFlagSet("restore-session")
-	target := fs.String("t", "", "snapshot session name")
+	target := fs.String("t", "", "persisted session name")
+	file := fs.String("f", "", ".meja file")
+	name := fs.String("s", "", "new session name")
 	mode := fs.String("commands", "prepare", "restore command mode")
+	positionalTarget := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		positionalTarget = args[0]
+		args = args[1:]
+	}
 	if err := fs.Parse(args); err != nil {
 		return commandResult{}, err
 	}
-	if *target == "" || len(fs.Args()) != 0 {
-		return commandResult{}, errors.New("restore-session requires -t <session-name>")
+	if len(fs.Args()) > 1 {
+		return commandResult{}, errors.New("restore accepts at most one persisted session name")
+	}
+	if len(fs.Args()) == 1 {
+		if *target != "" {
+			return commandResult{}, errors.New("restore session name was specified more than once")
+		}
+		*target = fs.Args()[0]
+	}
+	if positionalTarget != "" {
+		if *target != "" {
+			return commandResult{}, errors.New("restore session name was specified more than once")
+		}
+		*target = positionalTarget
+	}
+	if (*target == "") == (*file == "") {
+		return commandResult{}, errors.New("restore requires either a session name or -f <file>")
 	}
 	if *mode != "prepare" && *mode != "skip" && *mode != "run" {
 		return commandResult{}, errors.New("--commands must be prepare, skip, or run")
 	}
-	operation, err := d.executeSessionOperation("restore-session-"+*mode, commandSessionTarget{name: *target})
+	if *name != "" {
+		if err := validateSessionName(*name); err != nil {
+			return commandResult{}, err
+		}
+	}
+	path := ""
+	if *file != "" {
+		var err error
+		path, err = resolveCommandFilePath(*file, request.WorkingDirectory)
+		if err != nil {
+			return commandResult{}, err
+		}
+	}
+	operation, err := d.executeSessionOperation("restore-session", commandSessionTarget{
+		name:        *target,
+		file:        path,
+		newName:     *name,
+		restoreMode: restoreCommandMode(*mode),
+	})
 	if err != nil {
 		return commandResult{}, err
 	}
-	return commandResult{bootstrap: &operation.bootstrap}, nil
+	return commandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
+}
+
+func (d *Daemon) commandSaveSession(request protocol.CommandRequest, args []string) (commandResult, error) {
+	fs := commandFlagSet("save-session")
+	target := fs.String("t", "", "live session target")
+	output := fs.String("o", "", "output .meja file")
+	force := fs.Bool("f", false, "overwrite an existing file")
+	if err := fs.Parse(args); err != nil {
+		return commandResult{}, err
+	}
+	if *target == "" || *output == "" || len(fs.Args()) != 0 {
+		return commandResult{}, errors.New("save-session requires -t <session-id-or-name> -o <file>")
+	}
+	parsed, err := parseSessionTarget(*target)
+	if err != nil {
+		return commandResult{}, err
+	}
+	var session *Session
+	d.call(func() {
+		if parsed.name != "" {
+			session = d.sessionByName(parsed.name)
+		} else {
+			session = d.sessions[parsed.id]
+		}
+	})
+	if session == nil {
+		return commandResult{}, errSessionUnavailable
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sessionPersistenceTimeout)
+	defer cancel()
+	captured, err := session.captureSession(ctx, session.processNames)
+	if err != nil {
+		return commandResult{}, fmt.Errorf("capture session: %w", err)
+	}
+	persisted, err := sessionPlanFromCapture(captured)
+	if err != nil {
+		return commandResult{}, err
+	}
+	path, err := resolveCommandFilePath(*output, captured.SessionRoot)
+	if err != nil {
+		return commandResult{}, err
+	}
+	report, err := writeUserMejaFile(path, persisted, *force)
+	if err != nil {
+		return commandResult{}, err
+	}
+	var outputText strings.Builder
+	fmt.Fprintf(&outputText, "Saved %s.\n", filepath.Base(path))
+	if report.AbsolutePanePaths > 0 {
+		fmt.Fprintf(&outputText, "\nNote: %d pane", report.AbsolutePanePaths)
+		verb := " uses"
+		if report.AbsolutePanePaths != 1 {
+			outputText.WriteByte('s')
+			verb = " use"
+		}
+		outputText.WriteString(verb + " an absolute path outside the session root.\nThis file may not restore portably on another machine.\n")
+	}
+	outputText.WriteString("Reminder: scrub sensitive values before sharing or committing it.\n")
+	return commandResult{stdout: []byte(outputText.String())}, nil
+}
+
+func resolveCommandFilePath(path, workingDirectory string) (string, error) {
+	if path == "" {
+		return "", errors.New("file path must not be empty")
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Clean(filepath.Join(home, strings.TrimPrefix(path, "~/"))), nil
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+	if workingDirectory == "" {
+		var err error
+		workingDirectory, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
+	}
+	return filepath.Clean(filepath.Join(workingDirectory, path)), nil
 }
 
 func (d *Daemon) commandListSessions(args []string) (commandResult, error) {
@@ -1072,20 +1369,42 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 		return sessionOperationResult{sessions: sessions}, nil
 	}
 
-	restoreMode, restoring := restoreModeForOperation(operation)
-	var restoreSnapshot PersistedSession
+	restoring := operation == "restore-session"
+	var restored SessionPlan
 	if restoring {
-		if target.id != 0 || target.name == "" {
-			return sessionOperationResult{}, errors.New("restore requires a session name")
+		if target.restoreMode == "" {
+			target.restoreMode = restoreCommandsPrepare
 		}
-		if err := validateSessionName(target.name); err != nil {
-			return sessionOperationResult{}, err
+		switch target.restoreMode {
+		case restoreCommandsPrepare, restoreCommandsSkip, restoreCommandsRun:
+		default:
+			return sessionOperationResult{}, fmt.Errorf("invalid restore command mode %q", target.restoreMode)
 		}
 		var err error
-		restoreSnapshot, err = readPersistedSession(filepath.Join(d.snapshotDir, target.name+".json"), target.name)
+		if target.file != "" {
+			restored, err = readUserSessionPlan(target.file)
+		} else {
+			if target.id != 0 || target.name == "" {
+				return sessionOperationResult{}, errors.New("restore requires a session name")
+			}
+			if err := validateSessionName(target.name); err != nil {
+				return sessionOperationResult{}, err
+			}
+			var persistence SessionPersistence
+			persistence, err = readSessionPersistence(filepath.Join(d.sessionPersistenceDir, target.name+".session.meja"), target.name)
+			if err == nil {
+				restored = persistence.Plan
+				restored.Name = persistence.Name
+				restored.Root = persistence.Root
+			}
+		}
 		if err != nil {
 			return sessionOperationResult{}, err
 		}
+		if target.newName != "" {
+			restored.Name = target.newName
+		}
+		target.name = restored.Name
 	}
 
 	var session *Session
@@ -1109,7 +1428,7 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 			}
 			session = newSession(d.nextID, target.name)
 			session.daemon = d
-			session.startAutosave(d.snapshotDir)
+			session.startPersistence(d.sessionPersistenceDir)
 			d.sessions[d.nextID] = session
 			d.reserveSessionName(session, target.name)
 			d.nextID++
@@ -1122,7 +1441,7 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 			if session == nil {
 				operationErr = errSessionUnavailable
 			}
-		case "restore-session-prepare", "restore-session-skip", "restore-session-run":
+		case "restore-session":
 			if d.sessionByName(target.name) != nil {
 				operationErr = fmt.Errorf("session %q already exists; attach to it instead", target.name)
 				return
@@ -1131,16 +1450,16 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 				operationErr = errors.New("session ID exhausted")
 				return
 			}
-			session = newSession(d.nextID, restoreSnapshot.Name)
+			session = newSession(d.nextID, restored.Name)
 			session.daemon = d
-			session.startAutosave(d.snapshotDir)
-			operationErr = session.restoreSnapshot(restoreSnapshot, restoreMode)
+			session.startPersistence(d.sessionPersistenceDir)
+			operationErr = session.restoreSessionPlan(restored, target.restoreMode)
 			if operationErr != nil {
 				_ = session.shutdown()
 				return
 			}
 			d.sessions[d.nextID] = session
-			d.reserveSessionName(session, restoreSnapshot.Name)
+			d.reserveSessionName(session, restored.Name)
 			d.nextID++
 		default:
 			operationErr = fmt.Errorf("unsupported session operation %q", operation)

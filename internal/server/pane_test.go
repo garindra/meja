@@ -123,6 +123,22 @@ func TestBuildEnvPreservesUTF8Locale(t *testing.T) {
 	}
 }
 
+func TestBuildPaneEnvInjectsStableMejaContext(t *testing.T) {
+	env := buildPaneEnv(&user.User{HomeDir: "/home/test", Username: "test"}, "/bin/sh", 4, paneRequest{
+		MejaSocket:        "/srv/meja.sock",
+		MejaSessionTarget: "17",
+	})
+	for _, want := range []string{
+		"MEJA_SOCKET=/srv/meja.sock",
+		"MEJA_SESSION_TARGET=17",
+		"MEJA_PANE_ID=4",
+	} {
+		if !slices.Contains(env, want) {
+			t.Fatalf("pane environment omitted %q: %#v", want, env)
+		}
+	}
+}
+
 func TestDefaultShellUsesEnvironmentWithSafeFallback(t *testing.T) {
 	t.Setenv("SHELL", "/bin/zsh")
 	if got := defaultShell(); got != "/bin/zsh" {
@@ -168,6 +184,38 @@ func TestResolveStartingDirectoryRejectsAmbiguousOrInvalidPaths(t *testing.T) {
 		if _, err := resolveStartingDirectoryForUser(raw, unixUser); err == nil {
 			t.Fatalf("resolve %q unexpectedly succeeded", raw)
 		}
+	}
+}
+
+func TestResolveRootDirectoryUsesHostReferenceForRelativePaths(t *testing.T) {
+	reference := t.TempDir()
+	want := filepath.Join(reference, "project")
+	if err := os.Mkdir(want, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveRootDirectory("project", reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("resolved root = %q, want %q", got, want)
+	}
+	if _, err := resolveRootDirectory("project", "relative-reference"); err == nil {
+		t.Fatal("relative host reference produced a non-absolute root")
+	}
+}
+
+func TestResolveRootDirectoryDefaultsToHostUserHome(t *testing.T) {
+	want, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveRootDirectory("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("default root = %q, want host home %q", got, want)
 	}
 }
 

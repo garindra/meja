@@ -601,6 +601,7 @@ func (s *Session) FocusPaneDirection(clientID uint64, direction byte) (*Window, 
 		}
 	}
 	if best != nil {
+		changed := window.ActivePaneID != best.placement.PaneID
 		client.FocusedPaneID = best.placement.PaneID
 		window.ActivePaneID = best.placement.PaneID
 		if direction == 'A' || direction == 'B' {
@@ -609,6 +610,9 @@ func (s *Session) FocusPaneDirection(clientID uint64, direction byte) (*Window, 
 		} else {
 			client.FocusX2 = rectCenterX2(best.placement.Rect)
 			client.FocusY2 = clampToRectAxis(client.FocusY2, best.placement.Rect.Y, best.placement.Rect.Height)
+		}
+		if changed {
+			s.markWindowChangedForPersistence(window.ID)
 		}
 	}
 	return cloneWindow(window), cloneClientState(client), nil

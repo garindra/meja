@@ -44,7 +44,7 @@ meja -h prod new -- /usr/bin/bash -l
 meja new -h user@host
 meja new -s work -h prod
 meja -L dev new -h prod
-meja new -c /srv/app -h prod -- /usr/bin/bash -l
+meja new -r /srv/app -h prod -- /usr/bin/bash -l
 ```
 
 `-h` (or `--host`) is the SSH transport option. It accepts a hostname,
@@ -143,19 +143,23 @@ MEJA_DEBUG_RENDER=1 meja
 MEJA_DEBUG_LOG=/tmp/meja-render.log meja attach -t work
 ```
 
-`meja new -c <directory>` (or `--cwd`) sets the session's starting directory
-for its initial pane and all later windows and splits. The directory is
-resolved on the target machine and must be absolute or begin with `~/`.
+`meja new -r <directory>` (or `--root`) sets the session's absolute root and
+the working directory for its initial pane and all later windows and splits.
+The root is resolved on the target machine.
 Quote a remote home-relative path so the local shell does not expand it first:
 
 ```bash
-meja new -c '~/projects/app' -h prod
+meja new -r '~/projects/app' -h prod
 ```
 
 The command following `--` applies only to the initial pane. Later panes start
-the target user's shell in the session's starting directory.
-When `-c` is omitted, a local session inherits the invoking process's current
+the target user's shell in the session root.
+When `-r` is omitted, a local session inherits the invoking process's current
 directory; a remote session starts in the remote user's home directory.
+
+From the command prompt, `set-root [path]` changes the session root for future
+windows and panes. With no path it uses the active pane's current directory;
+existing panes are not moved.
 
 ## SSH command forwarding
 

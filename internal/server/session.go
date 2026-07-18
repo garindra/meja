@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -113,10 +115,15 @@ func (s *Session) shutdownNow() {
 }
 
 func (s *Session) shutdown() error {
-	return s.coordinate(func() error {
+	err := s.coordinate(func() error {
 		s.shutdownNow()
 		return nil
 	})
+	<-s.operationsDone
+	if s.persistenceStarted.Load() {
+		<-s.persistenceDone
+	}
+	return err
 }
 
 func (s *Session) attachClientInstance(client *ClientInstance, cols, rows uint16) error {
@@ -227,22 +234,26 @@ type Session struct {
 	NextPaneID         uint64
 	NextLayoutRevision uint64
 
-	daemon                *Daemon
-	clientInstance        *ClientInstance
-	defaultCwd            string
-	operations            chan sessionOperation
-	operationsDone        chan struct{}
-	statusCommands        chan statusCommand
-	stopOnce              sync.Once
-	processNames          ProcessObserver
-	nameMonitor           sync.Once
-	autosave              sync.Once
-	autosaveNow           chan struct{}
-	promptContinuations   map[uint64]promptContinuation
-	nextStatusMessageID   uint64
-	statusMessageDuration time.Duration
-	stopping              bool
-	ended                 bool
+	daemon                   *Daemon
+	clientInstance           *ClientInstance
+	rootDir                  string
+	operations               chan sessionOperation
+	operationsDone           chan struct{}
+	statusCommands           chan statusCommand
+	stopOnce                 sync.Once
+	processNames             ProcessObserver
+	nameMonitor              sync.Once
+	persistenceOnce          sync.Once
+	persistenceNow           chan struct{}
+	persistenceDone          chan struct{}
+	persistenceStarted       atomic.Bool
+	sessionPersistence       *SessionPersistence
+	obsoletePersistenceNames map[string]struct{}
+	promptContinuations      map[uint64]promptContinuation
+	nextStatusMessageID      uint64
+	statusMessageDuration    time.Duration
+	stopping                 bool
+	ended                    bool
 }
 
 type Window struct {
@@ -342,21 +353,31 @@ func (c *ClientState) setFocusedPane(paneID uint64) {
 
 func NewSession(id uint64) *Session {
 	session := &Session{
-		ID:                  id,
-		Windows:             map[uint64]*Window{},
-		Panes:               map[uint64]*Pane{},
-		Clients:             map[uint64]*ClientState{},
-		NextWindowID:        1,
-		operations:          make(chan sessionOperation, 64),
-		operationsDone:      make(chan struct{}),
-		statusCommands:      make(chan statusCommand, 64),
-		processNames:        NewProcessObserver(),
-		autosaveNow:         make(chan struct{}, 1),
-		promptContinuations: make(map[uint64]promptContinuation),
+		ID:                       id,
+		Windows:                  map[uint64]*Window{},
+		Panes:                    map[uint64]*Pane{},
+		Clients:                  map[uint64]*ClientState{},
+		NextWindowID:             1,
+		operations:               make(chan sessionOperation, 64),
+		operationsDone:           make(chan struct{}),
+		statusCommands:           make(chan statusCommand, 64),
+		processNames:             NewProcessObserver(),
+		persistenceNow:           make(chan struct{}, 1),
+		persistenceDone:          make(chan struct{}),
+		obsoletePersistenceNames: make(map[string]struct{}),
+		promptContinuations:      make(map[uint64]promptContinuation),
 	}
 	go session.runOperations()
 	go session.runStatusOutput()
 	return session
+}
+
+func (s *Session) contextualPaneRequest(request paneRequest) paneRequest {
+	request.MejaSessionTarget = strconv.FormatUint(s.ID, 10)
+	if s.daemon != nil {
+		request.MejaSocket = s.daemon.controlPath
+	}
+	return request
 }
 
 func (s *Session) nextLayoutRevisionLocked() uint64 {
@@ -506,10 +527,10 @@ func (s *Session) resolvePrompt(clientID uint64, result promptResult) error {
 func (s *Session) finishSessionRename(name string, accepted bool) error {
 	client := s.Clients[clientID0]
 	if accepted {
-		renamed := s.Name != name
+		changed := s.Name != name
 		s.Name = name
-		if renamed {
-			s.requestAutosave()
+		if changed {
+			s.markSessionChangedForPersistence()
 		}
 		if client != nil && client.Prompt != nil && client.Prompt.Kind == PromptKindRenameSession {
 			client.Prompt = nil
@@ -520,11 +541,21 @@ func (s *Session) finishSessionRename(name string, accepted bool) error {
 	return s.publishStatusBar()
 }
 
-func (s *Session) requestAutosave() {
-	select {
-	case s.autosaveNow <- struct{}{}:
-	default:
+func (s *Session) markSessionChangedForPersistence() {
+	s.persistSessionForPersistence()
+}
+
+func (s *Session) markWindowChangedForPersistence(windowID uint64) {
+	s.persistWindowForPersistence(windowID)
+}
+
+func (s *Session) setRoot(root string) {
+	root = filepath.Clean(root)
+	if root == s.rootDir {
+		return
 	}
+	s.rootDir = root
+	s.markSessionChangedForPersistence()
 }
 
 func (s *Session) SessionName() string {
@@ -547,15 +578,22 @@ func (s *Session) ensureClientFocusLocked(client *ClientState) {
 	if len(s.Windows) == 0 {
 		return
 	}
+	changed := false
 	window := s.Windows[client.ActiveWindowID]
 	if window == nil {
 		ids := s.windowIDsLocked()
 		window = s.Windows[ids[0]]
+		changed = client.ActiveWindowID != window.ID
 		client.ActiveWindowID = window.ID
 	}
-	window.ActivePaneID = windowActivePaneID(window)
+	activePaneID := windowActivePaneID(window)
+	changed = changed || window.ActivePaneID != activePaneID
+	window.ActivePaneID = activePaneID
 	if !windowHasPane(window, client.FocusedPaneID) {
 		client.setFocusedPane(window.ActivePaneID)
+	}
+	if changed {
+		s.markSessionChangedForPersistence()
 	}
 }
 
@@ -598,6 +636,7 @@ func (s *Session) CreateWindow(pane *Pane, activateFor uint64) (*Window, *Client
 	client.ActiveWindowID = windowID
 	client.setFocusedPane(pane.ID)
 	s.rebuildBindingsLocked(client, window)
+	s.markSessionChangedForPersistence()
 	return window, cloneClientState(client)
 }
 
@@ -693,18 +732,25 @@ func (s *Session) SelectWindow(clientID, windowID uint64) (*Window, *ClientState
 }
 
 func (s *Session) selectWindowLocked(client *ClientState, window *Window) {
+	changed := client.ActiveWindowID != window.ID
 	if client.ActiveWindowID != window.ID {
 		if previous := s.Windows[client.ActiveWindowID]; previous != nil && windowHasPane(previous, client.FocusedPaneID) {
+			changed = changed || previous.ActivePaneID != client.FocusedPaneID
 			previous.ActivePaneID = client.FocusedPaneID
 		}
 		client.LastWindowID = client.ActiveWindowID
 		client.HasLastWindow = client.LastWindowID != 0
 	}
 	client.ActiveWindowID = window.ID
-	window.ActivePaneID = windowActivePaneID(window)
+	activePaneID := windowActivePaneID(window)
+	changed = changed || window.ActivePaneID != activePaneID
+	window.ActivePaneID = activePaneID
 	client.setFocusedPane(window.ActivePaneID)
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	s.rebuildBindingsLocked(client, window)
+	if changed {
+		s.markSessionChangedForPersistence()
+	}
 }
 
 func (s *Session) RenameWindow(windowID uint64, name string) (*Window, error) {
@@ -713,8 +759,12 @@ func (s *Session) RenameWindow(windowID uint64, name string) (*Window, error) {
 		return nil, fmt.Errorf("unknown window %d", windowID)
 	}
 	// Empty names are valid; normal status projection remains well-formed.
+	changed := window.Name != name || window.AutomaticName
 	window.Name = name
 	window.AutomaticName = false
+	if changed {
+		s.markWindowChangedForPersistence(windowID)
+	}
 	return cloneWindow(window), nil
 }
 
@@ -735,8 +785,12 @@ func (s *Session) FocusPane(clientID, paneID uint64) (*Window, *ClientState, err
 		window.LayoutRevision = s.nextLayoutRevisionLocked()
 		s.rebuildBindingsLocked(client, window)
 	}
+	changed := window.ActivePaneID != paneID
 	window.ActivePaneID = paneID
 	client.setFocusedPane(paneID)
+	if changed {
+		s.markWindowChangedForPersistence(window.ID)
+	}
 	return cloneWindow(window), cloneClientState(client), nil
 }
 
@@ -752,6 +806,7 @@ func (s *Session) ToggleZoom(clientID uint64) (*Window, *ClientState, bool, erro
 	if len(window.Layout.PaneIDs()) <= 1 {
 		return cloneWindow(window), cloneClientState(client), false, nil
 	}
+	activePaneChanged := false
 	if window.Zoomed {
 		window.clearZoom()
 	} else {
@@ -760,10 +815,14 @@ func (s *Session) ToggleZoom(clientID uint64) (*Window, *ClientState, bool, erro
 		}
 		window.Zoomed = true
 		window.ZoomedPaneID = client.FocusedPaneID
+		activePaneChanged = window.ActivePaneID != client.FocusedPaneID
 		window.ActivePaneID = client.FocusedPaneID
 	}
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	s.rebuildBindingsLocked(client, window)
+	if activePaneChanged {
+		s.markWindowChangedForPersistence(window.ID)
+	}
 	return cloneWindow(window), cloneClientState(client), true, nil
 }
 
@@ -790,6 +849,7 @@ func (s *Session) CycleWindowLayout(clientID uint64) (*Window, *ClientState, boo
 	window.clearZoom()
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	s.rebuildBindingsLocked(client, window)
+	s.markWindowChangedForPersistence(window.ID)
 	return cloneWindow(window), cloneClientState(client), true, nil
 }
 
@@ -820,6 +880,9 @@ func (s *Session) ResizeFocusedPane(clientID uint64, direction PaneResizeDirecti
 	window.layoutCycleIndex = layoutPresetCustom
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	s.rebuildBindingsLocked(client, window)
+	if resized {
+		s.markWindowChangedForPersistence(window.ID)
+	}
 	return cloneWindow(window), cloneClientState(client), true, nil
 }
 
@@ -853,6 +916,7 @@ func (s *Session) SplitFocusedPane(clientID uint64, pane *Pane, direction SplitD
 	window.ActivePaneID = pane.ID
 	client.setFocusedPane(pane.ID)
 	s.rebuildBindingsLocked(client, window)
+	s.markWindowChangedForPersistence(window.ID)
 	return cloneWindow(window), cloneClientState(client), nil
 }
 
@@ -893,6 +957,7 @@ func (s *Session) SwapFocusedPane(clientID uint64, direction PaneSwapDirection) 
 	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	client.setFocusedPane(client.FocusedPaneID)
 	s.rebuildBindingsLocked(client, window)
+	s.markWindowChangedForPersistence(window.ID)
 	return cloneWindow(window), cloneClientState(client), true, nil
 }
 
@@ -931,6 +996,7 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 		windowClosed = true
 		closedWindowID = window.ID
 		if len(s.Windows) == 0 {
+			s.markSessionChangedForPersistence()
 			return closedPane, nil, cloneClientState(c), true, closedWindowID, true, nil
 		}
 		ids := s.windowIDsLocked()
@@ -939,6 +1005,7 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 		nextWindow.ActivePaneID = windowActivePaneID(nextWindow)
 		c.setFocusedPane(nextWindow.ActivePaneID)
 		s.rebuildBindingsLocked(c, nextWindow)
+		s.markSessionChangedForPersistence()
 		return closedPane, cloneWindow(nextWindow), cloneClientState(c), true, closedWindowID, false, nil
 	}
 	closedPane = s.Panes[c.FocusedPaneID]
@@ -956,6 +1023,7 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 	window.ActivePaneID = nextFocusedPaneID
 	c.setFocusedPane(nextFocusedPaneID)
 	s.rebuildBindingsLocked(c, window)
+	s.markSessionChangedForPersistence()
 	return closedPane, cloneWindow(window), cloneClientState(c), false, 0, false, nil
 }
 
@@ -1001,6 +1069,7 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 	} else {
 		delete(s.Windows, owner.ID)
 		if len(s.Windows) == 0 {
+			s.markSessionChangedForPersistence()
 			return nil, cloneClientState(c), true, true, nil
 		}
 		if c.ActiveWindowID == owner.ID {
@@ -1016,6 +1085,7 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 		return nil, nil, false, false, fmt.Errorf("client %d has no active window after removing pane %d", clientID, paneID)
 	}
 	s.rebuildBindingsLocked(c, active)
+	s.markSessionChangedForPersistence()
 	return cloneWindow(active), cloneClientState(c), false, true, nil
 }
 
@@ -1043,6 +1113,7 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	closed = windowID
 
 	if len(s.Windows) == 0 {
+		s.markSessionChangedForPersistence()
 		return closed, closedPanes, nil, nil, cloneClientState(c), true, nil
 	}
 	ids := s.windowIDsLocked()
@@ -1051,6 +1122,7 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	nextWindow.ActivePaneID = windowActivePaneID(nextWindow)
 	c.setFocusedPane(nextWindow.ActivePaneID)
 	s.rebuildBindingsLocked(c, nextWindow)
+	s.markSessionChangedForPersistence()
 	pane = s.Panes[c.FocusedPaneID]
 	return closed, closedPanes, cloneWindow(nextWindow), pane, cloneClientState(c), false, nil
 }
@@ -1420,7 +1492,33 @@ type processNameInput struct {
 	paneID   uint64
 	pane     *Pane
 	anchor   Anchor
+	latest   processSaveProjection
 }
+
+type processSaveProjection struct {
+	Cwd     string
+	Command string
+}
+
+type processSaveCandidate struct {
+	Projection processSaveProjection
+	Samples    int
+}
+
+// processSaveTracker belongs to the process-monitor goroutine. It is the only
+// place that compares observations; the session actor receives only stable,
+// changed pane leaves.
+type processSaveTracker struct {
+	candidates map[uint64]processSaveCandidate
+}
+
+func newProcessSaveTracker() *processSaveTracker {
+	return &processSaveTracker{
+		candidates: make(map[uint64]processSaveCandidate),
+	}
+}
+
+const processSaveStableSamples = 2
 
 func (s *Session) startProcessNameMonitor() {
 	s.nameMonitor.Do(func() {
@@ -1429,10 +1527,11 @@ func (s *Session) startProcessNameMonitor() {
 }
 
 func (s *Session) runProcessNameMonitor() {
+	tracker := newProcessSaveTracker()
 	refresh := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), processNameRefreshInterval)
 		defer cancel()
-		_ = s.refreshAutomaticWindowNames(ctx, s.processNames)
+		_ = s.refreshObservedProcesses(ctx, s.processNames, tracker)
 	}
 	refresh()
 	ticker := time.NewTicker(processNameRefreshInterval)
@@ -1448,38 +1547,56 @@ func (s *Session) runProcessNameMonitor() {
 }
 
 // refreshAutomaticWindowNames observes processes outside the Session actor,
-// then posts only validated name changes back through that actor. The status
-// goroutine continues to receive ordinary immutable status models.
+// then publishes validated automatic-name and stable persisted-command changes
+// through that actor. The status goroutine continues to receive ordinary
+// immutable status models.
 func (s *Session) refreshAutomaticWindowNames(ctx context.Context, observer ProcessObserver) error {
+	return s.refreshObservedProcesses(ctx, observer, newProcessSaveTracker())
+}
+
+func (s *Session) refreshObservedProcesses(ctx context.Context, observer ProcessObserver, tracker *processSaveTracker) error {
 	if observer == nil {
 		observer = NewProcessObserver()
 	}
+	if tracker == nil {
+		tracker = newProcessSaveTracker()
+	}
 	var inputs []processNameInput
 	if err := s.coordinate(func() error {
-		inputs = make([]processNameInput, 0, len(s.Windows))
+		latest := map[uint64]processSaveProjection{}
+		if s.sessionPersistence != nil {
+			latest = plannedProcessLeaves(s.sessionPersistence.Plan.Windows)
+		}
+		inputs = make([]processNameInput, 0, len(s.Panes))
 		for _, window := range s.Windows {
-			if window == nil || !window.AutomaticName {
+			if window == nil || window.Layout == nil {
 				continue
 			}
-			paneID := windowActivePaneID(window)
-			pane := s.Panes[paneID]
-			if pane == nil || pane.Root.PID <= 0 {
-				continue
-			}
-			inputs = append(inputs, processNameInput{
-				windowID: window.ID,
-				paneID:   paneID,
-				pane:     pane,
-				anchor: Anchor{
-					Key: PaneKey{
-						SessionID: s.ID,
-						PaneID:    paneID,
+			for _, paneID := range window.Layout.PaneIDs() {
+				pane := s.Panes[paneID]
+				if pane == nil || pane.Root.PID <= 0 {
+					continue
+				}
+				nameWindowID := uint64(0)
+				if window.AutomaticName && windowActivePaneID(window) == paneID {
+					nameWindowID = window.ID
+				}
+				inputs = append(inputs, processNameInput{
+					windowID: nameWindowID,
+					paneID:   paneID,
+					pane:     pane,
+					anchor: Anchor{
+						Key: PaneKey{
+							SessionID: s.ID,
+							PaneID:    paneID,
+						},
+						Root:        pane.Root,
+						PTY:         pane.PTY,
+						RootIsShell: len(pane.Launch.RequestedArgv) == 0,
 					},
-					Root:        pane.Root,
-					PTY:         pane.PTY,
-					RootIsShell: len(pane.Launch.RequestedArgv) == 0,
-				},
-			})
+					latest: latest[paneID],
+				})
+			}
 		}
 		return nil
 	}); err != nil {
@@ -1488,7 +1605,7 @@ func (s *Session) refreshAutomaticWindowNames(ctx context.Context, observer Proc
 	if err := ctx.Err(); err != nil || len(inputs) == 0 {
 		return err
 	}
-	sort.Slice(inputs, func(i, j int) bool { return inputs[i].windowID < inputs[j].windowID })
+	sort.Slice(inputs, func(i, j int) bool { return inputs[i].paneID < inputs[j].paneID })
 	anchors := make([]Anchor, len(inputs))
 	for index := range inputs {
 		anchors[index] = inputs[index].anchor
@@ -1498,25 +1615,113 @@ func (s *Session) refreshAutomaticWindowNames(ctx context.Context, observer Proc
 		return err
 	}
 
-	return s.coordinate(func() error {
-		changed := false
+	livePanes := make(map[uint64]bool, len(inputs))
+	changed := make(map[uint64]processSaveProjection)
+	for _, input := range inputs {
+		livePanes[input.paneID] = true
+		projection, valid := observedProcessSaveProjection(input.pane, observations[input.anchor.Key], input.latest)
+		if !valid {
+			continue
+		}
+		candidate := tracker.candidates[input.paneID]
+		if candidate.Projection == projection {
+			candidate.Samples++
+		} else {
+			candidate = processSaveCandidate{Projection: projection, Samples: 1}
+		}
+		tracker.candidates[input.paneID] = candidate
+		if candidate.Samples >= processSaveStableSamples && input.latest != projection {
+			changed[input.paneID] = projection
+		}
+	}
+	for paneID := range tracker.candidates {
+		if !livePanes[paneID] {
+			delete(tracker.candidates, paneID)
+		}
+	}
+
+	err := s.coordinate(func() error {
+		nameChanged := false
 		for _, input := range inputs {
-			window := s.Windows[input.windowID]
-			if window == nil || !window.AutomaticName || windowActivePaneID(window) != input.paneID ||
-				s.Panes[input.paneID] != input.pane || input.pane.Root != input.anchor.Root {
+			if s.Panes[input.paneID] != input.pane || input.pane.Root != input.anchor.Root {
 				continue
 			}
-			name := observationWindowName(observations[input.anchor.Key])
-			if name != "" && name != window.Name {
-				window.Name = name
-				changed = true
+			observation := observations[input.anchor.Key]
+			if input.windowID != 0 {
+				window := s.Windows[input.windowID]
+				if window != nil && window.AutomaticName && windowActivePaneID(window) == input.paneID {
+					name := observationWindowName(observation)
+					if name != "" && name != window.Name {
+						window.Name = name
+						s.markWindowChangedForPersistence(window.ID)
+						nameChanged = true
+					}
+				}
+			}
+			if projection, ok := changed[input.paneID]; ok {
+				s.persistObservedPaneForPersistence(input.paneID, projection)
 			}
 		}
-		if changed {
+		if nameChanged {
 			return s.publishStatusBar()
 		}
 		return nil
 	})
+	return err
+}
+
+func observedProcessSaveProjection(pane *Pane, observation ProcessObservation, previous processSaveProjection) (processSaveProjection, bool) {
+	if pane == nil {
+		return processSaveProjection{}, false
+	}
+	projection := processSaveProjection{Cwd: pane.Launch.Cwd}
+	if observation.Root != nil && observation.Root.Cwd != "" {
+		projection.Cwd = observation.Root.Cwd
+	}
+	if len(pane.Launch.RequestedArgv) > 0 {
+		projection.Command = shellJoin(pane.Launch.RequestedArgv)
+		return projection, true
+	}
+	switch observation.Status {
+	case StatusShellOwned:
+		return projection, true
+	case StatusDetected:
+		if observation.Candidate == nil {
+			return processSaveProjection{}, false
+		}
+		if isTransientObservedCommand(observation.Candidate) {
+			projection.Command = previous.Command
+			return projection, true
+		}
+		projection.Command = observedProcessCommand(observation.Candidate)
+		return projection, projection.Command != ""
+	default:
+		return processSaveProjection{}, false
+	}
+}
+
+func observedProcessCommand(process *ObservedProcess) string {
+	if process == nil {
+		return ""
+	}
+	if len(process.Argv) > 0 {
+		return shellJoin(process.Argv)
+	}
+	return process.Name
+}
+
+func isTransientObservedCommand(process *ObservedProcess) bool {
+	if process == nil {
+		return false
+	}
+	name := process.Name
+
+	switch name {
+	case "ls", "clear", "meja":
+		return true
+	default:
+		return false
+	}
 }
 
 func windowActivePaneID(window *Window) uint64 {
@@ -1534,6 +1739,9 @@ func observationWindowName(observation ProcessObservation) string {
 	switch observation.Status {
 	case StatusDetected:
 		observed = observation.Candidate
+		if isTransientObservedCommand(observed) {
+			return ""
+		}
 	case StatusShellOwned:
 		observed = observation.Root
 	default:

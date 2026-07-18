@@ -8,6 +8,7 @@ require (
 	github.com/creack/pty v1.1.21
 	github.com/quic-go/quic-go v0.48.2
 	github.com/rivo/uniseg v0.4.7
+	github.com/sblinch/kdl-go v0.0.0-20260121213736-8b7053306ca6
 	golang.org/x/sys v0.23.0
 	golang.org/x/term v0.23.0
 )

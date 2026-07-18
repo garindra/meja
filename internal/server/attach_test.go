@@ -6,6 +6,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -302,6 +305,132 @@ func TestLiveSwitchMovesClientAssignmentWithoutChangingReconnectToken(t *testing
 	}
 }
 
+func TestContextualCLIRestoreResolvesInvokerCwdAndSwitchesOuterClient(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "dev6.meja"), []byte(`root "."
+window {
+    pane
+}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	source := NewSession(17)
+	t.Cleanup(source.stopOperations)
+	source.daemon = d
+	source.rootDir = t.TempDir()
+	state := source.NewClient(clientID0)
+	state.TerminalCols, state.TerminalRows = 100, 30
+	source.CreateWindow(&Pane{ID: source.AddPaneID(), terminal: newTerminal(100, 30)}, clientID0)
+	d.sessions[source.ID] = source
+
+	credential := &reconnectCredential{EncodedToken: "stable-token"}
+	instance := newClientInstance(d, credential)
+	instance.managementOut = make(chan protocol.Frame, 8)
+	credential.Instance = instance
+	d.reconnectCredentials[credential.EncodedToken] = credential
+	d.clientSessions[credential] = source.ID
+	d.attachments[source.ID] = credential
+	source.clientInstance = instance
+	switchDone := completeOneTestClientSwitch(d, instance, source)
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"restore", "-f", "dev6.meja", "-s", "mynewsession", "--commands=skip"},
+		WorkingDirectory:    project,
+		CallerSessionTarget: "17",
+	})
+	if result.exitCode != 0 || result.bootstrap != nil {
+		t.Fatalf("contextual restore result = %#v", result)
+	}
+	if err := <-switchDone; err != nil {
+		t.Fatal(err)
+	}
+	restored := d.sessionByName("mynewsession")
+	if restored == nil {
+		t.Fatal("contextual restore did not create mynewsession")
+	}
+	if restored.rootDir != project {
+		t.Fatalf("restored root = %q, want %q", restored.rootDir, project)
+	}
+	if source.clientInstance != nil || restored.clientInstance != instance ||
+		d.clientSessions[credential] != restored.ID || d.attachments[source.ID] != nil || d.attachments[restored.ID] != credential {
+		t.Fatalf("outer client was not handed off: source=%#v restored=%#v assignments=%#v attachments=%#v",
+			source.clientInstance, restored.clientInstance, d.clientSessions, d.attachments)
+	}
+
+	d.detachClientInstance(instance, restored)
+	if err := restored.coordinate(func() error {
+		restored.daemon = nil
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pane := range restored.PanesSnapshot() {
+		_ = terminatePane(pane)
+	}
+	select {
+	case <-restored.operationsDone:
+	case <-time.After(time.Second):
+		t.Fatal("restored session did not stop")
+	}
+	if restored.persistenceStarted.Load() {
+		select {
+		case <-restored.persistenceDone:
+		case <-time.After(time.Second):
+			t.Fatal("restored persistence did not stop")
+		}
+	}
+}
+
+func TestContextualCLIAttachUsesGenericOuterClientHandoff(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	source := NewSession(17)
+	target := NewSession(18)
+	t.Cleanup(source.stopOperations)
+	t.Cleanup(target.stopOperations)
+	for _, session := range []*Session{source, target} {
+		state := session.NewClient(clientID0)
+		state.TerminalCols, state.TerminalRows = 80, 23
+		session.CreateWindow(&Pane{ID: session.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
+		session.daemon = d
+		d.sessions[session.ID] = session
+	}
+	target.setSessionName("target")
+	d.names[target.Name] = target
+
+	credential := &reconnectCredential{EncodedToken: "stable-token"}
+	instance := newClientInstance(d, credential)
+	instance.managementOut = make(chan protocol.Frame, 8)
+	credential.Instance = instance
+	d.clientSessions[credential] = source.ID
+	d.attachments[source.ID] = credential
+	source.clientInstance = instance
+	switchDone := completeOneTestClientSwitch(d, instance, source)
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args: []string{"attach", "-t", "target"}, CallerSessionTarget: "17",
+	})
+	if result.exitCode != 0 || result.bootstrap != nil || target.clientInstance != instance || source.clientInstance != nil {
+		t.Fatalf("contextual attach did not use generic handoff: result=%#v source=%#v target=%#v", result, source.clientInstance, target.clientInstance)
+	}
+	if err := <-switchDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func completeOneTestClientSwitch(d *Daemon, instance *ClientInstance, source *Session) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		request := <-instance.sessionSwitches
+		_, err := d.switchClientInstance(instance, source, request.rawTarget, request.cols, request.rows)
+		completeSessionSwitch(request, err)
+		done <- err
+	}()
+	return done
+}
+
 func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	source := NewSession(1)
@@ -360,7 +489,7 @@ func decodeTestWindowLayout(t *testing.T, frame protocol.Frame) protocol.WindowL
 
 func TestDaemonQUICListenerResumesByClientInstance(t *testing.T) {
 	d := newCommandTestDaemonWithActor(t)
-	d.snapshotDir = t.TempDir()
+	d.sessionPersistenceDir = t.TempDir()
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:         []string{"new", "--", "/bin/sleep", "30"},
 		TerminalCols: 80,
@@ -371,9 +500,9 @@ func TestDaemonQUICListenerResumesByClientInstance(t *testing.T) {
 	}
 	bootstrap := *result.bootstrap
 
-	firstConn, resumeToken := dialTestClientInstance(t, bootstrap, "")
+	firstConn, _, resumeToken := dialTestClientInstance(t, bootstrap, "")
 	_ = firstConn.CloseWithError(1, "test disconnect")
-	secondConn, resumedToken := dialTestClientInstance(t, bootstrap, resumeToken)
+	secondConn, _, resumedToken := dialTestClientInstance(t, bootstrap, resumeToken)
 	defer secondConn.CloseWithError(0, "")
 
 	if resumeToken == "" || resumedToken != resumeToken {
@@ -381,7 +510,117 @@ func TestDaemonQUICListenerResumesByClientInstance(t *testing.T) {
 	}
 }
 
-func dialTestClientInstance(t *testing.T, bootstrap protocol.CommandBootstrap, token string) (quic.Connection, string) {
+func TestContextualRestoreRetargetsLiveInputLoop(t *testing.T) {
+	d := newCommandTestDaemonWithActor(t)
+	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	sourceRoot := t.TempDir()
+	created := d.executeCommand(protocol.CommandRequest{
+		Args: []string{"new", "-s", "source", "--", "/bin/sleep", "30"}, WorkingDirectory: sourceRoot,
+		TerminalCols: 80, TerminalRows: 23,
+	})
+	if created.exitCode != 0 || created.bootstrap == nil {
+		t.Fatalf("create source = %#v", created)
+	}
+	conn, input, _ := dialTestClientInstance(t, *created.bootstrap, "")
+	source := d.sessionByName("source")
+	waitForAttachedClient(t, source)
+
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "dev.meja"), []byte(`root "."
+window {
+    pane
+}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"restore", "-f", "dev.meja", "-s", "target", "--commands=skip"},
+		WorkingDirectory:    project,
+		CallerSessionTarget: strconv.FormatUint(source.ID, 10),
+	})
+	if result.exitCode != 0 || result.bootstrap != nil {
+		t.Fatalf("contextual restore = %#v", result)
+	}
+	target := d.sessionByName("target")
+	if target == nil {
+		t.Fatal("contextual restore did not create target")
+	}
+
+	resize := encodedTestFrame(t, protocol.MsgResizePane, protocol.ResizePane{Cols: 99, Rows: 31}, protocol.EncodeResizePane)
+	if err := protocol.NewEncoder(input).WriteFrame(resize); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		var cols, rows uint16
+		if err := target.coordinate(func() error {
+			if state := target.Clients[clientID0]; state != nil {
+				cols, rows = state.TerminalCols, state.TerminalRows
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if cols == 99 && rows == 31 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("post-handoff input remained frozen: target size=%dx%d", cols, rows)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_ = conn.CloseWithError(0, "")
+	stopPersistenceTestSession(t, source)
+	stopPersistenceTestSession(t, target)
+}
+
+func waitForAttachedClient(t *testing.T, session *Session) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		attached := false
+		if err := session.coordinate(func() error {
+			attached = session.clientInstance != nil
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if attached {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("session did not attach")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func stopPersistenceTestSession(t *testing.T, session *Session) {
+	t.Helper()
+	if err := session.coordinate(func() error {
+		session.daemon = nil
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pane := range session.PanesSnapshot() {
+		_ = terminatePane(pane)
+	}
+	select {
+	case <-session.operationsDone:
+	case <-time.After(time.Second):
+		t.Fatal("session did not stop")
+	}
+	if session.persistenceStarted.Load() {
+		select {
+		case <-session.persistenceDone:
+		case <-time.After(time.Second):
+			t.Fatal("session persistence did not stop")
+		}
+	}
+}
+
+func dialTestClientInstance(t *testing.T, bootstrap protocol.CommandBootstrap, token string) (quic.Connection, quic.Stream, string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
@@ -426,7 +665,7 @@ func dialTestClientInstance(t *testing.T, bootstrap protocol.CommandBootstrap, t
 		if err != nil {
 			t.Fatal(err)
 		}
-		return conn, attached.ResumeToken
+		return conn, input, attached.ResumeToken
 	}
 	if frame.Type != protocol.MsgSessionResumeOK {
 		t.Fatalf("resume frame type = %d", frame.Type)
@@ -438,7 +677,7 @@ func dialTestClientInstance(t *testing.T, bootstrap protocol.CommandBootstrap, t
 	if resumed.Version != protocol.ProtocolVersion {
 		t.Fatalf("resume response = %#v", resumed)
 	}
-	return conn, token
+	return conn, input, token
 }
 
 func encodedTestFrame[T any](t *testing.T, frameType uint64, message T, encode func([]byte, T) ([]byte, error)) protocol.Frame {

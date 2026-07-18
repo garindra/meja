@@ -52,7 +52,7 @@ meja new -s deploy -h prod
 You can also choose its starting directory or initial command:
 
 ```bash
-meja new -s deploy -c /srv/app -h prod
+meja new -s deploy -r /srv/app -h prod
 meja new -s logs -h prod -- journalctl -f
 ```
 
@@ -191,6 +191,11 @@ Delete to remove characters, press Enter to save, or press Escape or `Ctrl+c`
 to cancel. Confirmation prompts use `y` to confirm; `n`, Enter, Escape, or
 `Ctrl+c` cancels.
 
+Open the command prompt with `Ctrl+b`, `:`, then run `set-root [path]` to set
+the absolute session root used by future windows and panes. Without a path it
+uses the active pane's current working directory. Existing panes keep their
+current working directories.
+
 ### History mode
 
 Press `Ctrl+b`, then `[` to open a frozen history view for the focused pane.
@@ -273,19 +278,19 @@ locally. With `-h` it creates the session remotely through SSH.
 
 ```text
 -s <session-name>    Give the session a unique name.
--c <directory>       Set the starting directory.
---cwd <directory>    Alias for -c.
+-r <directory>       Set the session root.
+--root <directory>   Alias for -r.
 ```
 
-The starting directory applies to the initial pane and to later windows and
-splits. It is resolved on the target machine and must be absolute or begin with
-`~/`. Quote a remote home-relative path so your local shell does not expand it:
+The root applies to the initial pane and to later windows and splits. It is
+resolved on the target machine. Quote a remote home-relative path so your local
+shell does not expand it:
 
 ```bash
-meja new -c '~/projects/app' -h prod
+meja new -r '~/projects/app' -h prod
 ```
 
-When `-c` is omitted, a local session inherits the invoking process's current
+When `-r` is omitted, a local session inherits the invoking process's current
 directory. A remote session starts in the remote user's home directory.
 
 The command after `--` applies only to the initial pane:

@@ -9,10 +9,6 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
-func (s *Session) readInput(client *ClientInstance, decoder *protocol.Decoder, done chan<- error) {
-	s.readInputFrames(client, decoder, done)
-}
-
 func (s *Session) readInputFrames(client *ClientInstance, decoder *protocol.Decoder, done chan<- error) {
 	for {
 		frame, err := decoder.ReadFrame()
@@ -24,50 +20,53 @@ func (s *Session) readInputFrames(client *ClientInstance, decoder *protocol.Deco
 			done <- fmt.Errorf("read input frame: %w", err)
 			return
 		}
-		switch frame.Type {
-		case protocol.MsgInputBytes:
-			msg, err := protocol.DecodeInputBytes(frame.Payload)
-			if err != nil {
-				done <- err
-				return
-			}
-			var detach, stopped bool
-			if err := s.coordinate(func() error {
-				if s.clientInstance != client {
-					return nil
-				}
-				var processErr error
-				detach, processErr = s.handleInputBytes(client, msg.Data)
-				stopped = s.stopping
-				return processErr
-			}); err != nil {
-				done <- err
-				return
-			}
-			if detach || stopped {
-				done <- nil
-				return
-			}
-		case protocol.MsgResizePane:
-			msg, err := protocol.DecodeResizePane(frame.Payload)
-			if err != nil {
-				done <- err
-				return
-			}
-			if err := s.coordinate(func() error {
-				if s.clientInstance != client {
-					return nil
-				}
-				return s.resizeClient(client, msg.Cols, msg.Rows)
-			}); err != nil {
-				done <- err
-				return
-			}
-		default:
-			done <- fmt.Errorf("unexpected input frame %d", frame.Type)
+		stopped, err := s.handleInputFrame(client, frame)
+		if err != nil || stopped {
+			done <- err
 			return
 		}
 	}
+}
+
+func (s *Session) handleInputFrame(client *ClientInstance, frame protocol.Frame) (bool, error) {
+	switch frame.Type {
+	case protocol.MsgInputBytes:
+		msg, err := protocol.DecodeInputBytes(frame.Payload)
+		if err != nil {
+			return false, err
+		}
+		var detach, stopped bool
+		if err := s.coordinate(func() error {
+			if s.clientInstance != client {
+				return nil
+			}
+			var processErr error
+			detach, processErr = s.handleInputBytes(client, msg.Data)
+			stopped = s.stopping
+			return processErr
+		}); err != nil {
+			return false, err
+		}
+		if detach || stopped {
+			return true, nil
+		}
+	case protocol.MsgResizePane:
+		msg, err := protocol.DecodeResizePane(frame.Payload)
+		if err != nil {
+			return false, err
+		}
+		if err := s.coordinate(func() error {
+			if s.clientInstance != client {
+				return nil
+			}
+			return s.resizeClient(client, msg.Cols, msg.Rows)
+		}); err != nil {
+			return false, err
+		}
+	default:
+		return false, fmt.Errorf("unexpected input frame %d", frame.Type)
+	}
+	return false, nil
 }
 
 func (s *Session) startPane(pane *Pane) {
@@ -115,7 +114,7 @@ func (s *Session) handlePaneProcessExitNow(paneID uint64) error {
 
 func (s *Session) createWindow(cwd string, argv []string, cols, rows uint16, shell string) (*Pane, *Window, *ClientState, error) {
 	paneID := s.AddPaneID()
-	pane, err := StartPane(paneID, paneRequest{Cwd: cwd, Command: argv, Cols: cols, Rows: rows, Shell: shell})
+	pane, err := StartPane(paneID, s.contextualPaneRequest(paneRequest{Cwd: cwd, Command: argv, Cols: cols, Rows: rows, Shell: shell}))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("start pane: %w", err)
 	}
@@ -270,7 +269,10 @@ func (s *Session) handlePromptEvent(c *ClientInstance, event serverInputEvent) (
 				var detach bool
 				detach, err = s.executeSessionCommand(c, argv)
 				if err == nil {
-					return detach, nil
+					if detach {
+						return true, nil
+					}
+					return false, s.publishStatusBar()
 				}
 				var request *sessionSwitchRequest
 				if errors.As(err, &request) {
@@ -296,7 +298,7 @@ func (s *Session) commandCreateWindow(c *ClientInstance) error {
 	if err != nil {
 		return err
 	}
-	pane, _, _, err := s.createWindow(s.defaultCwd, nil, cols, rows, c.shell)
+	pane, _, _, err := s.createWindow(s.rootDir, nil, cols, rows, c.shell)
 	if err != nil {
 		return err
 	}
@@ -326,7 +328,8 @@ func (s *Session) commandSplit(c *ClientInstance, direction SplitDirection) erro
 	}
 	paneID := s.AddPaneID()
 	cols, rows := activePane.TerminalSize()
-	newPane, err := StartPane(paneID, paneRequest{Cwd: s.defaultCwd, Cols: uint16(cols), Rows: uint16(rows), Shell: c.shell})
+	cwd := s.rootDir
+	newPane, err := StartPane(paneID, s.contextualPaneRequest(paneRequest{Cwd: cwd, Cols: uint16(cols), Rows: uint16(rows), Shell: c.shell}))
 	if err != nil {
 		return fmt.Errorf("start split pane: %w", err)
 	}

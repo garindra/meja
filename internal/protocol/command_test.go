@@ -8,10 +8,11 @@ import (
 
 func TestCommandRequestRoundTripPreservesArgumentsAndContext(t *testing.T) {
 	want := CommandRequest{
-		Args:             []string{"new", "-s", "my work", "--", "printf", "a b"},
-		WorkingDirectory: "/srv/work tree",
-		TerminalCols:     123,
-		TerminalRows:     45,
+		Args:                []string{"new", "-s", "my work", "--", "printf", "a b"},
+		WorkingDirectory:    "/srv/work tree",
+		CallerSessionTarget: "17",
+		TerminalCols:        123,
+		TerminalRows:        45,
 	}
 	var wire bytes.Buffer
 	if err := WriteCommandRequest(&wire, want); err != nil {

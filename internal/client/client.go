@@ -53,6 +53,7 @@ type Config struct {
 	Cwd                      string
 	RemotePath               string
 	SocketSelector           SocketSelector
+	CallerSessionTarget      string
 	CommandArgs              []string
 	TerminalCols             uint16
 	TerminalRows             uint16

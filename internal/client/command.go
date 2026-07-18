@@ -92,10 +92,11 @@ func validateProfile(profile string) error {
 
 func executeCommand(ctx context.Context, cfg Config) (commandResult, error) {
 	request := protocol.CommandRequest{
-		Args:             cfg.CommandArgs,
-		WorkingDirectory: cfg.Cwd,
-		TerminalCols:     cfg.TerminalCols,
-		TerminalRows:     cfg.TerminalRows,
+		Args:                cfg.CommandArgs,
+		WorkingDirectory:    cfg.Cwd,
+		CallerSessionTarget: cfg.CallerSessionTarget,
+		TerminalCols:        cfg.TerminalCols,
+		TerminalRows:        cfg.TerminalRows,
 	}
 	if cfg.Local {
 		return executeLocalCommand(ctx, cfg.SocketSelector, request)

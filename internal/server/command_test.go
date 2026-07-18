@@ -2,23 +2,27 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/garindra/meja/internal/protocol"
 )
 
 func TestNewSessionCommandCreatesInitialPaneBeforeAttach(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.snapshotDir = t.TempDir()
+	d.sessionPersistenceDir = t.TempDir()
+	callerCwd := t.TempDir()
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:             []string{"new", "-s", "work", "--", "/bin/sleep", "30"},
-		WorkingDirectory: t.TempDir(),
+		WorkingDirectory: callerCwd,
 		TerminalCols:     91,
 		TerminalRows:     27,
 	})
@@ -34,6 +38,9 @@ func TestNewSessionCommandCreatesInitialPaneBeforeAttach(t *testing.T) {
 	if pane == nil {
 		t.Fatal("new session has no focused pane")
 	}
+	if session.rootDir != callerCwd || pane.Launch.Cwd != callerCwd {
+		t.Fatalf("default root/pane cwd = %q/%q, want %q", session.rootDir, pane.Launch.Cwd, callerCwd)
+	}
 	cols, rows := pane.TerminalSize()
 	if cols != 91 || rows != 27 {
 		t.Fatalf("initial pane size = %dx%d, want 91x27", cols, rows)
@@ -43,9 +50,52 @@ func TestNewSessionCommandCreatesInitialPaneBeforeAttach(t *testing.T) {
 	}
 }
 
+func TestNewSessionRootFlagsSetRootAndInitialPaneCwd(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = t.TempDir()
+	callerCwd := t.TempDir()
+	root := t.TempDir()
+	result := d.executeCommand(protocol.CommandRequest{
+		Args: []string{"new", "-s", "work", "--root", root, "--", "/bin/sleep", "30"}, WorkingDirectory: callerCwd,
+		TerminalCols: 80, TerminalRows: 23,
+	})
+	defer d.disconnectActiveClients()
+	if result.exitCode != 0 {
+		t.Fatalf("new --root result = %#v", result)
+	}
+	session := d.sessionByName("work")
+	pane, _ := session.ActivePane(clientID0)
+	if session.rootDir != root || pane == nil || pane.Launch.Cwd != root {
+		t.Fatalf("created root/pane = %q %#v", session.rootDir, pane)
+	}
+	legacy := d.executeCommand(protocol.CommandRequest{Args: []string{"new", "-s", "legacy", "-c", root}})
+	if legacy.exitCode == 0 {
+		t.Fatalf("removed -c flag was accepted: %#v", legacy)
+	}
+}
+
+func TestNewSessionShortRootFlagResolvesRelativeToCaller(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = t.TempDir()
+	callerCwd := t.TempDir()
+	root := filepath.Join(callerCwd, "project")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := d.executeCommand(protocol.CommandRequest{
+		Args: []string{"new", "-s", "work", "-r", "project", "--", "/bin/sleep", "30"}, WorkingDirectory: callerCwd,
+		TerminalCols: 80, TerminalRows: 23,
+	})
+	defer d.disconnectActiveClients()
+	session := d.sessionByName("work")
+	if result.exitCode != 0 || session == nil || session.rootDir != root {
+		t.Fatalf("new -r result = %#v session=%#v", result, session)
+	}
+}
+
 func TestCommandAliasesAreResolvedByDaemon(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.snapshotDir = t.TempDir()
+	d.sessionPersistenceDir = t.TempDir()
 	created := d.executeCommand(protocol.CommandRequest{Args: []string{"new", "-s", "work"}, TerminalCols: 80, TerminalRows: 23})
 	defer d.disconnectActiveClients()
 	if created.bootstrap == nil {
@@ -61,9 +111,152 @@ func TestCommandAliasesAreResolvedByDaemon(t *testing.T) {
 	}
 }
 
+func TestSaveAndRestoreFileCommandsRoundTripSession(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	root := t.TempDir()
+	created := d.executeCommand(protocol.CommandRequest{
+		Args: []string{"new", "-s", "work", "--", "/bin/sleep", "30"}, WorkingDirectory: root,
+		TerminalCols: 80, TerminalRows: 23,
+	})
+	defer d.disconnectActiveClients()
+	if created.exitCode != 0 {
+		t.Fatalf("new session = %#v", created)
+	}
+	path := filepath.Join(t.TempDir(), "dev.meja")
+	saved := d.executeCommand(protocol.CommandRequest{Args: []string{"save-session", "-t", "work", "-o", path}})
+	if saved.exitCode != 0 {
+		t.Fatalf("save = %#v", saved)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "saved-at") || !strings.Contains(string(data), `root "`) ||
+		!strings.Contains(string(data), "window") || strings.Contains(string(data), "meja 1") {
+		t.Fatalf("saved file =\n%s", data)
+	}
+	refused := d.executeCommand(protocol.CommandRequest{Args: []string{"save", "-t", "work", "-o", path}})
+	if refused.exitCode == 0 || !strings.Contains(string(refused.stderr), "use -f") {
+		t.Fatalf("save without force = %#v", refused)
+	}
+	forced := d.executeCommand(protocol.CommandRequest{Args: []string{"save", "-t", "work", "-o", path, "-f"}})
+	if forced.exitCode != 0 {
+		t.Fatalf("forced save = %#v", forced)
+	}
+	restored := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "-f", path, "-s", "recovered", "--commands=skip"}})
+	if restored.exitCode != 0 || restored.bootstrap == nil {
+		t.Fatalf("restore file = %#v", restored)
+	}
+	if session := d.sessionByName("recovered"); session == nil || session.ID == d.sessionByName("work").ID {
+		t.Fatalf("restored session = %#v", session)
+	}
+}
+
+func TestSaveRelativeOutputUsesTargetSessionRoot(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	base := t.TempDir()
+	created := d.executeCommand(protocol.CommandRequest{
+		Args: []string{"new", "-s", "work", "--", "/bin/sleep", "30"}, WorkingDirectory: base,
+		TerminalCols: 80, TerminalRows: 23,
+	})
+	defer d.disconnectActiveClients()
+	if created.exitCode != 0 {
+		t.Fatalf("new session = %#v", created)
+	}
+	invokerCwd := t.TempDir()
+	saved := d.executeCommand(protocol.CommandRequest{
+		Args: []string{"save", "-t", "work", "-o", ".meja/dev.meja"}, WorkingDirectory: invokerCwd,
+	})
+	if saved.exitCode != 0 {
+		t.Fatalf("save = %#v", saved)
+	}
+	wantPath := filepath.Join(base, ".meja", "dev.meja")
+	plan, err := readUserSessionPlan(wantPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Root != base {
+		t.Fatalf("resolved plan root = %q, want %q", plan.Root, base)
+	}
+	if _, err := os.Stat(filepath.Join(invokerCwd, ".meja", "dev.meja")); !os.IsNotExist(err) {
+		t.Fatalf("save used invoking cwd: %v", err)
+	}
+	if !strings.Contains(string(saved.stdout), "Saved dev.meja.") ||
+		!strings.Contains(string(saved.stdout), "Reminder: scrub sensitive values") {
+		t.Fatalf("save output = %q", saved.stdout)
+	}
+}
+
+func TestRestoreRejectsMalformedPersistenceWithoutCreatingSession(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	if err := os.MkdirAll(d.sessionPersistenceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(d.sessionPersistenceDir, "broken.session.meja")
+	if err := os.WriteFile(path, []byte("meja 1\nsession \"broken\" active-window=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nextID := d.nextID
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "broken", "--commands=skip"}})
+	if result.exitCode == 0 || result.bootstrap != nil || !strings.Contains(string(result.stderr), "parse .meja file") {
+		t.Fatalf("malformed persistence restore = %#v", result)
+	}
+	if d.sessionByName("broken") != nil || d.nextID != nextID {
+		t.Fatalf("malformed persistence created a session: sessions=%#v nextID=%d", d.sessions, d.nextID)
+	}
+}
+
+func TestRestoreDoesNotReadLegacyPersistenceFilename(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	if err := os.MkdirAll(d.sessionPersistenceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d.sessionPersistenceDir, "work.meja"), []byte("meja 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "work", "--commands=skip"}})
+	if result.exitCode == 0 || !strings.Contains(string(result.stderr), "work.session.meja") {
+		t.Fatalf("legacy persistence filename was used: %#v", result)
+	}
+}
+
+func TestRestoreFileRejectsMalformedUserMejaWithoutCreatingSession(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	path := filepath.Join(t.TempDir(), "broken.meja")
+	if err := os.WriteFile(path, []byte("meja 1\nsession \"broken\" active-window=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nextID := d.nextID
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "-f", path, "-s", "recovered", "--commands=skip"}})
+	if result.exitCode == 0 || result.bootstrap != nil || !strings.Contains(string(result.stderr), "parse .meja file") {
+		t.Fatalf("malformed user file restore = %#v", result)
+	}
+	if d.sessionByName("recovered") != nil || d.nextID != nextID {
+		t.Fatalf("malformed user file created a session: sessions=%#v nextID=%d", d.sessions, d.nextID)
+	}
+}
+
+func TestRestoreRequiresExactlyOneSource(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	for _, args := range [][]string{
+		{"restore"},
+		{"restore", "work", "-f", filepath.Join(t.TempDir(), "dev.meja")},
+	} {
+		result := d.executeCommand(protocol.CommandRequest{Args: args})
+		if result.exitCode == 0 || !strings.Contains(string(result.stderr), "requires either a session name or -f") {
+			t.Fatalf("restore source validation for %v = %#v", args, result)
+		}
+	}
+}
+
 func TestNewSessionCommandRollsBackWhenInitialPaneFails(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.snapshotDir = t.TempDir()
+	d.sessionPersistenceDir = t.TempDir()
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:         []string{"new-session", "-s", "broken", "--", "/does/not/exist"},
 		TerminalCols: 80,
@@ -319,6 +512,102 @@ func TestSwitchSessionCommandReturnsLiveHandoffRequest(t *testing.T) {
 	}
 }
 
+func TestAttachedRestoreCreatesSessionAndReturnsHandoffRequest(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	project := t.TempDir()
+	planPath := filepath.Join(project, "dev6.meja")
+	if err := os.WriteFile(planPath, []byte(`root "."
+window {
+    pane
+}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	source := NewSession(41)
+	t.Cleanup(source.stopOperations)
+	source.daemon = d
+	source.setSessionName("source")
+	source.rootDir = project
+	source.processNames = emptyProcessObserver{}
+	state := source.NewClient(clientID0)
+	state.TerminalCols, state.TerminalRows = 101, 37
+	source.CreateWindow(&Pane{
+		ID: source.AddPaneID(), Launch: PaneLaunch{Cwd: project}, terminal: newTerminal(101, 37),
+	}, clientID0)
+	d.sessions[source.ID] = source
+	d.names[source.Name] = source
+
+	client := &ClientInstance{Daemon: d}
+	_, err := source.executeSessionCommand(client, []string{
+		"restore", "-f", "dev6.meja", "-s", "mynewsession", "--commands=skip",
+	})
+	var request *sessionSwitchRequest
+	if !errors.As(err, &request) {
+		t.Fatalf("attached restore error = %v, want handoff request", err)
+	}
+	restored := d.sessionByName("mynewsession")
+	if restored == nil {
+		t.Fatal("attached restore did not create mynewsession")
+	}
+	if request.rawTarget != strconv.FormatUint(restored.ID, 10) || request.cols != 101 || request.rows != 37 {
+		t.Fatalf("restore handoff request = %#v, restored session ID %d", request, restored.ID)
+	}
+	if restored.rootDir != project {
+		t.Fatalf("restored root = %q, want relative plan rooted at %q", restored.rootDir, project)
+	}
+
+	if err := restored.coordinate(func() error {
+		restored.daemon = nil
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pane := range restored.PanesSnapshot() {
+		_ = terminatePane(pane)
+	}
+	select {
+	case <-restored.operationsDone:
+	case <-time.After(time.Second):
+		t.Fatal("restored session did not stop after its panes were terminated")
+	}
+	if restored.persistenceStarted.Load() {
+		select {
+		case <-restored.persistenceDone:
+		case <-time.After(time.Second):
+			t.Fatal("restored session persistence did not stop")
+		}
+	}
+}
+
+func TestContextualCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	s := NewSession(17)
+	t.Cleanup(s.stopOperations)
+	s.daemon = d
+	s.setSessionName("renamed-session")
+	s.rootDir = t.TempDir()
+	s.processNames = emptyProcessObserver{}
+	project := t.TempDir()
+	s.NewClient(clientID0)
+	s.CreateWindow(&Pane{ID: s.AddPaneID(), Launch: PaneLaunch{Cwd: project}}, clientID0)
+	d.sessions[s.ID] = s
+	d.names[s.Name] = s
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"set-root", "."},
+		WorkingDirectory:    project,
+		CallerSessionTarget: "17",
+	})
+	if result.exitCode != 0 {
+		t.Fatalf("contextual set-root = %#v", result)
+	}
+	if s.rootDir != project {
+		t.Fatalf("contextual set-root changed root to %q, want %q", s.rootDir, project)
+	}
+}
+
 func TestCLIAndAttachedInvocationShareOperationalCommandHandler(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	s := NewSession(41)
@@ -363,6 +652,94 @@ func TestCLIAndAttachedInvocationShareOperationalCommandHandler(t *testing.T) {
 	placements = s.Windows[window.ID].Layout.Compute(Rect{Width: 80, Height: 23})
 	if placements[0].Rect.Width != initialLeftWidth+1 {
 		t.Fatalf("width after attached resize = %d, want %d", placements[0].Rect.Width, initialLeftWidth+1)
+	}
+}
+
+func TestSetRootUsesObservedPaneCwdAndDoesNotMoveExistingPane(t *testing.T) {
+	s := NewSession(42)
+	t.Cleanup(s.stopOperations)
+	oldRoot := t.TempDir()
+	observedCwd := t.TempDir()
+	relativeRoot := filepath.Join(observedCwd, "project")
+	if err := os.Mkdir(relativeRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.rootDir = oldRoot
+	s.setSessionName("work")
+	s.processNames = &changingProcessObserver{name: "bash", cwd: observedCwd}
+	pane := &Pane{ID: 0, Root: Identity{PID: 100, BirthToken: 1000}, Launch: PaneLaunch{Cwd: oldRoot, Shell: "/bin/sh"}}
+	s.CreateWindow(pane, clientID0)
+	connection := &ClientInstance{}
+	if _, err := s.executeSessionCommand(connection, []string{"set-root"}); err != nil {
+		t.Fatal(err)
+	}
+	if s.rootDir != observedCwd || pane.Launch.Cwd != oldRoot || s.sessionPersistence.Root != observedCwd {
+		t.Fatalf("set-root without path: root=%q pane=%q persistence=%#v", s.rootDir, pane.Launch.Cwd, s.sessionPersistence)
+	}
+	if _, err := s.executeSessionCommand(connection, []string{"set-root", "project"}); err != nil {
+		t.Fatal(err)
+	}
+	if s.rootDir != relativeRoot || pane.Launch.Cwd != oldRoot {
+		t.Fatalf("relative set-root: root=%q pane=%q", s.rootDir, pane.Launch.Cwd)
+	}
+}
+
+func TestSetRootControlsFutureWindowsPanesAndSaveLocation(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	oldRoot := t.TempDir()
+	newRoot := t.TempDir()
+	created := d.executeCommand(protocol.CommandRequest{
+		Args: []string{"new", "-s", "work", "--", "/bin/sleep", "30"}, WorkingDirectory: oldRoot,
+		TerminalCols: 80, TerminalRows: 23,
+	})
+	defer d.disconnectActiveClients()
+	if created.exitCode != 0 {
+		t.Fatalf("new session = %#v", created)
+	}
+	if result := d.executeCommand(protocol.CommandRequest{Args: []string{"set-root", "-t", "work", newRoot}}); result.exitCode != 0 {
+		t.Fatalf("set-root = %#v", result)
+	}
+	if result := d.executeCommand(protocol.CommandRequest{Args: []string{"new-window", "-t", "work"}}); result.exitCode != 0 {
+		t.Fatalf("new-window = %#v", result)
+	}
+	if result := d.executeCommand(protocol.CommandRequest{Args: []string{"split-window", "-t", "work", "-h"}}); result.exitCode != 0 {
+		t.Fatalf("split-window = %#v", result)
+	}
+	session := d.sessionByName("work")
+	oldCount, newCount := 0, 0
+	for _, pane := range session.PanesSnapshot() {
+		switch pane.Launch.Cwd {
+		case oldRoot:
+			oldCount++
+		case newRoot:
+			newCount++
+		}
+	}
+	if session.rootDir != newRoot || oldCount != 1 || newCount != 2 {
+		t.Fatalf("future pane roots: session=%q old=%d new=%d", session.rootDir, oldCount, newCount)
+	}
+	recoveryPath, err := session.flushPersistence(context.Background(), d.sessionPersistenceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := os.ReadFile(recoveryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(recovery), `root "`+newRoot+`"`) {
+		t.Fatalf("recovery file retained old root:\n%s", recovery)
+	}
+	saved := d.executeCommand(protocol.CommandRequest{Args: []string{"save", "-t", "work", "-o", "dev.meja"}})
+	if saved.exitCode != 0 {
+		t.Fatalf("save after set-root = %#v", saved)
+	}
+	plan, err := readUserSessionPlan(filepath.Join(newRoot, "dev.meja"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Root != newRoot {
+		t.Fatalf("saved root = %q, want %q", plan.Root, newRoot)
 	}
 }
 

@@ -45,19 +45,20 @@ type Daemon struct {
 	reconnectCredentials map[string]*reconnectCredential
 	// clientSessions is separate from reconnectCredentials: it is only the
 	// target-session hint consulted when rebuilding a client after reconnect.
-	clientSessions map[*reconnectCredential]uint64
-	attachments    map[uint64]*reconnectCredential
-	attachGrants   []attachGrant
-	tlsConfig      *tls.Config
-	certHash       string
-	quicMu         sync.Mutex
-	quicListener   *quic.Listener
-	quicPort       uint16
-	quicCancel     context.CancelFunc
-	serverCtx      context.Context
-	stop           context.CancelFunc
-	stderr         io.Writer
-	snapshotDir    string
+	clientSessions        map[*reconnectCredential]uint64
+	attachments           map[uint64]*reconnectCredential
+	attachGrants          []attachGrant
+	tlsConfig             *tls.Config
+	certHash              string
+	quicMu                sync.Mutex
+	quicListener          *quic.Listener
+	quicPort              uint16
+	quicCancel            context.CancelFunc
+	serverCtx             context.Context
+	stop                  context.CancelFunc
+	stderr                io.Writer
+	controlPath           string
+	sessionPersistenceDir string
 }
 
 type daemonRequest struct {
@@ -120,19 +121,20 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{protocol.ALPN}, MinVersion: tls.VersionTLS13}
 	d := &Daemon{
-		requests:             make(chan daemonRequest, 64),
-		nextID:               1,
-		sessions:             make(map[uint64]*Session),
-		names:                make(map[string]*Session),
-		reconnectCredentials: make(map[string]*reconnectCredential),
-		clientSessions:       make(map[*reconnectCredential]uint64),
-		attachments:          make(map[uint64]*reconnectCredential),
-		tlsConfig:            tlsConfig,
-		certHash:             hash,
-		serverCtx:            serverCtx,
-		stop:                 stop,
-		stderr:               cfg.Stderr,
-		snapshotDir:          snapshotDirectory(socket),
+		requests:              make(chan daemonRequest, 64),
+		nextID:                1,
+		sessions:              make(map[uint64]*Session),
+		names:                 make(map[string]*Session),
+		reconnectCredentials:  make(map[string]*reconnectCredential),
+		clientSessions:        make(map[*reconnectCredential]uint64),
+		attachments:           make(map[uint64]*reconnectCredential),
+		tlsConfig:             tlsConfig,
+		certHash:              hash,
+		serverCtx:             serverCtx,
+		stop:                  stop,
+		stderr:                cfg.Stderr,
+		controlPath:           socket,
+		sessionPersistenceDir: sessionPersistenceDirectory(socket),
 	}
 	actorCtx, stopActor := context.WithCancel(context.Background())
 	go d.runRequests(actorCtx)
@@ -156,8 +158,8 @@ func Run(ctx context.Context, cfg Config) error {
 	return err
 }
 
-func snapshotDirectory(controlPath string) string {
-	return filepath.Join(filepath.Dir(controlPath), "snapshots")
+func sessionPersistenceDirectory(controlPath string) string {
+	return filepath.Join(filepath.Dir(controlPath), "sessions")
 }
 
 func (d *Daemon) logSessionAttached(sessionID uint64) {
@@ -276,14 +278,14 @@ func (d *Daemon) prepareSessionRename(state *Session, currentName, name string) 
 		return
 	}
 	if currentName != name {
-		exists, err := snapshotFileExists(d.snapshotDir, name)
+		exists, err := sessionPersistenceFileExists(d.sessionPersistenceDir, name)
 		if err != nil {
-			d.logf("meja server: check snapshot before renaming session %d: %v\n", state.ID, err)
+			d.logf("meja server: check persistence before renaming session %d: %v\n", state.ID, err)
 			d.deliverSessionResult(state, func() error { return state.finishSessionRename(name, false) })
 			return
 		}
 		if exists {
-			label := fmt.Sprintf("snapshot %q exists; overwrite? (y/N) ", name)
+			label := fmt.Sprintf("persisted session %q exists; overwrite? (y/N) ", name)
 			d.deliverSessionResult(state, func() error {
 				_, err := state.beginConfirmationPrompt(clientID0, label, func(result promptResult) error {
 					if !result.Accepted {
@@ -327,8 +329,8 @@ func (d *Daemon) deliverSessionResult(state *Session, run func() error) {
 	state.post(run)
 }
 
-func snapshotFileExists(snapshotDir, name string) (bool, error) {
-	_, err := os.Stat(filepath.Join(snapshotDir, name+".json"))
+func sessionPersistenceFileExists(sessionPersistenceDir, name string) (bool, error) {
+	_, err := os.Stat(filepath.Join(sessionPersistenceDir, name+".session.meja"))
 	if err == nil {
 		return true, nil
 	}

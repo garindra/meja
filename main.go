@@ -116,6 +116,7 @@ type invocationOptions struct {
 
 func parseInvocation(args []string, stdin *os.File, stdout, stderr io.Writer) (client.Config, error) {
 	options := invocationOptions{remotePath: "meja", port: 4433}
+	callerSessionTarget := ""
 	commandArgs := make([]string, 0, len(args))
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
@@ -143,27 +144,33 @@ func parseInvocation(args []string, stdin *os.File, stdout, stderr io.Writer) (c
 			return client.Config{}, err
 		}
 	}
+	if options.host == "" && options.profile == "" && options.socket == "" {
+		contextSocket := os.Getenv("MEJA_SOCKET")
+		contextTarget := os.Getenv("MEJA_SESSION_TARGET")
+		if contextSocket != "" && contextTarget != "" {
+			options.socket = contextSocket
+			callerSessionTarget = contextTarget
+		}
+	}
 	selector, err := (client.SocketSelector{Profile: options.profile, Path: options.socket}).Normalize()
 	if err != nil {
 		return client.Config{}, err
-	}
-	if options.host == "" {
-		commandArgs, options.host = splitLegacyCommandHost(commandArgs)
 	}
 	if len(commandArgs) == 0 {
 		commandArgs = []string{"new-session"}
 	}
 	cfg := client.Config{
-		Local:          options.host == "",
-		Port:           options.port,
-		PortSet:        options.portSet,
-		IdentityFile:   options.identity,
-		RemotePath:     options.remotePath,
-		SocketSelector: selector,
-		CommandArgs:    commandArgs,
-		Stdin:          stdin,
-		Stdout:         stdout,
-		Stderr:         stderr,
+		Local:               options.host == "",
+		Port:                options.port,
+		PortSet:             options.portSet,
+		IdentityFile:        options.identity,
+		RemotePath:          options.remotePath,
+		SocketSelector:      selector,
+		CallerSessionTarget: callerSessionTarget,
+		CommandArgs:         commandArgs,
+		Stdin:               stdin,
+		Stdout:              stdout,
+		Stderr:              stderr,
 	}
 	applyDebugEnvironment(&cfg)
 	if options.host != "" {
@@ -178,50 +185,6 @@ func parseInvocation(args []string, stdin *os.File, stdout, stderr io.Writer) (c
 		}
 	}
 	return cfg, nil
-}
-
-func splitLegacyCommandHost(args []string) ([]string, string) {
-	if len(args) < 2 || !supportsLegacyCommandHost(args[0]) {
-		return args, ""
-	}
-	stop := len(args)
-	for index, arg := range args {
-		if arg == "--" {
-			stop = index
-			break
-		}
-	}
-	positionalIndex := -1
-	for index := 1; index < stop; index++ {
-		arg := args[index]
-		if strings.HasPrefix(arg, "-") {
-			if !strings.Contains(arg, "=") {
-				index++
-			}
-			continue
-		}
-		if positionalIndex != -1 {
-			return args, ""
-		}
-		positionalIndex = index
-	}
-	if positionalIndex == -1 {
-		return args, ""
-	}
-	host := args[positionalIndex]
-	forwarded := make([]string, 0, len(args)-1)
-	forwarded = append(forwarded, args[:positionalIndex]...)
-	forwarded = append(forwarded, args[positionalIndex+1:]...)
-	return forwarded, host
-}
-
-func supportsLegacyCommandHost(command string) bool {
-	switch command {
-	case "new", "new-session", "attach", "a", "attach-session", "restore", "restore-session", "ls", "list-sessions":
-		return true
-	default:
-		return false
-	}
 }
 
 func transportOption(arg string) (name, value string, hasValue, recognized bool) {

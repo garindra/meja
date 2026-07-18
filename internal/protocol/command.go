@@ -38,11 +38,12 @@ type CommandBootstrap struct {
 }
 
 type CommandRequest struct {
-	Version          int      `json:"version"`
-	Args             []string `json:"args"`
-	WorkingDirectory string   `json:"workingDirectory,omitempty"`
-	TerminalCols     uint16   `json:"terminalCols,omitempty"`
-	TerminalRows     uint16   `json:"terminalRows,omitempty"`
+	Version             int      `json:"version"`
+	Args                []string `json:"args"`
+	WorkingDirectory    string   `json:"workingDirectory,omitempty"`
+	CallerSessionTarget string   `json:"callerSessionTarget,omitempty"`
+	TerminalCols        uint16   `json:"terminalCols,omitempty"`
+	TerminalRows        uint16   `json:"terminalRows,omitempty"`
 }
 
 type CommandFrame struct {

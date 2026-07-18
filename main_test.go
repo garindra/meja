@@ -76,42 +76,22 @@ func TestInvocationDefaultsToNewSessionAndInvokerDirectory(t *testing.T) {
 }
 
 func TestRemoteInvocationLeavesWorkingDirectoryForForwarder(t *testing.T) {
-	cfg := parseTestInvocation(t, "-h", "prod", "new-session", "-c", "~/work")
+	cfg := parseTestInvocation(t, "-h", "prod", "new-session", "-r", "~/work")
 	if cfg.Local || cfg.Cwd != "" {
 		t.Fatalf("remote config = %#v", cfg)
 	}
-	want := []string{"new-session", "-c", "~/work"}
+	want := []string{"new-session", "-r", "~/work"}
 	if !reflect.DeepEqual(cfg.CommandArgs, want) {
 		t.Fatalf("forwarded argv = %v, want %v", cfg.CommandArgs, want)
 	}
 }
 
-func TestLegacyTrailingHostPreservesRemotePathAndDaemonArguments(t *testing.T) {
-	remotePath := "/home/garindra/extra-storage/home/garindra/projects/tali/bin/linux-amd64/meja"
-	cfg := parseTestInvocation(t,
-		"-L", "dev",
-		"restore", "-t", "YOYO",
-		"--remote-path="+remotePath,
-		"ubuntu-kas8",
-	)
-	if cfg.Local || cfg.Target.Original != "ubuntu-kas8" {
-		t.Fatalf("SSH target = %#v", cfg.Target)
+func TestTrailingPositionalArgumentIsForwardedToCommand(t *testing.T) {
+	wantArgs := []string{"restore", "-t", "work", "prod"}
+	cfg := parseTestInvocation(t, wantArgs...)
+	if !cfg.Local {
+		t.Fatalf("trailing command argument selected remote transport: %#v", cfg)
 	}
-	if cfg.RemotePath != remotePath {
-		t.Fatalf("remote path = %q, want %q", cfg.RemotePath, remotePath)
-	}
-	wantArgs := []string{"restore", "-t", "YOYO"}
-	if !reflect.DeepEqual(cfg.CommandArgs, wantArgs) {
-		t.Fatalf("forwarded argv = %v, want %v", cfg.CommandArgs, wantArgs)
-	}
-}
-
-func TestLegacyTrailingHostWorksAroundInitialCommandSeparator(t *testing.T) {
-	cfg := parseTestInvocation(t, "new", "-s", "work", "prod", "--", "/bin/sh", "-h", "literal")
-	if cfg.Local || cfg.Target.Original != "prod" {
-		t.Fatalf("SSH target = %#v", cfg.Target)
-	}
-	wantArgs := []string{"new", "-s", "work", "--", "/bin/sh", "-h", "literal"}
 	if !reflect.DeepEqual(cfg.CommandArgs, wantArgs) {
 		t.Fatalf("forwarded argv = %v, want %v", cfg.CommandArgs, wantArgs)
 	}
@@ -126,6 +106,27 @@ func TestInvocationAcceptsProfileAndSocketSelectors(t *testing.T) {
 	exact := parseTestInvocation(t, "-S", exactPath, "list-sessions")
 	if exact.SocketSelector.Path != exactPath {
 		t.Fatalf("socket selector = %#v", exact.SocketSelector)
+	}
+}
+
+func TestInvocationUsesInjectedPaneContextForPlainLocalCommands(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "meja.sock")
+	t.Setenv("MEJA_SOCKET", socket)
+	t.Setenv("MEJA_SESSION_TARGET", "17")
+
+	cfg := parseTestInvocation(t, "set-root", ".")
+	if cfg.SocketSelector.Path != socket || cfg.CallerSessionTarget != "17" {
+		t.Fatalf("in-pane config = %#v", cfg)
+	}
+
+	explicit := parseTestInvocation(t, "-L", "other", "set-root", "-t", "work", ".")
+	if explicit.SocketSelector.Profile != "other" || explicit.CallerSessionTarget != "" {
+		t.Fatalf("explicit selector retained pane context: %#v", explicit)
+	}
+
+	remote := parseTestInvocation(t, "-h", "prod", "restore", "-f", "dev.meja")
+	if remote.Local || remote.CallerSessionTarget != "" || remote.SocketSelector.Path != "" {
+		t.Fatalf("remote invocation retained local pane context: %#v", remote)
 	}
 }
 

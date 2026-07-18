@@ -209,7 +209,7 @@ func TestResizeFocusedPaneAdvancesRevisionAndPersistsRatio(t *testing.T) {
 	if window.LayoutRevision <= before {
 		t.Fatalf("layout revision = %d, want > %d", window.LayoutRevision, before)
 	}
-	persisted, err := persistedLayout(window.Layout)
+	persisted, err := planLayout(window.Layout)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -174,6 +174,9 @@ func TestRunForwardsArbitraryNonAttachCommandWithoutTerminal(t *testing.T) {
 		if err == nil && !reflect.DeepEqual(request.Args, wantArgs) {
 			err = fmt.Errorf("forwarded args = %v, want %v", request.Args, wantArgs)
 		}
+		if err == nil && request.CallerSessionTarget != "17" {
+			err = fmt.Errorf("caller session target = %q, want 17", request.CallerSessionTarget)
+		}
 		if err == nil {
 			err = protocol.WriteCommandOutput(conn, protocol.CommandFrameStdout, []byte("future output\n"))
 		}
@@ -189,12 +192,13 @@ func TestRunForwardsArbitraryNonAttachCommandWithoutTerminal(t *testing.T) {
 	defer stdin.Close()
 	var stdout bytes.Buffer
 	err = Run(context.Background(), Config{
-		Local:          true,
-		SocketSelector: SocketSelector{Path: socket},
-		CommandArgs:    wantArgs,
-		Stdin:          stdin,
-		Stdout:         &stdout,
-		Stderr:         io.Discard,
+		Local:               true,
+		SocketSelector:      SocketSelector{Path: socket},
+		CallerSessionTarget: "17",
+		CommandArgs:         wantArgs,
+		Stdin:               stdin,
+		Stdout:              &stdout,
+		Stderr:              io.Discard,
 	})
 	if err != nil {
 		t.Fatal(err)

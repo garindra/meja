@@ -233,6 +233,52 @@ func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 	}
 }
 
+func TestSuccessfulSetRootPromptRestoresNormalStatus(t *testing.T) {
+	s := NewSession(0)
+	root := t.TempDir()
+	s.rootDir = root
+	s.processNames = emptyProcessObserver{}
+	client := s.NewClient(clientID0)
+	client.TerminalCols, client.TerminalRows = 80, 23
+	pane := &Pane{
+		ID:       s.AddPaneID(),
+		Title:    "bash",
+		Launch:   PaneLaunch{Cwd: root},
+		terminal: newTerminal(80, 23),
+	}
+	s.CreateWindow(pane, clientID0)
+	statusClient := newStatusTestClient()
+	handler := &ClientInstance{}
+	attachStatusTestClient(t, s, testClientInstance(nil, nil, &statusClient.wire))
+
+	if _, err := s.BeginCommandPrompt(clientID0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.publishStatusBar(); err != nil {
+		t.Fatal(err)
+	}
+	assertStatusText(t, statusClient.read(t), ":")
+
+	for _, b := range []byte("set-root .\r") {
+		event := s.ConsumeInputByte(clientID0, b)
+		if event.Command == serverCommandNone {
+			continue
+		}
+		if err := runStatusEvent(t, s, handler, event); err != nil {
+			t.Fatal(err)
+		}
+		status := statusClient.read(t)
+		if b == '\r' {
+			assertStatusText(t, status, "[0] 0:bash* ")
+			for i, cell := range status.Cells {
+				if cell.StyleID != statusNormalStyleID {
+					t.Fatalf("submitted status cell %d style=%d, want %d", i, cell.StyleID, statusNormalStyleID)
+				}
+			}
+		}
+	}
+}
+
 func runStatusEvent(t *testing.T, s *Session, handler *ClientInstance, event serverInputEvent) error {
 	t.Helper()
 	_, err := s.handleServerInputEvent(handler, event)

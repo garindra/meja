@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,11 +55,13 @@ type PaneLaunch struct {
 }
 
 type paneRequest struct {
-	Cwd     string
-	Command []string
-	Cols    uint16
-	Rows    uint16
-	Shell   string
+	Cwd               string
+	Command           []string
+	Cols              uint16
+	Rows              uint16
+	Shell             string
+	MejaSocket        string
+	MejaSessionTarget string
 }
 
 type paneCommand struct {
@@ -194,7 +197,7 @@ func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
 		return nil, err
 	}
 
-	cmd.Env = buildEnv(unixUser, shell)
+	cmd.Env = buildPaneEnv(unixUser, shell, paneID, request)
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid:  true,
@@ -236,6 +239,38 @@ func resolveStartingDirectory(raw string) (string, error) {
 		return "", fmt.Errorf("resolve daemon user: %w", err)
 	}
 	return resolveStartingDirectoryForUser(raw, unixUser)
+}
+
+func resolveRootDirectory(raw, relativeTo string) (string, error) {
+	unixUser, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("resolve daemon user: %w", err)
+	}
+	path := raw
+	if path == "" || path == "~" {
+		path = unixUser.HomeDir
+	} else if strings.HasPrefix(path, "~/") {
+		path = filepath.Join(unixUser.HomeDir, strings.TrimPrefix(path, "~/"))
+	} else if strings.HasPrefix(path, "~") {
+		return "", fmt.Errorf("session root %q: only ~ and ~/... home expansion are supported", raw)
+	} else if !filepath.IsAbs(path) {
+		if relativeTo == "" {
+			relativeTo = unixUser.HomeDir
+		}
+		path = filepath.Join(relativeTo, path)
+	}
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("session root %q must resolve to an absolute path", raw)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("session root %q: %w", raw, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("session root %q is not a directory", raw)
+	}
+	return path, nil
 }
 
 func resolveStartingDirectoryForUser(raw string, unixUser *user.User) (string, error) {
@@ -329,6 +364,18 @@ func buildEnv(unixUser *user.User, shell string) []string {
 		}
 	}
 	return env
+}
+
+func buildPaneEnv(unixUser *user.User, shell string, paneID uint64, request paneRequest) []string {
+	env := buildEnv(unixUser, shell)
+	if request.MejaSocket == "" || request.MejaSessionTarget == "" {
+		return env
+	}
+	return append(env,
+		"MEJA_SOCKET="+request.MejaSocket,
+		"MEJA_SESSION_TARGET="+request.MejaSessionTarget,
+		"MEJA_PANE_ID="+strconv.FormatUint(paneID, 10),
+	)
 }
 
 func defaultShell() string {

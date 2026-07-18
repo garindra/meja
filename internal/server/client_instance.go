@@ -35,8 +35,10 @@ type ClientInstance struct {
 	Output       [protocol.MaxRenderSlots]*OutputLease
 	StatusOutput io.Writer
 
-	managementOut chan protocol.Frame
-	shell         string
+	managementOut   chan protocol.Frame
+	sessionSwitches chan *sessionSwitchRequest
+	lifetimeDone    chan struct{}
+	shell           string
 }
 
 // reconnectCredential is the small, indefinitely retained daemon record for
@@ -49,7 +51,57 @@ type reconnectCredential struct {
 }
 
 func newClientInstance(d *Daemon, credential *reconnectCredential) *ClientInstance {
-	return &ClientInstance{credential: credential, Daemon: d, shell: defaultShell()}
+	return &ClientInstance{
+		credential:      credential,
+		Daemon:          d,
+		sessionSwitches: make(chan *sessionSwitchRequest, 1),
+		lifetimeDone:    make(chan struct{}),
+		shell:           defaultShell(),
+	}
+}
+
+func (c *ClientInstance) requestSessionSwitch(request *sessionSwitchRequest) error {
+	if c == nil || request == nil || request.result == nil || c.sessionSwitches == nil || c.lifetimeDone == nil {
+		return errors.New("client instance cannot switch sessions")
+	}
+	select {
+	case c.sessionSwitches <- request:
+	case <-c.lifetimeDone:
+		return errors.New("client instance is no longer connected")
+	}
+	select {
+	case err := <-request.result:
+		return err
+	case <-c.lifetimeDone:
+		select {
+		case err := <-request.result:
+			return err
+		default:
+			return errors.New("client instance disconnected during session switch")
+		}
+	}
+}
+
+func completeSessionSwitch(request *sessionSwitchRequest, err error) {
+	if request == nil || request.result == nil {
+		return
+	}
+	request.result <- err
+}
+
+type clientInputEvent struct {
+	frame protocol.Frame
+	err   error
+}
+
+func readClientInput(decoder *protocol.Decoder, events chan<- clientInputEvent) {
+	for {
+		frame, err := decoder.ReadFrame()
+		events <- clientInputEvent{frame: frame, err: err}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func (c *ClientInstance) outputLeases() map[int]*OutputLease {
@@ -478,6 +530,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		_ = sendEncodedDirect(mgmtStream, protocol.MsgSessionAttachFailed, protocol.SessionAttachFailed{Reason: reason}, protocol.EncodeSessionAttachFailed)
 		return err
 	}
+	defer close(clientInstance.lifetimeDone)
 	attached := false
 	defer func() {
 		if !attached {
@@ -531,30 +584,55 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		_ = conn.CloseWithError(0, "")
 		d.detachClientInstance(clientInstance, s)
 	}()
+	inputEvents := make(chan clientInputEvent, 1)
+	go readClientInput(inputDecoder, inputEvents)
+	applySwitch := func(request *sessionSwitchRequest) error {
+		target, switchErr := d.switchClientInstance(clientInstance, s, request.rawTarget, request.cols, request.rows)
+		if switchErr != nil {
+			completeSessionSwitch(request, switchErr)
+			if target != nil {
+				s = target
+				return switchErr
+			}
+			_ = s.coordinate(func() error {
+				s.showStatusMessage(clientID0, switchErr.Error())
+				return s.publishStatusBar()
+			})
+			return nil
+		}
+		s = target
+		completeSessionSwitch(request, nil)
+		return nil
+	}
 	for {
-		inputErrs := make(chan error, 1)
-		go s.readInput(clientInstance, inputDecoder, inputErrs)
 		select {
 		case err := <-writerErrs:
 			return err
-		case err := <-inputErrs:
+		case event := <-inputEvents:
+			if event.err != nil {
+				if errors.Is(event.err, io.EOF) {
+					return nil
+				}
+				return fmt.Errorf("read input frame: %w", event.err)
+			}
+			stopped, err := s.handleInputFrame(clientInstance, event.frame)
+			if stopped {
+				return nil
+			}
 			var request *sessionSwitchRequest
 			if !errors.As(err, &request) {
-				return err
-			}
-			target, err := d.switchClientInstance(clientInstance, s, request.rawTarget, request.cols, request.rows)
-			if err != nil {
-				if target != nil {
-					s = target
+				if err != nil {
 					return err
 				}
-				_ = s.coordinate(func() error {
-					s.showStatusMessage(clientID0, err.Error())
-					return s.publishStatusBar()
-				})
 				continue
 			}
-			s = target
+			if err := applySwitch(request); err != nil {
+				return err
+			}
+		case request := <-clientInstance.sessionSwitches:
+			if err := applySwitch(request); err != nil {
+				return err
+			}
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-conn.Context().Done():
