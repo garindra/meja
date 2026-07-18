@@ -318,7 +318,7 @@ func registeredCommands() []commandDefinition {
 		{name: "select-pane", aliases: []string{"selectp"}, execute: sessionCommand(sessionTarget, handleSelectPaneCommand)},
 		{name: "resize-pane", aliases: []string{"resizep"}, execute: sessionCommand(sessionTarget, handleResizePaneCommand)},
 		{name: "rename-window", aliases: []string{"renamew"}, execute: sessionCommand(windowTarget, handleRenameWindowCommand)},
-		{name: "rename-session", aliases: []string{"renames"}, execute: sessionCommand(sessionTarget, handleRenameSessionCommand)},
+		{name: "rename-session", aliases: []string{"rename", "renames"}, execute: sessionCommand(sessionTarget, handleRenameSessionCommand)},
 		{name: "set-root", execute: sessionCommand(sessionTarget, handleSetRootCommand)},
 		{name: "switch-session", execute: attachedCommand(handleSwitchSessionCommand)},
 		{name: "confirm-before", execute: attachedCommand(handleConfirmBeforeCommand)},

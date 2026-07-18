@@ -109,6 +109,10 @@ func TestCommandAliasesAreResolvedByDaemon(t *testing.T) {
 	if attached.exitCode != 0 || attached.bootstrap == nil || attached.bootstrap.AttachToken == created.bootstrap.AttachToken {
 		t.Fatalf("attach alias result = %#v", attached)
 	}
+	renamed := d.executeCommand(protocol.CommandRequest{Args: []string{"rename", "-t", "work", "renamed"}})
+	if renamed.exitCode != 0 || d.sessionByName("renamed") == nil {
+		t.Fatalf("rename alias result = %#v", renamed)
+	}
 }
 
 func TestSaveAndRestoreFileCommandsRoundTripSession(t *testing.T) {
