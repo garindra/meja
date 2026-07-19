@@ -238,15 +238,15 @@ type Session struct {
 	NextPaneID         uint64
 	NextLayoutRevision uint64
 
-	daemon          *Daemon
-	clientInstance  *ClientInstance
-	rootDir         string
-	operations      chan sessionOperation
-	operationsDone  chan struct{}
-	statusCommands  chan statusCommand
-	stopOnce        sync.Once
-	processObserver ProcessObserver
-	processMonitor  *ProcessMonitor
+	daemon                    *Daemon
+	clientInstance            *ClientInstance
+	rootDir                   string
+	operations                chan sessionOperation
+	operationsDone            chan struct{}
+	statusCommands            chan statusCommand
+	stopOnce                  sync.Once
+	processObserver           ProcessObserver
+	processMonitor            *ProcessMonitor
 	processSaveCandidates     map[uint64]processSaveCandidate
 	processObservationUpdates chan monitoredProcessBatch
 	persistenceOnce           sync.Once
