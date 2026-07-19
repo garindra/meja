@@ -4,11 +4,14 @@ GORELEASER ?= goreleaser
 BINARY := meja
 MAIN_PACKAGE := .
 
-.PHONY: build test check clean snapshot
+.PHONY: build fmt test check clean snapshot
 
 build:
 	mkdir -p bin
 	CGO_ENABLED=0 $(GO) build -trimpath -o bin/$(BINARY) $(MAIN_PACKAGE)
+
+fmt:
+	$(GO) fmt ./...
 
 test:
 	$(GO) test ./...
