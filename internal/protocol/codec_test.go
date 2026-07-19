@@ -96,12 +96,11 @@ func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
 		}
 	}
 	encoder.AppendPresent()
-	batch, err := NewDisplayDecoder(oneByteReader{Reader: bytes.NewReader(encoder.Bytes())}).ReadBatch()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if batch.LayoutRevision != 7 || batch.GridCols != 80 || batch.GridRows != 24 || !reflect.DeepEqual(batch.Commands, commands) {
-		t.Fatalf("batch=%#v want commands=%#v", batch, commands)
+	want := append([]DisplayCommand{{Opcode: DisplayOpcodeRelayoutBarrier, LayoutRevision: 7, GridCols: 80, GridRows: 24}}, commands...)
+	want = append(want, DisplayCommand{Opcode: DisplayOpcodePresent})
+	got := decodeDisplayCommands(t, oneByteReader{Reader: bytes.NewReader(encoder.Bytes())})
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("commands=%#v want %#v", got, want)
 	}
 }
 
@@ -125,12 +124,11 @@ func TestDiverseClustersRoundTripAsOpaqueDisplayUnits(t *testing.T) {
 		}
 	}
 	encoder.AppendPresent()
-	batch, err := NewDisplayDecoder(oneByteReader{Reader: bytes.NewReader(encoder.Bytes())}).ReadBatch()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if batch.LayoutRevision != 19 || !reflect.DeepEqual(batch.Commands, clusters) {
-		t.Fatalf("decoded batch = %#v, want revision 19 commands %#v", batch, clusters)
+	want := append([]DisplayCommand{{Opcode: DisplayOpcodeRelayoutBarrier, LayoutRevision: 19, GridCols: 80, GridRows: 24}}, clusters...)
+	want = append(want, DisplayCommand{Opcode: DisplayOpcodePresent})
+	got := decodeDisplayCommands(t, oneByteReader{Reader: bytes.NewReader(encoder.Bytes())})
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("decoded commands = %#v, want %#v", got, want)
 	}
 }
 
@@ -144,12 +142,9 @@ func TestDisplayStyleRoundTripsExtendedAttributesWithoutChangingOldFlags(t *test
 		t.Fatal(err)
 	}
 	encoder.AppendPresent()
-	batch, err := NewDisplayDecoder(bytes.NewReader(encoder.Bytes())).ReadBatch()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(batch.Commands) != 1 || batch.Commands[0].Style != style {
-		t.Fatalf("decoded style=%#v want %#v", batch.Commands, style)
+	commands := decodeDisplayCommands(t, bytes.NewReader(encoder.Bytes()))
+	if len(commands) != 3 || commands[1].Style != style {
+		t.Fatalf("decoded commands=%#v want style %#v", commands, style)
 	}
 
 	var writer PayloadWriter
@@ -186,35 +181,54 @@ func TestDisplayDecoderMultipleBatches(t *testing.T) {
 	}
 	decoder := NewDisplayDecoder(bytes.NewReader(encoder.Bytes()))
 	for _, want := range []string{"one", "two"} {
-		batch, err := decoder.ReadBatch()
-		if err != nil {
-			t.Fatal(err)
+		barrier, _, err := decoder.ReadCommand()
+		if err != nil || barrier.Opcode != DisplayOpcodeRelayoutBarrier {
+			t.Fatalf("barrier=%#v err=%v", barrier, err)
 		}
-		if len(batch.Commands) != 1 || string(batch.Commands[0].Text) != want {
-			t.Fatalf("batch=%#v", batch)
+		text, _, err := decoder.ReadCommand()
+		if err != nil || string(text.Text) != want {
+			t.Fatalf("text=%#v err=%v", text, err)
+		}
+		present, _, err := decoder.ReadCommand()
+		if err != nil || present.Opcode != DisplayOpcodePresent {
+			t.Fatalf("present=%#v err=%v", present, err)
 		}
 	}
-	if _, err := decoder.ReadBatch(); !errors.Is(err, io.EOF) {
-		t.Fatalf("final ReadBatch error=%v", err)
+	if _, _, err := decoder.ReadCommand(); !errors.Is(err, io.EOF) {
+		t.Fatalf("final ReadCommand error=%v", err)
 	}
 }
 
 func TestDisplayDecoderRejectsMalformedCommands(t *testing.T) {
 	for name, data := range map[string][]byte{
-		"unknown opcode":         {0x7f},
-		"truncated position":     {byte(DisplayOpcodeSetWritePosition), 0x01},
-		"invalid width":          {byte(DisplayOpcodeWriteText), 0x03, 0x00},
-		"truncated text":         {byte(DisplayOpcodeWriteTextUTF8), 0x03, 'a'},
-		"invalid utf8":           {byte(DisplayOpcodeWriteTextUTF8), 0x01, 0xff},
-		"present before barrier": {byte(DisplayOpcodePresent)},
-		"command before barrier": {byte(DisplayOpcodeWriteTextUTF8), 0x00},
+		"unknown opcode":     {0x7f},
+		"truncated position": {byte(DisplayOpcodeSetWritePosition), 0x01},
+		"invalid width":      {byte(DisplayOpcodeWriteText), 0x03, 0x00},
+		"truncated text":     {byte(DisplayOpcodeWriteTextUTF8), 0x03, 'a'},
+		"invalid utf8":       {byte(DisplayOpcodeWriteTextUTF8), 0x01, 0xff},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := NewDisplayDecoder(bytes.NewReader(data)).ReadBatch()
+			_, _, err := NewDisplayDecoder(bytes.NewReader(data)).ReadCommand()
 			if err == nil {
 				t.Fatal("accepted malformed display stream")
 			}
 		})
+	}
+}
+
+func decodeDisplayCommands(tb testing.TB, reader io.Reader) []DisplayCommand {
+	tb.Helper()
+	decoder := NewDisplayDecoder(reader)
+	var commands []DisplayCommand
+	for {
+		command, _, err := decoder.ReadCommand()
+		if errors.Is(err, io.EOF) {
+			return commands
+		}
+		if err != nil {
+			tb.Fatal(err)
+		}
+		commands = append(commands, command)
 	}
 }
 

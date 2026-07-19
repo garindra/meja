@@ -11,6 +11,13 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
+type displayStyleMap map[uint32]protocol.Style
+
+func (m displayStyleMap) LookupStyle(id uint32) (protocol.Style, bool) {
+	style, ok := m[id]
+	return style, ok
+}
+
 func TestDisplayCompilerUsesSpecializedTextAndFill(t *testing.T) {
 	output := newRenderOutput()
 	cells := []decodedTestCell{{Width: 1}, {Width: 1}, {Width: 1}, {Cluster: "o", Width: 1}, {Cluster: "k", Width: 1}}
@@ -35,12 +42,7 @@ func TestDisplayCompilerMergesCompatibleRows(t *testing.T) {
 		return value
 	}
 	output := newRenderOutput()
-	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, func(cell cellWord) string {
-		if r, ok := cell.scalar(); ok {
-			return string(r)
-		}
-		return ""
-	}, 4, 2)
+	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, nil, 4)
 	if err := compiler.writeCells(0, 0, []cellWord{word('a'), word('b'), word('c'), word('d')}); err != nil {
 		t.Fatal(err)
 	}
@@ -71,10 +73,7 @@ func TestDisplayCompilerStreamsBoundedCompatibleText(t *testing.T) {
 	}
 	var wire countingBuffer
 	output := newRenderOutput(&wire)
-	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, func(cell cellWord) string {
-		r, _ := cell.scalar()
-		return string(r)
-	}, cols, rows)
+	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, nil, cols)
 	for rowIndex := 0; rowIndex < rows; rowIndex++ {
 		if err := compiler.writeCells(rowIndex, 0, row); err != nil {
 			t.Fatal(err)
@@ -115,7 +114,7 @@ func TestDisplayCompilerStreamsBoundedCompatibleText(t *testing.T) {
 
 func TestDisplayCompilerMergesFillAcrossRows(t *testing.T) {
 	output := newRenderOutput()
-	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, func(cellWord) string { return "" }, 4, 2)
+	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, nil, 4)
 	row := []cellWord{0, 0, 0, 0}
 	if err := compiler.writeCells(0, 0, row); err != nil {
 		t.Fatal(err)
@@ -1054,24 +1053,6 @@ func TestChineseTerminalOutputUsesWidthTwoDisplayCommand(t *testing.T) {
 	t.Fatalf("display commands did not contain width-two Chinese output: %#v", decodePendingCommands(t, wire.Bytes()))
 }
 
-func TestMergedDamageMovesWithLaterScroll(t *testing.T) {
-	aggregate := Update{}
-	aggregate.Merge(Update{
-		DirtySpans: []DirtySpan{{}, {Start: 0, End: 3}, {}},
-	}, 3)
-	aggregate.Merge(Update{ScrollDelta: -1}, 3)
-
-	if aggregate.ScrollDelta != -1 {
-		t.Fatalf("scroll delta = %d, want -1", aggregate.ScrollDelta)
-	}
-	if aggregate.DirtySpans[0].End == 0 {
-		t.Fatalf("damage was not shifted with scroll: %#v", aggregate.DirtySpans)
-	}
-	if aggregate.DirtySpans[1].End != 0 {
-		t.Fatalf("old damage row survived scroll: %#v", aggregate.DirtySpans)
-	}
-}
-
 func TestDisplayWireMeasurement(t *testing.T) {
 	rows := compilerBenchmarkRows()
 	output := newRenderOutput()
@@ -1205,12 +1186,11 @@ func conceptualFramedDisplaySize(tb testing.TB, stream []byte) int {
 	decoder := protocol.NewDisplayDecoder(bytes.NewReader(stream))
 	total := 0
 	for {
-		start := decoder.BytesRead()
-		command, _, err := decoder.ReadCommand()
+		command, wireBytes, err := decoder.ReadCommand()
 		if err != nil {
 			return total
 		}
-		payload := int(decoder.BytesRead()-start) - 1
+		payload := int(wireBytes) - 1
 		var scratch [10]byte
 		typeBytes := putUvarint(scratch[:], uint64(command.Opcode))
 		lengthBytes := putUvarint(scratch[:], uint64(payload))

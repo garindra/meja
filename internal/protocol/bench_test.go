@@ -57,7 +57,12 @@ func BenchmarkDisplayCommandCodec(b *testing.B) {
 		encoder := NewDisplayEncoder(nil)
 		_ = encoder.AppendWriteTextUTF8(text)
 		encoder.AppendPresent()
-		_, _ = NewDisplayDecoder(bytes.NewReader(encoder.Bytes())).ReadBatch()
+		decoder := NewDisplayDecoder(bytes.NewReader(encoder.Bytes()))
+		for {
+			if _, _, err := decoder.ReadCommand(); err != nil {
+				break
+			}
+		}
 	}
 }
 
@@ -67,13 +72,11 @@ func conceptualFramedDisplaySize(stream []byte) int {
 	decoder := NewDisplayDecoder(bytes.NewReader(stream))
 	total := 0
 	for {
-		start := decoder.BytesRead()
-		command, _, err := decoder.ReadCommand()
+		command, wireBytes, err := decoder.ReadCommand()
 		if err != nil {
 			break
 		}
-		end := decoder.BytesRead()
-		payload := int(end - start - 1)
+		payload := int(wireBytes) - 1
 		var buf [binary.MaxVarintLen64]byte
 		frameType := binary.PutUvarint(buf[:], uint64(command.Opcode))
 		total += frameType + binary.PutUvarint(buf[:], uint64(payload)) + payload

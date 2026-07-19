@@ -759,7 +759,7 @@ func TestPinnedTLSRequiresExactSPKI(t *testing.T) {
 	}
 }
 
-func TestStatusOutputAcceptsBarrierlessDisplayBatch(t *testing.T) {
+func TestStatusOutputAcceptsBarrierlessDisplayFrame(t *testing.T) {
 	encoder := protocol.NewDisplayEncoder(nil)
 	commands := []protocol.DisplayCommand{
 		{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: 1, Style: protocol.Style{Bold: true}},
@@ -853,6 +853,15 @@ func TestDisplayFrameCompilerRejectsWriteBeyondGrid(t *testing.T) {
 	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 1, Column: 3})
 	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("ab")}); err == nil {
 		t.Fatal("write beyond grid was accepted")
+	}
+}
+
+func TestDisplayFrameCompilerRejectsMultipleScrolls(t *testing.T) {
+	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
+	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1, GridCols: 4, GridRows: 2})
+	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: -1})
+	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: -1}); err == nil {
+		t.Fatal("multiple scroll commands in one frame were accepted")
 	}
 }
 
@@ -1014,7 +1023,7 @@ func TestNativeScrollUsesRectangularMargins(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
-	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDeltas: []int{-1}}); err != nil {
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDelta: -1}); err != nil {
 		t.Fatal(err)
 	}
 	out := string(s.takeANSI())
@@ -1037,7 +1046,7 @@ func TestFallbackScrollRetainsVisibleRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
-	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDeltas: []int{-1}, spans: []paintSpan{{kind: paintText, row: 2, styleID: 0, cellWidth: 1, text: []byte("dddd")}}}); err != nil {
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDelta: -1, spans: []paintSpan{{kind: paintText, row: 2, styleID: 0, cellWidth: 1, text: []byte("dddd")}}}); err != nil {
 		t.Fatal(err)
 	}
 	out := string(s.takeANSI())

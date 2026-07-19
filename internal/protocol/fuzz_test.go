@@ -8,6 +8,11 @@ import (
 func FuzzDisplayCommandDecoders(f *testing.F) {
 	f.Add([]byte{byte(DisplayOpcodeRelayoutBarrier), 1, 1, 1, byte(DisplayOpcodePresent)})
 	f.Fuzz(func(t *testing.T, b []byte) {
-		_, _ = NewDisplayDecoder(bytes.NewReader(b)).ReadBatch()
+		decoder := NewDisplayDecoder(bytes.NewReader(b))
+		for {
+			if _, _, err := decoder.ReadCommand(); err != nil {
+				return
+			}
+		}
 	})
 }

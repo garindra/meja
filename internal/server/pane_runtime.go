@@ -406,11 +406,9 @@ func renderHistoryMove(output *renderOutput, view *paneHistoryView, move history
 			return err
 		}
 	}
-	compiler := newDisplayCompiler(output, view.Snapshot, view.Snapshot.cellText, view.Snapshot.Cols, view.Snapshot.ViewportRows)
-	for _, run := range historyMoveRuns(view, move) {
-		if err := compiler.writeCells(run.row, run.column, run.cells); err != nil {
-			return err
-		}
+	compiler := newDisplayCompiler(output, view.Snapshot, view.Snapshot.clusters, view.Snapshot.Cols)
+	if err := writeHistoryMoveCells(compiler, view, move); err != nil {
+		return err
 	}
 	if err := compiler.finish(); err != nil {
 		return err
@@ -424,37 +422,34 @@ func renderHistoryMove(output *renderOutput, view *paneHistoryView, move history
 	return output.present()
 }
 
-type cellWordRun struct {
-	row, column int
-	cells       []cellWord
-}
-
-func historyMoveRuns(view *paneHistoryView, move historyMove) []cellWordRun {
+func writeHistoryMoveCells(compiler *displayCompiler, view *paneHistoryView, move historyMove) error {
+	snapshot := view.Snapshot
+	if move.Delta > 0 {
+		if err := compiler.writeCells(0, 0, snapshot.row(view.ViewTop)); err != nil {
+			return err
+		}
+		if snapshot.ViewportRows > 1 {
+			return writeHistoryCounterRow(compiler, view, 1, move.OldCounter, "")
+		}
+		return nil
+	}
 	if move.Delta == 0 {
 		return nil
 	}
-	snapshot := view.Snapshot
-	runs := make([]cellWordRun, 0, 2)
-	if move.Delta > 0 {
-		runs = append(runs, cellWordRun{row: 0, cells: snapshot.row(view.ViewTop)})
-		if snapshot.ViewportRows > 1 {
-			runs = append(runs, historyCounterRun(view, 1, move.OldCounter, ""))
-		}
-		return runs
-	}
 	bottom := snapshot.ViewportRows - 1
 	rowIndex := view.ViewTop + bottom
-	runs = append(runs, cellWordRun{row: bottom, cells: snapshot.row(rowIndex)})
-	runs = append(runs, historyCounterRun(view, 0, move.OldCounter, move.NewCounter))
-	return runs
+	if err := compiler.writeCells(bottom, 0, snapshot.row(rowIndex)); err != nil {
+		return err
+	}
+	return writeHistoryCounterRow(compiler, view, 0, move.OldCounter, move.NewCounter)
 }
 
-func historyCounterRun(view *paneHistoryView, viewportRow int, oldLabel, newLabel string) cellWordRun {
+func writeHistoryCounterRow(compiler *displayCompiler, view *paneHistoryView, viewportRow int, oldLabel, newLabel string) error {
 	snapshot := view.Snapshot
 	width := max(len(oldLabel), len(newLabel))
 	start := max(0, snapshot.Cols-width)
 	rowIndex := view.ViewTop + viewportRow
-	return cellWordRun{row: viewportRow, column: start, cells: snapshot.row(rowIndex)[start:]}
+	return compiler.writeCells(viewportRow, start, snapshot.row(rowIndex)[start:])
 }
 
 func writeHistoryCounter(compiler *displayCompiler, view *paneHistoryView, label string) error {
@@ -530,7 +525,7 @@ func sendHistorySnapshot(output *renderOutput, pane *Pane, view *paneHistoryView
 			return err
 		}
 	}
-	compiler := newDisplayCompiler(output, snapshot, snapshot.cellText, snapshot.Cols, snapshot.ViewportRows)
+	compiler := newDisplayCompiler(output, snapshot, snapshot.clusters, snapshot.Cols)
 	for row := 0; row < snapshot.ViewportRows; row++ {
 		if err := compiler.writeCells(row, 0, snapshot.row(view.ViewTop+row)); err != nil {
 			return err

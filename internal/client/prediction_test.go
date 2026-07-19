@@ -17,10 +17,8 @@ func testPredictionContext() predictionContext {
 
 func applyPredictorFrame(t *testing.T, predictor *inputPredictor, cache *paneScanoutCache, frame renderFrame) predictionResult {
 	t.Helper()
-	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange), cursorUpdated: frame.cursorUpdated, scrolled: len(frame.scrollDeltas) > 0}
-	for _, delta := range frame.scrollDeltas {
-		cache.scroll(delta)
-	}
+	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange), cursorUpdated: frame.cursorUpdated, scrolled: frame.scrollDelta != 0}
+	cache.scroll(frame.scrollDelta)
 	for _, span := range frame.spans {
 		if err := applySpanToCache(cache, span, &evidence); err != nil {
 			t.Fatal(err)

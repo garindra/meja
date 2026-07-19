@@ -1301,36 +1301,6 @@ func (u *Update) recordScroll(delta, rows int) {
 	}
 }
 
-func (u *Update) Merge(next Update, rows int) {
-	u.trackDamage = true
-	u.ensureRows(rows)
-	if next.FullRedraw {
-		u.FullRedraw = true
-		u.ScrollDelta = 0
-	} else if next.ScrollDelta != 0 {
-		u.recordScroll(next.ScrollDelta, rows)
-	}
-	for row, span := range next.DirtySpans {
-		if row >= rows || span.End == 0 {
-			continue
-		}
-		current := u.DirtySpans[row]
-		if current.End == 0 {
-			u.DirtySpans[row] = span
-			continue
-		}
-		if span.Start < current.Start {
-			current.Start = span.Start
-		}
-		if span.End > current.End {
-			current.End = span.End
-		}
-		u.DirtySpans[row] = current
-	}
-	u.CursorChanged = u.CursorChanged || next.CursorChanged
-	u.VisibleChange = u.VisibleChange || next.VisibleChange
-}
-
 func (u *Update) ensureRows(rows int) {
 	if rows < 0 {
 		rows = 0

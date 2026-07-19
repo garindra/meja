@@ -1461,7 +1461,7 @@ type testDisplayCompiler struct {
 func newTestDisplayCompiler(output *renderOutput, styles map[uint32]protocol.Style) *testDisplayCompiler {
 	terminal := &TerminalState{}
 	return &testDisplayCompiler{
-		displayCompiler: newDisplayCompiler(output, displayStyleMap(styles), terminal.cellText, int(protocol.MaxGridCols), int(protocol.MaxGridRows)),
+		displayCompiler: newDisplayCompiler(output, displayStyleMap(styles), &terminal.clusters, int(protocol.MaxGridCols)),
 		terminal:        terminal,
 	}
 }

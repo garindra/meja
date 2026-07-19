@@ -55,15 +55,6 @@ type DisplayCommand struct {
 	Delta          int
 }
 
-// DisplayBatch contains commands between a relayout barrier and PRESENT.
-// The barrier itself is stream state and is not included in Commands.
-type DisplayBatch struct {
-	LayoutRevision uint64
-	GridCols       int
-	GridRows       int
-	Commands       []DisplayCommand
-}
-
 type DisplayEncoder struct{ buf []byte }
 
 func NewDisplayEncoder(dst []byte) *DisplayEncoder { return &DisplayEncoder{buf: dst} }
@@ -249,26 +240,13 @@ func appendText(dst, text []byte) []byte {
 }
 
 type DisplayDecoder struct {
-	r              *bufio.Reader
-	bytesRead      uint64
-	hasBarrier     bool
-	layoutRevision uint64
-	gridCols       int
-	gridRows       int
-	pending        []DisplayCommand
+	r         *bufio.Reader
+	bytesRead uint64
 }
 
 func NewDisplayDecoder(r io.Reader) *DisplayDecoder {
 	return &DisplayDecoder{r: bufio.NewReader(r)}
 }
-
-// NewDisplayDecoderFromDecoder preserves bytes buffered while reading the
-// framed stream opener before switching that stream to display bytes.
-func NewDisplayDecoderFromDecoder(d *Decoder) *DisplayDecoder {
-	return &DisplayDecoder{r: d.r}
-}
-
-func (d *DisplayDecoder) BytesRead() uint64 { return d.bytesRead }
 
 func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 	start := d.bytesRead
@@ -389,37 +367,6 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 		}
 	}
 	return cmd, d.bytesRead - start, nil
-}
-
-func (d *DisplayDecoder) ReadBatch() (DisplayBatch, error) {
-	for {
-		cmd, _, err := d.ReadCommand()
-		if err != nil {
-			return DisplayBatch{}, err
-		}
-		switch cmd.Opcode {
-		case DisplayOpcodeNoop:
-			continue
-		case DisplayOpcodeRelayoutBarrier:
-			d.pending = d.pending[:0]
-			d.layoutRevision = cmd.LayoutRevision
-			d.gridCols = cmd.GridCols
-			d.gridRows = cmd.GridRows
-			d.hasBarrier = true
-		case DisplayOpcodePresent:
-			if !d.hasBarrier {
-				return DisplayBatch{}, errors.New("PRESENT before RELAYOUT_BARRIER")
-			}
-			batch := DisplayBatch{LayoutRevision: d.layoutRevision, GridCols: d.gridCols, GridRows: d.gridRows, Commands: append([]DisplayCommand(nil), d.pending...)}
-			d.pending = d.pending[:0]
-			return batch, nil
-		default:
-			if !d.hasBarrier {
-				return DisplayBatch{}, errors.New("display command before RELAYOUT_BARRIER")
-			}
-			d.pending = append(d.pending, cmd)
-		}
-	}
 }
 
 func normalizeDisplayReadError(err error) error {

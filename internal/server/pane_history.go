@@ -74,10 +74,6 @@ func (s *paneHistorySnapshot) row(row int) []cellWord {
 	return s.grid.logicalRow(row, s.Cols)
 }
 
-func (s *paneHistorySnapshot) cellText(word cellWord) string {
-	return cellTextFromStore(word, s.clusters)
-}
-
 func (s *paneHistorySnapshot) LookupStyle(id uint32) (protocol.Style, bool) {
 	if uint64(id) >= uint64(len(s.styles)) || s.styles[id].ID != id {
 		return protocol.Style{}, false

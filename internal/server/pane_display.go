@@ -7,24 +7,28 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
-func displayRune(cell cellWord, text string) (rune, bool) {
-	if text == "" {
-		return ' ', cell.width() == 1
+func displayRune(cell cellWord, clusters *clusterStore) (rune, bool) {
+	if cell.isBlank() {
+		return ' ', true
 	}
+	if r, ok := cell.scalar(); ok {
+		return r, true
+	}
+	text := cellTextFromStore(cell, clusters)
 	r, size := utf8.DecodeRuneInString(text)
-	return r, size == len(text)
+	return r, text != "" && size == len(text)
 }
 
 type displayCompiler struct {
 	output        *renderOutput
 	positionValid bool
 	row, column   int
-	cols, rows    int
+	cols          int
 	styleValid    bool
 	styleID       uint32
 	styles        displayStyleSource
 	installStyles bool
-	cellText      func(cellWord) string
+	clusters      *clusterStore
 	pendingOpcode protocol.DisplayOpcode
 	pendingWidth  uint8
 	pendingStyle  uint32
@@ -37,19 +41,12 @@ type displayStyleSource interface {
 	LookupStyle(uint32) (protocol.Style, bool)
 }
 
-type displayStyleMap map[uint32]protocol.Style
-
-func (m displayStyleMap) LookupStyle(id uint32) (protocol.Style, bool) {
-	style, ok := m[id]
-	return style, ok
-}
-
-func newDisplayCompiler(output *renderOutput, styles displayStyleSource, cellText func(cellWord) string, cols, rows int) *displayCompiler {
-	return &displayCompiler{output: output, styles: styles, cellText: cellText, cols: cols, rows: rows}
+func newDisplayCompiler(output *renderOutput, styles displayStyleSource, clusters *clusterStore, cols int) *displayCompiler {
+	return &displayCompiler{output: output, styles: styles, clusters: clusters, cols: cols}
 }
 
 func newLiveDisplayCompiler(output *renderOutput, terminal *TerminalState) *displayCompiler {
-	return &displayCompiler{output: output, styles: terminal, installStyles: true, cellText: terminal.cellText, cols: terminal.Cols, rows: terminal.Rows}
+	return &displayCompiler{output: output, styles: terminal, installStyles: true, clusters: &terminal.clusters, cols: terminal.Cols}
 }
 
 func (d *displayCompiler) writeCells(row, column int, cells []cellWord) error {
@@ -62,8 +59,8 @@ func (d *displayCompiler) writeCells(row, column int, cells []cellWord) error {
 		if err := d.moveTo(row, column+i); err != nil {
 			return err
 		}
-		text := d.cellText(cell)
-		if _, singleRune := displayRune(cell, text); !singleRune {
+		if _, singleRune := displayRune(cell, d.clusters); !singleRune {
+			text := cellTextFromStore(cell, d.clusters)
 			if err := d.finish(); err != nil {
 				return err
 			}
@@ -84,7 +81,7 @@ func (d *displayCompiler) writeCells(row, column int, cells []cellWord) error {
 			}
 			if j-i >= 3 {
 				count := j - i
-				r, _ := displayRune(cell, text)
+				r, _ := displayRune(cell, d.clusters)
 				if err := d.queueFill(protocol.Fill{Columns: count, Rune: r, Width: 1}, uint32(cell.styleID())); err != nil {
 					return err
 				}
@@ -101,7 +98,7 @@ func (d *displayCompiler) writeCells(row, column int, cells []cellWord) error {
 			if current.width() != width || current.width() == 0 {
 				break
 			}
-			r, singleRune := displayRune(current, d.cellText(current))
+			r, singleRune := displayRune(current, d.clusters)
 			if !singleRune {
 				break
 			}
@@ -145,7 +142,7 @@ func (d *displayCompiler) blankBridgeEnd(cells []cellWord, start int, targetStyl
 	checked := false
 	for end < len(cells) {
 		cell := cells[end]
-		r, singleRune := displayRune(cell, d.cellText(cell))
+		r, singleRune := displayRune(cell, d.clusters)
 		if cell.width() != 1 || !singleRune || r != ' ' {
 			break
 		}
@@ -161,7 +158,7 @@ func (d *displayCompiler) blankBridgeEnd(cells []cellWord, start int, targetStyl
 		return start, false
 	}
 	next := cells[end]
-	r, singleRune := displayRune(next, d.cellText(next))
+	r, singleRune := displayRune(next, d.clusters)
 	return end, next.width() > 0 && singleRune && r != ' ' && uint32(next.styleID()) == targetStyle
 }
 

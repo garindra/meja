@@ -95,7 +95,7 @@ type renderFrame struct {
 	layoutRevision uint64
 	cols, rows     int
 	styleInstalls  []protocol.StyleDefinition
-	scrollDeltas   []int
+	scrollDelta    int
 	spans          []paintSpan
 	cursor         protocol.Cursor
 	cursorVisible  bool
@@ -771,7 +771,10 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 			return false, fmt.Errorf("SCROLL after paint on slot %d", c.slot)
 		}
 		if command.Delta != 0 {
-			c.frame.scrollDeltas = append(c.frame.scrollDeltas, command.Delta)
+			if c.frame.scrollDelta != 0 {
+				return false, fmt.Errorf("multiple SCROLL commands in one frame on slot %d", c.slot)
+			}
+			c.frame.scrollDelta = command.Delta
 		}
 	case protocol.DisplayOpcodePresent:
 		c.frame.layoutRevision = c.layoutRevision
@@ -1309,11 +1312,9 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 		styles[def.ID] = def.Style
 	}
 	cache := s.caches[slot]
-	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange), cursorUpdated: frame.cursorUpdated, scrolled: len(frame.scrollDeltas) > 0}
+	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange), cursorUpdated: frame.cursorUpdated, scrolled: frame.scrollDelta != 0}
 	if cache != nil {
-		for _, delta := range frame.scrollDeltas {
-			cache.scroll(delta)
-		}
+		cache.scroll(frame.scrollDelta)
 		for _, span := range frame.spans {
 			if err := applySpanToCache(cache, span, &evidence); err != nil {
 				return err
@@ -1330,10 +1331,7 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 	display := result.frame
 	s.ansi.WriteString("\x1b[?25l")
 	fullPaneEmitted := false
-	for _, delta := range display.scrollDeltas {
-		if delta == 0 {
-			continue
-		}
+	if delta := display.scrollDelta; delta != 0 {
 		if s.rectangularScroll && !result.repaintPane {
 			// DECLRMM is enabled for the session. Margins are reset immediately.
 			fmt.Fprintf(&s.ansi, "\x1b[%d;%dr\x1b[%d;%ds\x1b[%d;%dH", rect.Y+1, rect.Y+rect.Height, rect.X+1, rect.X+rect.Width, rect.Y+1, rect.X+1)
@@ -1345,7 +1343,7 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 			fmt.Fprintf(&s.ansi, "\x1b[r\x1b[1;%ds", s.cols)
 		}
 	}
-	if cache != nil && len(display.scrollDeltas) > 0 && (!s.rectangularScroll || result.repaintPane) {
+	if cache != nil && display.scrollDelta != 0 && (!s.rectangularScroll || result.repaintPane) {
 		if err := s.emitCachedPane(rect, cache, styles); err != nil {
 			return err
 		}

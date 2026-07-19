@@ -24,7 +24,7 @@ func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {
 
 	snapshot := captureTerminalHistorySnapshot(pane.terminal)
 	pane.terminal.replaceTextCell(pane.terminal.grid.logicalRow(0, 4), 0, "X", 1, 0)
-	if got := snapshot.cellText(snapshot.row(0)[0]); got != "o" {
+	if got := cellTextFromStore(snapshot.row(0)[0], snapshot.clusters); got != "o" {
 		t.Fatalf("snapshot aliased canonical history: %q", got)
 	}
 
@@ -55,7 +55,7 @@ func TestHistorySnapshotNeverSplitsClusterAcrossRows(t *testing.T) {
 	setTestRows(term, nil, rows)
 	snapshot := captureTerminalHistorySnapshot(term)
 	defer snapshot.release()
-	if anchor, continuation := snapshot.row(0)[3], snapshot.row(0)[4]; snapshot.cellText(anchor) != "👩‍💻" || anchor.width() != 2 || continuation.width() != 0 {
+	if anchor, continuation := snapshot.row(0)[3], snapshot.row(0)[4]; cellTextFromStore(anchor, snapshot.clusters) != "👩‍💻" || anchor.width() != 2 || continuation.width() != 0 {
 		t.Fatalf("snapshot cluster = %#v %#v", anchor, continuation)
 	}
 }
