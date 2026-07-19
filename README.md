@@ -2,7 +2,9 @@
 
 **tmux-style workspaces that survive bad networks and rebuild from a file.**
 
-![image](screenshot.png)
+<p align="center">
+  <img src="screenshot.png" alt="Meja screenshot" width="800">
+</p>
 
 Meja brings tmux’s familiar workflow to local and remote sessions, keeping remote work responsive through latency and alive through disconnects. 
 
