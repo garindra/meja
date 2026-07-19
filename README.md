@@ -1,269 +1,251 @@
 # meja
 
-`meja` is a local and remote terminal multiplexer transported over QUIC. A
-single executable contains the interactive client, per-user server, and the
-small SSH control interface.
+**tmux-style workspaces that survive bad networks and rebuild from a file.**
 
-SSH performs remote-user authentication, agent/password handling, SSH
-configuration, and host-key verification. Meja does not inspect
-`authorized_keys` or implement a second SSH authentication protocol.
+![image](screenshot.png)
 
-## Build
+Meja brings tmux’s familiar workflow to local and remote sessions, keeping remote work responsive through latency and alive through disconnects. 
 
-Build the single supported executable:
+Sessions can be recovered after reboots, reconstructing the same windows, panes, directories, and commands. Readable `.meja` files can live in version control, letting anyone recreate them on their machines.
 
-```bash
-go build -o bin/meja .
+---
+
+## One familiar workflow, local or remote
+
+Start a new session on your machine by running:
+
+```sh
+meja
 ```
 
-Install the appropriate build as `meja` locally and on each remote host.
+This starts a session with tmux-style windows and panes you know and love, and keybindings you're familiar with.
 
-Install the latest version directly with Go:
+You can also start one on another machine:
 
-```bash
+```sh
+meja -h user@host
+```
+
+`-h` also accepts aliases from your system’s SSH configuration:
+
+```sh
+meja -h devbox
+```
+
+If the network disappears, the client stays open. Meja preserves the last confirmed screen, shows that it is reconnecting, and continues when the connection returns.
+
+Rename the session from inside it:
+
+```sh
+meja rename work
+```
+
+Detach from it:
+
+```sh
+meja detach
+```
+
+Meja keeps the session and its processes running. Return to it later:
+
+```sh
+meja attach -t work -h devbox
+```
+
+If the machine reboots—or the session otherwise ends—recover it from its latest recorded state:
+
+```sh
+meja restore -t work -h devbox
+```
+
+Meja creates and enters a new session with the saved windows, panes, directories, and prepared commands.
+
+
+You can also run `save` to save the current session as a readable and editable `.meja` file:
+
+```sh
+meja save -t work -o dev.meja
+```
+
+Then create a fresh session from it:
+
+```
+meja new -f dev.meja
+```
+
+The file is readable and editable. Check it into version control so your team can recreate the same session on their machines.
+
+---
+
+## Installation
+
+On Linux x86-64:
+
+```sh
+curl -fsSL https://github.com/garindra/meja/releases/latest/download/meja-linux-amd64 -o /tmp/meja \
+  && sudo install -m 0755 /tmp/meja /usr/local/bin/meja
+```
+
+On macOS with Apple Silicon:
+
+```sh
+curl -fsSL https://github.com/garindra/meja/releases/latest/download/meja-darwin-arm64 -o /tmp/meja \
+  && sudo install -m 0755 /tmp/meja /usr/local/bin/meja
+```
+
+You can also install the latest version with Go:
+
+```sh
 go install github.com/garindra/meja@latest
 ```
 
-## Commands
+Check that your meja installation is successful:
 
-Start a new local session:
-
-```bash
-meja
-meja new
-meja new -s work
-meja -L dev
+```sh
+meja version
 ```
 
-Connect to a new remote session using a hostname, `user@host`, or an OpenSSH
-config alias:
+For remote `meja -h <host>` sessions, make sure to also install the binary on the target machine, reachable on `$PATH`.
 
-```bash
-meja -h prod
-meja -h prod new -- /usr/bin/bash -l
-meja new -h user@host
-meja new -s work -h prod
-meja -L dev new -h prod
-meja new -r /srv/app -h prod -- /usr/bin/bash -l
+#### Build from source:
+
+```sh
+git clone https://github.com/garindra/meja
+cd meja
+go build -o bin/meja .
 ```
 
-`-h` (or `--host`) is the SSH transport option. It accepts a hostname,
-`user@host`, or OpenSSH alias, so command arguments never need to be parsed by
-the client to discover where they should be sent:
 
-```bash
-meja new -h server
-meja new -i ~/.ssh/prod_ed25519 -h prod
+---
+
+## `.meja` files
+
+A `.meja` file describes how to recreate a development session: its windows, panes, directories, and commands.
+
+For example, a typical project might have a development window for the app and another for its services:
+
+```kdl
+root "."
+
+window name="dev" {
+    layout "main-vertical"
+
+    pane {
+        cwd "frontend/"
+        cmd "npm run dev"
+    }
+
+    pane {
+        cwd "backend/"
+        cmd "go run ."
+    }
+}
+
+window name="services" {
+    layout "even-horizontal"
+
+    pane {
+        cmd "mysql"
+    }
+
+    pane {
+        cmd "redis-server"
+    }
+}
 ```
 
-Attach to an existing session by numeric ID or name. Omitting the host selects
-the local server:
+Create a new session from the file:
 
-```bash
-meja attach -t 12
-meja attach -t work
-meja a -t 12 -h prod
-meja -L dev a -t work -h prod
+```sh
+meja new -f dev.meja
 ```
 
-List local or remote sessions:
+The file is readable and editable. Check it into version control so your team can recreate the same session on their machines.
 
-```bash
-meja ls
-meja ls -h prod
-meja -L dev ls -h prod
+---
+
+## Canonical project flow
+
+A typical team workflow:
+
+Start a session on your development machine:
+
+```sh
+meja -h devbox
 ```
 
-While attached, press `Ctrl+b`, then `:` and run
-`switch-session -t <session-id-or-name>` to move the same client connection to
-another live session.
+Move into your project:
 
-The list is headed `Active Sessions` and shows each session's numeric ID,
-name (or `<unnamed>`), and whether a client is currently attached.
-
-Run or stop the local per-user server explicitly:
-
-```bash
-meja start-server
-meja kill-server
-meja -L dev start-server
-meja -L dev kill-server
+```sh
+cd ~/projects/acme
 ```
 
-## Servers and sockets
+Set the session root:
 
-Each socket identifies an isolated Meja server process with its own sessions,
-session-ID sequence, certificate, and shared QUIC listener. `-L` selects a
-named profile and `-S` selects an exact socket path. They are global, mutually
-exclusive transport options. Transport options may appear anywhere before
-`--` and are removed before the command argv is forwarded:
-
-```bash
-meja -L work
-meja -L work attach -t 3
-meja -L work new -s work -h prod
-meja -L work kill-server
-
-meja -S /home/alice/run/meja.sock
-meja -S /home/alice/run/meja.sock kill-server
+```sh
+meja set-root .
 ```
 
-With no selector, Meja uses the `default` profile. Named profiles resolve to
-`~/.meja/<profile>/meja.sock`, so the default socket is
-`~/.meja/default/meja.sock`. Profile names may use letters, digits, `.`, `_`,
-and `-`. Exact `-S` paths must be absolute. For a remote command the profile or
-path is resolved on the remote host.
+Arrange your windows, panes, directories, and running processes.
 
-Socket directories created by Meja have mode 0700 and sockets have mode 0600.
-Meja never changes the permissions of an existing socket parent. An existing
-parent must already be owned by the current user with mode 0700, so a socket
-cannot be placed directly in a shared directory such as `/tmp`.
+Save the session:
 
-Commands that create or restore a session start the selected server if its
-socket is missing or stale. `attach`, `ls`, and `kill-server` require a running
-server. A foreground `start-server` and an automatically detached server use the
-same profile selector. A per-socket lifetime lock prevents two server processes
-from owning the same profile. A foreground server logs
-`meja server: session <id> attached` for each successful client attachment,
-including reconnects and reattachments.
-
-`-h` selects the SSH host, `-i` selects an SSH identity, `--port` selects the
-SSH port, and `--remote-path` selects the exact remote `meja` executable. These
-transport options may appear anywhere before `--`. The default remote path is
-`meja`.
-
-Client render diagnostics are enabled through environment variables. Set
-`MEJA_DEBUG=1` to enable all available diagnostics or
-`MEJA_DEBUG_RENDER=1` to enable render diagnostics specifically. Diagnostics
-are written to stderr unless `MEJA_DEBUG_LOG` names a file; setting that path
-also enables render diagnostics:
-
-```bash
-MEJA_DEBUG_RENDER=1 meja
-MEJA_DEBUG_LOG=/tmp/meja-render.log meja attach -t work
+```sh
+meja save -t work -o dev.meja
 ```
 
-`meja new -r <directory>` (or `--root`) sets the session's absolute root and
-the working directory for its initial pane and all later windows and splits.
-The root is resolved on the target machine.
-Quote a remote home-relative path so the local shell does not expand it first:
+Commit the file with the project:
 
-```bash
-meja new -r '~/projects/app' -h prod
+```sh
+git add dev.meja
+git commit
 ```
 
-The command following `--` applies only to the initial pane. Later panes start
-the target user's shell in the session root.
-When `-r` is omitted, a local session inherits the invoking process's current
-directory; a remote session starts in the remote user's home directory.
+Now anyone on the team can recreate the same development environment:
 
-From the command prompt, `set-root [path]` changes the session root for future
-windows and panes. With no path it uses the active pane's current directory;
-existing panes are not moved.
-
-## SSH command forwarding
-
-For a remote command, the local client invokes the installed `ssh` executable
-with one private, versioned forwarding command:
-
-```text
-meja -L <profile> __ssh-forward-v1
-meja -S <socket-path> __ssh-forward-v1
+```sh
+meja new -f dev.meja
 ```
+---
 
-The user's command arguments travel in a framed request on SSH stdin. The
-remote process resolves the selected Unix socket, starts the server if needed,
-and forwards the request without interpreting the command. Framed stdout,
-stderr, attach-bootstrap, and exit responses return on SSH stdout.
+## Why `meja`
 
-The bootstrap JSON contains a UDP port, expiring single-use attach token, and
-the SHA-256 hash of the daemon certificate's SubjectPublicKeyInfo. The attach
-token is already bound to its target session, so no session ID is exposed.
+### Familiar by design
 
-Local connections skip SSH entirely. They send the same command request directly
-to the protected Unix command socket and connect to the QUIC server through
-`127.0.0.1`. Once attached, local and remote reconnects go directly to the
-daemon's QUIC listener without consulting SSH or the command socket again.
+Meja follows tmux wherever practical.
 
-The protected command socket is selected by `-L` or `-S`; the socket directory is
-mode 0700 and the socket is mode 0600. Session IDs increase from 1 for the
-lifetime of a daemon. Session names are unique within one server/socket. A
-session is destroyed when its last pane exits. The daemon's QUIC listener and
-UDP port remain available to its other sessions and client instances.
+It uses the same `Ctrl+b` prefix and the familiar model of sessions, windows, panes, splits, history, detaching, and attaching. Existing tmux knowledge transfers directly.
 
-`meja kill-server` cleanly disconnects active clients as if they detached,
-gracefully stops the active daemon, and reports its PID when available. SIGINT
-and SIGTERM on a foreground daemon use the same client-disconnect behavior.
+### Editable `.meja` files
 
-## Security model
+`meja save` writes a live session's plan to a readable `.meja` file.
 
-The daemon runs under the SSH-authenticated account, so panes naturally have
-that account's UID/GID and environment. No root credential switching is used.
-The daemon generates a self-signed TLS 1.3 certificate and binds one UDP port
-in 60000–61000 for all of its client instances and sessions. The client uses
-an internal `InsecureSkipVerify` setting only
-with a mandatory exact SPKI `VerifyConnection` pin from the bootstrap; there
-is no genuinely unverified production TLS mode and no CA/certificate/key setup
-is required.
+These files can be edited, kept with a project, checked into version control, and used by other people to create the same session arrangement.
 
-The first QUIC management message is the versioned session attachment
-`{attachToken}`. The token is random, expiry-bound, daemon-bound,
-constant-time compared, and atomically consumed after a successful match. A
-successful attachment creates a daemon-owned client instance for that running
-Meja process and returns its reconnect token. The reconnect credential remains
-stable for the client-process lifetime and is kept only in memory on both
-sides; the client never needs a daemon-side client-instance or session ID.
 
-Each client instance is assigned to at most one session, and each session is
-assigned to at most one client instance. A fresh SSH-authenticated `attach`
-creates a distinct client instance and takes ownership of its requested
-session; a displaced live client shows the takeover reason briefly in its
-status bar and exits cleanly. When QUIC closes, the live client-instance object
-is discarded immediately. Its small reconnect-token and session-assignment
-record remains in daemon memory indefinitely, allowing a later reconnect to
-rebuild the client instance without SSH.
+### Named-session recovery
 
-The daemon owns client-instance assignment and asks a session to attach or
-detach it. The client instance owns the QUIC connection and its explicit
-management, input, status, and pane-output streams; the attached session reads
-those endpoints directly for input dispatch and graceful output handoff. A
-session never discovers its target dynamically from an incoming frame.
+Meja persists the recoverable state of every named session.
 
-Meja uses 1200-byte initial QUIC packets so the handshake fits paths with a
-1280-byte IP MTU without depending on fragmentation.
+After a reboot or ended session, `meja restore -t <session-name>` creates a new session from its latest recovery record. It preserves the session's windows, panes, layout, working directories, shells, commands, and active selection—not process memory or application state.
 
-On Linux, quic-go may warn when the kernel limits its UDP socket buffers below
-the preferred size. This does not prevent Meja from running, but it can limit
-throughput on fast connections. An administrator can raise the live limits:
+### The client survives disconnections
 
-```bash
-sudo sysctl -w net.core.rmem_max=7500000
-sudo sysctl -w net.core.wmem_max=7500000
-```
+A dropped connection does not close the client or return you to the local shell.
 
-Persist those values through the system's sysctl configuration if desired.
+Meja keeps the last confirmed terminal contents visible, displays its connection status, and reconnects automatically. Once connected again, it applies the latest layout and complete visible pane contents before normal input resumes.
 
-## Terminal behavior
+### Latency compensation
 
-The server owns terminal emulation, pane state, layout, and rendering. A QUIC
-disconnect detaches the client without immediately killing the session; an
-explicit detach or remote session exit ends the attached client flow.
+Eligible keystrokes are applied optimistically on the client, keeping remote typing responsive while waiting for the server's render.
 
-Each connected client instance owns nine server-to-client unidirectional
-display streams. The first server stream is permanently bound to the one-row
-status surface; the remaining eight are movable pane render slots. Stream
-roles come from their QUIC stream ordinals, and every surface uses the same
-display-command codec.
+The server remains authoritative. Confirmed renders reconcile the local display with the actual terminal state.
 
-Press `Ctrl+b`, then `$` to rename the current session using the status-bar
-prompt. Press `Ctrl+b`, then `,` to rename the current window.
 
-After a live QUIC connection drops, the client keeps the last confirmed
-terminal contents, replaces the client-visible status bar with an orange
-reconnecting indicator with a `Press Ctrl+c to exit` hint, and drops other
-input while disconnected. It first retries
-the pinned daemon endpoint using its in-memory client-instance reconnect
-credential. The reconnect loop never returns to the local command socket or
-SSH. A rejected or superseded client instance shows the terminal reason in the
-status bar briefly and exits cleanly. Input resumes only after the server's
-layout, status bar, and full visible-pane renders have been applied.
+---
+
+### Documentation
+
+See [REFERENCE.md](REFERENCE.md) for the complete command, option, keybinding, recovery, and configuration reference.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design behind Meja's transport, reconnection, persistence, session model, and file format.
