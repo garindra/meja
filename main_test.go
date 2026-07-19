@@ -124,7 +124,7 @@ func TestInvocationUsesInjectedPaneContextForPlainLocalCommands(t *testing.T) {
 		t.Fatalf("explicit selector retained pane context: %#v", explicit)
 	}
 
-	remote := parseTestInvocation(t, "-h", "prod", "restore", "-f", "dev.meja")
+	remote := parseTestInvocation(t, "-h", "prod", "new", "-f", "dev.meja")
 	if remote.Local || remote.CallerSessionTarget != "" || remote.SocketSelector.Path != "" {
 		t.Fatalf("remote invocation retained local pane context: %#v", remote)
 	}

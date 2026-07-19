@@ -162,7 +162,7 @@ func TestHelpRejectsUnknownCommand(t *testing.T) {
 	}
 }
 
-func TestSaveAndRestoreFileCommandsRoundTripSession(t *testing.T) {
+func TestSaveAndNewFileCommandsRoundTripSession(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
 	root := t.TempDir()
@@ -195,7 +195,7 @@ func TestSaveAndRestoreFileCommandsRoundTripSession(t *testing.T) {
 	if forced.exitCode != 0 {
 		t.Fatalf("forced save = %#v", forced)
 	}
-	restored := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "-f", path, "-s", "recovered", "--commands=skip"}})
+	restored := d.executeCommand(protocol.CommandRequest{Args: []string{"new", "-f", path, "-s", "recovered", "--commands=skip"}})
 	if restored.exitCode != 0 || restored.bootstrap == nil {
 		t.Fatalf("restore file = %#v", restored)
 	}
@@ -251,7 +251,7 @@ func TestRestoreRejectsMalformedPersistenceWithoutCreatingSession(t *testing.T) 
 		t.Fatal(err)
 	}
 	nextID := d.nextID
-	result := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "broken", "--commands=skip"}})
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "-t", "broken", "--commands=skip"}})
 	if result.exitCode == 0 || result.bootstrap != nil || !strings.Contains(string(result.stderr), "parse .meja file") {
 		t.Fatalf("malformed persistence restore = %#v", result)
 	}
@@ -269,13 +269,13 @@ func TestRestoreDoesNotReadLegacyPersistenceFilename(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(d.sessionPersistenceDir, "work.meja"), []byte("meja 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	result := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "work", "--commands=skip"}})
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "-t", "work", "--commands=skip"}})
 	if result.exitCode == 0 || !strings.Contains(string(result.stderr), "work.session.meja") {
 		t.Fatalf("legacy persistence filename was used: %#v", result)
 	}
 }
 
-func TestRestoreFileRejectsMalformedUserMejaWithoutCreatingSession(t *testing.T) {
+func TestNewFileRejectsMalformedUserMejaWithoutCreatingSession(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
 	path := filepath.Join(t.TempDir(), "broken.meja")
@@ -283,7 +283,7 @@ func TestRestoreFileRejectsMalformedUserMejaWithoutCreatingSession(t *testing.T)
 		t.Fatal(err)
 	}
 	nextID := d.nextID
-	result := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "-f", path, "-s", "recovered", "--commands=skip"}})
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"new", "-f", path, "-s", "recovered", "--commands=skip"}})
 	if result.exitCode == 0 || result.bootstrap != nil || !strings.Contains(string(result.stderr), "parse .meja file") {
 		t.Fatalf("malformed user file restore = %#v", result)
 	}
@@ -292,15 +292,32 @@ func TestRestoreFileRejectsMalformedUserMejaWithoutCreatingSession(t *testing.T)
 	}
 }
 
-func TestRestoreRequiresExactlyOneSource(t *testing.T) {
+func TestRestoreRequiresTargetAndRejectsFilesAndPositionalNames(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	for _, test := range []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"restore"}, want: "requires -t <session-name>"},
+		{args: []string{"restore", "work"}, want: "requires -t <session-name>"},
+		{args: []string{"restore", "-f", filepath.Join(t.TempDir(), "dev.meja")}, want: "flag provided but not defined: -f"},
+	} {
+		result := d.executeCommand(protocol.CommandRequest{Args: test.args})
+		if result.exitCode == 0 || !strings.Contains(string(result.stderr), test.want) {
+			t.Fatalf("restore source validation for %v = %#v", test.args, result)
+		}
+	}
+}
+
+func TestNewFileRejectsRootAndInitialCommand(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	for _, args := range [][]string{
-		{"restore"},
-		{"restore", "work", "-f", filepath.Join(t.TempDir(), "dev.meja")},
+		{"new", "-f", "dev.meja", "-r", "/tmp"},
+		{"new", "-f", "dev.meja", "--", "echo", "no"},
 	} {
 		result := d.executeCommand(protocol.CommandRequest{Args: args})
-		if result.exitCode == 0 || !strings.Contains(string(result.stderr), "requires either a session name or -f") {
-			t.Fatalf("restore source validation for %v = %#v", args, result)
+		if result.exitCode == 0 || !strings.Contains(string(result.stderr), "cannot be combined with a root or initial command") {
+			t.Fatalf("new file combination validation for %v = %#v", args, result)
 		}
 	}
 }
@@ -567,12 +584,16 @@ func TestAttachedRestoreCreatesSessionAndReturnsHandoffRequest(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
 	project := t.TempDir()
-	planPath := filepath.Join(project, "dev6.meja")
-	if err := os.WriteFile(planPath, []byte(`root "."
-window {
-    pane
-}
-`), 0o600); err != nil {
+	plan := SessionPlan{
+		Version: mejaFormatVersion, Name: "persisted", Root: project, ActiveWindow: 1,
+		Windows: []PlanWindow{{
+			ID: 1, Cwd: project, ActivePane: 1, Layout: PlanLayout{Pane: paneIDRef(1)},
+			Panes: []PlanPane{{ID: 1, Cwd: project}},
+		}},
+	}
+	if _, err := writeSessionPersistence(d.sessionPersistenceDir, SessionPersistence{
+		Version: mejaFormatVersion, SessionID: 6, Name: "persisted", SavedAt: time.Now(), Root: project, Plan: plan,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -591,7 +612,7 @@ window {
 
 	client := &ClientInstance{Daemon: d}
 	_, err := source.executeSessionCommand(client, []string{
-		"restore", "-f", "dev6.meja", "-s", "mynewsession", "--commands=skip",
+		"restore", "-t", "persisted", "-s", "mynewsession", "--commands=skip",
 	})
 	var request *sessionSwitchRequest
 	if !errors.As(err, &request) {
@@ -605,7 +626,7 @@ window {
 		t.Fatalf("restore handoff request = %#v, restored session ID %d", request, restored.ID)
 	}
 	if restored.rootDir != project {
-		t.Fatalf("restored root = %q, want relative plan rooted at %q", restored.rootDir, project)
+		t.Fatalf("restored root = %q, want %q", restored.rootDir, project)
 	}
 
 	if err := restored.coordinate(func() error {

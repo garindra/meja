@@ -273,6 +273,8 @@ remote executable path is used exactly as supplied.
 
 ```text
 meja [transport-options] new [new-options] [-- command args...]
+meja [transport-options] new -f <file> [-s <session-name>]
+     [--commands=prepare|skip|run]
 ```
 
 `new` creates and attaches to a session. Without `-h` it creates the session
@@ -303,6 +305,22 @@ meja new -h prod -- /usr/bin/bash -l
 
 Creating a session starts the selected server automatically when its socket is
 missing or stale.
+
+`-f <file>` creates the session from a readable `.meja` project file. Relative
+paths inside the file are resolved from the file's directory, and the filename
+becomes the session name unless `-s` supplies another name. `-f` cannot be
+combined with `-r`, `--root`, or an initial command after `--`.
+
+Use `save` to create a project file from a live session, then use `new -f` to
+create another session from it:
+
+```bash
+meja save -t work -o dev.meja
+meja new -f dev.meja
+```
+
+The `--commands` modes described under `restore` also control how commands from
+the project file are prepared or run.
 
 ### `attach` / `a`
 
@@ -335,12 +353,15 @@ memory indefinitely so it can reconnect later without SSH.
 
 ```text
 meja [transport-options] restore -t <session-name>
+     [-s <new-session-name>]
      [--commands=prepare|skip|run]
 ```
 
 `-t` is required and must be a session name, not a numeric ID. `restore` reads
 that name's snapshot, creates a new session with the same name and layout, and
-attaches to it. It fails when a live session with that name already exists.
+attaches to it. `-s` gives the restored session a different name. It fails when
+a live session with the resulting name already exists. `restore` only reads
+automatic snapshots; use `new -f <file>` for a project file.
 
 `--commands` controls how each saved pane command is handled:
 
@@ -351,14 +372,9 @@ run       Type the command followed by a newline so it runs immediately.
 ```
 
 Named sessions are snapshotted approximately every five seconds. For a profile,
-snapshots are stored at `~/.meja/<profile>/snapshots/<session-name>.json`. With
-`-S /path/to/meja.sock`, they are stored under
-`/path/to/snapshots/<session-name>.json`. Snapshot directories use mode `0700`
-and snapshot files use mode `0600`.
-
-The JSON snapshot is deliberately readable and contains the snapshot version,
-session name, save time, active window, windows, pane layout, pane working
-directories, shells, and commands.
+snapshots are stored under `~/.meja/<profile>/sessions/`. With
+`-S /path/to/meja.sock`, they are stored under `/path/to/sessions/`. Snapshot
+directories use mode `0700` and snapshot files use mode `0600`.
 
 Restoring starts the selected server automatically when necessary.
 

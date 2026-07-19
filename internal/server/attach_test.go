@@ -337,7 +337,7 @@ window {
 	switchDone := completeOneTestClientSwitch(d, instance, source)
 
 	result := d.executeCommand(protocol.CommandRequest{
-		Args:                []string{"restore", "-f", "dev6.meja", "-s", "mynewsession", "--commands=skip"},
+		Args:                []string{"new", "-f", "dev6.meja", "-s", "mynewsession", "--commands=skip"},
 		WorkingDirectory:    project,
 		CallerSessionTarget: "17",
 	})
@@ -534,7 +534,7 @@ window {
 		t.Fatal(err)
 	}
 	result := d.executeCommand(protocol.CommandRequest{
-		Args:                []string{"restore", "-f", "dev.meja", "-s", "target", "--commands=skip"},
+		Args:                []string{"new", "-f", "dev.meja", "-s", "target", "--commands=skip"},
 		WorkingDirectory:    project,
 		CallerSessionTarget: strconv.FormatUint(source.ID, 10),
 	})

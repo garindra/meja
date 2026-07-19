@@ -304,9 +304,9 @@ type commandDefinition struct {
 func registeredCommands() []commandDefinition {
 	return []commandDefinition{
 		{name: "help", aliases: []string{"--help"}, usage: "help [command]", description: "Show this reference or help for one server command.", execute: daemonCommand(handleDaemonHelpCommand)},
-		{name: "new-session", aliases: []string{"new"}, usage: "new-session [-s name] [-r directory] [-- command args...]", description: "Create a session and attach to it.", sessionResult: true, execute: daemonCommand(handleDaemonNewSessionCommand)},
+		{name: "new-session", aliases: []string{"new"}, usage: "new-session [-s name] [-r directory] [-- command args...] | new-session -f file [-s name] [--commands=prepare|skip|run]", description: "Create a session, optionally from a .meja file, and attach.", sessionResult: true, execute: daemonCommand(handleDaemonNewSessionCommand)},
 		{name: "attach-session", aliases: []string{"attach", "a"}, usage: "attach-session -t session-id-or-name", description: "Attach to an existing session.", sessionResult: true, execute: daemonCommand(handleDaemonAttachSessionCommand)},
-		{name: "restore-session", aliases: []string{"restore"}, usage: "restore-session (-t name | -f file) [-s new-name] [--commands=prepare|skip|run]", description: "Restore a persisted session or .meja file and attach.", sessionResult: true, execute: restoreCommand()},
+		{name: "restore-session", aliases: []string{"restore"}, usage: "restore-session -t name [-s new-name] [--commands=prepare|skip|run]", description: "Restore a named session's automatic snapshot and attach.", sessionResult: true, execute: restoreCommand()},
 		{name: "save-session", aliases: []string{"save"}, usage: "save-session -t session-id-or-name -o file [-f]", description: "Save a live session to a .meja file.", execute: daemonCommand(handleDaemonSaveSessionCommand)},
 		{name: "list-sessions", aliases: []string{"ls"}, usage: "list-sessions", description: "List active sessions.", execute: daemonCommand(handleDaemonListSessionsCommand)},
 		{name: "kill-server", usage: "kill-server", description: "Stop the selected server.", execute: daemonCommand(handleDaemonKillServerCommand)},
@@ -1109,6 +1109,8 @@ func parseCommandLine(line string) ([]string, error) {
 func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []string) (commandResult, error) {
 	fs := commandFlagSet("new-session")
 	name := fs.String("s", "", "session name")
+	file := fs.String("f", "", ".meja file")
+	mode := fs.String("commands", "prepare", "restore command mode")
 	var root string
 	fs.StringVar(&root, "r", "", "session root")
 	fs.StringVar(&root, "root", "", "session root")
@@ -1119,6 +1121,31 @@ func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []strin
 		if err := validateSessionName(*name); err != nil {
 			return commandResult{}, err
 		}
+	}
+	if *file != "" {
+		if root != "" || len(fs.Args()) != 0 {
+			return commandResult{}, errors.New("new-session -f cannot be combined with a root or initial command")
+		}
+		restoreMode, err := parseRestoreCommandMode(*mode)
+		if err != nil {
+			return commandResult{}, err
+		}
+		path, err := resolveCommandFilePath(*file, request.WorkingDirectory)
+		if err != nil {
+			return commandResult{}, err
+		}
+		operation, err := d.executeSessionOperation("restore-session", commandSessionTarget{
+			file:        path,
+			newName:     *name,
+			restoreMode: restoreMode,
+		})
+		if err != nil {
+			return commandResult{}, err
+		}
+		return commandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
+	}
+	if *mode != "prepare" {
+		return commandResult{}, errors.New("new-session --commands requires -f <file>")
 	}
 	if root == "" {
 		root = request.WorkingDirectory
@@ -1180,64 +1207,45 @@ func (d *Daemon) commandAttachSession(args []string) (commandResult, error) {
 	return commandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
 }
 
-func (d *Daemon) commandRestoreSession(request protocol.CommandRequest, args []string) (commandResult, error) {
+func (d *Daemon) commandRestoreSession(_ protocol.CommandRequest, args []string) (commandResult, error) {
 	fs := commandFlagSet("restore-session")
 	target := fs.String("t", "", "persisted session name")
-	file := fs.String("f", "", ".meja file")
 	name := fs.String("s", "", "new session name")
 	mode := fs.String("commands", "prepare", "restore command mode")
-	positionalTarget := ""
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		positionalTarget = args[0]
-		args = args[1:]
-	}
 	if err := fs.Parse(args); err != nil {
 		return commandResult{}, err
 	}
-	if len(fs.Args()) > 1 {
-		return commandResult{}, errors.New("restore accepts at most one persisted session name")
+	if *target == "" || len(fs.Args()) != 0 {
+		return commandResult{}, errors.New("restore-session requires -t <session-name>")
 	}
-	if len(fs.Args()) == 1 {
-		if *target != "" {
-			return commandResult{}, errors.New("restore session name was specified more than once")
-		}
-		*target = fs.Args()[0]
-	}
-	if positionalTarget != "" {
-		if *target != "" {
-			return commandResult{}, errors.New("restore session name was specified more than once")
-		}
-		*target = positionalTarget
-	}
-	if (*target == "") == (*file == "") {
-		return commandResult{}, errors.New("restore requires either a session name or -f <file>")
-	}
-	if *mode != "prepare" && *mode != "skip" && *mode != "run" {
-		return commandResult{}, errors.New("--commands must be prepare, skip, or run")
+	restoreMode, err := parseRestoreCommandMode(*mode)
+	if err != nil {
+		return commandResult{}, err
 	}
 	if *name != "" {
 		if err := validateSessionName(*name); err != nil {
 			return commandResult{}, err
 		}
 	}
-	path := ""
-	if *file != "" {
-		var err error
-		path, err = resolveCommandFilePath(*file, request.WorkingDirectory)
-		if err != nil {
-			return commandResult{}, err
-		}
-	}
 	operation, err := d.executeSessionOperation("restore-session", commandSessionTarget{
 		name:        *target,
-		file:        path,
 		newName:     *name,
-		restoreMode: restoreCommandMode(*mode),
+		restoreMode: restoreMode,
 	})
 	if err != nil {
 		return commandResult{}, err
 	}
 	return commandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
+}
+
+func parseRestoreCommandMode(raw string) (restoreCommandMode, error) {
+	mode := restoreCommandMode(raw)
+	switch mode {
+	case restoreCommandsPrepare, restoreCommandsSkip, restoreCommandsRun:
+		return mode, nil
+	default:
+		return "", errors.New("--commands must be prepare, skip, or run")
+	}
 }
 
 func (d *Daemon) commandSaveSession(request protocol.CommandRequest, args []string) (commandResult, error) {
