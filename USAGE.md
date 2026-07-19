@@ -220,8 +220,10 @@ meja version
 meja [transport-options] [command [command-args...]]
 ```
 
-Use `meja help` or `meja --help` to print the built-in synopsis. `-h` is the
-SSH host option.
+Use `meja help` or `meja --help` to ask the selected server for its command
+reference. Use `meja help <command>` or `meja <command> --help` for a command's
+synopsis. Help starts the selected server when necessary. `-h` is the SSH host
+option, so remote help comes from the selected remote server.
 
 ### Argument and option placement
 
@@ -400,10 +402,13 @@ start-server` or `meja kill-server` through SSH on that machine.
 meja version
 meja help
 meja --help
+meja help new-session
+meja new-session --help
 ```
 
 `version` prints `meja <version>` and accepts no additional arguments. The help
-forms print the command synopsis. `-h` requires an SSH host.
+forms print the selected server's full command reference or one command's
+synopsis. `-h` requires an SSH host.
 
 ### Session names
 

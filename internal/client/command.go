@@ -218,11 +218,18 @@ func commandMayStartServer(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "new", "new-session", "restore", "restore-session":
+	case "help", "--help", "new", "new-session", "restore", "restore-session":
 		return true
-	default:
-		return false
 	}
+	for _, arg := range args[1:] {
+		if arg == "--" {
+			break
+		}
+		if arg == "--help" {
+			return true
+		}
+	}
+	return false
 }
 
 func executeRemoteCommand(ctx context.Context, cfg Config, request protocol.CommandRequest) (commandResult, error) {

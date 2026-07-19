@@ -115,6 +115,53 @@ func TestCommandAliasesAreResolvedByDaemon(t *testing.T) {
 	}
 }
 
+func TestHelpIsGeneratedFromRegisteredCommands(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"--help"}})
+	if result.exitCode != 0 {
+		t.Fatalf("help failed: %s", result.stderr)
+	}
+	output := string(result.stdout)
+	for _, want := range []string{
+		"transport options",
+		"start-server",
+		"new-session (new)",
+		"resize-pane (resizep)",
+		"meja help <command>",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("help output omitted %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "server (stop)") {
+		t.Fatalf("help exposed legacy server command:\n%s", output)
+	}
+}
+
+func TestCommandSpecificHelpSupportsBothFormsWithoutExecuting(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	for _, args := range [][]string{
+		{"help", "new"},
+		{"new", "-s", "must-not-exist", "--help"},
+	} {
+		result := d.executeCommand(protocol.CommandRequest{Args: args})
+		if result.exitCode != 0 || !strings.Contains(string(result.stdout), "usage: meja [transport-options] new-session") {
+			t.Fatalf("help %v = %#v", args, result)
+		}
+		if d.sessionByName("must-not-exist") != nil {
+			t.Fatal("command-specific help executed new-session")
+		}
+	}
+}
+
+func TestHelpRejectsUnknownCommand(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"help", "no-such-command"}})
+	if result.exitCode == 0 || !strings.Contains(string(result.stderr), `unknown command "no-such-command"`) {
+		t.Fatalf("unknown help result = %#v", result)
+	}
+}
+
 func TestSaveAndRestoreFileCommandsRoundTripSession(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")

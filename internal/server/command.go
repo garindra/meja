@@ -210,6 +210,9 @@ func (d *Daemon) executeCommandNow(request protocol.CommandRequest) (commandResu
 	if len(request.Args) == 0 {
 		return commandResult{}, errors.New("missing command")
 	}
+	if commandRequestsHelp(request.Args) {
+		return commandHelp(request.Args[0:1])
+	}
 	command, ok := resolveRegisteredCommand(request.Args[0])
 	if !ok {
 		return commandResult{}, fmt.Errorf("unknown command %q", request.Args[0])
@@ -291,39 +294,112 @@ type commandExecution struct {
 type commandDefinition struct {
 	name          string
 	aliases       []string
+	usage         string
+	description   string
+	hidden        bool
 	sessionResult bool
 	execute       commandHandler
 }
 
 func registeredCommands() []commandDefinition {
 	return []commandDefinition{
-		{name: "new-session", aliases: []string{"new"}, sessionResult: true, execute: daemonCommand(handleDaemonNewSessionCommand)},
-		{name: "attach-session", aliases: []string{"attach", "a"}, sessionResult: true, execute: daemonCommand(handleDaemonAttachSessionCommand)},
-		{name: "restore-session", aliases: []string{"restore"}, sessionResult: true, execute: restoreCommand()},
-		{name: "save-session", aliases: []string{"save"}, execute: daemonCommand(handleDaemonSaveSessionCommand)},
-		{name: "list-sessions", aliases: []string{"ls"}, execute: daemonCommand(handleDaemonListSessionsCommand)},
-		{name: "kill-server", execute: daemonCommand(handleDaemonKillServerCommand)},
-		{name: "server", execute: daemonCommand(handleLegacyDaemonServerCommand)},
-		{name: "new-window", aliases: []string{"neww"}, execute: sessionCommand(sessionTarget, handleNewWindowCommand)},
-		{name: "next-layout", execute: sessionCommand(sessionTarget, handleNextLayoutCommand)},
-		{name: "split-window", aliases: []string{"splitw"}, execute: sessionCommand(sessionTarget, handleSplitWindowCommand)},
-		{name: "detach-client", aliases: []string{"detach"}, execute: sessionCommand(sessionTarget, handleDetachClientCommand)},
-		{name: "next-window", aliases: []string{"next"}, execute: sessionCommand(sessionTarget, handleNextWindowCommand)},
-		{name: "previous-window", aliases: []string{"prev"}, execute: sessionCommand(sessionTarget, handlePreviousWindowCommand)},
-		{name: "last-window", aliases: []string{"last"}, execute: sessionCommand(sessionTarget, handleLastWindowCommand)},
-		{name: "select-window", aliases: []string{"selectw"}, execute: sessionCommand(windowTarget, handleSelectWindowCommand)},
-		{name: "kill-pane", aliases: []string{"killp"}, execute: sessionCommand(sessionTarget, handleKillPaneCommand)},
-		{name: "copy-mode", execute: sessionCommand(sessionTarget, handleCopyModeCommand)},
-		{name: "swap-pane", aliases: []string{"swapp"}, execute: sessionCommand(sessionTarget, handleSwapPaneCommand)},
-		{name: "select-pane", aliases: []string{"selectp"}, execute: sessionCommand(sessionTarget, handleSelectPaneCommand)},
-		{name: "resize-pane", aliases: []string{"resizep"}, execute: sessionCommand(sessionTarget, handleResizePaneCommand)},
-		{name: "rename-window", aliases: []string{"renamew"}, execute: sessionCommand(windowTarget, handleRenameWindowCommand)},
-		{name: "rename-session", aliases: []string{"rename", "renames"}, execute: sessionCommand(sessionTarget, handleRenameSessionCommand)},
-		{name: "set-root", execute: sessionCommand(sessionTarget, handleSetRootCommand)},
-		{name: "switch-session", execute: attachedCommand(handleSwitchSessionCommand)},
-		{name: "confirm-before", execute: attachedCommand(handleConfirmBeforeCommand)},
-		{name: "command-prompt", execute: attachedCommand(handleCommandPromptCommand)},
+		{name: "help", aliases: []string{"--help"}, usage: "help [command]", description: "Show this reference or help for one server command.", execute: daemonCommand(handleDaemonHelpCommand)},
+		{name: "new-session", aliases: []string{"new"}, usage: "new-session [-s name] [-r directory] [-- command args...]", description: "Create a session and attach to it.", sessionResult: true, execute: daemonCommand(handleDaemonNewSessionCommand)},
+		{name: "attach-session", aliases: []string{"attach", "a"}, usage: "attach-session -t session-id-or-name", description: "Attach to an existing session.", sessionResult: true, execute: daemonCommand(handleDaemonAttachSessionCommand)},
+		{name: "restore-session", aliases: []string{"restore"}, usage: "restore-session (-t name | -f file) [-s new-name] [--commands=prepare|skip|run]", description: "Restore a persisted session or .meja file and attach.", sessionResult: true, execute: restoreCommand()},
+		{name: "save-session", aliases: []string{"save"}, usage: "save-session -t session-id-or-name -o file [-f]", description: "Save a live session to a .meja file.", execute: daemonCommand(handleDaemonSaveSessionCommand)},
+		{name: "list-sessions", aliases: []string{"ls"}, usage: "list-sessions", description: "List active sessions.", execute: daemonCommand(handleDaemonListSessionsCommand)},
+		{name: "kill-server", usage: "kill-server", description: "Stop the selected server.", execute: daemonCommand(handleDaemonKillServerCommand)},
+		{name: "server", hidden: true, execute: daemonCommand(handleLegacyDaemonServerCommand)},
+		{name: "new-window", aliases: []string{"neww"}, usage: "new-window [-t session]", description: "Create a window in a session.", execute: sessionCommand(sessionTarget, handleNewWindowCommand)},
+		{name: "next-layout", usage: "next-layout [-t session]", description: "Cycle the active window to its next layout.", execute: sessionCommand(sessionTarget, handleNextLayoutCommand)},
+		{name: "split-window", aliases: []string{"splitw"}, usage: "split-window [-t session] [-h | -v]", description: "Split the active pane left/right or top/bottom.", execute: sessionCommand(sessionTarget, handleSplitWindowCommand)},
+		{name: "detach-client", aliases: []string{"detach"}, usage: "detach-client [-t session]", description: "Detach the client from a session.", execute: sessionCommand(sessionTarget, handleDetachClientCommand)},
+		{name: "next-window", aliases: []string{"next"}, usage: "next-window [-t session]", description: "Select the next window.", execute: sessionCommand(sessionTarget, handleNextWindowCommand)},
+		{name: "previous-window", aliases: []string{"prev"}, usage: "previous-window [-t session]", description: "Select the previous window.", execute: sessionCommand(sessionTarget, handlePreviousWindowCommand)},
+		{name: "last-window", aliases: []string{"last"}, usage: "last-window [-t session]", description: "Select the last active window.", execute: sessionCommand(sessionTarget, handleLastWindowCommand)},
+		{name: "select-window", aliases: []string{"selectw"}, usage: "select-window -t session:window", description: "Select a window by index.", execute: sessionCommand(windowTarget, handleSelectWindowCommand)},
+		{name: "kill-pane", aliases: []string{"killp"}, usage: "kill-pane [-t session]", description: "Close the active pane.", execute: sessionCommand(sessionTarget, handleKillPaneCommand)},
+		{name: "copy-mode", usage: "copy-mode [-t session]", description: "Open history mode for the active pane.", execute: sessionCommand(sessionTarget, handleCopyModeCommand)},
+		{name: "swap-pane", aliases: []string{"swapp"}, usage: "swap-pane [-t session] (-U | -D)", description: "Swap the active pane with its neighbor.", execute: sessionCommand(sessionTarget, handleSwapPaneCommand)},
+		{name: "select-pane", aliases: []string{"selectp"}, usage: "select-pane [-t session] (-U | -D | -L | -R)", description: "Select an adjacent pane.", execute: sessionCommand(sessionTarget, handleSelectPaneCommand)},
+		{name: "resize-pane", aliases: []string{"resizep"}, usage: "resize-pane [-t session] ((-U | -D | -L | -R) [amount] | -Z)", description: "Resize the active pane or toggle zoom.", execute: sessionCommand(sessionTarget, handleResizePaneCommand)},
+		{name: "rename-window", aliases: []string{"renamew"}, usage: "rename-window [-t session:window] [name]", description: "Rename a window, prompting when no name is supplied.", execute: sessionCommand(windowTarget, handleRenameWindowCommand)},
+		{name: "rename-session", aliases: []string{"rename", "renames"}, usage: "rename-session [-t session] [name]", description: "Rename a session, prompting when no name is supplied.", execute: sessionCommand(sessionTarget, handleRenameSessionCommand)},
+		{name: "set-root", usage: "set-root [-t session] [directory]", description: "Set the session root directory.", execute: sessionCommand(sessionTarget, handleSetRootCommand)},
+		{name: "switch-session", usage: "switch-session -t session-id-or-name", description: "Move the attached client to another session.", execute: attachedCommand(handleSwitchSessionCommand)},
+		{name: "confirm-before", usage: "confirm-before command [args...]", description: "Prompt before running an attached command.", execute: attachedCommand(handleConfirmBeforeCommand)},
+		{name: "command-prompt", usage: "command-prompt", description: "Open the attached client's command prompt.", execute: attachedCommand(handleCommandPromptCommand)},
 	}
+}
+
+func commandRequestsHelp(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	for _, arg := range args[1:] {
+		if arg == "--" {
+			return false
+		}
+		if arg == "--help" {
+			return true
+		}
+	}
+	return false
+}
+
+func commandHelp(args []string) (commandResult, error) {
+	if len(args) > 1 {
+		return commandResult{}, errors.New("help accepts at most one command")
+	}
+	if len(args) == 1 {
+		command, ok := resolveRegisteredCommand(args[0])
+		if !ok || command.hidden {
+			return commandResult{}, fmt.Errorf("unknown command %q", args[0])
+		}
+		var output strings.Builder
+		fmt.Fprintf(&output, "usage: meja [transport-options] %s\n\n%s\n", command.usage, command.description)
+		if len(command.aliases) > 0 {
+			fmt.Fprintf(&output, "\naliases: %s\n", strings.Join(command.aliases, ", "))
+		}
+		return commandResult{stdout: []byte(output.String())}, nil
+	}
+
+	var output strings.Builder
+	output.WriteString(`usage:
+  meja version
+  meja [transport-options] [command [command-args...]]
+
+transport options (handled by the client before forwarding):
+  -L profile              select a named server socket
+  -S socket-path          select an exact server socket
+  -h, --host user@host    run the command on an SSH host
+  -i identity-file        use an SSH identity file
+  --port port             use an SSH port
+  --remote-path path      remote meja executable (default: meja)
+
+client commands:
+  version                 print the client version
+  start-server            run the selected local server in the foreground
+
+server commands:
+`)
+	table := tabwriter.NewWriter(&output, 0, 4, 2, ' ', 0)
+	for _, command := range registeredCommands() {
+		if command.hidden {
+			continue
+		}
+		name := command.name
+		if len(command.aliases) > 0 {
+			name += " (" + strings.Join(command.aliases, ", ") + ")"
+		}
+		fmt.Fprintf(table, "  %s\t%s\n", name, command.description)
+	}
+	if err := table.Flush(); err != nil {
+		return commandResult{}, err
+	}
+	output.WriteString("\nRun 'meja help <command>' or 'meja <command> --help' for command usage.\n")
+	return commandResult{stdout: []byte(output.String())}, nil
 }
 
 func resolveRegisteredCommand(name string) (commandDefinition, bool) {
@@ -571,6 +647,10 @@ func resolveCommandSession(ctx *commandContext, raw string) (*Session, error) {
 
 func handleDaemonNewSessionCommand(d *Daemon, request protocol.CommandRequest, args []string) (commandResult, error) {
 	return d.commandNewSession(request, args)
+}
+
+func handleDaemonHelpCommand(_ *Daemon, _ protocol.CommandRequest, args []string) (commandResult, error) {
+	return commandHelp(args)
 }
 
 func handleDaemonAttachSessionCommand(d *Daemon, _ protocol.CommandRequest, args []string) (commandResult, error) {

@@ -48,7 +48,7 @@ transport options (removed before forwarding):
   --remote-path path      remote meja executable (default: meja)
 
 transport options may appear anywhere before --. With no command, Meja runs
-new-session. Use --help to show this text.`
+new-session. Use --help for the server-backed command reference.`
 
 func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.Writer) error {
 	cfg, err := parseInvocation(args, stdin, stdout, stderr)
@@ -56,13 +56,6 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 		return usageError{err.Error()}
 	}
 	command := cfg.CommandArgs[0]
-	if command == "help" || command == "--help" {
-		if len(cfg.CommandArgs) != 1 {
-			return usageError{command + " accepts no arguments"}
-		}
-		fmt.Fprintln(stdout, usage)
-		return nil
-	}
 	switch command {
 	case "start-server":
 		if !cfg.Local {

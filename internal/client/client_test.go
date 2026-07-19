@@ -211,6 +211,27 @@ func TestRunForwardsArbitraryNonAttachCommandWithoutTerminal(t *testing.T) {
 	}
 }
 
+func TestHelpCommandsMayStartServer(t *testing.T) {
+	for _, args := range [][]string{
+		{"help"},
+		{"--help"},
+		{"list-sessions", "--help"},
+		{"new-session", "--help"},
+	} {
+		if !commandMayStartServer(args) {
+			t.Fatalf("help request %v may not start server", args)
+		}
+	}
+	for _, args := range [][]string{
+		{"list-sessions"},
+		{"new-session", "--", "--help"},
+	} {
+		if got := commandMayStartServer(args); got != (args[0] == "new-session") {
+			t.Fatalf("commandMayStartServer(%v) = %v", args, got)
+		}
+	}
+}
+
 func TestSSHCommandErrorIncludesRemoteStderr(t *testing.T) {
 	err := sshCommandError("SSH bootstrap failed", io.EOF, "bash: meja: command not found\n")
 	want := "SSH bootstrap failed: EOF: bash: meja: command not found"
