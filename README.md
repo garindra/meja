@@ -82,15 +82,15 @@ The file is readable and editable. Check it into version control so your team ca
 On Linux x86-64:
 
 ```sh
-curl -fsSL https://github.com/garindra/meja/releases/latest/download/meja-linux-amd64 -o /tmp/meja \
-  && sudo install -m 0755 /tmp/meja /usr/local/bin/meja
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.2/meja_0.0.2_linux_amd64.tar.gz \
+  | sudo tar -xz -C /usr/local/bin meja
 ```
 
 On macOS with Apple Silicon:
 
 ```sh
-curl -fsSL https://github.com/garindra/meja/releases/latest/download/meja-darwin-arm64 -o /tmp/meja \
-  && sudo install -m 0755 /tmp/meja /usr/local/bin/meja
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.2/meja_0.0.2_darwin_arm64.tar.gz \
+  | sudo tar -xz -C /usr/local/bin meja
 ```
 
 You can also install the latest version with Go:
@@ -240,12 +240,3 @@ Meja keeps the last confirmed terminal contents visible, displays its connection
 Eligible keystrokes are applied optimistically on the client, keeping remote typing responsive while waiting for the server's render.
 
 The server remains authoritative. Confirmed renders reconcile the local display with the actual terminal state.
-
-
----
-
-### Documentation
-
-See [REFERENCE.md](REFERENCE.md) for the complete command, option, keybinding, recovery, and configuration reference.
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the design behind Meja's transport, reconnection, persistence, session model, and file format.
