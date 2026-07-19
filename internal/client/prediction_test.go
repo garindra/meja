@@ -208,7 +208,7 @@ func TestInputPredictorSupportsTypingAfterBackspace(t *testing.T) {
 
 func TestInputPredictorRefusesNonblankTarget(t *testing.T) {
 	cache := newPaneScanoutCache(8, 1)
-	cache.row(0)[0] = protocol.Cell{Cluster: "x", Width: 1}
+	cache.row(0)[0] = scanoutCell{Cluster: "x", Width: 1}
 	var predictor inputPredictor
 	if result, changed := predictor.applyLocalInput([]byte("a"), testPredictionContext(), cache); changed || len(result.frame.spans) != 0 || len(predictor.pendingOperations()) != 0 {
 		t.Fatalf("nonblank prediction result=%#v changed=%v predictor=%#v", result, changed, predictor)

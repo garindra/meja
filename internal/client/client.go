@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/quic-go/quic-go"
 	"golang.org/x/term"
@@ -92,6 +93,7 @@ type paintSpan struct {
 
 type renderFrame struct {
 	layoutRevision uint64
+	cols, rows     int
 	styleInstalls  []protocol.StyleDefinition
 	scrollDeltas   []int
 	spans          []paintSpan
@@ -630,6 +632,9 @@ func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeS
 		styles:        defaultStyles(),
 		cursorVisible: true,
 	}
+	if slot == protocol.StatusRenderSlot {
+		state.cols, state.rows = int(protocol.MaxGridCols), 1
+	}
 	for {
 		command, wireBytes, err := decoder.ReadCommand()
 		if err != nil {
@@ -667,6 +672,7 @@ type displayFrameCompiler struct {
 	slot           uint8
 	layoutRevision uint64
 	hasBarrier     bool
+	cols, rows     int
 	row, column    int
 	styleID        uint32
 	styles         map[uint32]protocol.Style
@@ -680,7 +686,7 @@ type displayFrameCompiler struct {
 
 func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, error) {
 	if c.frameReady {
-		c.frame = renderFrame{layoutRevision: c.layoutRevision}
+		c.frame = renderFrame{layoutRevision: c.layoutRevision, cols: c.cols, rows: c.rows}
 		c.frameReady = false
 		c.cursorUpdated = false
 	}
@@ -688,12 +694,16 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		if c.slot == protocol.StatusRenderSlot {
 			return false, errors.New("RELAYOUT_BARRIER on status output")
 		}
+		if command.GridCols <= 0 || command.GridRows <= 0 || uint64(command.GridCols) > protocol.MaxGridCols || uint64(command.GridRows) > protocol.MaxGridRows {
+			return false, fmt.Errorf("invalid display grid %dx%d on slot %d", command.GridCols, command.GridRows, c.slot)
+		}
 		c.layoutRevision = command.LayoutRevision
 		c.hasBarrier = true
+		c.cols, c.rows = command.GridCols, command.GridRows
 		c.row, c.column = 0, 0
 		c.styleID = protocol.CanonicalDefaultStyleID
 		c.styles = defaultStyles()
-		c.frame = renderFrame{layoutRevision: c.layoutRevision}
+		c.frame = renderFrame{layoutRevision: c.layoutRevision, cols: c.cols, rows: c.rows}
 		c.paintStarted = false
 		return false, nil
 	}
@@ -712,6 +722,9 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		c.styles[command.StyleID] = command.Style
 		c.frame.styleInstalls = append(c.frame.styleInstalls, protocol.StyleDefinition{ID: command.StyleID, Style: command.Style})
 	case protocol.DisplayOpcodeSetWritePosition:
+		if command.Row < 0 || command.Row >= c.rows || command.Column < 0 || command.Column >= c.cols {
+			return false, fmt.Errorf("write position %d,%d outside %dx%d grid on slot %d", command.Row, command.Column, c.cols, c.rows, c.slot)
+		}
 		c.row, c.column = command.Row, command.Column
 	case protocol.DisplayOpcodeSetWriteStyle:
 		if _, ok := c.styles[command.StyleID]; !ok {
@@ -727,28 +740,27 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		if command.Opcode == protocol.DisplayOpcodeWriteTextUTF8Default {
 			styleID = protocol.CanonicalDefaultStyleID
 		}
-		span := paintSpan{kind: paintText, row: c.row, column: c.column, styleID: styleID, cellWidth: width, text: command.Text}
-		c.frame.spans = append(c.frame.spans, span)
-		for range string(command.Text) {
-			c.column += int(width)
+		if err := c.appendText(command.Text, width, styleID); err != nil {
+			return false, err
 		}
 		c.paintStarted = true
 	case protocol.DisplayOpcodeWriteCluster:
 		if len(command.Text) == 0 || (command.Width != 1 && command.Width != 2) {
 			return false, fmt.Errorf("invalid display cluster on slot %d", c.slot)
 		}
+		if err := c.requireCell(int(command.Width)); err != nil {
+			return false, err
+		}
 		c.frame.spans = append(c.frame.spans, paintSpan{
 			kind: paintCluster, row: c.row, column: c.column,
 			styleID: c.styleID, cellWidth: command.Width, text: command.Text,
 		})
-		c.column += int(command.Width)
+		c.advance(int(command.Width))
 		c.paintStarted = true
 	case protocol.DisplayOpcodeFill:
-		c.frame.spans = append(c.frame.spans, paintSpan{
-			kind: paintFill, row: c.row, column: c.column, styleID: c.styleID,
-			cellWidth: command.Fill.Width, fillRune: command.Fill.Rune, fillColumns: command.Fill.Columns,
-		})
-		c.column += command.Fill.Columns
+		if err := c.appendFill(command.Fill); err != nil {
+			return false, err
+		}
 		c.paintStarted = true
 	case protocol.DisplayOpcodeCursorUpdate:
 		c.cursor = command.Cursor.Cursor
@@ -773,6 +785,64 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		return false, fmt.Errorf("unexpected display opcode 0x%02x on slot %d", byte(command.Opcode), c.slot)
 	}
 	return false, nil
+}
+
+func (c *displayFrameCompiler) requireCell(width int) error {
+	if width <= 0 || c.row < 0 || c.row >= c.rows || c.column < 0 || c.column+width > c.cols {
+		return fmt.Errorf("write at %d,%d width %d outside %dx%d grid on slot %d", c.row, c.column, width, c.cols, c.rows, c.slot)
+	}
+	return nil
+}
+
+func (c *displayFrameCompiler) advance(columns int) {
+	c.column += columns
+	if c.column == c.cols {
+		c.row++
+		c.column = 0
+	}
+}
+
+func (c *displayFrameCompiler) appendText(text []byte, width uint8, styleID uint32) error {
+	segmentStart := 0
+	segmentRow, segmentColumn := c.row, c.column
+	for offset := 0; offset < len(text); {
+		if err := c.requireCell(int(width)); err != nil {
+			return err
+		}
+		_, size := utf8.DecodeRune(text[offset:])
+		offset += size
+		previousRow := c.row
+		c.advance(int(width))
+		if c.row != previousRow {
+			c.frame.spans = append(c.frame.spans, paintSpan{kind: paintText, row: segmentRow, column: segmentColumn, styleID: styleID, cellWidth: width, text: text[segmentStart:offset]})
+			segmentStart = offset
+			segmentRow, segmentColumn = c.row, c.column
+		}
+	}
+	if segmentStart < len(text) {
+		c.frame.spans = append(c.frame.spans, paintSpan{kind: paintText, row: segmentRow, column: segmentColumn, styleID: styleID, cellWidth: width, text: text[segmentStart:]})
+	}
+	return nil
+}
+
+func (c *displayFrameCompiler) appendFill(fill protocol.Fill) error {
+	width := int(fill.Width)
+	if (width != 1 && width != 2) || fill.Columns <= 0 || fill.Columns%width != 0 {
+		return fmt.Errorf("invalid fill width %d for %d columns on slot %d", width, fill.Columns, c.slot)
+	}
+	for remaining := fill.Columns; remaining > 0; {
+		if err := c.requireCell(width); err != nil {
+			return err
+		}
+		columns := min(remaining, c.cols-c.column)
+		if columns%width != 0 {
+			return fmt.Errorf("fill splits a width-%d cell at row %d on slot %d", width, c.row, c.slot)
+		}
+		c.frame.spans = append(c.frame.spans, paintSpan{kind: paintFill, row: c.row, column: c.column, styleID: c.styleID, cellWidth: fill.Width, fillRune: fill.Rune, fillColumns: columns})
+		c.advance(columns)
+		remaining -= columns
+	}
+	return nil
 }
 
 func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- connectionResult, lastContact *atomic.Int64) {
@@ -952,18 +1022,26 @@ type physicalCursor struct {
 	valid       bool
 }
 
+// scanoutCell is the client-only decoded representation. It is bounded by the
+// visible pane grid and deliberately separate from the server's packed store.
+type scanoutCell struct {
+	Cluster string
+	StyleID uint32
+	Width   uint8
+}
+
 type paneScanoutCache struct {
 	cols, rows, head int
-	cells            []protocol.Cell
+	cells            []scanoutCell
 }
 
 func newPaneScanoutCache(cols, rows int) *paneScanoutCache {
-	cells := make([]protocol.Cell, max(0, cols*rows))
+	cells := make([]scanoutCell, max(0, cols*rows))
 	fillBlank(cells)
 	return &paneScanoutCache{cols: cols, rows: rows, cells: cells}
 }
 
-func (p *paneScanoutCache) row(row int) []protocol.Cell {
+func (p *paneScanoutCache) row(row int) []scanoutCell {
 	physical := (p.head + row) % p.rows
 	return p.cells[physical*p.cols : (physical+1)*p.cols]
 }
@@ -1219,6 +1297,9 @@ func placementForSlot(layout protocol.WindowLayout, slot uint8) (protocol.PanePl
 }
 
 func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFrame) error {
+	if slot != protocol.StatusRenderSlot && frame.cols != 0 && (frame.cols != rect.Width || frame.rows != rect.Height) {
+		return fmt.Errorf("pane slot %d frame grid %dx%d does not match layout %dx%d", slot, frame.cols, frame.rows, rect.Width, rect.Height)
+	}
 	styles := s.styles[slot]
 	if styles == nil {
 		styles = defaultStyles()
@@ -1310,7 +1391,7 @@ func applySpanToCache(cache *paneScanoutCache, span paintSpan, evidence *frameEv
 		return errors.New("paint span outside pane cache")
 	}
 	row, column := cache.row(span.row), span.column
-	record := func(column int, cell protocol.Cell) {
+	record := func(column int, cell scanoutCell) {
 		position := cellPosition{row: span.row, column: column}
 		change, exists := evidence.touched[position]
 		if !exists {
@@ -1330,9 +1411,9 @@ func applySpanToCache(cache *paneScanoutCache, span paintSpan, evidence *frameEv
 		}
 		styleID := row[anchor].StyleID
 		width := row[anchor].Width
-		record(anchor, protocol.Cell{StyleID: styleID, Width: 1})
+		record(anchor, scanoutCell{StyleID: styleID, Width: 1})
 		if width == 2 && anchor+1 < len(row) {
-			record(anchor+1, protocol.Cell{StyleID: styleID, Width: 1})
+			record(anchor+1, scanoutCell{StyleID: styleID, Width: 1})
 		}
 	}
 	write := func(cluster string, width uint8) error {
@@ -1346,9 +1427,9 @@ func applySpanToCache(cache *paneScanoutCache, span paintSpan, evidence *frameEv
 		if width == 2 {
 			clearOccupant(column + 1)
 		}
-		record(column, protocol.Cell{Cluster: cluster, StyleID: span.styleID, Width: width})
+		record(column, scanoutCell{Cluster: cluster, StyleID: span.styleID, Width: width})
 		for n := 1; n < int(width); n++ {
-			record(column+n, protocol.Cell{StyleID: span.styleID, Width: 0})
+			record(column+n, scanoutCell{StyleID: span.styleID, Width: 0})
 		}
 		column += int(width)
 		return nil
@@ -1631,9 +1712,9 @@ func defaultStyles() map[uint32]protocol.Style {
 	return map[uint32]protocol.Style{protocol.CanonicalDefaultStyleID: protocol.CanonicalDefaultStyle()}
 }
 
-func fillBlank(cells []protocol.Cell) {
+func fillBlank(cells []scanoutCell) {
 	for i := range cells {
-		cells[i] = protocol.Cell{Width: 1}
+		cells[i] = scanoutCell{Width: 1}
 	}
 }
 

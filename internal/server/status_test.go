@@ -286,7 +286,7 @@ func runStatusEvent(t *testing.T, s *Session, handler *ClientInstance, event ser
 }
 
 type testStatusBar struct {
-	Cells  []protocol.Cell
+	Cells  []decodedTestCell
 	Styles map[uint32]protocol.Style
 }
 
@@ -322,23 +322,23 @@ func (c *statusTestClient) read(t *testing.T) testStatusBar {
 		case protocol.DisplayOpcodeFill:
 			end := c.column + command.Fill.Columns
 			if end > len(c.status.Cells) {
-				c.status.Cells = append(c.status.Cells, make([]protocol.Cell, end-len(c.status.Cells))...)
+				c.status.Cells = append(c.status.Cells, make([]decodedTestCell, end-len(c.status.Cells))...)
 			}
 			for c.column < end {
 				cluster := string(command.Fill.Rune)
 				if command.Fill.Rune == ' ' {
 					cluster = ""
 				}
-				c.status.Cells[c.column] = protocol.Cell{Cluster: cluster, StyleID: c.styleID, Width: command.Fill.Width}
+				c.status.Cells[c.column] = decodedTestCell{Cluster: cluster, StyleID: c.styleID, Width: command.Fill.Width}
 				c.column++
 			}
 		case protocol.DisplayOpcodeWriteTextUTF8:
 			for _, r := range string(command.Text) {
-				c.status.Cells[c.column] = protocol.Cell{Cluster: string(r), StyleID: c.styleID, Width: 1}
+				c.status.Cells[c.column] = decodedTestCell{Cluster: string(r), StyleID: c.styleID, Width: 1}
 				c.column++
 			}
 		case protocol.DisplayOpcodePresent:
-			out := testStatusBar{Cells: append([]protocol.Cell(nil), c.status.Cells...), Styles: make(map[uint32]protocol.Style, len(c.status.Styles))}
+			out := testStatusBar{Cells: append([]decodedTestCell(nil), c.status.Cells...), Styles: make(map[uint32]protocol.Style, len(c.status.Styles))}
 			for id, style := range c.status.Styles {
 				out.Styles[id] = style
 			}

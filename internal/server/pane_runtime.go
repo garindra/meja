@@ -14,8 +14,11 @@ import (
 var ptyReadBuffers = sync.Pool{New: func() any { return make([]byte, 32*1024) }}
 
 const (
-	renderIdleFlush          = time.Millisecond
-	renderMaxBatchAge        = 16 * time.Millisecond
+	renderIdleFlush   = time.Millisecond
+	renderMaxBatchAge = 16 * time.Millisecond
+	// Finalized commands are streamed at this size while PRESENT remains the
+	// client's atomic frame boundary.
+	renderStreamChunkSize    = 8 << 10
 	startupInputIdle         = 25 * time.Millisecond
 	startupInputMaxWait      = 500 * time.Millisecond
 	maxRetainedRenderBuffer  = 64 << 10
@@ -63,7 +66,7 @@ func (p *Pane) attachOutputStream(lease *OutputLease, layoutRevision uint64) err
 }
 
 func (p *Pane) renderAttachedView(output *renderOutput, layoutRevision uint64) error {
-	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: layoutRevision}); err != nil {
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: layoutRevision, GridCols: p.terminal.Cols, GridRows: p.terminal.Rows}); err != nil {
 		return err
 	}
 	if err := installStyle(output, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {
@@ -403,11 +406,17 @@ func renderHistoryMove(output *renderOutput, view *paneHistoryView, move history
 			return err
 		}
 	}
-	compiler := newDisplayCompiler(output, styleDefinitionsMap(view.Snapshot.Styles))
+	compiler := newDisplayCompiler(output, view.Snapshot, view.Snapshot.cellText, view.Snapshot.Cols, view.Snapshot.ViewportRows)
 	for _, run := range historyMoveRuns(view, move) {
-		if err := compiler.writeCells(run.Row, run.Column, run.Cells); err != nil {
+		if err := compiler.writeCells(run.row, run.column, run.cells); err != nil {
 			return err
 		}
+	}
+	if err := compiler.finish(); err != nil {
+		return err
+	}
+	if err := writeHistoryCounter(compiler, view, move.NewCounter); err != nil {
+		return err
 	}
 	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: move.Cursor, Visible: true}}); err != nil {
 		return err
@@ -415,21 +424,19 @@ func renderHistoryMove(output *renderOutput, view *paneHistoryView, move history
 	return output.present()
 }
 
-type displayCellRun struct {
-	Row, Column int
-	Cells       []protocol.Cell
+type cellWordRun struct {
+	row, column int
+	cells       []cellWord
 }
 
-func historyMoveRuns(view *paneHistoryView, move historyMove) []displayCellRun {
+func historyMoveRuns(view *paneHistoryView, move historyMove) []cellWordRun {
 	if move.Delta == 0 {
 		return nil
 	}
 	snapshot := view.Snapshot
-	runs := make([]displayCellRun, 0, 2)
+	runs := make([]cellWordRun, 0, 2)
 	if move.Delta > 0 {
-		cells := append([]protocol.Cell(nil), snapshot.Rows[view.ViewTop].Cells...)
-		overlayHistoryCounter(cells, snapshot.Cols, move.NewCounter, snapshot.CounterStyle)
-		runs = append(runs, displayCellRun{Row: 0, Cells: cells})
+		runs = append(runs, cellWordRun{row: 0, cells: snapshot.row(view.ViewTop)})
 		if snapshot.ViewportRows > 1 {
 			runs = append(runs, historyCounterRun(view, 1, move.OldCounter, ""))
 		}
@@ -437,29 +444,31 @@ func historyMoveRuns(view *paneHistoryView, move historyMove) []displayCellRun {
 	}
 	bottom := snapshot.ViewportRows - 1
 	rowIndex := view.ViewTop + bottom
-	runs = append(runs, displayCellRun{Row: bottom, Cells: append([]protocol.Cell(nil), snapshot.Rows[rowIndex].Cells...)})
+	runs = append(runs, cellWordRun{row: bottom, cells: snapshot.row(rowIndex)})
 	runs = append(runs, historyCounterRun(view, 0, move.OldCounter, move.NewCounter))
 	return runs
 }
 
-func historyCounterRun(view *paneHistoryView, viewportRow int, oldLabel, newLabel string) displayCellRun {
+func historyCounterRun(view *paneHistoryView, viewportRow int, oldLabel, newLabel string) cellWordRun {
 	snapshot := view.Snapshot
 	width := max(len(oldLabel), len(newLabel))
 	start := max(0, snapshot.Cols-width)
 	rowIndex := view.ViewTop + viewportRow
-	cells := append([]protocol.Cell(nil), snapshot.Rows[rowIndex].Cells[start:]...)
-	if newLabel != "" {
-		overlayHistoryCounter(cells, len(cells), newLabel, snapshot.CounterStyle)
-	}
-	return displayCellRun{Row: viewportRow, Column: start, Cells: cells}
+	return cellWordRun{row: viewportRow, column: start, cells: snapshot.row(rowIndex)[start:]}
 }
 
-func styleDefinitionsMap(defs []protocol.StyleDefinition) map[uint32]protocol.Style {
-	styles := make(map[uint32]protocol.Style, len(defs))
-	for _, def := range defs {
-		styles[def.ID] = def.Style
+func writeHistoryCounter(compiler *displayCompiler, view *paneHistoryView, label string) error {
+	cols := view.Snapshot.Cols
+	if len(label) > cols {
+		label = label[len(label)-cols:]
 	}
-	return styles
+	if err := compiler.moveTo(0, max(0, cols-len(label))); err != nil {
+		return err
+	}
+	if err := compiler.selectStyle(view.Snapshot.CounterStyle); err != nil {
+		return err
+	}
+	return compiler.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte(label)})
 }
 
 func emitTerminalUpdate(output *renderOutput, pane *Pane, update Update) error {
@@ -482,10 +491,13 @@ func emitTerminalUpdate(output *renderOutput, pane *Pane, update Update) error {
 		if span.End == 0 {
 			continue
 		}
-		cells := pane.terminal.GridRows[row].Cells[span.Start:span.End]
+		cells := pane.terminal.gridRow(row)[span.Start:span.End]
 		if err := compiler.writeCells(row, span.Start, cells); err != nil {
 			return err
 		}
+	}
+	if err := compiler.finish(); err != nil {
+		return err
 	}
 	if update.CursorChanged || update.VisibleChange {
 		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.terminal.CursorX, Y: pane.terminal.CursorY}, Visible: pane.terminal.CursorVisible}}); err != nil {
@@ -498,9 +510,12 @@ func emitTerminalUpdate(output *renderOutput, pane *Pane, update Update) error {
 func sendFullRender(output *renderOutput, pane *Pane) error {
 	compiler := newLiveDisplayCompiler(output, pane.terminal)
 	for row := 0; row < pane.terminal.Rows; row++ {
-		if err := compiler.writeCells(row, 0, pane.terminal.GridRows[row].Cells); err != nil {
+		if err := compiler.writeCells(row, 0, pane.terminal.gridRow(row)); err != nil {
 			return err
 		}
+	}
+	if err := compiler.finish(); err != nil {
+		return err
 	}
 	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.terminal.CursorX, Y: pane.terminal.CursorY}, Visible: pane.terminal.CursorVisible}}); err != nil {
 		return err
@@ -510,18 +525,22 @@ func sendFullRender(output *renderOutput, pane *Pane) error {
 
 func sendHistorySnapshot(output *renderOutput, pane *Pane, view *paneHistoryView) error {
 	snapshot := view.Snapshot
-	for _, def := range snapshot.Styles {
+	for _, def := range snapshot.styles {
 		if err := installStyle(output, def.ID, def.Style); err != nil {
 			return err
 		}
 	}
-	cells := historyViewport(view)
-	compiler := newDisplayCompiler(output, styleDefinitionsMap(snapshot.Styles))
+	compiler := newDisplayCompiler(output, snapshot, snapshot.cellText, snapshot.Cols, snapshot.ViewportRows)
 	for row := 0; row < snapshot.ViewportRows; row++ {
-		start := row * snapshot.Cols
-		if err := compiler.writeCells(row, 0, cells[start:start+snapshot.Cols]); err != nil {
+		if err := compiler.writeCells(row, 0, snapshot.row(view.ViewTop+row)); err != nil {
 			return err
 		}
+	}
+	if err := compiler.finish(); err != nil {
+		return err
+	}
+	if err := writeHistoryCounter(compiler, view, historyCounter(view)); err != nil {
+		return err
 	}
 	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: min(view.CursorCol, snapshot.Cols-1), Y: view.CursorRow - view.ViewTop}, Visible: true}}); err != nil {
 		return err
@@ -546,7 +565,6 @@ func installStyle(output *renderOutput, id uint32, style protocol.Style) error {
 type renderOutput struct {
 	stream          io.Writer
 	pending         []byte
-	textScratch     []byte
 	installedStyles map[uint32]protocol.Style
 }
 
@@ -567,6 +585,9 @@ func (o *renderOutput) append(command protocol.DisplayCommand) error {
 		return err
 	}
 	o.pending = encoder.Bytes()
+	if len(o.pending) >= renderStreamChunkSize {
+		return o.commit()
+	}
 	return nil
 }
 

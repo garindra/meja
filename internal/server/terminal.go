@@ -26,7 +26,6 @@ var printableASCIIStrings = func() [utf8.RuneSelf]string {
 	return strings
 }()
 
-type Cell = protocol.Cell
 type Style = protocol.Style
 type Color = protocol.Color
 
@@ -50,10 +49,6 @@ func logUnsupportedf(format string, args ...any) {
 		return
 	}
 	_, _ = fmt.Fprintf(debugLogger.w, "meja terminal: "+format+"\n", args...)
-}
-
-func blankCell(styleID uint32) Cell {
-	return Cell{StyleID: styleID, Width: 1}
 }
 
 func colorIndexed(idx int) Color {
@@ -97,11 +92,12 @@ func clusterBaseCellWidth(cluster string) uint8 {
 	return 1
 }
 
-func applicationNarrowWideCluster(cell Cell) bool {
-	if cell.Width != 2 || clusterBaseCellWidth(cell.Cluster) != 1 {
+func (t *TerminalState) applicationNarrowWideCluster(cell cellWord) bool {
+	cluster := t.cellText(cell)
+	if cell.width() != 2 || clusterBaseCellWidth(cluster) != 1 {
 		return false
 	}
-	return strings.ContainsRune(cell.Cluster, '\ufe0f') || strings.HasSuffix(cell.Cluster, "\u20e3")
+	return strings.ContainsRune(cluster, '\ufe0f') || strings.HasSuffix(cluster, "\u20e3")
 }
 
 func isSingleGrapheme(cluster string) bool {
@@ -182,15 +178,10 @@ type DirtySpan struct {
 	End   int
 }
 
-type Row struct {
-	Cells     []Cell
-	WrapsNext bool
-}
-
 type TerminalState struct {
 	Cols                  int
 	Rows                  int
-	GridRows              []Row
+	grid                  rowStore
 	CursorX               int
 	CursorY               int
 	CurrentStyle          Style
@@ -200,10 +191,8 @@ type TerminalState struct {
 	SavedCursor           SavedCursor
 	ScrollTop             int
 	ScrollBottom          int
-	History               []Row
-	HistoryLimit          int
 	Alternate             bool
-	Primary               *screenBuffer
+	Primary               *savedScreen
 	ApplicationCursorKeys bool
 	AutoWrap              bool
 	OriginMode            bool
@@ -223,11 +212,11 @@ type TerminalState struct {
 	nextStyleID   uint32
 	cachedStyle   Style
 	cachedStyleID uint32
-	historyStart  int
+	clusters      clusterStore
 }
 
-type screenBuffer struct {
-	Rows               []Row
+type savedScreen struct {
+	grid               rowStore
 	CursorX            int
 	CursorY            int
 	CurrentStyle       Style
@@ -256,14 +245,13 @@ type SavedCursor struct {
 }
 
 type logicalLine struct {
-	cells        []Cell
-	reflowable   bool
+	cells        []cellWord
 	cursorHere   bool
 	cursorOffset int
 }
 
 type reflowRow struct {
-	cells      []Cell
+	cells      []cellWord
 	continued  bool
 	cursorHere bool
 	cursorCol  int
@@ -282,17 +270,13 @@ func newTerminal(cols, rows int) *TerminalState {
 		styleToID:     make(map[Style]uint32, initialStyleCapacity),
 		nextStyleID:   1,
 		ScrollBottom:  rows - 1,
-		HistoryLimit:  2000,
 		AutoWrap:      true,
 		G0Charset:     'B',
 		G1Charset:     'B',
 	}
 	t.styleToID[DefaultStyle] = 0
 	t.TabStops = defaultTabStops(cols)
-	t.GridRows = make([]Row, rows)
-	for row := range t.GridRows {
-		t.GridRows[row] = blankRow(cols, 0)
-	}
+	t.grid.initialize(cols, rows)
 	return t
 }
 
@@ -324,8 +308,6 @@ func (t *TerminalState) Resize(cols, rows int) {
 	next.styleByID = cloneStyles(t.styleByID)
 	next.styleToID = cloneStyleIDMap(t.styleToID)
 	next.nextStyleID = t.nextStyleID
-	next.History = t.cloneHistoryRows()
-	next.HistoryLimit = t.HistoryLimit
 
 	lines := t.collectLogicalLines()
 	projected := make([]reflowRow, 0, max(rows, len(lines)))
@@ -346,32 +328,28 @@ func (t *TerminalState) Resize(cols, rows int) {
 		}
 	}
 
-	start := 0
-	if len(projected) > rows {
-		start = len(projected) - rows
+	start := max(0, len(projected)-terminalRowCapacity)
+	retained := projected[start:]
+	next.grid.initialize(cols, 0)
+	for _, src := range retained {
+		row := next.grid.appendBlank(cols, 0, &t.clusters)
+		copy(row, src.cells)
+		retainCellWords(row, &t.clusters)
+		next.grid.setLogicalWrapped(int(next.grid.count)-1, src.continued)
 	}
-	visible := projected[start:]
-	if len(visible) > rows {
-		visible = visible[:rows]
-	}
-	for row := range next.GridRows {
-		next.GridRows[row] = blankRow(cols, 0)
-	}
-	for row, src := range visible {
-		copy(next.GridRows[row].Cells, src.cells)
-		next.GridRows[row].WrapsNext = src.continued
-		if src.cursorHere {
-			next.CursorY = row
-			next.CursorX = src.cursorCol
-		}
+	for int(next.grid.count) < rows {
+		next.grid.appendBlank(cols, 0, &t.clusters)
 	}
 	if cursorPlaced {
 		cursorProjectedRow -= start
-		if cursorProjectedRow >= 0 && cursorProjectedRow < len(visible) {
-			next.CursorY = cursorProjectedRow
+		visibleStart := int(next.grid.count) - rows
+		if cursorProjectedRow >= visibleStart && cursorProjectedRow < int(next.grid.count) {
+			next.CursorY = cursorProjectedRow - visibleStart
 			next.CursorX = cursorProjectedCol
 		}
 	}
+	t.grid.release(t.Cols, &t.clusters)
+	next.clusters = t.clusters
 	next.clampCursor()
 	*t = *next
 }
@@ -380,7 +358,7 @@ func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 	oldCols := t.Cols
 	p := t.Primary
 	primary := newTerminal(t.Cols, t.Rows)
-	primary.GridRows = cloneRows(p.Rows)
+	primary.grid = p.grid
 	primary.CursorX = p.CursorX
 	primary.CursorY = p.CursorY
 	primary.CurrentStyle = p.CurrentStyle
@@ -391,37 +369,28 @@ func (t *TerminalState) resizeWhileAlternate(cols, rows int) {
 	primary.ScrollBottom = p.ScrollBottom
 	primary.LastPrintedCluster = p.LastPrintedCluster
 	primary.LastPrintedValid = p.LastPrintedValid
-	primary.History = t.cloneHistoryRows()
-	primary.HistoryLimit = t.HistoryLimit
+	primary.clusters = t.clusters
 	primary.styleByID = cloneStyles(t.styleByID)
 	primary.styleToID = cloneStyleIDMap(t.styleToID)
 	primary.nextStyleID = t.nextStyleID
 	primary.Resize(cols, rows)
-	active := make([]Row, rows)
-	for row := range active {
-		active[row] = blankRow(cols, 0)
+	active := rowStore{}
+	active.initialize(cols, rows)
+	for row := 0; row < min(rows, t.Rows); row++ {
+		destination := active.visibleRow(row, rows, cols)
+		copy(destination, t.gridRow(row)[:min(cols, t.Cols)])
+		retainCellWords(destination, &primary.clusters)
+		active.setLogicalWrapped(row, t.rowWrapped(row))
 	}
-	for row := 0; row < min(rows, len(t.GridRows)); row++ {
-		copy(active[row].Cells, t.GridRows[row].Cells[:min(cols, len(t.GridRows[row].Cells))])
-		active[row].WrapsNext = t.GridRows[row].WrapsNext
-	}
+	t.grid.release(oldCols, &primary.clusters)
 	t.Cols, t.Rows = cols, rows
 	t.TabStops = resizedTabStops(t.TabStops, oldCols, cols)
-	t.GridRows = active
+	t.grid = active
+	t.clusters = primary.clusters
 	t.ScrollTop = 0
 	t.ScrollBottom = rows - 1
 	t.clampCursor()
-	t.History = primary.History
-	t.historyStart = 0
-	t.Primary = &screenBuffer{Rows: cloneRows(primary.GridRows), CursorX: primary.CursorX, CursorY: primary.CursorY, CurrentStyle: primary.CurrentStyle, CursorVisible: primary.CursorVisible, WrapPending: primary.wrapPending, SavedCursor: primary.SavedCursor, ScrollTop: primary.ScrollTop, ScrollBottom: primary.ScrollBottom, LastPrintedCluster: primary.LastPrintedCluster, LastPrintedValid: primary.LastPrintedValid, G0Charset: p.G0Charset, G1Charset: p.G1Charset, ActiveCharset: p.ActiveCharset}
-}
-
-func (t *TerminalState) SnapshotStyles() []protocolStyleDef {
-	out := make([]protocolStyleDef, 0, len(t.styleByID))
-	for id, style := range t.styleByID {
-		out = append(out, protocolStyleDef{ID: uint32(id), Style: style})
-	}
-	return out
+	t.Primary = &savedScreen{grid: primary.grid, CursorX: primary.CursorX, CursorY: primary.CursorY, CurrentStyle: primary.CurrentStyle, CursorVisible: primary.CursorVisible, WrapPending: primary.wrapPending, SavedCursor: primary.SavedCursor, ScrollTop: primary.ScrollTop, ScrollBottom: primary.ScrollBottom, LastPrintedCluster: primary.LastPrintedCluster, LastPrintedValid: primary.LastPrintedValid, G0Charset: p.G0Charset, G1Charset: p.G1Charset, ActiveCharset: p.ActiveCharset}
 }
 
 func (t *TerminalState) LookupStyle(id uint32) (Style, bool) {
@@ -429,11 +398,6 @@ func (t *TerminalState) LookupStyle(id uint32) (Style, bool) {
 		return Style{}, false
 	}
 	return t.styleByID[id], true
-}
-
-type protocolStyleDef struct {
-	ID    uint32
-	Style Style
 }
 
 func (t *TerminalState) Apply(data []byte) Update {
@@ -503,7 +467,7 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 				t.invalidateTail()
 				if t.CursorX > 0 {
 					t.CursorX--
-					if t.CursorX > 0 && t.GridRows[t.CursorY].Cells[t.CursorX].Width == 0 && applicationNarrowWideCluster(t.GridRows[t.CursorY].Cells[t.CursorX-1]) {
+					if t.CursorX > 0 && t.gridRow(t.CursorY)[t.CursorX].width() == 0 && t.applicationNarrowWideCluster(t.gridRow(t.CursorY)[t.CursorX-1]) {
 						// Many applications still measure text-default emoji bases per
 						// code point and emit one BS even when VS16 made the terminal
 						// presentation two cells. Keep literal BS compatible with that
@@ -685,23 +649,19 @@ func (t *TerminalState) putASCII(data []byte, update *Update) {
 		start := t.CursorX
 		count := min(len(data), t.Cols-start)
 		end := start + count
-		cells := t.GridRows[t.CursorY].Cells
+		cells := t.gridRow(t.CursorY)
 		dirtyStart, dirtyEnd := start, end
-		if start > 0 && cells[start].Width == 0 && cells[start-1].Width == 2 {
-			cells[start-1] = blankCell(styleID)
+		if start > 0 && cells[start].width() == 0 && cells[start-1].width() == 2 {
+			t.replaceBlankCell(cells, start-1, styleID)
 			dirtyStart--
 		}
-		if end < t.Cols && cells[end-1].Width == 2 {
-			cells[end] = blankCell(styleID)
+		if end < t.Cols && cells[end-1].width() == 2 {
+			t.replaceBlankCell(cells, end, styleID)
 			dirtyEnd++
 		}
 		t.setRowWrapped(t.CursorY, false)
 		for column, b := range data[:count] {
-			cluster := printableASCIIStrings[b]
-			if b == ' ' {
-				cluster = ""
-			}
-			cells[start+column] = Cell{Cluster: cluster, StyleID: styleID, Width: 1}
+			t.replaceCell(cells, start+column, printableASCIIWords[b]|cellWord(styleID))
 		}
 		update.markDirty(t.CursorY, dirtyStart, dirtyEnd, t.Cols)
 		lastRow, lastColumn = t.CursorY, end-1
@@ -734,11 +694,7 @@ func (t *TerminalState) putASCIIByte(b byte, update *Update) {
 	writtenColumn := t.CursorX
 	t.insertChars(1, styleID)
 	dirtyStart, dirtyEnd := t.clearGlyphsForWrite(t.CursorY, writtenColumn, 1, styleID)
-	cluster := printableASCIIStrings[b]
-	if b == ' ' {
-		cluster = ""
-	}
-	t.GridRows[t.CursorY].Cells[writtenColumn] = Cell{Cluster: cluster, StyleID: styleID, Width: 1}
+	t.replaceCell(t.gridRow(t.CursorY), writtenColumn, printableASCIIWords[b]|cellWord(styleID))
 	t.LastPrintedCluster = printableASCIIStrings[b]
 	t.LastPrintedValid = true
 	t.tailRow, t.tailColumn, t.tailValid = t.CursorY, writtenColumn, b != ' '
@@ -825,9 +781,9 @@ func (t *TerminalState) putRune(r rune, update *Update) {
 		t.insertChars(cellWidth, styleID)
 	}
 	dirtyStart, dirtyEnd := t.clearGlyphsForWrite(t.CursorY, writtenColumn, cellWidth, styleID)
-	t.GridRows[t.CursorY].Cells[writtenColumn] = Cell{Cluster: cluster, StyleID: styleID, Width: uint8(cellWidth)}
+	t.replaceTextCell(t.gridRow(t.CursorY), writtenColumn, cluster, uint8(cellWidth), styleID)
 	for column := writtenColumn + 1; column < writtenColumn+cellWidth; column++ {
-		t.GridRows[t.CursorY].Cells[column] = Cell{StyleID: styleID, Width: 0}
+		t.replaceCell(t.gridRow(t.CursorY), column, makeContinuationCellWord(uint16(styleID)))
 	}
 	t.LastPrintedCluster = string(r)
 	t.LastPrintedValid = true
@@ -847,34 +803,36 @@ func (t *TerminalState) extendTail(r rune, update *Update) bool {
 	if !t.tailValid || t.tailRow < 0 || t.tailRow >= t.Rows || t.tailColumn < 0 || t.tailColumn >= t.Cols {
 		return false
 	}
-	anchor := &t.GridRows[t.tailRow].Cells[t.tailColumn]
-	if anchor.Width == 0 || anchor.Cluster == "" {
+	cells := t.gridRow(t.tailRow)
+	anchor := cells[t.tailColumn]
+	anchorText := t.cellText(anchor)
+	if anchor.width() == 0 || anchorText == "" {
 		t.invalidateTail()
 		return false
 	}
-	candidate := anchor.Cluster + string(r)
+	candidate := anchorText + string(r)
 	if !isSingleGrapheme(candidate) {
 		return false
 	}
-	oldWidth := int(anchor.Width)
+	oldWidth := int(anchor.width())
 	newWidth := int(clusterCellWidth(candidate))
 	if newWidth > t.Cols {
 		newWidth = 1
 	}
-	styleID := anchor.StyleID
+	styleID := uint32(anchor.styleID())
 
 	if oldWidth == 1 && newWidth == 2 && t.tailColumn+1 >= t.Cols {
 		if !t.AutoWrap {
 			// There is no two-column span available. Keep a deterministic degraded
 			// width while preserving the complete cluster text in the anchor.
-			anchor.Cluster = candidate
+			t.replaceTextCell(cells, t.tailColumn, candidate, 1, styleID)
 			update.markDirty(t.tailRow, t.tailColumn, t.tailColumn+1, t.Cols)
 			t.LastPrintedCluster, t.LastPrintedValid = candidate, true
 			return true
 		}
 		// A provisional width-1 tail at the final column became wide. Relocate
 		// it exactly as if the complete cluster had arrived atomically.
-		t.GridRows[t.tailRow].Cells[t.tailColumn] = blankCell(styleID)
+		t.replaceBlankCell(cells, t.tailColumn, styleID)
 		update.markDirty(t.tailRow, t.tailColumn, t.tailColumn+1, t.Cols)
 		t.setRowWrapped(t.tailRow, true)
 		t.CursorX = 0
@@ -882,9 +840,9 @@ func (t *TerminalState) extendTail(r rune, update *Update) bool {
 		t.wrapPending = false
 		t.wrapLine(update)
 		t.tailRow, t.tailColumn = t.CursorY, 0
-		anchor = &t.GridRows[t.tailRow].Cells[0]
-		*anchor = Cell{Cluster: candidate, StyleID: styleID, Width: 2}
-		t.GridRows[t.tailRow].Cells[1] = Cell{StyleID: styleID, Width: 0}
+		cells = t.gridRow(t.tailRow)
+		t.replaceTextCell(cells, 0, candidate, 2, styleID)
+		t.replaceCell(cells, 1, makeContinuationCellWord(uint16(styleID)))
 		t.CursorX = 2
 		update.markDirty(t.tailRow, 0, 2, t.Cols)
 		update.CursorChanged = true
@@ -892,16 +850,15 @@ func (t *TerminalState) extendTail(r rune, update *Update) bool {
 		return true
 	}
 
-	anchor.Cluster = candidate
-	anchor.Width = uint8(newWidth)
+	t.replaceTextCell(cells, t.tailColumn, candidate, uint8(newWidth), styleID)
 	if oldWidth == 1 && newWidth == 2 {
 		t.clearGlyphsForWrite(t.tailRow, t.tailColumn+1, 1, styleID)
-		t.GridRows[t.tailRow].Cells[t.tailColumn+1] = Cell{StyleID: styleID, Width: 0}
+		t.replaceCell(cells, t.tailColumn+1, makeContinuationCellWord(uint16(styleID)))
 		if t.CursorY == t.tailRow && t.CursorX == t.tailColumn+1 {
 			t.CursorX++
 		}
 	} else if oldWidth == 2 && newWidth == 1 {
-		t.GridRows[t.tailRow].Cells[t.tailColumn+1] = blankCell(styleID)
+		t.replaceBlankCell(cells, t.tailColumn+1, styleID)
 		if t.CursorY == t.tailRow && t.CursorX == t.tailColumn+2 {
 			t.CursorX--
 		}
@@ -925,17 +882,17 @@ func (t *TerminalState) invalidateTail() {
 func (t *TerminalState) clearGlyphsForWrite(row, start, cellWidth int, styleID uint32) (int, int) {
 	dirtyStart, dirtyEnd := start, start+cellWidth
 	for column := start; column < start+cellWidth; column++ {
-		cell := t.GridRows[row].Cells[column]
+		cell := t.gridRow(row)[column]
 		switch {
-		case cell.Width == 2:
-			t.GridRows[row].Cells[column] = blankCell(styleID)
+		case cell.width() == 2:
+			t.replaceBlankCell(t.gridRow(row), column, styleID)
 			if column+1 < t.Cols {
-				t.GridRows[row].Cells[column+1] = blankCell(styleID)
+				t.replaceBlankCell(t.gridRow(row), column+1, styleID)
 				dirtyEnd = max(dirtyEnd, column+2)
 			}
-		case cell.Width == 0 && column > 0 && t.GridRows[row].Cells[column-1].Width == 2:
-			t.GridRows[row].Cells[column-1] = blankCell(styleID)
-			t.GridRows[row].Cells[column] = blankCell(styleID)
+		case cell.width() == 0 && column > 0 && t.gridRow(row)[column-1].width() == 2:
+			t.replaceBlankCell(t.gridRow(row), column-1, styleID)
+			t.replaceBlankCell(t.gridRow(row), column, styleID)
 			dirtyStart = min(dirtyStart, column-1)
 		}
 	}
@@ -1005,8 +962,7 @@ func (t *TerminalState) executeCSI(seq []byte, update *Update) {
 	case 'J':
 		mode := paramOr(params, 0, 0)
 		if mode == 3 {
-			t.History = nil
-			t.historyStart = 0
+			t.grid.discardHistory(t.Rows, t.Cols, &t.clusters)
 		} else {
 			t.breakAllWrapChains()
 			t.eraseDisplay(mode)
@@ -1249,8 +1205,8 @@ func (t *TerminalState) eraseDisplay(mode int) {
 			t.fillRow(row, start, end, styleID)
 		}
 	case 2:
-		for row := range t.GridRows {
-			t.GridRows[row] = blankRow(t.Cols, styleID)
+		for row := 0; row < t.Rows; row++ {
+			t.fillRow(row, 0, t.Cols, styleID)
 		}
 	default:
 		for row := t.CursorY; row < t.Rows; row++ {
@@ -1430,21 +1386,26 @@ func (t *TerminalState) fillRow(row, start, end int, styleID uint32) {
 	}
 	t.setRowWrapped(row, false)
 	for col := start; col < end; col++ {
-		t.GridRows[row].Cells[col] = blankCell(styleID)
+		t.replaceBlankCell(t.gridRow(row), col, styleID)
 	}
 }
 
 func (t *TerminalState) scrollUpRegion(top, bottom int, styleID uint32) {
-	if top < 0 || bottom >= len(t.GridRows) || top > bottom {
+	if top < 0 || bottom >= t.Rows || top > bottom {
 		return
 	}
-	recycled := t.GridRows[top]
-	if !t.Alternate && top == 0 && bottom == len(t.GridRows)-1 {
-		recycled = t.rotateHistoryRow(recycled)
+	if !t.Alternate && top == 0 && bottom == t.Rows-1 {
+		t.grid.appendBlank(t.Cols, uint16(styleID), &t.clusters)
+		return
 	}
-	copy(t.GridRows[top:bottom], t.GridRows[top+1:bottom+1])
-	clearRow(&recycled, styleID)
-	t.GridRows[bottom] = recycled
+	discarded := t.gridRow(top)
+	releaseCellWords(discarded, &t.clusters)
+	for row := top; row < bottom; row++ {
+		copy(t.gridRow(row), t.gridRow(row+1))
+		t.setRowWrapped(row, t.rowWrapped(row+1))
+	}
+	fillCellWords(t.gridRow(bottom), makeBlankCellWord(uint16(styleID)))
+	t.setRowWrapped(bottom, false)
 	t.breakWrapChainAt(top)
 	t.breakWrapChainAt(bottom)
 }
@@ -1453,11 +1414,8 @@ func (t *TerminalState) enterAlternateScreen() {
 	if t.Alternate {
 		return
 	}
-	t.Primary = &screenBuffer{Rows: cloneRows(t.GridRows), CursorX: t.CursorX, CursorY: t.CursorY, CurrentStyle: t.CurrentStyle, CursorVisible: t.CursorVisible, WrapPending: t.wrapPending, SavedCursor: t.SavedCursor, ScrollTop: t.ScrollTop, ScrollBottom: t.ScrollBottom, LastPrintedCluster: t.LastPrintedCluster, LastPrintedValid: t.LastPrintedValid, G0Charset: t.G0Charset, G1Charset: t.G1Charset, ActiveCharset: t.ActiveCharset}
-	t.GridRows = make([]Row, t.Rows)
-	for row := range t.GridRows {
-		t.GridRows[row] = blankRow(t.Cols, 0)
-	}
+	t.Primary = &savedScreen{grid: t.grid, CursorX: t.CursorX, CursorY: t.CursorY, CurrentStyle: t.CurrentStyle, CursorVisible: t.CursorVisible, WrapPending: t.wrapPending, SavedCursor: t.SavedCursor, ScrollTop: t.ScrollTop, ScrollBottom: t.ScrollBottom, LastPrintedCluster: t.LastPrintedCluster, LastPrintedValid: t.LastPrintedValid, G0Charset: t.G0Charset, G1Charset: t.G1Charset, ActiveCharset: t.ActiveCharset}
+	t.grid.initialize(t.Cols, t.Rows)
 	t.CursorX, t.CursorY = 0, 0
 	t.CurrentStyle = DefaultStyle
 	t.cachedStyle = DefaultStyle
@@ -1476,7 +1434,8 @@ func (t *TerminalState) exitAlternateScreen() {
 		return
 	}
 	p := t.Primary
-	t.GridRows = cloneRows(p.Rows)
+	t.grid.release(t.Cols, &t.clusters)
+	t.grid = p.grid
 	t.CursorX = p.CursorX
 	t.CursorY = p.CursorY
 	t.CurrentStyle = p.CurrentStyle
@@ -1496,68 +1455,17 @@ func (t *TerminalState) exitAlternateScreen() {
 	t.clampCursor()
 }
 
-func (t *TerminalState) rotateHistoryRow(row Row) Row {
-	if t.HistoryLimit <= 0 {
-		return row
-	}
-	if len(t.History) > t.HistoryLimit {
-		ordered := t.orderedHistoryRows()
-		t.History = ordered[len(ordered)-t.HistoryLimit:]
-		t.historyStart = 0
-	} else if t.historyStart != 0 && len(t.History) < t.HistoryLimit {
-		t.History = t.orderedHistoryRows()
-		t.historyStart = 0
-	}
-	if len(t.History) >= t.HistoryLimit {
-		index := t.historyStart
-		recycled := t.History[index]
-		t.History[index] = row
-		t.historyStart = (t.historyStart + 1) % len(t.History)
-		return recycled
-	}
-	t.History = append(t.History, row)
-	return Row{Cells: make([]Cell, len(row.Cells))}
-}
-
-func (t *TerminalState) SnapshotRows() (history, primary []Row) {
-	history = t.cloneHistoryRows()
-	primary = cloneRows(t.GridRows)
-	return history, primary
-}
-
-func (t *TerminalState) cloneHistoryRows() []Row {
-	out := make([]Row, len(t.History))
-	for i := range out {
-		row := t.History[(t.historyStart+i)%len(t.History)]
-		out[i] = Row{Cells: append([]Cell(nil), row.Cells...), WrapsNext: row.WrapsNext}
-	}
-	return out
-}
-
-func (t *TerminalState) orderedHistoryRows() []Row {
-	out := make([]Row, len(t.History))
-	for i := range out {
-		out[i] = t.History[(t.historyStart+i)%len(t.History)]
-	}
-	return out
-}
-
-func cloneRows(rows []Row) []Row {
-	out := make([]Row, len(rows))
-	for i, row := range rows {
-		out[i] = Row{Cells: append([]Cell(nil), row.Cells...), WrapsNext: row.WrapsNext}
-	}
-	return out
-}
-
 func (t *TerminalState) scrollDownRegion(top, bottom int, styleID uint32) {
-	if top < 0 || bottom >= len(t.GridRows) || top > bottom {
+	if top < 0 || bottom >= t.Rows || top > bottom {
 		return
 	}
-	recycled := t.GridRows[bottom]
-	copy(t.GridRows[top+1:bottom+1], t.GridRows[top:bottom])
-	clearRow(&recycled, styleID)
-	t.GridRows[top] = recycled
+	releaseCellWords(t.gridRow(bottom), &t.clusters)
+	for row := bottom; row > top; row-- {
+		copy(t.gridRow(row), t.gridRow(row-1))
+		t.setRowWrapped(row, t.rowWrapped(row-1))
+	}
+	fillCellWords(t.gridRow(top), makeBlankCellWord(uint16(styleID)))
+	t.setRowWrapped(top, false)
 	t.breakWrapChainAt(top)
 	t.breakWrapChainAt(bottom)
 }
@@ -1630,16 +1538,17 @@ func (t *TerminalState) deleteChars(n int, styleID uint32) {
 	if t.CursorY < 0 || t.CursorY >= t.Rows || n <= 0 {
 		return
 	}
-	row := t.GridRows[t.CursorY].Cells
+	row := t.gridRow(t.CursorY)
 	if t.CursorX < 0 || t.CursorX >= len(row) {
 		return
 	}
 	if n > len(row)-t.CursorX {
 		n = len(row) - t.CursorX
 	}
+	releaseCellWords(row[t.CursorX:t.CursorX+n], &t.clusters)
 	copy(row[t.CursorX:], row[t.CursorX+n:])
 	for i := len(row) - n; i < len(row); i++ {
-		row[i] = blankCell(styleID)
+		row[i] = makeBlankCellWord(uint16(styleID))
 	}
 	t.normalizeRow(t.CursorY)
 }
@@ -1648,13 +1557,14 @@ func (t *TerminalState) insertChars(n int, styleID uint32) {
 	if t.CursorY < 0 || t.CursorY >= t.Rows || t.CursorX < 0 || t.CursorX >= t.Cols || n <= 0 {
 		return
 	}
-	row := t.GridRows[t.CursorY].Cells
+	row := t.gridRow(t.CursorY)
 	if n > len(row)-t.CursorX {
 		n = len(row) - t.CursorX
 	}
+	releaseCellWords(row[len(row)-n:], &t.clusters)
 	copy(row[t.CursorX+n:], row[t.CursorX:len(row)-n])
 	for i := t.CursorX; i < t.CursorX+n; i++ {
-		row[i] = blankCell(styleID)
+		row[i] = makeBlankCellWord(uint16(styleID))
 	}
 	t.normalizeRow(t.CursorY)
 }
@@ -1665,10 +1575,7 @@ func (t *TerminalState) insertLines(n int, styleID uint32) {
 	}
 	n = min(n, t.ScrollBottom-t.CursorY+1)
 	for range n {
-		recycled := t.GridRows[t.ScrollBottom]
-		copy(t.GridRows[t.CursorY+1:t.ScrollBottom+1], t.GridRows[t.CursorY:t.ScrollBottom])
-		clearRow(&recycled, styleID)
-		t.GridRows[t.CursorY] = recycled
+		t.scrollDownRegion(t.CursorY, t.ScrollBottom, styleID)
 	}
 	t.breakAllWrapChains()
 }
@@ -1679,10 +1586,7 @@ func (t *TerminalState) deleteLines(n int, styleID uint32) {
 	}
 	n = min(n, t.ScrollBottom-t.CursorY+1)
 	for range n {
-		recycled := t.GridRows[t.CursorY]
-		copy(t.GridRows[t.CursorY:t.ScrollBottom], t.GridRows[t.CursorY+1:t.ScrollBottom+1])
-		clearRow(&recycled, styleID)
-		t.GridRows[t.ScrollBottom] = recycled
+		t.scrollUpRegion(t.CursorY, t.ScrollBottom, styleID)
 	}
 	t.breakAllWrapChains()
 }
@@ -1752,9 +1656,9 @@ func (t *TerminalState) softReset() {
 }
 
 func (t *TerminalState) reset() {
-	cols, rows, historyLimit := t.Cols, t.Rows, t.HistoryLimit
+	cols, rows := t.Cols, t.Rows
+	t.grid.release(cols, &t.clusters)
 	*t = *newTerminal(cols, rows)
-	t.HistoryLimit = historyLimit
 }
 
 func defaultTabStops(cols int) []bool {
@@ -1835,13 +1739,13 @@ func (t *TerminalState) normalizeRow(row int) {
 	if row < 0 || row >= t.Rows {
 		return
 	}
-	cells := t.GridRows[row].Cells
+	cells := t.gridRow(row)
 	for i := 0; i < len(cells); i++ {
-		if cells[i].Width == 2 && (i+1 >= len(cells) || cells[i+1].Width != 0) {
-			cells[i] = blankCell(0)
-		} else if cells[i].Width == 0 {
-			if i == 0 || cells[i-1].Width <= 1 {
-				cells[i] = blankCell(0)
+		if cells[i].width() == 2 && (i+1 >= len(cells) || cells[i+1].width() != 0) {
+			t.replaceBlankCell(cells, i, 0)
+		} else if cells[i].width() == 0 {
+			if i == 0 || cells[i-1].width() <= 1 {
+				t.replaceBlankCell(cells, i, 0)
 			}
 		}
 	}
@@ -1955,21 +1859,22 @@ func (t *TerminalState) clampCursor() {
 }
 
 func (t *TerminalState) collectLogicalLines() []logicalLine {
-	lines := make([]logicalLine, 0, t.Rows)
-	current := logicalLine{reflowable: true}
-	for row := 0; row < t.Rows; row++ {
-		segment := append([]Cell(nil), t.GridRows[row].Cells...)
-		if !t.GridRows[row].WrapsNext {
+	lines := make([]logicalLine, 0, int(t.grid.count))
+	current := logicalLine{}
+	cursorLogicalRow := int(t.grid.count) - t.Rows + t.CursorY
+	for row := 0; row < int(t.grid.count); row++ {
+		segment := append([]cellWord(nil), t.grid.logicalRow(row, t.Cols)...)
+		if !t.grid.logicalWrapped(row) {
 			segment = trimTrailingBlankCells(segment)
 		}
-		if row == t.CursorY {
+		if row == cursorLogicalRow {
 			current.cursorHere = true
 			current.cursorOffset = len(current.cells) + min(t.CursorX, len(segment))
 		}
 		current.cells = append(current.cells, segment...)
-		if !t.GridRows[row].WrapsNext {
+		if !t.grid.logicalWrapped(row) {
 			lines = append(lines, current)
-			current = logicalLine{reflowable: true}
+			current = logicalLine{}
 		}
 	}
 	if len(current.cells) > 0 || current.cursorHere {
@@ -1983,7 +1888,7 @@ func (t *TerminalState) collectLogicalLines() []logicalLine {
 		lines = lines[:len(lines)-1]
 	}
 	if len(lines) == 0 {
-		return []logicalLine{{reflowable: true}}
+		return []logicalLine{{}}
 	}
 	return lines
 }
@@ -1995,23 +1900,10 @@ func (t *TerminalState) projectLogicalLine(line logicalLine, cols int) []reflowR
 	if len(line.cells) == 0 {
 		return []reflowRow{{cursorHere: line.cursorHere, cursorCol: line.cursorOffset}}
 	}
-	if !line.reflowable {
-		row := reflowRow{
-			cells:      make([]Cell, cols),
-			continued:  false,
-			cursorHere: line.cursorHere,
-			cursorCol:  min(line.cursorOffset, cols-1),
-		}
-		for i := range row.cells {
-			row.cells[i] = blankCell(0)
-		}
-		copy(row.cells, line.cells[:min(len(line.cells), cols)])
-		return []reflowRow{row}
-	}
 	newRow := func() reflowRow {
-		row := reflowRow{cells: make([]Cell, cols)}
+		row := reflowRow{cells: make([]cellWord, cols)}
 		for i := range row.cells {
-			row.cells[i] = blankCell(0)
+			row.cells[i] = makeBlankCellWord(0)
 		}
 		return row
 	}
@@ -2020,9 +1912,9 @@ func (t *TerminalState) projectLogicalLine(line logicalLine, cols int) []reflowR
 	for source := 0; source < len(line.cells); {
 		cell := line.cells[source]
 		width := 1
-		if cell.Width == 2 && source+1 < len(line.cells) && line.cells[source+1].Width == 0 {
+		if cell.width() == 2 && source+1 < len(line.cells) && line.cells[source+1].width() == 0 {
 			width = 2
-		} else if cell.Width == 0 {
+		} else if cell.width() == 0 {
 			// Never reproduce an orphan continuation from malformed legacy state.
 			source++
 			continue
@@ -2032,7 +1924,7 @@ func (t *TerminalState) projectLogicalLine(line logicalLine, cols int) []reflowR
 			// A one-column viewport cannot hold a two-column cluster. Preserve the
 			// text as a width-degraded one-column anchor rather than splitting it.
 			width = 1
-			cell.Width = 1
+			cell = cellWordWithWidth(cell, 1)
 		}
 		if column+width > cols {
 			row.continued = true
@@ -2041,7 +1933,7 @@ func (t *TerminalState) projectLogicalLine(line logicalLine, cols int) []reflowR
 		}
 		row.cells[column] = cell
 		if width == 2 {
-			row.cells[column+1] = Cell{StyleID: cell.StyleID, Width: 0}
+			row.cells[column+1] = makeContinuationCellWord(cell.styleID())
 		}
 		if line.cursorHere && line.cursorOffset >= source && line.cursorOffset < source+width {
 			row.cursorHere = true
@@ -2058,38 +1950,19 @@ func (t *TerminalState) projectLogicalLine(line logicalLine, cols int) []reflowR
 	return out
 }
 
-func (t *TerminalState) setRowWrapped(row int, wrapped bool) {
-	if row >= 0 && row < len(t.GridRows) {
-		t.GridRows[row].WrapsNext = wrapped
-	}
-}
-
 func (t *TerminalState) breakWrapChainAt(row int) {
-	if row >= 0 && row < len(t.GridRows) {
-		t.GridRows[row].WrapsNext = false
+	if row >= 0 && row < t.Rows {
+		t.setRowWrapped(row, false)
 	}
-	if row > 0 && row-1 < len(t.GridRows) {
-		t.GridRows[row-1].WrapsNext = false
+	if row > 0 && row-1 < t.Rows {
+		t.setRowWrapped(row-1, false)
 	}
 }
 
 func (t *TerminalState) breakAllWrapChains() {
-	for row := range t.GridRows {
-		t.GridRows[row].WrapsNext = false
+	for row := 0; row < t.Rows; row++ {
+		t.setRowWrapped(row, false)
 	}
-}
-
-func blankRow(cols int, styleID uint32) Row {
-	row := Row{Cells: make([]Cell, cols)}
-	clearRow(&row, styleID)
-	return row
-}
-
-func clearRow(row *Row, styleID uint32) {
-	for i := range row.Cells {
-		row.Cells[i] = blankCell(styleID)
-	}
-	row.WrapsNext = false
 }
 
 func cloneStyles(in []Style) []Style {
@@ -2121,14 +1994,470 @@ func max1(params []int, def int) int {
 	return v
 }
 
-func trimTrailingBlankCells(cells []Cell) []Cell {
+func trimTrailingBlankCells(cells []cellWord) []cellWord {
 	end := len(cells)
 	for end > 0 {
 		cell := cells[end-1]
-		if cell.Cluster != "" || cell.Width != 1 {
+		if !cell.isBlank() {
 			break
 		}
 		end--
 	}
 	return cells[:end]
+}
+
+type cellWord uint32
+
+const (
+	cellStyleBits    = 12
+	cellPayloadBits  = 16
+	cellStyleMask    = cellWord(1<<cellStyleBits - 1)
+	cellPayloadMask  = cellWord(1<<cellPayloadBits - 1)
+	cellPayloadShift = cellStyleBits
+	cellKindShift    = cellPayloadShift + cellPayloadBits
+
+	maxPaneClusters = 1 << 17
+)
+
+const (
+	cellKindBlank cellKind = iota
+	cellKindContinuation
+	cellKindNarrowScalar0
+	cellKindNarrowScalar1
+	cellKindNarrowScalar2
+	cellKindNarrowScalar3
+	cellKindWideScalar0
+	cellKindWideScalar1
+	cellKindWideScalar2
+	cellKindWideScalar3
+	cellKindNarrowClusterLow
+	cellKindNarrowClusterHigh
+	cellKindWideClusterLow
+	cellKindWideClusterHigh
+)
+
+type cellKind uint8
+
+var printableASCIIWords = func() [utf8.RuneSelf]cellWord {
+	var words [utf8.RuneSelf]cellWord
+	for b := byte('!'); b <= '~'; b++ {
+		words[b], _ = makeScalarCellWord(rune(b), 1, 0)
+	}
+	return words
+}()
+
+func makeBlankCellWord(styleID uint16) cellWord {
+	return cellWord(styleID) & cellStyleMask
+}
+
+func makeContinuationCellWord(styleID uint16) cellWord {
+	return makeCellWord(cellKindContinuation, 0, styleID)
+}
+
+func makeScalarCellWord(r rune, width uint8, styleID uint16) (cellWord, bool) {
+	if r < 0 || r > 0x3ffff || width < 1 || width > 2 {
+		return 0, false
+	}
+	if r == ' ' && width == 1 {
+		return makeBlankCellWord(styleID), true
+	}
+	window := cellKind(uint32(r) >> cellPayloadBits)
+	kind := cellKindNarrowScalar0 + window
+	if width == 2 {
+		kind = cellKindWideScalar0 + window
+	}
+	return makeCellWord(kind, uint16(r), styleID), true
+}
+
+func makeClusterCellWord(handle uint32, width uint8, styleID uint16) (cellWord, bool) {
+	if handle >= maxPaneClusters || width < 1 || width > 2 {
+		return 0, false
+	}
+	kind := cellKindNarrowClusterLow
+	if handle >= 1<<16 {
+		kind = cellKindNarrowClusterHigh
+	}
+	if width == 2 {
+		kind += cellKindWideClusterLow - cellKindNarrowClusterLow
+	}
+	return makeCellWord(kind, uint16(handle), styleID), true
+}
+
+func makeCellWord(kind cellKind, payload uint16, styleID uint16) cellWord {
+	return cellWord(kind)<<cellKindShift |
+		cellWord(payload)<<cellPayloadShift |
+		cellWord(styleID)&cellStyleMask
+}
+
+func (c cellWord) kind() cellKind {
+	return cellKind(c >> cellKindShift)
+}
+
+func (c cellWord) payload() uint16 {
+	return uint16(c >> cellPayloadShift & cellPayloadMask)
+}
+
+func (c cellWord) styleID() uint16 {
+	return uint16(c & cellStyleMask)
+}
+
+func (c cellWord) width() uint8 {
+	switch c.kind() {
+	case cellKindContinuation:
+		return 0
+	case cellKindWideScalar0, cellKindWideScalar1, cellKindWideScalar2, cellKindWideScalar3,
+		cellKindWideClusterLow, cellKindWideClusterHigh:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func (c cellWord) scalar() (rune, bool) {
+	kind := c.kind()
+	var window cellKind
+	switch {
+	case kind >= cellKindNarrowScalar0 && kind <= cellKindNarrowScalar3:
+		window = kind - cellKindNarrowScalar0
+	case kind >= cellKindWideScalar0 && kind <= cellKindWideScalar3:
+		window = kind - cellKindWideScalar0
+	default:
+		return 0, false
+	}
+	return rune(uint32(window)<<cellPayloadBits | uint32(c.payload())), true
+}
+
+func (c cellWord) clusterHandle() (uint32, bool) {
+	kind := c.kind()
+	switch kind {
+	case cellKindNarrowClusterLow, cellKindWideClusterLow:
+		return uint32(c.payload()), true
+	case cellKindNarrowClusterHigh, cellKindWideClusterHigh:
+		return 1<<16 | uint32(c.payload()), true
+	default:
+		return 0, false
+	}
+}
+
+func (c cellWord) isBlank() bool {
+	return c.kind() == cellKindBlank
+}
+
+type clusterEntry struct {
+	text string
+	refs uint32
+}
+
+type clusterStore struct {
+	entries []clusterEntry
+	byText  map[string]uint32
+	free    []uint32
+}
+
+func (s *clusterStore) acquire(text string) (uint32, bool) {
+	if text == "" {
+		return 0, false
+	}
+	if handle, ok := s.byText[text]; ok {
+		s.entries[handle].refs++
+		return handle, true
+	}
+	var handle uint32
+	switch {
+	case len(s.free) > 0:
+		handle = s.free[len(s.free)-1]
+		s.free = s.free[:len(s.free)-1]
+	case len(s.entries) < maxPaneClusters:
+		handle = uint32(len(s.entries))
+		s.entries = append(s.entries, clusterEntry{})
+	default:
+		return 0, false
+	}
+	if s.byText == nil {
+		s.byText = make(map[string]uint32)
+	}
+	s.entries[handle] = clusterEntry{text: text, refs: 1}
+	s.byText[text] = handle
+	return handle, true
+}
+
+func (s *clusterStore) retain(handle uint32) bool {
+	if handle >= uint32(len(s.entries)) || s.entries[handle].refs == 0 {
+		return false
+	}
+	s.entries[handle].refs++
+	return true
+}
+
+func (s *clusterStore) release(handle uint32) {
+	if handle >= uint32(len(s.entries)) || s.entries[handle].refs == 0 {
+		return
+	}
+	entry := &s.entries[handle]
+	entry.refs--
+	if entry.refs != 0 {
+		return
+	}
+	delete(s.byText, entry.text)
+	entry.text = ""
+	s.free = append(s.free, handle)
+}
+
+func (s *clusterStore) lookup(handle uint32) (string, bool) {
+	if handle >= uint32(len(s.entries)) || s.entries[handle].refs == 0 {
+		return "", false
+	}
+	return s.entries[handle].text, true
+}
+
+func (t *TerminalState) makeTextCellWord(text string, width uint8, styleID uint16) cellWord {
+	if text == "" || text == " " && width == 1 {
+		return makeBlankCellWord(styleID)
+	}
+	if r, size := utf8.DecodeRuneInString(text); size == len(text) {
+		if word, ok := makeScalarCellWord(r, width, styleID); ok {
+			return word
+		}
+	}
+	if handle, ok := t.clusters.acquire(text); ok {
+		word, _ := makeClusterCellWord(handle, width, styleID)
+		return word
+	}
+	word, _ := makeScalarCellWord(utf8.RuneError, width, styleID)
+	return word
+}
+
+func (t *TerminalState) cellText(word cellWord) string {
+	return cellTextFromStore(word, &t.clusters)
+}
+
+func cellTextFromStore(word cellWord, clusters *clusterStore) string {
+	if word.isBlank() {
+		return ""
+	}
+	if r, ok := word.scalar(); ok {
+		return string(r)
+	}
+	if handle, ok := word.clusterHandle(); ok && clusters != nil {
+		text, _ := clusters.lookup(handle)
+		return text
+	}
+	return ""
+}
+
+func (t *TerminalState) replaceCell(cells []cellWord, column int, word cellWord) {
+	if handle, ok := cells[column].clusterHandle(); ok {
+		t.clusters.release(handle)
+	}
+	cells[column] = word
+}
+
+func (t *TerminalState) gridRow(row int) []cellWord {
+	return t.grid.visibleRow(row, t.Rows, t.Cols)
+}
+
+func (t *TerminalState) rowWrapped(row int) bool {
+	return t.grid.logicalWrapped(int(t.grid.count) - t.Rows + row)
+}
+
+func (t *TerminalState) setRowWrapped(row int, wrapped bool) {
+	t.grid.setLogicalWrapped(int(t.grid.count)-t.Rows+row, wrapped)
+}
+
+func (t *TerminalState) replaceTextCell(cells []cellWord, column int, text string, width uint8, styleID uint32) {
+	t.replaceCell(cells, column, t.makeTextCellWord(text, width, uint16(styleID)))
+}
+
+func (t *TerminalState) replaceBlankCell(cells []cellWord, column int, styleID uint32) {
+	t.replaceCell(cells, column, makeBlankCellWord(uint16(styleID)))
+}
+
+func cellWordWithWidth(word cellWord, width uint8) cellWord {
+	if r, ok := word.scalar(); ok {
+		out, _ := makeScalarCellWord(r, width, word.styleID())
+		return out
+	}
+	if handle, ok := word.clusterHandle(); ok {
+		out, _ := makeClusterCellWord(handle, width, word.styleID())
+		return out
+	}
+	return makeBlankCellWord(word.styleID())
+}
+
+const (
+	terminalRowCapacity = 2048
+	terminalBlockRows   = 128
+	terminalBlockCount  = terminalRowCapacity / terminalBlockRows
+	terminalRowMask     = terminalRowCapacity - 1
+)
+
+type rowBlock struct {
+	cells []cellWord
+	wraps [2]uint64
+}
+
+type rowStore struct {
+	blocks [terminalBlockCount]rowBlock
+	head   uint16
+	count  uint16
+}
+
+func (s *rowStore) initialize(cols, rows int) {
+	*s = rowStore{}
+	rows = min(max(rows, 0), terminalRowCapacity)
+	for slot := 0; slot < rows; slot++ {
+		s.ensureSlot(slot, cols)
+	}
+	s.count = uint16(rows)
+}
+
+func (s *rowStore) ensureSlot(slot, cols int) {
+	if slot < 0 || slot >= terminalRowCapacity || cols <= 0 {
+		return
+	}
+	block := &s.blocks[slot/terminalBlockRows]
+	if block.cells == nil {
+		block.cells = make([]cellWord, terminalBlockRows*cols)
+	}
+}
+
+func (s *rowStore) physicalRow(slot, cols int) []cellWord {
+	if slot < 0 || slot >= terminalRowCapacity || cols <= 0 {
+		return nil
+	}
+	block := &s.blocks[slot/terminalBlockRows]
+	if block.cells == nil {
+		return nil
+	}
+	row := slot % terminalBlockRows
+	start := row * cols
+	return block.cells[start : start+cols]
+}
+
+func (s *rowStore) logicalSlot(row int) int {
+	if row < 0 || row >= int(s.count) {
+		return -1
+	}
+	return (int(s.head) + row) & terminalRowMask
+}
+
+func (s *rowStore) logicalRow(row, cols int) []cellWord {
+	return s.physicalRow(s.logicalSlot(row), cols)
+}
+
+func (s *rowStore) visibleRow(row, viewportRows, cols int) []cellWord {
+	return s.logicalRow(int(s.count)-viewportRows+row, cols)
+}
+
+func (s *rowStore) appendBlank(cols int, styleID uint16, clusters *clusterStore) []cellWord {
+	var slot int
+	if int(s.count) < terminalRowCapacity {
+		slot = (int(s.head) + int(s.count)) & terminalRowMask
+		s.ensureSlot(slot, cols)
+		s.count++
+	} else {
+		slot = int(s.head)
+		s.head = uint16((slot + 1) & terminalRowMask)
+	}
+	row := s.physicalRow(slot, cols)
+	releaseCellWords(row, clusters)
+	fillCellWords(row, makeBlankCellWord(styleID))
+	s.setPhysicalWrapped(slot, false)
+	return row
+}
+
+func (s *rowStore) physicalWrapped(slot int) bool {
+	if slot < 0 || slot >= terminalRowCapacity {
+		return false
+	}
+	block := &s.blocks[slot/terminalBlockRows]
+	row := slot % terminalBlockRows
+	return block.wraps[row/64]&(uint64(1)<<uint(row%64)) != 0
+}
+
+func (s *rowStore) setPhysicalWrapped(slot int, wrapped bool) {
+	if slot < 0 || slot >= terminalRowCapacity {
+		return
+	}
+	block := &s.blocks[slot/terminalBlockRows]
+	row := slot % terminalBlockRows
+	mask := uint64(1) << uint(row%64)
+	if wrapped {
+		block.wraps[row/64] |= mask
+	} else {
+		block.wraps[row/64] &^= mask
+	}
+}
+
+func (s *rowStore) logicalWrapped(row int) bool {
+	return s.physicalWrapped(s.logicalSlot(row))
+}
+
+func (s *rowStore) setLogicalWrapped(row int, wrapped bool) {
+	s.setPhysicalWrapped(s.logicalSlot(row), wrapped)
+}
+
+func (s *rowStore) clone(cols int, clusters *clusterStore) rowStore {
+	out := rowStore{head: s.head, count: s.count}
+	for i := range s.blocks {
+		if s.blocks[i].cells == nil {
+			continue
+		}
+		out.blocks[i].cells = append([]cellWord(nil), s.blocks[i].cells...)
+		out.blocks[i].wraps = s.blocks[i].wraps
+	}
+	for row := 0; row < int(out.count); row++ {
+		retainCellWords(out.logicalRow(row, cols), clusters)
+	}
+	return out
+}
+
+func (s *rowStore) release(cols int, clusters *clusterStore) {
+	for row := 0; row < int(s.count); row++ {
+		releaseCellWords(s.logicalRow(row, cols), clusters)
+	}
+	*s = rowStore{}
+}
+
+func (s *rowStore) discardHistory(viewportRows, cols int, clusters *clusterStore) {
+	historyRows := int(s.count) - viewportRows
+	if historyRows <= 0 {
+		return
+	}
+	for row := 0; row < historyRows; row++ {
+		cells := s.logicalRow(row, cols)
+		releaseCellWords(cells, clusters)
+		fillCellWords(cells, 0)
+		s.setLogicalWrapped(row, false)
+	}
+	s.head = uint16((int(s.head) + historyRows) & terminalRowMask)
+	s.count = uint16(viewportRows)
+}
+
+func fillCellWords(cells []cellWord, word cellWord) {
+	for i := range cells {
+		cells[i] = word
+	}
+}
+
+func retainCellWords(cells []cellWord, clusters *clusterStore) {
+	if clusters == nil {
+		return
+	}
+	for _, word := range cells {
+		if handle, ok := word.clusterHandle(); ok {
+			clusters.retain(handle)
+		}
+	}
+}
+
+func releaseCellWords(cells []cellWord, clusters *clusterStore) {
+	if clusters == nil {
+		return
+	}
+	for _, word := range cells {
+		if handle, ok := word.clusterHandle(); ok {
+			clusters.release(handle)
+		}
+	}
 }

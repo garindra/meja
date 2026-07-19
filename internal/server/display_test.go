@@ -13,8 +13,8 @@ import (
 
 func TestDisplayCompilerUsesSpecializedTextAndFill(t *testing.T) {
 	output := newRenderOutput()
-	cells := []protocol.Cell{{Width: 1}, {Width: 1}, {Width: 1}, {Cluster: "o", Width: 1}, {Cluster: "k", Width: 1}}
-	if err := newDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(2, 4, cells); err != nil {
+	cells := []decodedTestCell{{Width: 1}, {Width: 1}, {Width: 1}, {Cluster: "o", Width: 1}, {Cluster: "k", Width: 1}}
+	if err := newTestDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(2, 4, cells); err != nil {
 		t.Fatal(err)
 	}
 	commands := decodePendingCommands(t, output.pending)
@@ -26,6 +26,109 @@ func TestDisplayCompilerUsesSpecializedTextAndFill(t *testing.T) {
 		if commands[i].Opcode != opcode {
 			t.Fatalf("commands[%d]=0x%02x want 0x%02x", i, commands[i].Opcode, opcode)
 		}
+	}
+}
+
+func TestDisplayCompilerMergesCompatibleRows(t *testing.T) {
+	word := func(r rune) cellWord {
+		value, _ := makeScalarCellWord(r, 1, 0)
+		return value
+	}
+	output := newRenderOutput()
+	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, func(cell cellWord) string {
+		if r, ok := cell.scalar(); ok {
+			return string(r)
+		}
+		return ""
+	}, 4, 2)
+	if err := compiler.writeCells(0, 0, []cellWord{word('a'), word('b'), word('c'), word('d')}); err != nil {
+		t.Fatal(err)
+	}
+	if err := compiler.writeCells(1, 0, []cellWord{word('e'), word('f'), word('g'), word('h')}); err != nil {
+		t.Fatal(err)
+	}
+	if err := compiler.finish(); err != nil {
+		t.Fatal(err)
+	}
+	commands := decodePendingCommands(t, output.pending)
+	if len(commands) != 2 || commands[0].Opcode != protocol.DisplayOpcodeSetWritePosition || commands[1].Opcode != protocol.DisplayOpcodeWriteTextUTF8Default || string(commands[1].Text) != "abcdefgh" {
+		t.Fatalf("commands = %#v", commands)
+	}
+}
+
+func TestDisplayCompilerStreamsBoundedCompatibleText(t *testing.T) {
+	word := func(r rune) cellWord {
+		value, _ := makeScalarCellWord(r, 1, 0)
+		return value
+	}
+	const (
+		cols = 1024
+		rows = 12
+	)
+	row := make([]cellWord, cols)
+	for column := range row {
+		row[column] = word(rune('a' + column%26))
+	}
+	var wire countingBuffer
+	output := newRenderOutput(&wire)
+	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, func(cell cellWord) string {
+		r, _ := cell.scalar()
+		return string(r)
+	}, cols, rows)
+	for rowIndex := 0; rowIndex < rows; rowIndex++ {
+		if err := compiler.writeCells(rowIndex, 0, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := compiler.finish(); err != nil {
+		t.Fatal(err)
+	}
+	if err := output.present(); err != nil {
+		t.Fatal(err)
+	}
+	if wire.writes < 2 {
+		t.Fatalf("physical writes = %d, want incremental streaming", wire.writes)
+	}
+	if wire.maxWrite > renderStreamChunkSize {
+		t.Fatalf("largest write = %d, want at most %d", wire.maxWrite, renderStreamChunkSize)
+	}
+	commands := decodePendingCommands(t, wire.Bytes())
+	if got := countOpcode(commandOpcodes(commands), protocol.DisplayOpcodeSetWritePosition); got != 1 {
+		t.Fatalf("position commands = %d, want 1", got)
+	}
+	if got := countOpcode(commandOpcodes(commands), protocol.DisplayOpcodeWriteTextUTF8Default); got < 2 {
+		t.Fatalf("text commands = %d, want split commands", got)
+	}
+	textBytes := 0
+	for _, command := range commands {
+		if command.Opcode == protocol.DisplayOpcodeWriteTextUTF8Default {
+			textBytes += len(command.Text)
+		}
+	}
+	if textBytes != cols*rows {
+		t.Fatalf("text bytes = %d, want %d", textBytes, cols*rows)
+	}
+	if len(output.pending) != 0 || cap(output.pending) > maxRetainedRenderBuffer {
+		t.Fatalf("reusable buffer len=%d cap=%d", len(output.pending), cap(output.pending))
+	}
+}
+
+func TestDisplayCompilerMergesFillAcrossRows(t *testing.T) {
+	output := newRenderOutput()
+	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, func(cellWord) string { return "" }, 4, 2)
+	row := []cellWord{0, 0, 0, 0}
+	if err := compiler.writeCells(0, 0, row); err != nil {
+		t.Fatal(err)
+	}
+	if err := compiler.writeCells(1, 0, row); err != nil {
+		t.Fatal(err)
+	}
+	if err := compiler.finish(); err != nil {
+		t.Fatal(err)
+	}
+	commands := decodePendingCommands(t, output.pending)
+	if len(commands) != 3 || commands[2].Opcode != protocol.DisplayOpcodeFill || commands[2].Fill.Columns != 8 {
+		t.Fatalf("commands = %#v", commands)
 	}
 }
 
@@ -88,11 +191,13 @@ func TestPaneOutputRateLimiterAllowsBurstThenLimitsSustainedOutput(t *testing.T)
 
 type countingBuffer struct {
 	bytes.Buffer
-	writes int
+	writes   int
+	maxWrite int
 }
 
 func (b *countingBuffer) Write(data []byte) (int, error) {
 	b.writes++
+	b.maxWrite = max(b.maxWrite, len(data))
 	return b.Buffer.Write(data)
 }
 
@@ -132,6 +237,9 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 	if len(commands) < 2 || commands[0].Opcode != protocol.DisplayOpcodeRelayoutBarrier || commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
 		t.Fatalf("commands=%#v", commands)
 	}
+	if commands[0].GridCols != 8 || commands[0].GridRows != 3 {
+		t.Fatalf("barrier grid = %dx%d", commands[0].GridCols, commands[0].GridRows)
+	}
 }
 
 func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
@@ -142,7 +250,7 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 	var first, second bytes.Buffer
 	firstLease := testOutputLease(0, &first)
 	if err := pane.attachOutputWithRefresh(firstLease, func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1}); err != nil {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1, GridCols: 80, GridRows: 24}); err != nil {
 			return err
 		}
 		return output.present()
@@ -175,7 +283,7 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 	}
 
 	if err := pane.attachOutputWithRefresh(testOutputLease(0, &second), func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 2}); err != nil {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 2, GridCols: 80, GridRows: 24}); err != nil {
 			return err
 		}
 		return output.present()
@@ -711,7 +819,7 @@ func (w errorWriter) Write([]byte) (int, error) {
 func TestDisplayCompilerDefaultOverrideDoesNotLatchStyle(t *testing.T) {
 	output := newRenderOutput()
 	styles := map[uint32]protocol.Style{0: {}, 2: {Bold: true}}
-	compiler := newDisplayCompiler(output, styles)
+	compiler := newTestDisplayCompiler(output, styles)
 	cells := append(textCells("bold", 2), textCells(" default", 0)...)
 	cells = append(cells, textCells("bold", 2)...)
 	if err := compiler.writeCells(0, 0, cells); err != nil {
@@ -729,8 +837,8 @@ func TestDisplayCompilerDefaultOverrideDoesNotLatchStyle(t *testing.T) {
 
 func TestDisplayCompilerKeepsWidthTwoFallback(t *testing.T) {
 	output := newRenderOutput()
-	cells := []protocol.Cell{{Cluster: "界", Width: 2, StyleID: 0}, {Width: 0}}
-	if err := newDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
+	cells := []decodedTestCell{{Cluster: "界", Width: 2, StyleID: 0}, {Width: 0}}
+	if err := newTestDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
 		t.Fatal(err)
 	}
 	commands := decodePendingCommands(t, output.pending)
@@ -741,8 +849,8 @@ func TestDisplayCompilerKeepsWidthTwoFallback(t *testing.T) {
 
 func TestDisplayCompilerWritesMultiRuneClusterAtomically(t *testing.T) {
 	output := newRenderOutput()
-	cells := []protocol.Cell{{Cluster: "👩‍💻", Width: 2}, {Width: 0}, {Cluster: "X", Width: 1}}
-	if err := newDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
+	cells := []decodedTestCell{{Cluster: "👩‍💻", Width: 2}, {Width: 0}, {Cluster: "X", Width: 1}}
+	if err := newTestDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
 		t.Fatal(err)
 	}
 	commands := decodePendingCommands(t, output.pending)
@@ -777,12 +885,12 @@ func TestDisplayCompilerPreservesRepresentativeInternationalClusters(t *testing.
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			output := newRenderOutput()
-			cells := []protocol.Cell{{Cluster: tt.cluster, Width: tt.width}}
+			cells := []decodedTestCell{{Cluster: tt.cluster, Width: tt.width}}
 			if tt.width == 2 {
-				cells = append(cells, protocol.Cell{Width: 0})
+				cells = append(cells, decodedTestCell{Width: 0})
 			}
-			cells = append(cells, protocol.Cell{Cluster: "X", Width: 1})
-			if err := newDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
+			cells = append(cells, decodedTestCell{Cluster: "X", Width: 1})
+			if err := newTestDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
 				t.Fatal(err)
 			}
 			commands := decodePendingCommands(t, output.pending)
@@ -804,7 +912,7 @@ func TestCompilerBridgesVisuallyEquivalentBlankStyles(t *testing.T) {
 	cells := append(textCells("Desktop", 2), textCells("    ", 0)...)
 	cells = append(cells, textCells("Downloads", 2)...)
 	output := newRenderOutput()
-	if err := newDisplayCompiler(output, styles).writeCells(0, 0, cells); err != nil {
+	if err := newTestDisplayCompiler(output, styles).writeCells(0, 0, cells); err != nil {
 		t.Fatal(err)
 	}
 	commands := decodePendingCommands(t, output.pending)
@@ -827,7 +935,7 @@ func TestDisplayCompilerPreservesVisibleBackgroundBoundary(t *testing.T) {
 	cells := append(textCells("blue", 1), textCells("   ", 2)...)
 	cells = append(cells, textCells("panel", 1)...)
 	output := newRenderOutput()
-	if err := newDisplayCompiler(output, styles).writeCells(0, 0, cells); err != nil {
+	if err := newTestDisplayCompiler(output, styles).writeCells(0, 0, cells); err != nil {
 		t.Fatal(err)
 	}
 	commands := decodePendingCommands(t, output.pending)
@@ -967,7 +1075,7 @@ func TestMergedDamageMovesWithLaterScroll(t *testing.T) {
 func TestDisplayWireMeasurement(t *testing.T) {
 	rows := compilerBenchmarkRows()
 	output := newRenderOutput()
-	compiler := newDisplayCompiler(output, compilerBenchmarkStyles())
+	compiler := newTestDisplayCompiler(output, compilerBenchmarkStyles())
 	for row, cells := range rows {
 		if err := compiler.writeCells(row, 0, cells); err != nil {
 			t.Fatal(err)
@@ -981,7 +1089,7 @@ func TestDisplayWireMeasurement(t *testing.T) {
 func BenchmarkPaneOutputHotPath(b *testing.B) {
 	pane := &Pane{terminal: newTerminal(80, 24)}
 	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
-	pane.terminal.Apply(bytes.Repeat([]byte{'w'}, 80*(pane.terminal.Rows+pane.terminal.HistoryLimit)))
+	pane.terminal.Apply(bytes.Repeat([]byte{'w'}, 80*terminalRowCapacity))
 	output := newRenderOutput(io.Discard)
 	var update Update
 	update.Reset(pane.terminal.Rows)
@@ -1055,18 +1163,18 @@ func countOpcode(opcodes []protocol.DisplayOpcode, want protocol.DisplayOpcode) 
 	return count
 }
 
-func textCells(text string, styleID uint32) []protocol.Cell {
-	cells := make([]protocol.Cell, 0, len(text))
+func textCells(text string, styleID uint32) []decodedTestCell {
+	cells := make([]decodedTestCell, 0, len(text))
 	for _, r := range text {
-		cells = append(cells, protocol.Cell{Cluster: string(r), StyleID: styleID, Width: 1})
+		cells = append(cells, decodedTestCell{Cluster: string(r), StyleID: styleID, Width: 1})
 	}
 	return cells
 }
 
-func compilerBenchmarkRows() [][]protocol.Cell {
-	rows := make([][]protocol.Cell, 39)
+func compilerBenchmarkRows() [][]decodedTestCell {
+	rows := make([][]decodedTestCell, 39)
 	for row := range rows {
-		cells := make([]protocol.Cell, 120)
+		cells := make([]decodedTestCell, 120)
 		for col := range cells {
 			style := uint32(0)
 			r := ' '
@@ -1077,7 +1185,7 @@ func compilerBenchmarkRows() [][]protocol.Cell {
 				style = 3
 				r = rune('a' + col%26)
 			}
-			cells[col] = protocol.Cell{Cluster: string(r), StyleID: style, Width: 1}
+			cells[col] = decodedTestCell{Cluster: string(r), StyleID: style, Width: 1}
 		}
 		rows[row] = cells
 	}

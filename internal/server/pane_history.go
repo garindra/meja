@@ -9,8 +9,9 @@ import (
 )
 
 type paneHistorySnapshot struct {
-	Rows          []Row
-	Styles        []protocol.StyleDefinition
+	grid          rowStore
+	clusters      *clusterStore
+	styles        []protocol.StyleDefinition
 	Cols          int
 	ViewportRows  int
 	InitialTop    int
@@ -30,38 +31,32 @@ type historyMove struct {
 	OldCounter string
 	NewCounter string
 	Cursor     protocol.Cursor
-	CursorOnly bool
-	Exited     bool
 	Changed    bool
 }
 
 func captureTerminalHistorySnapshot(state *TerminalState) *paneHistorySnapshot {
-	history, primary := state.SnapshotRows()
 	cols, rows := state.Cols, state.Rows
-	projected := projectHistoryRows(history, cols)
-	initialTop := len(projected)
-	projected = append(projected, normalizeRows(primary, cols)...)
-	styles := state.SnapshotStyles()
-	styleDefs := make([]protocol.StyleDefinition, 0, len(styles)+1)
-	var maxStyleID uint32
-	for _, def := range styles {
-		styleDefs = append(styleDefs, protocol.StyleDefinition{ID: def.ID, Style: def.Style})
-		if def.ID > maxStyleID {
-			maxStyleID = def.ID
-		}
+	grid := state.grid.clone(cols, &state.clusters)
+	initialTop := int(grid.count) - rows
+	styleDefs := make([]protocol.StyleDefinition, 0, len(state.styleByID)+1)
+	for id, style := range state.styleByID {
+		styleID := uint32(id)
+		styleDefs = append(styleDefs, protocol.StyleDefinition{ID: styleID, Style: style})
 	}
-	counterStyle := maxStyleID + 1
-	styleDefs = append(styleDefs, protocol.StyleDefinition{
+	counterStyle := uint32(len(state.styleByID))
+	counterDefinition := protocol.StyleDefinition{
 		ID: counterStyle,
 		Style: protocol.Style{
 			Bold: true,
 			FG:   protocol.Color{Mode: "indexed", Index: 226},
 			BG:   protocol.Color{Mode: "default"},
 		},
-	})
+	}
+	styleDefs = append(styleDefs, counterDefinition)
 	return &paneHistorySnapshot{
-		Rows:          projected,
-		Styles:        styleDefs,
+		grid:          grid,
+		clusters:      &state.clusters,
+		styles:        styleDefs,
 		Cols:          cols,
 		ViewportRows:  rows,
 		InitialTop:    initialTop,
@@ -75,66 +70,30 @@ func (p *Pane) enterHistoryMode() (bool, error) {
 	return result.Changed, err
 }
 
-func projectHistoryRows(rows []Row, cols int) []Row {
-	if cols <= 0 {
-		return nil
-	}
-	var out []Row
-	var chain []protocol.Cell
-	flush := func() {
-		if len(chain) == 0 {
-			out = append(out, blankHistoryRow(cols))
-			return
-		}
-		for _, projected := range (&TerminalState{}).projectLogicalLine(logicalLine{cells: chain, reflowable: true}, cols) {
-			out = append(out, Row{Cells: projected.cells, WrapsNext: projected.continued})
-		}
-		chain = nil
-	}
-	for _, row := range rows {
-		cells := row.Cells
-		if !row.WrapsNext {
-			cells = trimHistoryBlanks(cells)
-		}
-		chain = append(chain, cells...)
-		if !row.WrapsNext {
-			flush()
-		}
-	}
-	if len(chain) > 0 {
-		flush()
-	}
-	return out
+func (s *paneHistorySnapshot) row(row int) []cellWord {
+	return s.grid.logicalRow(row, s.Cols)
 }
 
-func normalizeRows(rows []Row, cols int) []Row {
-	out := make([]Row, len(rows))
-	for i, src := range rows {
-		out[i] = blankHistoryRow(cols)
-		copy(out[i].Cells, src.Cells[:min(len(src.Cells), cols)])
-		out[i].WrapsNext = src.WrapsNext
-	}
-	return out
+func (s *paneHistorySnapshot) cellText(word cellWord) string {
+	return cellTextFromStore(word, s.clusters)
 }
 
-func blankHistoryRow(cols int) Row {
-	row := Row{Cells: make([]protocol.Cell, cols)}
-	for i := range row.Cells {
-		row.Cells[i] = protocol.Cell{Width: 1}
+func (s *paneHistorySnapshot) LookupStyle(id uint32) (protocol.Style, bool) {
+	if uint64(id) >= uint64(len(s.styles)) || s.styles[id].ID != id {
+		return protocol.Style{}, false
 	}
-	return row
+	return s.styles[id].Style, true
 }
 
-func trimHistoryBlanks(cells []protocol.Cell) []protocol.Cell {
-	end := len(cells)
-	for end > 0 && cells[end-1].Cluster == "" && cells[end-1].Width == 1 {
-		end--
+func (s *paneHistorySnapshot) release() {
+	if s != nil && s.clusters != nil {
+		s.grid.release(s.Cols, s.clusters)
+		s.clusters = nil
 	}
-	return cells[:end]
 }
 
 func (p *Pane) installHistoryView(snapshot *paneHistorySnapshot) error {
-	if snapshot == nil || snapshot.ViewportRows <= 0 || len(snapshot.Rows) < snapshot.ViewportRows {
+	if snapshot == nil || snapshot.ViewportRows <= 0 || int(snapshot.grid.count) < snapshot.ViewportRows {
 		return fmt.Errorf("invalid history snapshot for pane %d", p.ID)
 	}
 	p.historyView = &paneHistoryView{
@@ -178,7 +137,6 @@ func (p *Pane) moveHistory(direction int) (historyMove, bool) {
 	if direction < 0 {
 		if view.CursorRow > view.ViewTop {
 			view.CursorRow--
-			move.CursorOnly = true
 			move.Changed = true
 		} else if view.ViewTop > 0 {
 			view.ViewTop--
@@ -189,7 +147,6 @@ func (p *Pane) moveHistory(direction int) (historyMove, bool) {
 	} else if direction > 0 {
 		if view.CursorRow < viewportBottom {
 			view.CursorRow++
-			move.CursorOnly = true
 			move.Changed = true
 		} else if view.ViewTop < view.Snapshot.InitialTop {
 			view.ViewTop++
@@ -224,6 +181,7 @@ func (p *Pane) exitHistoryModeNow() bool {
 	if !p.isHistoryMode() {
 		return false
 	}
+	p.historyView.Snapshot.release()
 	p.historyView = nil
 	p.viewMode.Store(uint32(paneViewLive))
 	return true
@@ -377,27 +335,4 @@ func decodeHistoryInput(data []byte) (direction, count int, exit bool, consumed 
 func historyCounter(view *paneHistoryView) string {
 	uncovered := view.Snapshot.InitialTop - view.ViewTop
 	return "[" + strconv.Itoa(uncovered) + "/" + strconv.Itoa(view.Snapshot.InitialTop) + "]"
-}
-
-func historyViewport(view *paneHistoryView) []protocol.Cell {
-	snapshot := view.Snapshot
-	cells := make([]protocol.Cell, 0, snapshot.Cols*snapshot.ViewportRows)
-	for row := 0; row < snapshot.ViewportRows; row++ {
-		cells = append(cells, snapshot.Rows[view.ViewTop+row].Cells...)
-	}
-	overlayHistoryCounter(cells[:snapshot.Cols], snapshot.Cols, historyCounter(view), snapshot.CounterStyle)
-	return cells
-}
-
-func overlayHistoryCounter(row []protocol.Cell, cols int, label string, styleID uint32) {
-	if len(label) > cols {
-		label = label[len(label)-cols:]
-	}
-	start := max(0, cols-len(label))
-	for i, r := range label {
-		if start+i >= len(row) {
-			break
-		}
-		row[start+i] = protocol.Cell{Cluster: string(r), StyleID: styleID, Width: 1}
-	}
 }

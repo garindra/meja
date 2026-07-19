@@ -10,20 +10,21 @@ import (
 
 func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {
 	pane := &Pane{ID: 0, terminal: newTerminal(4, 3)}
-	pane.terminal.History = []Row{
+	history := []decodedTestRow{
 		historyTestRow("old1"),
 		historyTestRow("old2"),
 	}
-	pane.terminal.GridRows = []Row{
+	visible := []decodedTestRow{
 		historyTestRow("live"),
 		historyTestRow("mid "),
 		historyTestRow("end "),
 	}
+	setTestRows(pane.terminal, history, visible)
 	pane.terminal.CursorY = 2
 
 	snapshot := captureTerminalHistorySnapshot(pane.terminal)
-	pane.terminal.History[0].Cells[0].Cluster = "X"
-	if got := snapshot.Rows[0].Cells[0].Cluster; got != "o" {
+	pane.terminal.replaceTextCell(pane.terminal.grid.logicalRow(0, 4), 0, "X", 1, 0)
+	if got := snapshot.cellText(snapshot.row(0)[0]); got != "o" {
 		t.Fatalf("snapshot aliased canonical history: %q", got)
 	}
 
@@ -32,7 +33,7 @@ func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {
 	}
 	for i := 0; i < 2; i++ {
 		move, ok := pane.moveHistory(-1)
-		if !ok || !move.CursorOnly || move.Delta != 0 {
+		if !ok || move.Delta != 0 {
 			t.Fatalf("cursor-only move %d = %#v ok=%v", i, move, ok)
 		}
 	}
@@ -42,20 +43,20 @@ func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {
 	}
 }
 
-func TestHistoryProjectionNeverSplitsClusterAcrossRows(t *testing.T) {
-	rows := []Row{{Cells: []protocol.Cell{
+func TestHistorySnapshotNeverSplitsClusterAcrossRows(t *testing.T) {
+	term := newTerminal(5, 1)
+	rows := []decodedTestRow{{Cells: []decodedTestCell{
 		{Cluster: "a", Width: 1},
 		{Cluster: "b", Width: 1},
 		{Cluster: "c", Width: 1},
 		{Cluster: "👩‍💻", Width: 2},
 		{Width: 0},
 	}}}
-	projected := projectHistoryRows(rows, 4)
-	if len(projected) != 2 || !projected[0].WrapsNext {
-		t.Fatalf("projected rows = %#v", projected)
-	}
-	if anchor, continuation := projected[1].Cells[0], projected[1].Cells[1]; anchor.Cluster != "👩‍💻" || anchor.Width != 2 || continuation.Width != 0 {
-		t.Fatalf("projected cluster = %#v", projected[1].Cells[:2])
+	setTestRows(term, nil, rows)
+	snapshot := captureTerminalHistorySnapshot(term)
+	defer snapshot.release()
+	if anchor, continuation := snapshot.row(0)[3], snapshot.row(0)[4]; snapshot.cellText(anchor) != "👩‍💻" || anchor.width() != 2 || continuation.width() != 0 {
+		t.Fatalf("snapshot cluster = %#v %#v", anchor, continuation)
 	}
 }
 
@@ -85,7 +86,7 @@ func TestPanesRetainIndependentHistoryViews(t *testing.T) {
 
 func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	pane := &Pane{ID: 0, terminal: newTerminal(4, 2)}
-	pane.terminal.GridRows = []Row{historyTestRow("live"), historyTestRow("end ")}
+	setTestRows(pane.terminal, nil, []decodedTestRow{historyTestRow("live"), historyTestRow("end ")})
 	ptyOutput := startTestPaneLoop(pane)
 	defer func() {
 		close(ptyOutput)
@@ -156,10 +157,10 @@ func TestControlCExitsHistoryInputMode(t *testing.T) {
 	}
 }
 
-func historyTestRow(text string) Row {
-	cells := make([]protocol.Cell, 4)
+func historyTestRow(text string) decodedTestRow {
+	cells := make([]decodedTestCell, 4)
 	for i := range cells {
-		cells[i] = protocol.Cell{Width: 1}
+		cells[i] = decodedTestCell{Width: 1}
 	}
 	for i, r := range text {
 		if i >= len(cells) {
@@ -167,5 +168,5 @@ func historyTestRow(text string) Row {
 		}
 		cells[i].Cluster = string(r)
 	}
-	return Row{Cells: cells, WrapsNext: strings.HasSuffix(text, "\\")}
+	return decodedTestRow{Cells: cells, WrapsNext: strings.HasSuffix(text, "\\")}
 }

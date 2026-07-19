@@ -341,7 +341,7 @@ func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
 		}
 	}
 	encoder := protocol.NewDisplayEncoder(nil)
-	encoder.AppendRelayoutBarrier(protocol.RelayoutBarrier{LayoutRevision: 1})
+	encoder.AppendRelayoutBarrier(protocol.RelayoutBarrier{LayoutRevision: 1, Cols: 8, Rows: 3})
 	write(encoder.Bytes())
 	encoder.Reset(nil)
 	encoder.AppendSetWritePosition(protocol.SetWritePosition{})
@@ -805,10 +805,61 @@ func TestPaneOutputStillRequiresRelayoutBarrier(t *testing.T) {
 	}
 }
 
+func TestDisplayFrameCompilerSplitsImplicitlyWrappedText(t *testing.T) {
+	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
+	commands := []protocol.DisplayCommand{
+		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1, GridCols: 4, GridRows: 2},
+		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 2},
+		{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("abcdef")},
+		{Opcode: protocol.DisplayOpcodePresent},
+	}
+	for _, command := range commands {
+		if _, err := c.apply(command); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(c.frame.spans) != 2 {
+		t.Fatalf("spans = %#v", c.frame.spans)
+	}
+	first, second := c.frame.spans[0], c.frame.spans[1]
+	if first.row != 0 || first.column != 2 || string(first.text) != "ab" || second.row != 1 || second.column != 0 || string(second.text) != "cdef" {
+		t.Fatalf("spans = %#v", c.frame.spans)
+	}
+	if c.row != 2 || c.column != 0 {
+		t.Fatalf("insertion state = %d,%d", c.row, c.column)
+	}
+}
+
+func TestDisplayFrameCompilerSplitsImplicitlyWrappedFill(t *testing.T) {
+	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
+	for _, command := range []protocol.DisplayCommand{
+		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1, GridCols: 4, GridRows: 2},
+		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0},
+		{Opcode: protocol.DisplayOpcodeFill, Fill: protocol.Fill{Columns: 8, Rune: ' ', Width: 1}},
+		{Opcode: protocol.DisplayOpcodePresent},
+	} {
+		if _, err := c.apply(command); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(c.frame.spans) != 2 || c.frame.spans[0].fillColumns != 4 || c.frame.spans[1].row != 1 || c.frame.spans[1].fillColumns != 4 {
+		t.Fatalf("spans = %#v", c.frame.spans)
+	}
+}
+
+func TestDisplayFrameCompilerRejectsWriteBeyondGrid(t *testing.T) {
+	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
+	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1, GridCols: 4, GridRows: 2})
+	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 1, Column: 3})
+	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("ab")}); err == nil {
+		t.Fatal("write beyond grid was accepted")
+	}
+}
+
 func TestDisplayFrameCompilerExpandsWireLatches(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
 	commands := []protocol.DisplayCommand{
-		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 4},
+		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 4, GridCols: 80, GridRows: 24},
 		{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: 2, Style: protocol.Style{Bold: true}},
 		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 3, Column: 5},
 		{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: 2},
@@ -834,7 +885,7 @@ func TestDisplayFrameCompilerExpandsWireLatches(t *testing.T) {
 func TestDisplayFrameCompilerTreatsClusterAsOneDisplayUnit(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
 	commands := []protocol.DisplayCommand{
-		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 4},
+		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 4, GridCols: 80, GridRows: 24},
 		{Opcode: protocol.DisplayOpcodeWriteCluster, Text: []byte("👩‍💻"), Width: 2},
 		{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("X")},
 		{Opcode: protocol.DisplayOpcodePresent},

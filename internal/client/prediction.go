@@ -49,7 +49,7 @@ type cellPosition struct {
 }
 
 type authoritativeCellChange struct {
-	before, after protocol.Cell
+	before, after scanoutCell
 }
 
 type frameEvidence struct {
@@ -343,9 +343,9 @@ func (p *inputPredictor) currentScope() *predictionScope {
 	return &p.scopes[len(p.scopes)-1]
 }
 
-func (p *inputPredictor) composedCell(cursor protocol.Cursor, view *paneScanoutCache) (protocol.Cell, bool) {
+func (p *inputPredictor) composedCell(cursor protocol.Cursor, view *paneScanoutCache) (scanoutCell, bool) {
 	if view == nil || cursor.Y < 0 || cursor.Y >= view.rows || cursor.X < 0 || cursor.X >= view.cols {
-		return protocol.Cell{}, false
+		return scanoutCell{}, false
 	}
 	cell := view.row(cursor.Y)[cursor.X]
 	for _, scope := range p.scopes {
@@ -355,7 +355,7 @@ func (p *inputPredictor) composedCell(cursor protocol.Cursor, view *paneScanoutC
 				if op.displayChar() == ' ' {
 					cluster = ""
 				}
-				cell = protocol.Cell{Cluster: cluster, StyleID: op.styleID, Width: 1}
+				cell = scanoutCell{Cluster: cluster, StyleID: op.styleID, Width: 1}
 			}
 		}
 	}
@@ -411,11 +411,11 @@ func (p *inputPredictor) collectClosedScopes() {
 	}
 }
 
-func predictionBlankCell(cell protocol.Cell) bool {
+func predictionBlankCell(cell scanoutCell) bool {
 	return cell.Width == 1 && cell.Cluster == ""
 }
 
-func predictionCellMatches(cell protocol.Cell, b byte) bool {
+func predictionCellMatches(cell scanoutCell, b byte) bool {
 	if b == ' ' {
 		return cell.Width == 1 && cell.Cluster == ""
 	}

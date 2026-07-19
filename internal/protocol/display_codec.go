@@ -43,6 +43,8 @@ const MaxDisplayTextBytes = DefaultMaxFrameSize
 type DisplayCommand struct {
 	Opcode         DisplayOpcode
 	LayoutRevision uint64
+	GridCols       int
+	GridRows       int
 	StyleID        uint32
 	Style          Style
 	Row, Column    int
@@ -57,6 +59,8 @@ type DisplayCommand struct {
 // The barrier itself is stream state and is not included in Commands.
 type DisplayBatch struct {
 	LayoutRevision uint64
+	GridCols       int
+	GridRows       int
 	Commands       []DisplayCommand
 }
 
@@ -72,7 +76,7 @@ func (e *DisplayEncoder) AppendCommand(cmd DisplayCommand) error {
 		e.opcode(DisplayOpcodeNoop)
 		return nil
 	case DisplayOpcodeRelayoutBarrier:
-		return e.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: cmd.LayoutRevision})
+		return e.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: cmd.LayoutRevision, Cols: cmd.GridCols, Rows: cmd.GridRows})
 	case DisplayOpcodeStyleInstall:
 		return e.AppendStyleInstall(StyleInstall{ID: cmd.StyleID, Style: cmd.Style})
 	case DisplayOpcodeSetWritePosition:
@@ -104,8 +108,13 @@ func (e *DisplayEncoder) AppendCommand(cmd DisplayCommand) error {
 func (e *DisplayEncoder) opcode(op DisplayOpcode) { e.buf = append(e.buf, byte(op)) }
 
 func (e *DisplayEncoder) AppendRelayoutBarrier(msg RelayoutBarrier) error {
+	if msg.Cols <= 0 || msg.Rows <= 0 || uint64(msg.Cols) > MaxGridCols || uint64(msg.Rows) > MaxGridRows {
+		return fmt.Errorf("invalid display grid %dx%d", msg.Cols, msg.Rows)
+	}
 	e.opcode(DisplayOpcodeRelayoutBarrier)
 	e.buf = appendUvarint(e.buf, msg.LayoutRevision)
+	e.buf = appendUvarint(e.buf, uint64(msg.Cols))
+	e.buf = appendUvarint(e.buf, uint64(msg.Rows))
 	return nil
 }
 
@@ -183,7 +192,7 @@ func (e *DisplayEncoder) AppendWriteCluster(msg WriteText) error {
 }
 
 func (e *DisplayEncoder) AppendFill(msg Fill) error {
-	if msg.Columns <= 0 || !validRune(msg.Rune) || (msg.Width != 1 && msg.Width != 2) {
+	if msg.Columns <= 0 || uint64(msg.Columns) > MaxGridCells || !validRune(msg.Rune) || (msg.Width != 1 && msg.Width != 2) || msg.Columns%int(msg.Width) != 0 {
 		return fmt.Errorf("invalid fill")
 	}
 	e.opcode(DisplayOpcodeFill)
@@ -244,6 +253,8 @@ type DisplayDecoder struct {
 	bytesRead      uint64
 	hasBarrier     bool
 	layoutRevision uint64
+	gridCols       int
+	gridRows       int
 	pending        []DisplayCommand
 }
 
@@ -273,6 +284,18 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 	case DisplayOpcodeNoop:
 	case DisplayOpcodeRelayoutBarrier:
 		cmd.LayoutRevision, err = d.readUvarint()
+		if err == nil {
+			cmd.GridCols, err = d.readCoord(MaxGridCols)
+		}
+		if err == nil && cmd.GridCols <= 0 {
+			err = fmt.Errorf("invalid display grid columns")
+		}
+		if err == nil {
+			cmd.GridRows, err = d.readCoord(MaxGridRows)
+		}
+		if err == nil && cmd.GridRows <= 0 {
+			err = fmt.Errorf("invalid display grid rows")
+		}
 	case DisplayOpcodeStyleInstall:
 		var id uint64
 		id, err = d.readUvarint()
@@ -311,7 +334,7 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 		cmd.Width = 1
 		cmd.Text, err = d.readText()
 	case DisplayOpcodeFill:
-		cmd.Fill.Columns, err = d.readCoord(MaxGridCols)
+		cmd.Fill.Columns, err = d.readCoord(MaxGridCells)
 		if err == nil && cmd.Fill.Columns <= 0 {
 			err = fmt.Errorf("invalid fill count")
 		}
@@ -330,6 +353,9 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 			cmd.Fill.Width, err = d.readByte()
 			if err == nil && cmd.Fill.Width != 1 && cmd.Fill.Width != 2 {
 				err = ErrInvalidCellWidth
+			}
+			if err == nil && cmd.Fill.Columns%int(cmd.Fill.Width) != 0 {
+				err = fmt.Errorf("fill columns split a cell")
 			}
 		}
 	case DisplayOpcodeCursorUpdate:
@@ -377,12 +403,14 @@ func (d *DisplayDecoder) ReadBatch() (DisplayBatch, error) {
 		case DisplayOpcodeRelayoutBarrier:
 			d.pending = d.pending[:0]
 			d.layoutRevision = cmd.LayoutRevision
+			d.gridCols = cmd.GridCols
+			d.gridRows = cmd.GridRows
 			d.hasBarrier = true
 		case DisplayOpcodePresent:
 			if !d.hasBarrier {
 				return DisplayBatch{}, errors.New("PRESENT before RELAYOUT_BARRIER")
 			}
-			batch := DisplayBatch{LayoutRevision: d.layoutRevision, Commands: append([]DisplayCommand(nil), d.pending...)}
+			batch := DisplayBatch{LayoutRevision: d.layoutRevision, GridCols: d.gridCols, GridRows: d.gridRows, Commands: append([]DisplayCommand(nil), d.pending...)}
 			d.pending = d.pending[:0]
 			return batch, nil
 		default:

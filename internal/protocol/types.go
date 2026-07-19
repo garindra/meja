@@ -2,7 +2,7 @@ package protocol
 
 const (
 	ALPN            = "meja/1"
-	ProtocolVersion = 7
+	ProtocolVersion = 8
 
 	// SessionReplacedErrorCode is a terminal QUIC application close: another
 	// client has taken ownership of the session, so the displaced client must
@@ -96,6 +96,8 @@ type WindowLayout struct {
 
 type RelayoutBarrier struct {
 	LayoutRevision uint64
+	Cols           int
+	Rows           int
 }
 
 type StyleInstall struct {
@@ -161,15 +163,6 @@ func CanonicalDefaultStyle() Style {
 
 func IsCanonicalDefaultStyle(style Style) bool {
 	return style == CanonicalDefaultStyle()
-}
-
-type Cell struct {
-	// Cluster is the complete UTF-8 display cluster stored on an anchor cell.
-	// An empty cluster with Width 1 is a styled blank; an empty cluster with
-	// Width 0 is the continuation of the width-2 anchor immediately to its left.
-	Cluster string
-	StyleID uint32
-	Width   uint8
 }
 
 type Cursor struct {

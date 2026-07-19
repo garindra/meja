@@ -10,7 +10,7 @@ import (
 
 func TestDisplayWireBytesHaveNoGenericFrameLength(t *testing.T) {
 	encoder := NewDisplayEncoder(nil)
-	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 7}); err != nil {
+	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 7, Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
 	}
 	if err := encoder.AppendSetWritePosition(SetWritePosition{Row: 4, Column: 9}); err != nil {
@@ -20,12 +20,30 @@ func TestDisplayWireBytesHaveNoGenericFrameLength(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoder.AppendPresent()
-	want := []byte{0x01, 0x07, 0x03, 0x04, 0x09, 0x05, 0x02, 0x03, 0xe7, 0x95, 0x8c, 0xff}
+	want := []byte{0x01, 0x07, 0x50, 0x18, 0x03, 0x04, 0x09, 0x05, 0x02, 0x03, 0xe7, 0x95, 0x8c, 0xff}
 	if !bytes.Equal(encoder.Bytes(), want) {
 		t.Fatalf("wire=% x want % x", encoder.Bytes(), want)
 	}
 	if encoder.Bytes()[1] == byte(len(encoder.Bytes())) {
 		t.Fatal("render stream contains a generic payload length")
+	}
+}
+
+func TestRelayoutBarrierCarriesDisplayGrid(t *testing.T) {
+	encoder := NewDisplayEncoder(nil)
+	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 9, Cols: 120, Rows: 40}); err != nil {
+		t.Fatal(err)
+	}
+	decoder := NewDisplayDecoder(bytes.NewReader(encoder.Bytes()))
+	command, _, err := decoder.ReadCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.LayoutRevision != 9 || command.GridCols != 120 || command.GridRows != 40 {
+		t.Fatalf("barrier = %#v", command)
+	}
+	if err := NewDisplayEncoder(nil).AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 1}); err == nil {
+		t.Fatal("barrier without a display grid was accepted")
 	}
 }
 
@@ -69,7 +87,7 @@ func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
 		{Opcode: DisplayOpcodeCursorUpdate, Cursor: CursorUpdate{Cursor: Cursor{X: 2, Y: 3}, Visible: true}},
 		{Opcode: DisplayOpcodeScroll, Delta: -1},
 	}
-	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 7}); err != nil {
+	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 7, Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
 	}
 	for _, command := range commands {
@@ -82,7 +100,7 @@ func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if batch.LayoutRevision != 7 || !reflect.DeepEqual(batch.Commands, commands) {
+	if batch.LayoutRevision != 7 || batch.GridCols != 80 || batch.GridRows != 24 || !reflect.DeepEqual(batch.Commands, commands) {
 		t.Fatalf("batch=%#v want commands=%#v", batch, commands)
 	}
 }
@@ -98,7 +116,7 @@ func TestDiverseClustersRoundTripAsOpaqueDisplayUnits(t *testing.T) {
 		{Opcode: DisplayOpcodeWriteCluster, Width: 2, Text: []byte("葛\U000e0100")},
 	}
 	encoder := NewDisplayEncoder(nil)
-	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 19}); err != nil {
+	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 19, Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
 	}
 	for _, command := range clusters {
@@ -119,7 +137,7 @@ func TestDiverseClustersRoundTripAsOpaqueDisplayUnits(t *testing.T) {
 func TestDisplayStyleRoundTripsExtendedAttributesWithoutChangingOldFlags(t *testing.T) {
 	style := Style{Bold: true, Dim: true, Blink: true, Italic: true, Underline: true, Reverse: true, Invisible: true, FG: Color{Mode: "default"}, BG: Color{Mode: "default"}}
 	encoder := NewDisplayEncoder(nil)
-	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 1}); err != nil {
+	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 1, Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
 	}
 	if err := encoder.AppendStyleInstall(StyleInstall{ID: 1, Style: style}); err != nil {
@@ -158,7 +176,7 @@ func TestDisplayEncoderStyleInstallFailurePreservesBytes(t *testing.T) {
 func TestDisplayDecoderMultipleBatches(t *testing.T) {
 	encoder := NewDisplayEncoder(nil)
 	for _, text := range []string{"one", "two"} {
-		if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 3}); err != nil {
+		if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 3, Cols: 80, Rows: 24}); err != nil {
 			t.Fatal(err)
 		}
 		if err := encoder.AppendWriteTextUTF8([]byte(text)); err != nil {

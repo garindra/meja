@@ -17,6 +17,7 @@ const (
 	StatusRenderSlot      uint8  = uint8(MaxRenderSlots)
 	MaxGridCols           uint64 = 1024
 	MaxGridRows           uint64 = 1024
+	MaxGridCells                 = MaxGridCols * MaxGridRows
 )
 
 // OutputIndexFromStreamID maps server-initiated unidirectional QUIC stream IDs
