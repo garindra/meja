@@ -695,10 +695,10 @@ func TestFrontendTerminalControlUsesRenderWriter(t *testing.T) {
 	}
 }
 
-func TestControlLoopRegistersExitCommandBeforeTerminalWrite(t *testing.T) {
+func TestControlLoopAppliesRegisteredExitCommandAndAcknowledges(t *testing.T) {
 	var wire bytes.Buffer
 	encoder := protocol.NewEncoder(&wire)
-	exitCommand := []byte("restore")
+	exitCommand := []byte("\x1b[<u")
 	payload, err := protocol.EncodeFrontendRegisterTerminalExitCommand(nil, protocol.FrontendRegisterTerminalExitCommand{Data: exitCommand})
 	if err != nil {
 		t.Fatal(err)
@@ -706,12 +706,15 @@ func TestControlLoopRegistersExitCommandBeforeTerminalWrite(t *testing.T) {
 	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendRegisterTerminalExitCommand, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	wantWrite := []byte("setup")
+	wantWrite := []byte("\x1b[>3u")
 	payload, err = protocol.EncodeFrontendTerminalWrite(nil, protocol.FrontendTerminalWrite{Data: wantWrite})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendTerminalWrite, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendExecuteTerminalExitCommand}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -721,15 +724,49 @@ func TestControlLoopRegistersExitCommandBeforeTerminalWrite(t *testing.T) {
 	ui := &runtimeState{stdout: &stdout, events: make(chan renderEvent, 8), renderDone: make(chan struct{})}
 	go ui.renderLoop(ctx, make(chan error, 1))
 	done := make(chan connectionResult, 1)
-	controlLoop(protocol.NewDecoder(&wire, protocol.DefaultMaxFrameSize), ui, done, nil)
+	controlFrames := make(chan protocol.Frame, 1)
+	controlLoop(protocol.NewDecoder(&wire, protocol.DefaultMaxFrameSize), ui, controlFrames, done, nil)
 	if result := <-done; result.err != nil {
 		t.Fatal(result.err)
 	}
-	if err := ui.executeTerminalExitCommand(ctx); err != nil {
-		t.Fatal(err)
+	ack := <-controlFrames
+	if ack.Type != protocol.MsgFrontendTerminalExitComplete || len(ack.Payload) != 0 {
+		t.Fatalf("terminal exit acknowledgment = %#v", ack)
 	}
 	if got := stdout.Bytes(); !bytes.Equal(got, append(wantWrite, exitCommand...)) {
 		t.Fatalf("terminal output = %q", got)
+	}
+}
+
+func TestFrontendTerminalConfigurationOwnsExitCommandAcrossDecoderReuse(t *testing.T) {
+	var wire bytes.Buffer
+	encoder := protocol.NewEncoder(&wire)
+	exitCommand := []byte("\x1b[?1003;1006;1004;2004l\x1b[<u")
+	setup := []byte("\x1b[>3u\x1b[?1003;1006;1004;2004h")
+	exitPayload, err := protocol.EncodeFrontendRegisterTerminalExitCommand(nil, protocol.FrontendRegisterTerminalExitCommand{Data: exitCommand})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendRegisterTerminalExitCommand, Payload: exitPayload}); err != nil {
+		t.Fatal(err)
+	}
+	setupPayload, err := protocol.EncodeFrontendTerminalWrite(nil, protocol.FrontendTerminalWrite{Data: setup})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendTerminalWrite, Payload: setupPayload}); err != nil {
+		t.Fatal(err)
+	}
+
+	gotExit, gotSetup, err := readFrontendTerminalConfiguration(protocol.NewDecoder(&wire, protocol.DefaultMaxFrameSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotExit, exitCommand) {
+		t.Fatalf("exit command was overwritten by decoder reuse: got %q, want %q", gotExit, exitCommand)
+	}
+	if !bytes.Equal(gotSetup, setup) {
+		t.Fatalf("setup = %q, want %q", gotSetup, setup)
 	}
 }
 
@@ -762,6 +799,35 @@ func TestTerminalShutdownEndsSingleWriter(t *testing.T) {
 	}
 	if got := stdout.String(); got != "registered-exitfixed-exit" {
 		t.Fatalf("late output reached terminal: %q", got)
+	}
+}
+
+func TestEarlyTerminalExitIsNotRepeatedByShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout lockedBuffer
+	ui := &runtimeState{
+		stdout:            &stdout,
+		events:            make(chan renderEvent, 8),
+		renderDone:        make(chan struct{}),
+		renderExitCommand: make(chan []byte, 1),
+	}
+	go ui.renderLoop(ctx, make(chan error, 1))
+	if err := ui.registerTerminalExitCommand(ctx, []byte("registered-exit")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ui.executeTerminalExitCommand(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := ui.shutdownTerminal(ctx, []byte("fixed-exit")); err != nil {
+		t.Fatal(err)
+	}
+	<-ui.renderDone
+	if pending := <-ui.renderExitCommand; len(pending) != 0 {
+		t.Fatalf("pending exit command = %q", pending)
+	}
+	if got := stdout.String(); got != "registered-exitfixed-exit" {
+		t.Fatalf("terminal output = %q", got)
 	}
 }
 
@@ -884,7 +950,7 @@ func TestCleanQUICCloseWinsWhenOutputEOFArrivesFirst(t *testing.T) {
 
 	done := make(chan connectionResult, 1)
 	err := &quic.ApplicationError{ErrorCode: 0, ErrorMessage: "server stopped"}
-	controlLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), ui, done, nil)
+	controlLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), ui, nil, done, nil)
 	if result := <-done; !result.graceful || result.err != nil {
 		t.Fatalf("terminal result = %#v, want graceful", result)
 	}
@@ -896,7 +962,7 @@ func TestSessionReplacementIsTerminal(t *testing.T) {
 		ErrorMessage: "session attached elsewhere",
 	}
 	done := make(chan connectionResult, 1)
-	controlLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), &runtimeState{}, done, nil)
+	controlLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), &runtimeState{}, nil, done, nil)
 	if result := <-done; !result.graceful || result.err != nil || result.terminalMessage != "session attached elsewhere" {
 		t.Fatalf("replacement result = %#v, want graceful terminal result with status message", result)
 	}

@@ -271,6 +271,16 @@ func TestFrontendAttachmentCleanupDisablesCaptureWithoutXTermModeRestore(t *test
 	}
 }
 
+func TestFrontendAttachmentCleanupRestoresOuterKittyMode(t *testing.T) {
+	term := newTerminal(80, 24)
+	term.Apply([]byte("\x1b[>1u"))
+	term.Apply([]byte(frontendTerminalSetup))
+	term.Apply([]byte(frontendTerminalExitCommand))
+	if term.KittyFlags != 1 {
+		t.Fatalf("frontend cleanup did not restore outer Kitty flags: got %d, want 1", term.KittyFlags)
+	}
+}
+
 func TestKittyInputConvertsForLegacyAndKittyPanes(t *testing.T) {
 	key := frontendKeyEvent{Code: frontendKeyRune, Rune: 'b', Modifiers: frontendModifierControl, Action: frontendKeyPress, HasEventType: true}
 	if got := encodeKeyForPane(key, paneTerminalMetadata{}); !bytes.Equal(got, []byte{0x02}) {

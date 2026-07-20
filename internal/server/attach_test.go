@@ -500,13 +500,62 @@ func TestDaemonQUICListenerResumesByClientInstance(t *testing.T) {
 	}
 	bootstrap := *result.bootstrap
 
-	firstConn, _, resumeToken := dialTestClientInstance(t, bootstrap, "")
+	firstConn, _, _, resumeToken := dialTestClientInstance(t, bootstrap, "")
 	_ = firstConn.CloseWithError(1, "test disconnect")
-	secondConn, _, resumedToken := dialTestClientInstance(t, bootstrap, resumeToken)
+	secondConn, _, _, resumedToken := dialTestClientInstance(t, bootstrap, resumeToken)
 	defer secondConn.CloseWithError(0, "")
 
 	if resumeToken == "" || resumedToken != resumeToken {
 		t.Fatalf("resume credential changed from %q to %q", resumeToken, resumedToken)
+	}
+}
+
+func TestNormalDetachWaitsForFrontendTerminalExitCompletion(t *testing.T) {
+	d := newCommandTestDaemonWithActor(t)
+	d.sessionPersistenceDir = t.TempDir()
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:         []string{"new", "--", "/bin/sleep", "30"},
+		TerminalCols: 80,
+		TerminalRows: 23,
+	})
+	if result.exitCode != 0 || result.bootstrap == nil {
+		t.Fatalf("create result = %#v", result)
+	}
+
+	conn, control, decoder, _ := dialTestClientInstance(t, *result.bootstrap, "")
+	defer conn.CloseWithError(0, "")
+	input := encodedTestFrame(t, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: []byte{0x02, 'd'}}, protocol.EncodeFrontendInputBytes)
+	if err := protocol.NewEncoder(control).WriteFrame(input); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := control.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		frame, err := decoder.ReadFrame()
+		if err != nil {
+			t.Fatalf("read terminal exit request: %v", err)
+		}
+		if frame.Type != protocol.MsgFrontendExecuteTerminalExitCommand {
+			continue
+		}
+		if len(frame.Payload) != 0 {
+			t.Fatalf("terminal exit request payload = %q", frame.Payload)
+		}
+		break
+	}
+
+	controlEncoder := protocol.NewEncoder(control)
+	queuedResize := encodedTestFrame(t, protocol.MsgFrontendResize, protocol.FrontendResize{Cols: 81, Rows: 24}, protocol.EncodeFrontendResize)
+	if err := controlEncoder.WriteFrame(queuedResize); err != nil {
+		t.Fatal(err)
+	}
+	if err := controlEncoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendTerminalExitComplete}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.ReadFrame(); err == nil {
+		t.Fatal("connection remained open after terminal exit completion")
 	}
 }
 
@@ -521,7 +570,7 @@ func TestContextualRestoreRetargetsLiveInputLoop(t *testing.T) {
 	if created.exitCode != 0 || created.bootstrap == nil {
 		t.Fatalf("create source = %#v", created)
 	}
-	conn, input, _ := dialTestClientInstance(t, *created.bootstrap, "")
+	conn, input, _, _ := dialTestClientInstance(t, *created.bootstrap, "")
 	source := d.sessionByName("source")
 	waitForAttachedClient(t, source)
 
@@ -620,7 +669,7 @@ func stopPersistenceTestSession(t *testing.T, session *Session) {
 	}
 }
 
-func dialTestClientInstance(t *testing.T, bootstrap protocol.CommandBootstrap, token string) (quic.Connection, quic.Stream, string) {
+func dialTestClientInstance(t *testing.T, bootstrap protocol.CommandBootstrap, token string) (quic.Connection, quic.Stream, *protocol.Decoder, string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
@@ -698,7 +747,7 @@ func dialTestClientInstance(t *testing.T, bootstrap protocol.CommandBootstrap, t
 	if len(setup.Data) == 0 {
 		t.Fatal("frontend terminal setup was empty")
 	}
-	return conn, control, resumeToken
+	return conn, control, controlDecoder, resumeToken
 }
 
 func encodedTestFrame[T any](t *testing.T, frameType uint64, message T, encode func([]byte, T) ([]byte, error)) protocol.Frame {

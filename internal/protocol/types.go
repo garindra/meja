@@ -2,7 +2,7 @@ package protocol
 
 const (
 	ALPN            = "meja/1"
-	ProtocolVersion = 10
+	ProtocolVersion = 11
 
 	// SessionReplacedErrorCode is a terminal QUIC application close: another
 	// client has taken ownership of the session, so the displaced client must
@@ -21,6 +21,8 @@ const (
 	MsgSessionResumeOK
 	MsgFrontendTerminalWrite
 	MsgFrontendRegisterTerminalExitCommand
+	MsgFrontendExecuteTerminalExitCommand
+	MsgFrontendTerminalExitComplete
 )
 
 type SessionAttach struct {

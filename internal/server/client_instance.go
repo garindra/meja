@@ -526,7 +526,10 @@ const (
 	quicKeepAlivePeriod = 2 * time.Second
 	// The frontend stays in one rich, attachment-scoped capture mode. Terminals
 	// that do not implement Kitty keyboard enhancements safely ignore CSI > u.
-	frontendTerminalSetup       = "\x1b[>3u\x1b[?1003;1006;1004;2004h"
+	frontendTerminalSetup = "\x1b[>3u\x1b[?1003;1006;1004;2004h"
+	// Pop exactly the keyboard-mode entry installed by setup. This is supported
+	// by both the Kitty protocol and older iTerm2 implementations, which do not
+	// implement the newer CSI = flags ; mode u replacement form.
 	frontendTerminalExitCommand = "\x1b[?1003;1006;1004;2004l\x1b[<u"
 )
 
@@ -669,6 +672,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		completeSessionSwitch(request, nil)
 		return nil
 	}
+	exitRequested := false
 	for {
 		select {
 		case err := <-writerErrs:
@@ -680,9 +684,27 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 				}
 				return fmt.Errorf("read control frame: %w", event.err)
 			}
+			if exitRequested {
+				if event.frame.Type == protocol.MsgFrontendTerminalExitComplete {
+					if len(event.frame.Payload) != 0 {
+						return errors.New("frontend terminal exit completion has a payload")
+					}
+					return nil
+				}
+				// Input and resize frames already queued before the client applied
+				// the exit command can arrive before its acknowledgment. Ignore
+				// them while retaining the acknowledgment as the close barrier.
+				continue
+			}
 			stopped, err := s.handleControlFrame(clientInstance, event.frame)
 			if stopped {
-				return nil
+				if err := sendEncoded(clientInstance.controlOut, protocol.MsgFrontendExecuteTerminalExitCommand, struct{}{}, func(dst []byte, _ struct{}) ([]byte, error) {
+					return dst, nil
+				}); err != nil {
+					return err
+				}
+				exitRequested = true
+				continue
 			}
 			var request *sessionSwitchRequest
 			if !errors.As(err, &request) {
