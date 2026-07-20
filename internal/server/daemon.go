@@ -201,9 +201,9 @@ func daemonCertificate() (tls.Certificate, string, error) {
 	return cert, hex.EncodeToString(hash[:]), nil
 }
 
-// disconnectActiveClients uses the same clean QUIC close path as an explicit
-// client detach (Ctrl-B, d). The client restores its terminal and does not
-// receive a protocol error or a synthetic input event.
+// disconnectActiveClients shuts sessions down concurrently so pane termination
+// retains one global grace period instead of multiplying it by session count.
+// Clients receive the same clean QUIC close used by an explicit detach.
 func (d *Daemon) disconnectActiveClients() {
 	var sessions []*Session
 	d.call(func() {
@@ -212,9 +212,24 @@ func (d *Daemon) disconnectActiveClients() {
 			sessions = append(sessions, session)
 		}
 	})
-	for _, session := range sessions {
-		_ = session.shutdown()
+	// Actor-less daemons are used by tests and embedders. Their registry helpers
+	// execute inline, so concurrent sessionExited callbacks would mutate the
+	// registry maps concurrently.
+	if d.requests == nil {
+		for _, session := range sessions {
+			_ = session.shutdown()
+		}
+		return
 	}
+	var wait sync.WaitGroup
+	wait.Add(len(sessions))
+	for _, session := range sessions {
+		go func() {
+			defer wait.Done()
+			_ = session.shutdown()
+		}()
+	}
+	wait.Wait()
 }
 
 func newSession(id uint64, name string) *Session {
@@ -392,6 +407,94 @@ func terminatePane(pane *Pane) error {
 		_ = pane.Process.Process.Signal(syscall.SIGHUP)
 	}
 	pane.stop()
+	return nil
+}
+
+type paneTerminationTimeouts struct {
+	hangup    time.Duration
+	terminate time.Duration
+	kill      time.Duration
+}
+
+var defaultPaneTerminationTimeouts = paneTerminationTimeouts{
+	hangup:    time.Second,
+	terminate: time.Second,
+	kill:      time.Second,
+}
+
+// terminatePanesAndWait preserves terminal hangup semantics first, then
+// escalates stubborn pane leaders under one shared deadline per stage. The
+// process waiter remains the sole owner of Process.Wait and closes processDone.
+func terminatePanesAndWait(panes []*Pane, timeouts paneTerminationTimeouts) []*Pane {
+	pending := livePaneProcesses(panes)
+	for _, pane := range pending {
+		_ = pane.Process.Process.Signal(syscall.SIGHUP)
+		pane.stop()
+	}
+	pending = waitForPaneProcesses(pending, timeouts.hangup)
+	for _, pane := range pending {
+		_ = pane.Process.Process.Signal(syscall.SIGTERM)
+	}
+	pending = waitForPaneProcesses(pending, timeouts.terminate)
+	for _, pane := range pending {
+		_ = pane.Process.Process.Signal(syscall.SIGKILL)
+	}
+	return waitForPaneProcesses(pending, timeouts.kill)
+}
+
+func livePaneProcesses(panes []*Pane) []*Pane {
+	live := make([]*Pane, 0, len(panes))
+	for _, pane := range panes {
+		if pane == nil || pane.Process == nil || pane.Process.Process == nil || pane.processDone == nil {
+			continue
+		}
+		select {
+		case <-pane.processDone:
+		default:
+			live = append(live, pane)
+		}
+	}
+	return live
+}
+
+func waitForPaneProcesses(panes []*Pane, timeout time.Duration) []*Pane {
+	pending := livePaneProcesses(panes)
+	if len(pending) == 0 || timeout <= 0 {
+		return pending
+	}
+
+	exited := make(chan *Pane, len(pending))
+	stop := make(chan struct{})
+	for _, pane := range pending {
+		go func(pane *Pane) {
+			select {
+			case <-pane.processDone:
+				exited <- pane
+			case <-stop:
+			}
+		}(pane)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	remaining := make(map[*Pane]struct{}, len(pending))
+	for _, pane := range pending {
+		remaining[pane] = struct{}{}
+	}
+	for len(remaining) > 0 {
+		select {
+		case pane := <-exited:
+			delete(remaining, pane)
+		case <-timer.C:
+			close(stop)
+			out := make([]*Pane, 0, len(remaining))
+			for pane := range remaining {
+				out = append(out, pane)
+			}
+			return out
+		}
+	}
+	close(stop)
 	return nil
 }
 

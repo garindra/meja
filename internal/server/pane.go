@@ -35,6 +35,7 @@ type Pane struct {
 	mainDone               chan struct{}
 	writerDone             chan struct{}
 	done                   chan struct{}
+	processDone            chan struct{}
 	stopping               atomic.Bool
 	processActivityPending atomic.Bool
 	processMonitor         *ProcessMonitor
@@ -264,7 +265,8 @@ func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
 			ResolvedPath:  cmd.Path,
 			Cwd:           cmd.Dir,
 		},
-		Root: root,
+		Root:        root,
+		processDone: make(chan struct{}),
 	}, nil
 }
 
@@ -404,9 +406,8 @@ func buildEnv(unixUser *user.User, shell string) []string {
 		"LOGNAME=" + unixUser.Username,
 		"SHELL=" + shell,
 		"TERM=xterm-256color",
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	}
-	for _, key := range []string{"LANG", "LC_ALL", "LC_CTYPE"} {
+	for _, key := range []string{"PATH", "LANG", "LC_ALL", "LC_CTYPE"} {
 		if value, ok := os.LookupEnv(key); ok && value != "" {
 			env = append(env, key+"="+value)
 		}

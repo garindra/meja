@@ -481,7 +481,7 @@ Meja removes stale owned sockets for commands allowed to start a server.
 
 Socket directories must be owned by the user with exact mode `0700`; sockets and locks use `0600`. An exact socket cannot live directly in a shared directory such as `/tmp`. A file lock prevents duplicate servers.
 
-Session IDs start at 1 for each server lifetime. Detached sessions continue while they have panes. The final pane ending closes the session. Stopping the server ends live sessions but leaves named recovery files.
+Session IDs start at 1 for each server lifetime. Detached sessions continue while they have panes. The final pane ending closes the session. Stopping the server ends live sessions but leaves named recovery files. Server shutdown terminates all panes concurrently: it allows one second after `SIGHUP` and PTY closure, one second after `SIGTERM`, and one final second after `SIGKILL`, for a maximum pane-cleanup delay of about three seconds regardless of pane count.
 
 ## SSH and QUIC
 
@@ -504,7 +504,7 @@ Panes start login shells unless the initial pane received an explicit command. T
 ```text
 HOME USER LOGNAME SHELL
 TERM=xterm-256color
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=<inherited from the server environment when set>
 ```
 
 `LANG`, `LC_ALL`, and `LC_CTYPE` are copied when set. Meja also injects `MEJA_SOCKET`, `MEJA_SESSION_TARGET`, and `MEJA_PANE_ID` for in-pane context.
