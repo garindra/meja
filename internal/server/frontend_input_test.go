@@ -565,6 +565,12 @@ func TestMouseClickWithoutDragDoesNotCopy(t *testing.T) {
 	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
 		t.Fatal(err)
 	}
+	if pane.isHistoryMode() {
+		t.Fatal("mouse press entered history mode before a drag")
+	}
+	if !frontend.pointerCapture.active || !frontend.pointerCapture.mejaSelection || frontend.pointerCapture.selecting {
+		t.Fatalf("mouse press capture = %#v", frontend.pointerCapture)
+	}
 	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerRelease, Button: 0, X: point.X, Y: point.Y}); err != nil {
 		t.Fatal(err)
 	}
@@ -575,6 +581,175 @@ func TestMouseClickWithoutDragDoesNotCopy(t *testing.T) {
 	}
 	if pane.isHistoryMode() {
 		t.Fatal("click left pane in history mode")
+	}
+	if frontend.pointerCapture.active {
+		t.Fatalf("click left pointer capture active: %#v", frontend.pointerCapture)
+	}
+}
+
+func TestMousePressWithoutReleaseDoesNotBlockKey(t *testing.T) {
+	s := NewSession(1)
+	clientState := s.NewClient(clientID0)
+	clientState.TerminalCols, clientState.TerminalRows = 12, 4
+	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4), ptyInput: make(chan []byte, 1)}
+	s.CreateWindow(pane, clientID0)
+	layout, err := s.WindowLayout(clientID0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontend := newClientInstance(nil, nil)
+	frontend.rememberLayout(layout)
+	point := layout.Panes[0].Rect
+	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
+		t.Fatal(err)
+	}
+
+	if detach, err := s.handleFrontendKey(frontend, frontendKeyEvent{Code: frontendKeyRune, Rune: 'x', Action: frontendKeyPress}); err != nil || detach {
+		t.Fatalf("key after truncated click detach=%v err=%v", detach, err)
+	}
+	if pane.isHistoryMode() || frontend.pointerCapture.active {
+		t.Fatalf("key left pending click state: pane history=%v capture=%#v", pane.isHistoryMode(), frontend.pointerCapture)
+	}
+	select {
+	case got := <-pane.ptyInput:
+		if !bytes.Equal(got, []byte("x")) {
+			t.Fatalf("forwarded key = %q", got)
+		}
+	default:
+		t.Fatal("key was not forwarded after a truncated click")
+	}
+}
+
+func TestMouseMotionWithoutHeldButtonCancelsTruncatedGesture(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		activeDrag bool
+	}{
+		{name: "pending press"},
+		{name: "active drag", activeDrag: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := NewSession(1)
+			clientState := s.NewClient(clientID0)
+			clientState.TerminalCols, clientState.TerminalRows = 12, 4
+			pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4)}
+			s.CreateWindow(pane, clientID0)
+			layout, err := s.WindowLayout(clientID0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frontend := newClientInstance(nil, nil)
+			frontend.rememberLayout(layout)
+			point := layout.Panes[0].Rect
+			if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
+				t.Fatal(err)
+			}
+			if test.activeDrag {
+				if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerMove, Button: 0, X: point.X + 1, Y: point.Y}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerMove, Button: 3, X: point.X + 2, Y: point.Y}); err != nil {
+				t.Fatal(err)
+			}
+			if pane.isHistoryMode() || frontend.pointerCapture.active {
+				t.Fatalf("buttonless motion left gesture active: pane history=%v capture=%#v", pane.isHistoryMode(), frontend.pointerCapture)
+			}
+		})
+	}
+}
+
+func TestMouseSelectionWithoutReleaseCancelsAndForwardsKey(t *testing.T) {
+	s := NewSession(1)
+	clientState := s.NewClient(clientID0)
+	clientState.TerminalCols, clientState.TerminalRows = 12, 4
+	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4), ptyInput: make(chan []byte, 1)}
+	pane.terminal.Apply([]byte("hello"))
+	s.CreateWindow(pane, clientID0)
+	layout, err := s.WindowLayout(clientID0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontend := newClientInstance(nil, nil)
+	frontend.rememberLayout(layout)
+	point := layout.Panes[0].Rect
+
+	for _, pointer := range []frontendPointerEvent{
+		{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y},
+		{Action: frontendPointerMove, Button: 0, X: point.X + 2, Y: point.Y},
+	} {
+		if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, pointer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !pane.isHistoryMode() || !frontend.pointerCapture.selecting {
+		t.Fatalf("drag did not enter selection: pane history=%v capture=%#v", pane.isHistoryMode(), frontend.pointerCapture)
+	}
+
+	if detach, err := s.handleFrontendKey(frontend, frontendKeyEvent{Code: frontendKeyRune, Rune: 'x', Action: frontendKeyPress}); err != nil || detach {
+		t.Fatalf("key after truncated drag detach=%v err=%v", detach, err)
+	}
+	if pane.isHistoryMode() || frontend.pointerCapture.active {
+		t.Fatalf("key did not cancel automatic selection: pane history=%v capture=%#v", pane.isHistoryMode(), frontend.pointerCapture)
+	}
+	select {
+	case got := <-pane.ptyInput:
+		if !bytes.Equal(got, []byte("x")) {
+			t.Fatalf("forwarded key = %q", got)
+		}
+	default:
+		t.Fatal("key was not forwarded after cancelling automatic selection")
+	}
+}
+
+func TestMouseSelectionWithoutReleaseCancelsOnFocusLossAndRelayout(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		cancel func(*Session, *ClientInstance) error
+	}{
+		{name: "focus loss", cancel: func(s *Session, frontend *ClientInstance) error {
+			_, err := s.handleFrontendInputEvent(frontend, frontendInputEvent{Kind: frontendEventFocus, Focused: false})
+			return err
+		}},
+		{name: "split relayout", cancel: func(s *Session, frontend *ClientInstance) error {
+			second := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4)}
+			_, clientState, err := s.SplitFocusedPane(clientID0, second, SplitVertical)
+			if err != nil {
+				return err
+			}
+			s.ResizeAll(clientState.TerminalCols, clientState.TerminalRows)
+			return s.rebindOutputsAndPublishLayout(nil)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := NewSession(1)
+			clientState := s.NewClient(clientID0)
+			clientState.TerminalCols, clientState.TerminalRows = 12, 4
+			pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4)}
+			s.CreateWindow(pane, clientID0)
+			layout, err := s.WindowLayout(clientID0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frontend := newClientInstance(nil, nil)
+			frontend.rememberLayout(layout)
+			s.clientInstance = frontend
+			point := layout.Panes[0].Rect
+			for _, pointer := range []frontendPointerEvent{
+				{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y},
+				{Action: frontendPointerMove, Button: 0, X: point.X + 2, Y: point.Y},
+			} {
+				if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, pointer); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := test.cancel(s, frontend); err != nil {
+				t.Fatal(err)
+			}
+			if pane.isHistoryMode() || frontend.pointerCapture.active {
+				t.Fatalf("boundary did not cancel selection: pane history=%v capture=%#v", pane.isHistoryMode(), frontend.pointerCapture)
+			}
+		})
 	}
 }
 

@@ -46,10 +46,19 @@ type ClientInstance struct {
 }
 
 type frontendPaneCapture struct {
-	paneID    uint64
-	active    bool
-	selecting bool
-	rect      protocol.Rect
+	paneID uint64
+	active bool
+	button uint8
+	// mejaSelection distinguishes a pending or active server-owned history
+	// selection from mouse capture forwarded directly to an application.
+	mejaSelection bool
+	// selecting becomes true only after motion leaves the pressed cell and the
+	// pane has actually entered history mode.
+	selecting     bool
+	autoSelection bool
+	anchorRow     int
+	anchorColumn  int
+	rect          protocol.Rect
 }
 
 // reconnectCredential is the small, indefinitely retained daemon record for
