@@ -36,6 +36,16 @@ func (b *lockedBuffer) Write(p []byte) (int, error) {
 }
 func (b *lockedBuffer) Len() int { b.mu.Lock(); defer b.mu.Unlock(); return b.Buffer.Len() }
 
+func shortUnixSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "meja-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "meja.sock")
+}
+
 func TestParseTarget(t *testing.T) {
 	target, err := ParseTarget("alice@example.com")
 	if err != nil {
@@ -112,7 +122,7 @@ func TestSocketSelectorRejectsUnsafeProfilesAndRelativePaths(t *testing.T) {
 }
 
 func TestForwardCommandAddsRemoteWorkingDirectoryAndProxiesFrames(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "meja.sock")
+	socket := shortUnixSocketPath(t)
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +165,7 @@ func TestForwardCommandAddsRemoteWorkingDirectoryAndProxiesFrames(t *testing.T) 
 }
 
 func TestRunForwardsArbitraryNonAttachCommandWithoutTerminal(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "meja.sock")
+	socket := shortUnixSocketPath(t)
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
