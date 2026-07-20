@@ -1,28 +1,11 @@
 # meja
 
-```{=html}
-<p align="center">
-```
-`<strong>`{=html}tmux-style workspaces that survive bad networks and
-rebuild from a file.`</strong>`{=html}
-```{=html}
-</p>
-```
-```{=html}
-<p align="center">
-```
-`<img src="screenshot.png" alt="Meja screenshot" width="800">`{=html}
-```{=html}
-</p>
-```
-```{=html}
-<p align="center">
-```
+**tmux-style workspaces that survive bad networks and rebuild from a file.**
+
+![Meja screenshot](screenshot.png)
+
 Local and remote terminal sessions with persistent layouts, reconnecting
 clients, and reproducible environments.
-```{=html}
-</p>
-```
 
 ------------------------------------------------------------------------
 
