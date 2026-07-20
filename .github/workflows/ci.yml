@@ -11,8 +11,12 @@ permissions:
 
 jobs:
   check:
-    name: Check
-    runs-on: ubuntu-latest
+    name: Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - name: Check out repository
@@ -27,3 +31,6 @@ jobs:
 
       - name: Run checks
         run: make check
+
+      - name: Run race tests
+        run: make race

@@ -9,8 +9,36 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run checks
+        run: make check
+
+      - name: Run race tests
+        run: make race
+
   release:
     name: Release
+    needs: check
     runs-on: ubuntu-latest
 
     steps:
@@ -25,9 +53,6 @@ jobs:
           go-version: "1.26.x"
           cache: true
           cache-dependency-path: go.sum
-
-      - name: Run checks
-        run: make check
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7

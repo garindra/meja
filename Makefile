@@ -4,7 +4,7 @@ GORELEASER ?= goreleaser
 BINARY := meja
 MAIN_PACKAGE := .
 
-.PHONY: build fmt test check clean snapshot
+.PHONY: build fmt test race check clean snapshot
 
 build:
 	mkdir -p bin
@@ -15,6 +15,9 @@ fmt:
 
 test:
 	$(GO) test ./...
+
+race:
+	$(GO) test -race ./...
 
 check:
 	test -z "$$(gofmt -l .)"
