@@ -101,6 +101,12 @@ func (s *Session) handleFrontendInputEvent(c *ClientInstance, event frontendInpu
 		}
 		return false, pane.sendInput(data)
 	case frontendEventFocus:
+		if !event.Focused {
+			clear(c.heldKeys)
+			if err := s.cancelFrontendPointerCapture(c); err != nil {
+				return false, err
+			}
+		}
 		pane, _ := s.ActivePane(clientID0)
 		if pane != nil && pane.InputMode().focusReporting {
 			if event.Focused {
@@ -115,6 +121,11 @@ func (s *Session) handleFrontendInputEvent(c *ClientInstance, event frontendInpu
 }
 
 func (s *Session) handleFrontendKey(c *ClientInstance, key frontendKeyEvent) (bool, error) {
+	if key.Action != frontendKeyRelease && c.pointerCapture.mejaSelection && c.pointerCapture.autoSelection {
+		if err := s.cancelFrontendPointerCapture(c); err != nil {
+			return false, err
+		}
+	}
 	if c.heldKeys == nil {
 		c.heldKeys = make(map[frontendHeldKey]uint64)
 	}
@@ -151,6 +162,22 @@ func (s *Session) handleFrontendKey(c *ClientInstance, key frontendKeyEvent) (bo
 		return false, fmt.Errorf("write frontend key to pane: %w", err)
 	}
 	return false, nil
+}
+
+func (s *Session) cancelFrontendPointerCapture(c *ClientInstance) error {
+	if c == nil {
+		return nil
+	}
+	capture := c.pointerCapture
+	c.pointerCapture = frontendPaneCapture{}
+	if !capture.active || !capture.mejaSelection || !capture.selecting {
+		return nil
+	}
+	pane := s.Pane(capture.paneID)
+	if pane == nil {
+		return nil
+	}
+	return pane.cancelHistorySelection()
 }
 
 func isMejaPrefixKey(key frontendKeyEvent) bool {
@@ -437,14 +464,19 @@ func kittyFunctionalSequence(code frontendKeyCode) (byte, string, bool) {
 }
 
 func (s *Session) handleFrontendPointer(c *ClientInstance, revision uint64, pointer frontendPointerEvent) error {
+	if pointer.Action == frontendPointerPress && c.pointerCapture.active {
+		if err := s.cancelFrontendPointerCapture(c); err != nil {
+			return err
+		}
+	}
 	paneID, rect, found := hitTestFrontendLayout(c.layouts[revision], pointer.X, pointer.Y)
-	captured := c.pointerCapture.active
-	selecting := captured && c.pointerCapture.selecting
+	capture := c.pointerCapture
+	captured := capture.active
 	if pointer.Action == frontendPointerMove || pointer.Action == frontendPointerRelease {
 		if captured {
-			paneID = c.pointerCapture.paneID
+			paneID = capture.paneID
 			found = true
-			rect = c.pointerCapture.rect
+			rect = capture.rect
 			if placement, ok := panePlacement(c.layouts[revision], paneID); ok {
 				rect = placement.Rect
 			}
@@ -470,21 +502,40 @@ func (s *Session) handleFrontendPointer(c *ClientInstance, revision uint64, poin
 		mode := pane.InputMode()
 		if pointer.Button == 0 && (pane.isHistoryMode() || mode.mouseTracking == MouseTrackingNone) {
 			row, column := pointer.Y-rect.Y, pointer.X-rect.X
-			auto := !pane.isHistoryMode()
-			if err := pane.beginHistorySelection(row, column, auto); err != nil {
-				return err
+			c.pointerCapture = frontendPaneCapture{
+				paneID:        paneID,
+				active:        true,
+				button:        pointer.Button,
+				mejaSelection: true,
+				autoSelection: !pane.isHistoryMode(),
+				anchorRow:     row,
+				anchorColumn:  column,
+				rect:          rect,
 			}
-			c.pointerCapture = frontendPaneCapture{paneID: paneID, active: true, selecting: true, rect: rect}
 			return nil
 		}
-		c.pointerCapture = frontendPaneCapture{paneID: paneID, active: true, rect: rect}
+		c.pointerCapture = frontendPaneCapture{paneID: paneID, active: true, button: pointer.Button, rect: rect}
 	}
 	if pointer.Action == frontendPointerRelease {
 		defer func() { c.pointerCapture = frontendPaneCapture{} }()
 	}
-	if selecting {
+	if captured && capture.mejaSelection {
+		if pointer.Action == frontendPointerMove && pointer.Button != capture.button {
+			return s.cancelFrontendPointerCapture(c)
+		}
 		row := min(max(pointer.Y-rect.Y, 0), max(rect.Height-1, 0))
 		column := min(max(pointer.X-rect.X, 0), max(rect.Width-1, 0))
+		if !capture.selecting {
+			if pointer.Action != frontendPointerMove || (row == capture.anchorRow && column == capture.anchorColumn) {
+				return nil
+			}
+			if err := pane.beginHistorySelection(capture.anchorRow, capture.anchorColumn, capture.autoSelection); err != nil {
+				c.pointerCapture = frontendPaneCapture{}
+				return err
+			}
+			capture.selecting = true
+			c.pointerCapture = capture
+		}
 		switch pointer.Action {
 		case frontendPointerMove:
 			return pane.updateHistorySelection(row, column)

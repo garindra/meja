@@ -202,6 +202,9 @@ func (s *Session) publishStatusBar() error {
 }
 
 func (s *Session) publishWindowLayout() error {
+	if err := s.cancelFrontendPointerCapture(s.clientInstance); err != nil {
+		return err
+	}
 	layout, err := s.WindowLayout(clientID0)
 	if err != nil {
 		return err
@@ -253,6 +256,9 @@ func (s *Session) beginOutputHandoff() *outputHandoff {
 }
 
 func (s *Session) rebindOutputsAndPublishLayout(handoff *outputHandoff) error {
+	if err := s.cancelFrontendPointerCapture(s.clientInstance); err != nil {
+		return err
+	}
 	bindings, _, _, err := s.RebuildRenderBindings(clientID0)
 	if err != nil {
 		return err
