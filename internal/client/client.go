@@ -301,6 +301,16 @@ func Run(ctx context.Context, cfg Config) error {
 		case result := <-live.done:
 			ui.stopConnection()
 			clearControlDestination(&control, live.controlFrames)
+			// A clean server close means this frontend is leaving the
+			// attachment. Disable its input-reporting modes immediately, before
+			// waiting for transport workers, so key releases generated during
+			// teardown cannot be inherited by the caller's shell. On success the
+			// render loop clears the registered command; terminal shutdown will
+			// therefore not execute it twice. On failure it remains available to
+			// the shutdown fallback.
+			if result.graceful {
+				_ = ui.executeTerminalExitCommand(context.Background())
+			}
 			live.destroy()
 			ui.sync(clientCtx)
 			if result.graceful {
@@ -560,37 +570,19 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 	default:
 		return fail(fmt.Errorf("unexpected session attachment result %d", attachResult.Type))
 	}
-	exitCommandFrame, err := controlDecoder.ReadFrame()
+	exitCommand, setup, err := readFrontendTerminalConfiguration(controlDecoder)
 	if err != nil {
-		return fail(fmt.Errorf("read frontend terminal exit command: %w", err))
-	}
-	if exitCommandFrame.Type != protocol.MsgFrontendRegisterTerminalExitCommand {
-		return fail(fmt.Errorf("expected frontend terminal exit command, got message type %d", exitCommandFrame.Type))
-	}
-	exitCommand, err := protocol.DecodeFrontendRegisterTerminalExitCommand(exitCommandFrame.Payload)
-	if err != nil {
-		return fail(fmt.Errorf("decode frontend terminal exit command: %w", err))
-	}
-	setupFrame, err := controlDecoder.ReadFrame()
-	if err != nil {
-		return fail(fmt.Errorf("read frontend terminal setup: %w", err))
-	}
-	if setupFrame.Type != protocol.MsgFrontendTerminalWrite {
-		return fail(fmt.Errorf("expected frontend terminal setup, got message type %d", setupFrame.Type))
-	}
-	setup, err := protocol.DecodeFrontendTerminalWrite(setupFrame.Payload)
-	if err != nil {
-		return fail(fmt.Errorf("decode frontend terminal setup: %w", err))
+		return fail(err)
 	}
 	if prepareFrontend != nil {
 		if err := prepareFrontend(); err != nil {
 			return fail(err)
 		}
 	}
-	if err := ui.registerTerminalExitCommand(ctx, exitCommand.Data); err != nil {
+	if err := ui.registerTerminalExitCommand(ctx, exitCommand); err != nil {
 		return fail(err)
 	}
-	if err := ui.writeTerminal(ctx, setup.Data); err != nil {
+	if err := ui.writeTerminal(ctx, setup); err != nil {
 		return fail(err)
 	}
 	outputReady := make(chan struct{})
@@ -602,7 +594,7 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 	case <-ctx.Done():
 		return fail(ctx.Err())
 	}
-	live.start(func() { controlLoop(controlDecoder, ui, live.done, &live.lastContact) })
+	live.start(func() { controlLoop(controlDecoder, ui, live.controlFrames, live.done, &live.lastContact) })
 	live.start(func() {
 		for {
 			select {
@@ -614,6 +606,37 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 		}
 	})
 	return live, nil
+}
+
+func readFrontendTerminalConfiguration(decoder *protocol.Decoder) ([]byte, []byte, error) {
+	exitCommandFrame, err := decoder.ReadFrame()
+	if err != nil {
+		return nil, nil, fmt.Errorf("read frontend terminal exit command: %w", err)
+	}
+	if exitCommandFrame.Type != protocol.MsgFrontendRegisterTerminalExitCommand {
+		return nil, nil, fmt.Errorf("expected frontend terminal exit command, got message type %d", exitCommandFrame.Type)
+	}
+	exitCommand, err := protocol.DecodeFrontendRegisterTerminalExitCommand(exitCommandFrame.Payload)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode frontend terminal exit command: %w", err)
+	}
+	// Decoder payloads alias reusable storage. Take ownership before reading the
+	// setup frame, which may otherwise overwrite the registered cleanup with the
+	// beginning of the setup command.
+	exitCommandData := append([]byte(nil), exitCommand.Data...)
+
+	setupFrame, err := decoder.ReadFrame()
+	if err != nil {
+		return nil, nil, fmt.Errorf("read frontend terminal setup: %w", err)
+	}
+	if setupFrame.Type != protocol.MsgFrontendTerminalWrite {
+		return nil, nil, fmt.Errorf("expected frontend terminal setup, got message type %d", setupFrame.Type)
+	}
+	setup, err := protocol.DecodeFrontendTerminalWrite(setupFrame.Payload)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode frontend terminal setup: %w", err)
+	}
+	return exitCommandData, append([]byte(nil), setup.Data...), nil
 }
 
 func quicDialError(addr string, err error) error {
@@ -911,7 +934,7 @@ func (c *displayFrameCompiler) appendFill(fill protocol.Fill) error {
 	return nil
 }
 
-func controlLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- connectionResult, lastContact *atomic.Int64) {
+func controlLoop(decoder *protocol.Decoder, ui *runtimeState, controlFrames chan<- protocol.Frame, done chan<- connectionResult, lastContact *atomic.Int64) {
 	for {
 		frame, err := decoder.ReadFrame()
 		if err != nil {
@@ -963,6 +986,20 @@ func controlLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- connec
 				done <- connectionResult{err: err}
 				return
 			}
+		case protocol.MsgFrontendExecuteTerminalExitCommand:
+			if len(frame.Payload) != 0 {
+				done <- connectionResult{err: errors.New("frontend terminal exit request has a payload")}
+				return
+			}
+			if err := ui.executeTerminalExitCommand(context.Background()); err != nil {
+				done <- connectionResult{err: err}
+				return
+			}
+			if controlFrames == nil {
+				done <- connectionResult{err: errors.New("frontend terminal exit request has no control writer")}
+				return
+			}
+			controlFrames <- protocol.Frame{Type: protocol.MsgFrontendTerminalExitComplete}
 		default:
 		}
 	}
@@ -1880,7 +1917,8 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 				e.done <- presentErr
 				return false, "", presentErr
 			}
-			err = writeAll(r.stdout, terminalExitCommand)
+			exitCommand := append([]byte(nil), terminalExitCommand...)
+			err = writeAll(r.stdout, exitCommand)
 			if err == nil {
 				terminalExitCommand = terminalExitCommand[:0]
 			}
@@ -1890,7 +1928,8 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 				e.done <- presentErr
 				return false, "", presentErr
 			}
-			err = writeAll(r.stdout, terminalExitCommand)
+			exitCommand := append([]byte(nil), terminalExitCommand...)
+			err = writeAll(r.stdout, exitCommand)
 			if err == nil {
 				terminalExitCommand = terminalExitCommand[:0]
 				err = writeAll(r.stdout, e.data)
