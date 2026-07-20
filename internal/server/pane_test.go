@@ -53,7 +53,7 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatalf("PTY input = %q, want %q", got, want)
 	}
-	if !pane.UsesApplicationCursorKeys() {
+	if !pane.InputMode().applicationCursorKeys {
 		t.Fatal("pane main loop did not publish application cursor mode")
 	}
 

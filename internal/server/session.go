@@ -176,6 +176,11 @@ func (s *Session) detachClientInstance() {
 			return nil
 		}
 		var detachErr error
+		for _, pane := range s.Panes {
+			if err := pane.cancelHistorySelection(); err != nil && detachErr == nil {
+				detachErr = err
+			}
+		}
 		if err := s.detachStatusOutput(client); err != nil {
 			detachErr = err
 		}
@@ -189,13 +194,6 @@ func (s *Session) detachClientInstance() {
 		s.clientInstance = nil
 		return detachErr
 	})
-}
-
-func (s *Session) currentManagementFrames() chan protocol.Frame {
-	if s.clientInstance == nil {
-		return nil
-	}
-	return s.clientInstance.managementOut
 }
 
 func (s *Session) currentOutputLease(slot int) *OutputLease {

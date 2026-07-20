@@ -240,42 +240,6 @@ func TestSSHCommandErrorIncludesRemoteStderr(t *testing.T) {
 	}
 }
 
-func TestInitialManagementFrameActivatesTerminalAfterRead(t *testing.T) {
-	var wire bytes.Buffer
-	want := protocol.Frame{Type: protocol.MsgSessionAttachOK, Payload: []byte("attached")}
-	if err := protocol.NewEncoder(&wire).WriteFrame(want); err != nil {
-		t.Fatal(err)
-	}
-	activated := false
-	got, err := readInitialManagementFrame(protocol.NewDecoder(&wire, protocol.DefaultMaxFrameSize), func() error {
-		activated = true
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !activated {
-		t.Fatal("terminal was not activated after receiving the initial management frame")
-	}
-	if got.Type != want.Type || !bytes.Equal(got.Payload, want.Payload) {
-		t.Fatalf("frame = %#v, want %#v", got, want)
-	}
-}
-
-func TestInitialManagementReadFailureDoesNotActivateTerminal(t *testing.T) {
-	activated := false
-	_, err := readInitialManagementFrame(protocol.NewDecoder(bytes.NewReader(nil), protocol.DefaultMaxFrameSize), func() error {
-		activated = true
-		return nil
-	})
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("error = %v, want EOF", err)
-	}
-	if activated {
-		t.Fatal("terminal activated before an initial management frame was received")
-	}
-}
-
 func TestQUICDialIdleTimeoutReportsUnreachableUDPAddress(t *testing.T) {
 	err := quicDialError("example.com:60000", &quic.IdleTimeoutError{})
 	want := "UDP example.com:60000 is unreachable: timeout: no recent network activity"
@@ -392,14 +356,15 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 	}
 	defer stdinR.Close()
 
-	inputFrames := make(chan protocol.Frame, 8)
+	controlFrames := make(chan protocol.Frame, 8)
 	errs := make(chan error, 1)
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
-	var input atomic.Pointer[inputDestination]
-	input.Store(&inputDestination{frames: inputFrames, done: ctx.Done()})
+	var control atomic.Pointer[controlDestination]
+	control.Store(&controlDestination{frames: controlFrames, done: ctx.Done()})
 	ui := &runtimeState{events: make(chan renderEvent, 1)}
-	go forwardInput(ctx, stdinR, &input, ui, errs, cancel)
+	ui.appliedLayoutRevision.Store(42)
+	go forwardInput(ctx, stdinR, &control, ui, errs, cancel)
 
 	if _, err := stdinW.Write([]byte("abc")); err != nil {
 		t.Fatalf("stdin write = %v", err)
@@ -413,32 +378,25 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 	}
 
 	select {
-	case frame := <-inputFrames:
-		if frame.Type != protocol.MsgInputBytes {
+	case frame := <-controlFrames:
+		if frame.Type != protocol.MsgFrontendInputBytes {
 			t.Fatalf("input frame type = %d", frame.Type)
 		}
-		msg, err := protocol.DecodeInputBytes(frame.Payload)
+		msg, err := protocol.DecodeFrontendInputBytes(frame.Payload)
 		if err != nil {
-			t.Fatalf("DecodeInputBytes() = %v", err)
+			t.Fatalf("DecodeFrontendInputBytes() = %v", err)
 		}
 		if string(msg.Data) != "abc" {
 			t.Fatalf("batched input data = %q", string(msg.Data))
+		}
+		if msg.LayoutRevision != 42 {
+			t.Fatalf("layout revision = %d", msg.LayoutRevision)
 		}
 	default:
 		t.Fatal("expected one input frame")
 	}
 	select {
-	case event := <-ui.events:
-		local, ok := event.(localInputEvent)
-		if !ok || string(local.data) != "abc" {
-			t.Fatalf("local input event = %#v", event)
-		}
-	default:
-		t.Fatal("expected local input event")
-	}
-
-	select {
-	case frame := <-inputFrames:
+	case frame := <-controlFrames:
 		t.Fatalf("unexpected extra input frame: %#v", frame)
 	default:
 	}
@@ -446,8 +404,8 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 }
 
 func TestInputRouterDropsInputWhileDisconnected(t *testing.T) {
-	var input atomic.Pointer[inputDestination]
-	if err := sendCurrentInputEncoded(&input, protocol.MsgInputBytes, protocol.InputBytes{Data: []byte("dropped")}, protocol.EncodeInputBytes); err != nil {
+	var control atomic.Pointer[controlDestination]
+	if err := sendCurrentControlEncoded(&control, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: []byte("dropped")}, protocol.EncodeFrontendInputBytes); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -462,10 +420,10 @@ func TestCtrlCExitsWhileDisconnected(t *testing.T) {
 
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
-	var input atomic.Pointer[inputDestination]
+	var control atomic.Pointer[controlDestination]
 	ui := &runtimeState{events: make(chan renderEvent, 1)}
 	errs := make(chan error, 1)
-	go forwardInput(ctx, stdinR, &input, ui, errs, cancel)
+	go forwardInput(ctx, stdinR, &control, ui, errs, cancel)
 
 	if _, err := stdinW.Write([]byte{0x03}); err != nil {
 		t.Fatalf("stdin write = %v", err)
@@ -488,9 +446,9 @@ func TestCtrlCExitsWhileDisconnected(t *testing.T) {
 func TestInputRoutesAfterConnectionDestinationIsInstalled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var input atomic.Pointer[inputDestination]
+	var control atomic.Pointer[controlDestination]
 	frames := make(chan protocol.Frame, 1)
-	if err := sendCurrentInputEncoded(&input, protocol.MsgInputBytes, protocol.InputBytes{Data: []byte("before")}, protocol.EncodeInputBytes); err != nil {
+	if err := sendCurrentControlEncoded(&control, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: []byte("before")}, protocol.EncodeFrontendInputBytes); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -498,8 +456,8 @@ func TestInputRoutesAfterConnectionDestinationIsInstalled(t *testing.T) {
 		t.Fatal("input routed without a connection destination")
 	default:
 	}
-	input.Store(&inputDestination{frames: frames, done: ctx.Done()})
-	if err := sendCurrentInputEncoded(&input, protocol.MsgInputBytes, protocol.InputBytes{Data: []byte("after")}, protocol.EncodeInputBytes); err != nil {
+	control.Store(&controlDestination{frames: frames, done: ctx.Done()})
+	if err := sendCurrentControlEncoded(&control, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: []byte("after")}, protocol.EncodeFrontendInputBytes); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -509,21 +467,48 @@ func TestInputRoutesAfterConnectionDestinationIsInstalled(t *testing.T) {
 	}
 }
 
-func TestDroppedPredictedInputQueuesResetAfterLocalEvent(t *testing.T) {
+func TestDroppedFrontendInputDoesNotQueuePredictionEvents(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	frames := make(chan protocol.Frame)
-	var input atomic.Pointer[inputDestination]
-	input.Store(&inputDestination{frames: frames, done: done})
+	var control atomic.Pointer[controlDestination]
+	control.Store(&controlDestination{frames: frames, done: done})
 	ui := &runtimeState{events: make(chan renderEvent, 2)}
-	if _, err := sendCurrentPredictedInput(&input, ui, []byte("a")); err != nil {
+	if _, err := sendCurrentFrontendInput(&control, ui, []byte("a"), []byte("a")); err != nil {
 		t.Fatal(err)
 	}
-	if event := <-ui.events; event.(localInputEvent).data[0] != 'a' {
-		t.Fatalf("first event = %#v", event)
+	select {
+	case event := <-ui.events:
+		t.Fatalf("unexpected prediction event = %#v", event)
+	default:
 	}
-	if event := <-ui.events; event != (inputPredictionResetEvent{}) {
-		t.Fatalf("second event = %#v", event)
+}
+
+func TestQueuedFrontendInputQueuesDecodedPrediction(t *testing.T) {
+	done := make(chan struct{})
+	frames := make(chan protocol.Frame, 1)
+	var control atomic.Pointer[controlDestination]
+	control.Store(&controlDestination{frames: frames, done: done})
+	ui := &runtimeState{events: make(chan renderEvent, 1)}
+	if _, err := sendCurrentFrontendInput(&control, ui, []byte("\x1b[97u"), []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-ui.events:
+		input, ok := event.(localInputEvent)
+		if !ok || string(input.data) != "a" {
+			t.Fatalf("prediction event = %#v", event)
+		}
+	default:
+		t.Fatal("queued input did not queue its prediction")
+	}
+	select {
+	case frame := <-frames:
+		if frame.Type != protocol.MsgFrontendInputBytes {
+			t.Fatalf("frame type = %d", frame.Type)
+		}
+	default:
+		t.Fatal("frontend input frame was not queued")
 	}
 }
 
@@ -546,6 +531,92 @@ func TestPaneBatchBeforeLayoutIsBuffered(t *testing.T) {
 	}
 	ui.emit(layoutEvent{layout: testSnapshotLayout(9)})
 	waitForBufferText(t, &stdout, "buffered")
+}
+
+func TestFrontendTerminalControlUsesRenderWriter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout lockedBuffer
+	ui := &runtimeState{stdout: &stdout, events: make(chan renderEvent, 8), renderDone: make(chan struct{})}
+	errs := make(chan error, 1)
+	go ui.renderLoop(ctx, errs)
+	want := []byte("\x1b[?1003h\x1b[?1006h")
+	if err := ui.writeTerminal(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	if got := stdout.Bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("terminal output = %q", got)
+	}
+}
+
+func TestControlLoopRegistersExitCommandBeforeTerminalWrite(t *testing.T) {
+	var wire bytes.Buffer
+	encoder := protocol.NewEncoder(&wire)
+	exitCommand := []byte("restore")
+	payload, err := protocol.EncodeFrontendRegisterTerminalExitCommand(nil, protocol.FrontendRegisterTerminalExitCommand{Data: exitCommand})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendRegisterTerminalExitCommand, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	wantWrite := []byte("setup")
+	payload, err = protocol.EncodeFrontendTerminalWrite(nil, protocol.FrontendTerminalWrite{Data: wantWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendTerminalWrite, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout lockedBuffer
+	ui := &runtimeState{stdout: &stdout, events: make(chan renderEvent, 8), renderDone: make(chan struct{})}
+	go ui.renderLoop(ctx, make(chan error, 1))
+	done := make(chan connectionResult, 1)
+	controlLoop(protocol.NewDecoder(&wire, protocol.DefaultMaxFrameSize), ui, done, nil)
+	if result := <-done; result.err != nil {
+		t.Fatal(result.err)
+	}
+	if err := ui.executeTerminalExitCommand(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := stdout.Bytes(); !bytes.Equal(got, append(wantWrite, exitCommand...)) {
+		t.Fatalf("terminal output = %q", got)
+	}
+}
+
+func TestTerminalShutdownEndsSingleWriter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout lockedBuffer
+	ui := &runtimeState{
+		stdout:            &stdout,
+		events:            make(chan renderEvent, 8),
+		renderDone:        make(chan struct{}),
+		renderExitCommand: make(chan []byte, 1),
+	}
+	go ui.renderLoop(ctx, make(chan error, 1))
+	if err := ui.registerTerminalExitCommand(ctx, []byte("registered-exit")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ui.shutdownTerminal(ctx, []byte("fixed-exit")); err != nil {
+		t.Fatal(err)
+	}
+	<-ui.renderDone
+	if pending := <-ui.renderExitCommand; len(pending) != 0 {
+		t.Fatalf("pending exit command = %q", pending)
+	}
+	if got := stdout.String(); got != "registered-exitfixed-exit" {
+		t.Fatalf("terminal output = %q", got)
+	}
+	if err := ui.writeTerminal(ctx, []byte("late")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("late terminal write error = %v", err)
+	}
+	if got := stdout.String(); got != "registered-exitfixed-exit" {
+		t.Fatalf("late output reached terminal: %q", got)
+	}
 }
 
 func TestStoppedConnectionEventsAreDropped(t *testing.T) {
@@ -656,7 +727,7 @@ func TestCleanQUICCloseWinsWhenOutputEOFArrivesFirst(t *testing.T) {
 
 	done := make(chan connectionResult, 1)
 	err := &quic.ApplicationError{ErrorCode: 0, ErrorMessage: "server stopped"}
-	managementLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), ui, done, nil)
+	controlLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), ui, done, nil)
 	if result := <-done; !result.graceful || result.err != nil {
 		t.Fatalf("terminal result = %#v, want graceful", result)
 	}
@@ -668,7 +739,7 @@ func TestSessionReplacementIsTerminal(t *testing.T) {
 		ErrorMessage: "session attached elsewhere",
 	}
 	done := make(chan connectionResult, 1)
-	managementLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), &runtimeState{}, done, nil)
+	controlLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), &runtimeState{}, done, nil)
 	if result := <-done; !result.graceful || result.err != nil || result.terminalMessage != "session attached elsewhere" {
 		t.Fatalf("replacement result = %#v, want graceful terminal result with status message", result)
 	}

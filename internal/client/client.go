@@ -64,12 +64,28 @@ type Config struct {
 }
 
 type runtimeState struct {
-	stdout               io.Writer
-	events               chan renderEvent
-	diagnostics          *renderDiagnostics
-	renderDone           chan struct{}
-	dropConnectionEvents atomic.Bool
-	rectangularScroll    bool
+	stdout                io.Writer
+	events                chan renderEvent
+	diagnostics           *renderDiagnostics
+	renderDone            chan struct{}
+	renderExitCommand     chan []byte
+	dropConnectionEvents  atomic.Bool
+	appliedLayoutRevision atomic.Uint64
+	rectangularScroll     bool
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		data = data[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 type renderEvent any
@@ -107,7 +123,6 @@ type paneFrameEvent struct {
 	frame renderFrame
 }
 type localInputEvent struct{ data []byte }
-type inputPredictionResetEvent struct{}
 type layoutEvent struct{ layout protocol.WindowLayout }
 type sizeEvent struct{ cols, rows int }
 type reconnectEvent struct {
@@ -116,6 +131,25 @@ type reconnectEvent struct {
 }
 type terminalStatusEvent struct{ message string }
 type renderBarrierEvent struct{ done chan struct{} }
+
+type terminalWriteEvent struct {
+	data []byte
+	done chan error
+}
+
+type terminalExitCommandEvent struct {
+	data []byte
+	done chan struct{}
+}
+
+type terminalExitEvent struct{ done chan error }
+
+type terminalShutdownEvent struct {
+	data []byte
+	done chan error
+}
+
+var errRenderShutdown = errors.New("render loop shutdown")
 
 func ParseTarget(raw string) (Target, error) {
 	raw = strings.TrimSpace(raw)
@@ -197,18 +231,17 @@ func Run(ctx context.Context, cfg Config) error {
 		events:            make(chan renderEvent, 256),
 		diagnostics:       diagnostics,
 		renderDone:        make(chan struct{}),
+		renderExitCommand: make(chan []byte, 1),
 		rectangularScroll: true,
 	}
 	ui.dropConnectionEvents.Store(false)
-	go ui.renderLoop(clientCtx, streamErrs)
+	renderCtx, stopRender := context.WithCancel(context.Background())
+	go ui.renderLoop(renderCtx, streamErrs)
 	ui.emit(sizeEvent{cols: int(cols), rows: int(rows)})
 
-	var terminalMu sync.Mutex
 	var rawState *term.State
 	terminalActive := false
 	enterTerminal := func() error {
-		terminalMu.Lock()
-		defer terminalMu.Unlock()
 		if terminalActive {
 			return nil
 		}
@@ -216,7 +249,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if err != nil {
 			return fmt.Errorf("set terminal raw mode: %w", err)
 		}
-		if _, err := io.WriteString(cfg.Stdout, "\x1b[?1049h\x1b[?69h\x1b[H\x1b[2J"); err != nil {
+		if err := ui.writeTerminal(clientCtx, []byte("\x1b[?1049h\x1b[?69h\x1b[H\x1b[2J")); err != nil {
 			_ = term.Restore(int(cfg.Stdin.Fd()), state)
 			return fmt.Errorf("enter alternate screen: %w", err)
 		}
@@ -225,44 +258,44 @@ func Run(ctx context.Context, cfg Config) error {
 		return nil
 	}
 	restoreTerminal := func() {
-		terminalMu.Lock()
-		defer terminalMu.Unlock()
+		fixedExit := []byte(fmt.Sprintf("\x1b[r\x1b[1;%ds\x1b[?69l\x1b[?25h\x1b[0m\x1b[?1049l", cols))
+		fallback := false
+		if terminalActive {
+			if err := ui.shutdownTerminal(context.Background(), fixedExit); err != nil {
+				fallback = true
+			}
+		}
+		stopRender()
+		<-ui.renderDone
+		pendingExit := <-ui.renderExitCommand
+		if terminalActive && (fallback || len(pendingExit) > 0) {
+			cleanup := append(append([]byte(nil), pendingExit...), fixedExit...)
+			_ = writeAll(cfg.Stdout, cleanup)
+		}
 		if !terminalActive {
 			return
 		}
-		_, _ = fmt.Fprintf(cfg.Stdout, "\x1b[r\x1b[1;%ds\x1b[?69l\x1b[?25h\x1b[0m\x1b[?1049l", cols)
 		_ = term.Restore(int(cfg.Stdin.Fd()), rawState)
 		terminalActive = false
 	}
 	defer restoreTerminal()
 
-	restoreSignals := make(chan os.Signal, 1)
-	signal.Notify(restoreSignals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(restoreSignals)
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-restoreSignals:
-			restoreTerminal()
-		}
-	}()
-
-	var input atomic.Pointer[inputDestination]
+	var control atomic.Pointer[controlDestination]
 
 	ui.beginConnection(false, time.Now())
 	live, err := openConnection(clientCtx, bootstrap, hostname, cols, rows, cfg, "", ui, enterTerminal)
 	if err != nil {
 		return err
 	}
-	input.Store(live.inputDestination())
-	go forwardInput(clientCtx, cfg.Stdin, &input, ui, streamErrs, cancelClient)
-	go forwardResize(clientCtx, cfg.Stdin, &input, ui, streamErrs)
+	control.Store(live.controlDestination())
+	go forwardInput(clientCtx, cfg.Stdin, &control, ui, streamErrs, cancelClient)
+	go forwardResize(clientCtx, cfg.Stdin, &control, ui, streamErrs)
 
 	for {
 		select {
 		case result := <-live.done:
 			ui.stopConnection()
-			clearInputDestination(&input, live.inputFrames)
+			clearControlDestination(&control, live.controlFrames)
 			live.destroy()
 			ui.sync(clientCtx)
 			if result.graceful {
@@ -276,6 +309,7 @@ func Run(ctx context.Context, cfg Config) error {
 			if clientCtx.Err() != nil {
 				return clientExitError(clientCtx)
 			}
+			_ = ui.executeTerminalExitCommand(clientCtx)
 			lastContact := live.lastContactTime()
 			ui.markDisconnected(lastContact)
 			resumeToken := live.resumeToken
@@ -289,7 +323,7 @@ func Run(ctx context.Context, cfg Config) error {
 				if reconnectErr == nil {
 					live = candidate
 					ui.beginConnection(false, lastContact)
-					input.Store(live.inputDestination())
+					control.Store(live.controlDestination())
 					break
 				}
 				var terminalErr *terminalAttachError
@@ -305,12 +339,12 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 		case err := <-streamErrs:
 			if err != nil {
-				clearInputDestination(&input, live.inputFrames)
+				clearControlDestination(&control, live.controlFrames)
 				live.destroy()
 				return err
 			}
 		case <-clientCtx.Done():
-			clearInputDestination(&input, live.inputFrames)
+			clearControlDestination(&control, live.controlFrames)
 			live.destroy()
 			return clientExitError(clientCtx)
 		}
@@ -324,12 +358,12 @@ func clientExitError(ctx context.Context) error {
 	return ctx.Err()
 }
 
-type inputDestination struct {
+type controlDestination struct {
 	frames chan<- protocol.Frame
 	done   <-chan struct{}
 }
 
-func clearInputDestination(current *atomic.Pointer[inputDestination], frames chan<- protocol.Frame) {
+func clearControlDestination(current *atomic.Pointer[controlDestination], frames chan<- protocol.Frame) {
 	for {
 		destination := current.Load()
 		if destination == nil || destination.frames != frames || current.CompareAndSwap(destination, nil) {
@@ -338,7 +372,7 @@ func clearInputDestination(current *atomic.Pointer[inputDestination], frames cha
 	}
 }
 
-func sendCurrentInput(current *atomic.Pointer[inputDestination], frame protocol.Frame) error {
+func sendCurrentControl(current *atomic.Pointer[controlDestination], frame protocol.Frame) error {
 	destination := current.Load()
 	if destination == nil {
 		return nil // disconnected input is deliberately dropped
@@ -351,29 +385,33 @@ func sendCurrentInput(current *atomic.Pointer[inputDestination], frame protocol.
 	}
 }
 
-func sendCurrentInputEncoded[T any](current *atomic.Pointer[inputDestination], msgType uint64, value T, encode func([]byte, T) ([]byte, error)) error {
+func sendCurrentControlEncoded[T any](current *atomic.Pointer[controlDestination], msgType uint64, value T, encode func([]byte, T) ([]byte, error)) error {
 	payload, err := encode(nil, value)
 	if err != nil {
 		return err
 	}
-	return sendCurrentInput(current, protocol.Frame{Type: msgType, Payload: payload})
+	return sendCurrentControl(current, protocol.Frame{Type: msgType, Payload: payload})
 }
 
-func sendCurrentPredictedInput(current *atomic.Pointer[inputDestination], ui *runtimeState, data []byte) (bool, error) {
+func sendCurrentFrontendInput(current *atomic.Pointer[controlDestination], ui *runtimeState, data, prediction []byte) (bool, error) {
 	destination := current.Load()
 	if destination == nil {
 		return false, nil
 	}
-	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: data})
+	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{
+		LayoutRevision: ui.appliedLayoutRevision.Load(),
+		Data:           data,
+	})
 	if err != nil {
 		return true, err
 	}
-	ui.emit(localInputEvent{data: append([]byte(nil), data...)})
 	select {
-	case destination.frames <- protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}:
+	case destination.frames <- protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}:
+		if len(prediction) > 0 {
+			ui.emit(localInputEvent{data: append([]byte(nil), prediction...)})
+		}
 		return true, nil
 	case <-destination.done:
-		ui.emit(inputPredictionResetEvent{})
 		return true, nil
 	}
 }
@@ -385,19 +423,18 @@ type connectionResult struct {
 }
 
 type liveConnection struct {
-	conn        quic.Connection
-	mgmtFrames  chan protocol.Frame
-	inputFrames chan protocol.Frame
-	cancel      context.CancelFunc
-	ctx         context.Context
-	done        chan connectionResult
-	resumeToken string
-	lastContact atomic.Int64
-	workers     sync.WaitGroup
+	conn          quic.Connection
+	controlFrames chan protocol.Frame
+	cancel        context.CancelFunc
+	ctx           context.Context
+	done          chan connectionResult
+	resumeToken   string
+	lastContact   atomic.Int64
+	workers       sync.WaitGroup
 }
 
-func (c *liveConnection) inputDestination() *inputDestination {
-	return &inputDestination{frames: c.inputFrames, done: c.ctx.Done()}
+func (c *liveConnection) controlDestination() *controlDestination {
+	return &controlDestination{frames: c.controlFrames, done: c.ctx.Done()}
 }
 
 func (c *liveConnection) noteContact() { c.lastContact.Store(time.Now().UnixNano()) }
@@ -428,7 +465,7 @@ type terminalAttachError struct{ reason string }
 
 func (e *terminalAttachError) Error() string { return e.reason }
 
-func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, hostname string, cols, rows uint16, cfg Config, resumeToken string, ui *runtimeState, onFirstManagementFrame func() error) (*liveConnection, error) {
+func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, hostname string, cols, rows uint16, cfg Config, resumeToken string, ui *runtimeState, prepareFrontend func() error) (*liveConnection, error) {
 	tlsConfig, err := loadTLSConfig(bootstrap.CertSPKISHA256)
 	if err != nil {
 		return nil, err
@@ -445,49 +482,38 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 	}
 	connCtx, cancel := context.WithCancel(ctx)
 	live := &liveConnection{
-		conn:        conn,
-		mgmtFrames:  make(chan protocol.Frame, 64),
-		inputFrames: make(chan protocol.Frame, 64),
-		cancel:      cancel,
-		ctx:         connCtx,
-		done:        make(chan connectionResult, 1),
+		conn:          conn,
+		controlFrames: make(chan protocol.Frame, 256),
+		cancel:        cancel,
+		ctx:           connCtx,
+		done:          make(chan connectionResult, 1),
 	}
 	fail := func(err error) (*liveConnection, error) {
+		_ = ui.executeTerminalExitCommand(context.Background())
 		ui.stopConnection()
 		live.destroy()
 		ui.sync(ctx)
 		return nil, err
 	}
 	live.noteContact()
-	mgmtStream, err := conn.OpenStreamSync(ctx)
+	controlStream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		return fail(fmt.Errorf("open management stream: %w", err))
-	}
-	inputStream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		return fail(fmt.Errorf("open input stream: %w", err))
+		return fail(fmt.Errorf("open control stream: %w", err))
 	}
 	errs := make(chan error, 8)
-	live.start(func() { writeFrames(connCtx, mgmtStream, live.mgmtFrames, errs) })
-	live.start(func() { writeFrames(connCtx, inputStream, live.inputFrames, errs) })
-	if err := enqueueEncoded(live.mgmtFrames, protocol.MsgOpenManagementStream, protocol.StreamOpen{StreamType: protocol.StreamTypeManagement}, protocol.EncodeStreamOpen); err != nil {
-		return fail(err)
-	}
+	live.start(func() { writeFrames(connCtx, controlStream, live.controlFrames, errs) })
 	if resumeToken == "" {
-		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, Token: bootstrap.AttachToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionAttach)
+		err = enqueueEncoded(live.controlFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, Token: bootstrap.AttachToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionAttach)
 	} else {
-		err = enqueueEncoded(live.mgmtFrames, protocol.MsgSessionResume, protocol.SessionResume{Version: protocol.ProtocolVersion, ResumeToken: resumeToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionResume)
+		err = enqueueEncoded(live.controlFrames, protocol.MsgSessionResume, protocol.SessionResume{Version: protocol.ProtocolVersion, ResumeToken: resumeToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionResume)
 	}
 	if err != nil {
 		return fail(err)
 	}
-	if err := enqueueEncoded(live.inputFrames, protocol.MsgOpenInputStream, protocol.StreamOpen{StreamType: protocol.StreamTypeInput}, protocol.EncodeStreamOpen); err != nil {
-		return fail(err)
-	}
-	mgmtDecoder := protocol.NewDecoder(mgmtStream, protocol.DefaultMaxFrameSize)
-	attachResult, err := readInitialManagementFrame(mgmtDecoder, onFirstManagementFrame)
+	controlDecoder := protocol.NewDecoder(controlStream, protocol.DefaultMaxFrameSize)
+	attachResult, err := controlDecoder.ReadFrame()
 	if err != nil {
-		return fail(err)
+		return fail(fmt.Errorf("read session attachment result: %w", err))
 	}
 	switch attachResult.Type {
 	case protocol.MsgSessionAttachOK:
@@ -517,6 +543,39 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 	default:
 		return fail(fmt.Errorf("unexpected session attachment result %d", attachResult.Type))
 	}
+	exitCommandFrame, err := controlDecoder.ReadFrame()
+	if err != nil {
+		return fail(fmt.Errorf("read frontend terminal exit command: %w", err))
+	}
+	if exitCommandFrame.Type != protocol.MsgFrontendRegisterTerminalExitCommand {
+		return fail(fmt.Errorf("expected frontend terminal exit command, got message type %d", exitCommandFrame.Type))
+	}
+	exitCommand, err := protocol.DecodeFrontendRegisterTerminalExitCommand(exitCommandFrame.Payload)
+	if err != nil {
+		return fail(fmt.Errorf("decode frontend terminal exit command: %w", err))
+	}
+	setupFrame, err := controlDecoder.ReadFrame()
+	if err != nil {
+		return fail(fmt.Errorf("read frontend terminal setup: %w", err))
+	}
+	if setupFrame.Type != protocol.MsgFrontendTerminalWrite {
+		return fail(fmt.Errorf("expected frontend terminal setup, got message type %d", setupFrame.Type))
+	}
+	setup, err := protocol.DecodeFrontendTerminalWrite(setupFrame.Payload)
+	if err != nil {
+		return fail(fmt.Errorf("decode frontend terminal setup: %w", err))
+	}
+	if prepareFrontend != nil {
+		if err := prepareFrontend(); err != nil {
+			return fail(err)
+		}
+	}
+	if err := ui.registerTerminalExitCommand(ctx, exitCommand.Data); err != nil {
+		return fail(err)
+	}
+	if err := ui.writeTerminal(ctx, setup.Data); err != nil {
+		return fail(err)
+	}
 	outputReady := make(chan struct{})
 	live.start(func() { acceptOutputStreams(connCtx, conn, ui, outputReady, errs, live.start, &live.lastContact) })
 	select {
@@ -526,12 +585,12 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 	case <-ctx.Done():
 		return fail(ctx.Err())
 	}
-	live.start(func() { managementLoop(mgmtDecoder, ui, live.done, &live.lastContact) })
+	live.start(func() { controlLoop(controlDecoder, ui, live.done, &live.lastContact) })
 	live.start(func() {
 		for {
 			select {
 			case <-errs:
-				// The management stream is the authoritative lifecycle signal.
+				// The control stream is the authoritative lifecycle signal.
 			case <-connCtx.Done():
 				return
 			}
@@ -546,19 +605,6 @@ func quicDialError(addr string, err error) error {
 		return fmt.Errorf("UDP %s is unreachable: %w", addr, err)
 	}
 	return fmt.Errorf("dial %s: %w", addr, err)
-}
-
-func readInitialManagementFrame(decoder *protocol.Decoder, onFrame func() error) (protocol.Frame, error) {
-	frame, err := decoder.ReadFrame()
-	if err != nil {
-		return protocol.Frame{}, fmt.Errorf("read session attachment result: %w", err)
-	}
-	if onFrame != nil {
-		if err := onFrame(); err != nil {
-			return protocol.Frame{}, err
-		}
-	}
-	return frame, nil
 }
 
 func waitReconnect(ctx context.Context, delay time.Duration) error {
@@ -848,7 +894,7 @@ func (c *displayFrameCompiler) appendFill(fill protocol.Fill) error {
 	return nil
 }
 
-func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- connectionResult, lastContact *atomic.Int64) {
+func controlLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- connectionResult, lastContact *atomic.Int64) {
 	for {
 		frame, err := decoder.ReadFrame()
 		if err != nil {
@@ -866,7 +912,7 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- con
 				done <- connectionResult{}
 				return
 			}
-			done <- connectionResult{err: fmt.Errorf("read management frame: %w", err)}
+			done <- connectionResult{err: fmt.Errorf("read control frame: %w", err)}
 			return
 		}
 		if lastContact != nil {
@@ -880,6 +926,26 @@ func managementLoop(decoder *protocol.Decoder, ui *runtimeState, done chan<- con
 				return
 			}
 			ui.emit(layoutEvent{layout: msg})
+		case protocol.MsgFrontendTerminalWrite:
+			msg, err := protocol.DecodeFrontendTerminalWrite(frame.Payload)
+			if err != nil {
+				done <- connectionResult{err: fmt.Errorf("decode FRONTEND_TERMINAL_WRITE: %w", err)}
+				return
+			}
+			if err := ui.writeTerminal(context.Background(), msg.Data); err != nil {
+				done <- connectionResult{err: err}
+				return
+			}
+		case protocol.MsgFrontendRegisterTerminalExitCommand:
+			msg, err := protocol.DecodeFrontendRegisterTerminalExitCommand(frame.Payload)
+			if err != nil {
+				done <- connectionResult{err: fmt.Errorf("decode FRONTEND_REGISTER_TERMINAL_EXIT_COMMAND: %w", err)}
+				return
+			}
+			if err := ui.registerTerminalExitCommand(context.Background(), msg.Data); err != nil {
+				done <- connectionResult{err: err}
+				return
+			}
 		default:
 		}
 	}
@@ -891,13 +957,15 @@ func isTerminalQUICClose(err error) bool {
 		(applicationErr.ErrorCode == 0 || applicationErr.ErrorCode == protocol.SessionReplacedErrorCode)
 }
 
-func forwardInput(ctx context.Context, stdin *os.File, input *atomic.Pointer[inputDestination], ui *runtimeState, errs chan<- error, cancel context.CancelCauseFunc) {
+func forwardInput(ctx context.Context, stdin *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error, cancel context.CancelCauseFunc) {
 	buf := make([]byte, 4096)
+	var predictionDecoder predictionInputDecoder
 	for {
 		n, err := stdin.Read(buf)
 		if n > 0 {
 			data := append([]byte(nil), buf[:n]...)
-			connected, sendErr := sendCurrentPredictedInput(input, ui, data)
+			prediction := predictionDecoder.Feed(data)
+			connected, sendErr := sendCurrentFrontendInput(control, ui, data, prediction)
 			if sendErr != nil {
 				if ctx.Err() != nil {
 					return
@@ -920,7 +988,7 @@ func forwardInput(ctx context.Context, stdin *os.File, input *atomic.Pointer[inp
 	}
 }
 
-func forwardResize(ctx context.Context, tty *os.File, input *atomic.Pointer[inputDestination], ui *runtimeState, errs chan<- error) {
+func forwardResize(ctx context.Context, tty *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error) {
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, syscall.SIGWINCH)
 	defer signal.Stop(sigch)
@@ -935,10 +1003,10 @@ func forwardResize(ctx context.Context, tty *os.File, input *atomic.Pointer[inpu
 				return
 			}
 			ui.emit(sizeEvent{cols: int(cols), rows: int(rows)})
-			if sendErr := sendCurrentInputEncoded(input, protocol.MsgResizePane, protocol.ResizePane{
+			if sendErr := sendCurrentControlEncoded(control, protocol.MsgFrontendResize, protocol.FrontendResize{
 				Cols: cols,
 				Rows: drawableRows(int(rows)),
-			}, protocol.EncodeResizePane); sendErr != nil {
+			}, protocol.EncodeFrontendResize); sendErr != nil {
 				errs <- sendErr
 				return
 			}
@@ -1566,9 +1634,15 @@ func (s *scanoutState) setTerminalStatus(message string) {
 }
 
 func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
+	var terminalExitCommand []byte
 	if r.renderDone != nil {
 		defer close(r.renderDone)
 	}
+	defer func() {
+		if r.renderExitCommand != nil {
+			r.renderExitCommand <- append([]byte(nil), terminalExitCommand...)
+		}
+	}()
 	state := newScanoutState(r.rectangularScroll)
 	present := func(reason string) error {
 		buf := state.takeANSI()
@@ -1578,8 +1652,13 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 		if len(buf) == 0 {
 			return nil
 		}
-		_, err := r.stdout.Write(buf)
-		return err
+		if err := writeAll(r.stdout, buf); err != nil {
+			return err
+		}
+		if state.layout.LayoutRevision != 0 {
+			r.appliedLayoutRevision.Store(state.layout.LayoutRevision)
+		}
+		return nil
 	}
 	handleEvent := func(event renderEvent) (bool, string, error) {
 		needsPresent := false
@@ -1616,9 +1695,40 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 			}
 			needsPresent, err = state.acceptLocalInput(e.data)
 			reason = "local-input"
-		case inputPredictionResetEvent:
-			needsPresent, err = state.resetPrediction()
-			reason = "input-drop"
+		case terminalWriteEvent:
+			if presentErr := present("before terminal control write"); presentErr != nil {
+				e.done <- presentErr
+				return false, "", presentErr
+			}
+			err = writeAll(r.stdout, e.data)
+			e.done <- err
+		case terminalExitCommandEvent:
+			terminalExitCommand = append(terminalExitCommand[:0], e.data...)
+			close(e.done)
+		case terminalExitEvent:
+			if presentErr := present("before terminal exit command"); presentErr != nil {
+				e.done <- presentErr
+				return false, "", presentErr
+			}
+			err = writeAll(r.stdout, terminalExitCommand)
+			if err == nil {
+				terminalExitCommand = terminalExitCommand[:0]
+			}
+			e.done <- err
+		case terminalShutdownEvent:
+			if presentErr := present("before terminal shutdown"); presentErr != nil {
+				e.done <- presentErr
+				return false, "", presentErr
+			}
+			err = writeAll(r.stdout, terminalExitCommand)
+			if err == nil {
+				terminalExitCommand = terminalExitCommand[:0]
+				err = writeAll(r.stdout, e.data)
+			}
+			e.done <- err
+			if err == nil {
+				return false, "", errRenderShutdown
+			}
 		case layoutEvent:
 			if r.dropConnectionEvents.Load() {
 				return false, "", nil
@@ -1668,6 +1778,9 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 					draining = false
 				}
 			}
+			if errors.Is(err, errRenderShutdown) {
+				return
+			}
 			if err == nil && needsPresent {
 				err = present(reason)
 			}
@@ -1682,6 +1795,109 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 }
 
 func (r *runtimeState) emit(event renderEvent) { r.events <- event }
+
+func (r *runtimeState) writeTerminal(ctx context.Context, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	done := make(chan error, 1)
+	event := terminalWriteEvent{data: append([]byte(nil), data...), done: done}
+	select {
+	case r.events <- event:
+	case <-r.renderDone:
+		return io.ErrClosedPipe
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-r.renderDone:
+		select {
+		case err := <-done:
+			return err
+		default:
+			return io.ErrClosedPipe
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *runtimeState) registerTerminalExitCommand(ctx context.Context, data []byte) error {
+	done := make(chan struct{})
+	event := terminalExitCommandEvent{data: append([]byte(nil), data...), done: done}
+	select {
+	case r.events <- event:
+	case <-r.renderDone:
+		return io.ErrClosedPipe
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-r.renderDone:
+		select {
+		case <-done:
+			return nil
+		default:
+			return io.ErrClosedPipe
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *runtimeState) executeTerminalExitCommand(ctx context.Context) error {
+	done := make(chan error, 1)
+	event := terminalExitEvent{done: done}
+	select {
+	case r.events <- event:
+	case <-r.renderDone:
+		return io.ErrClosedPipe
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-r.renderDone:
+		select {
+		case err := <-done:
+			return err
+		default:
+			return io.ErrClosedPipe
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *runtimeState) shutdownTerminal(ctx context.Context, data []byte) error {
+	done := make(chan error, 1)
+	event := terminalShutdownEvent{data: append([]byte(nil), data...), done: done}
+	select {
+	case r.events <- event:
+	case <-r.renderDone:
+		return io.ErrClosedPipe
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-r.renderDone:
+		select {
+		case err := <-done:
+			return err
+		default:
+			return io.ErrClosedPipe
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 func (r *runtimeState) sync(ctx context.Context) {
 	done := make(chan struct{})

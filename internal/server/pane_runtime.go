@@ -419,7 +419,76 @@ func renderHistoryMove(output *renderOutput, view *paneHistoryView, move history
 	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: move.Cursor, Visible: true}}); err != nil {
 		return err
 	}
+	if err := output.present(); err != nil {
+		return err
+	}
+	if view.Selection != nil {
+		return renderHistorySelectionChange(output, view, nil, view.Selection)
+	}
+	return nil
+}
+
+const historySelectionStyleMask uint32 = 1 << 31
+
+func renderHistorySelectionChange(output *renderOutput, view *paneHistoryView, old, next *paneHistorySelection) error {
+	if view == nil || view.Snapshot == nil {
+		return nil
+	}
+	snapshot := view.Snapshot
+	for viewportRow := 0; viewportRow < snapshot.ViewportRows; viewportRow++ {
+		logicalRow := view.ViewTop + viewportRow
+		column := 0
+		for column < snapshot.Cols {
+			wasSelected := historySelectionContains(old, logicalRow, column)
+			isSelected := historySelectionContains(next, logicalRow, column)
+			if wasSelected == isSelected {
+				column++
+				continue
+			}
+			start := column
+			for column < snapshot.Cols &&
+				historySelectionContains(old, logicalRow, column) != historySelectionContains(next, logicalRow, column) &&
+				historySelectionContains(next, logicalRow, column) == isSelected {
+				column++
+			}
+			compiler := newDisplayCompiler(output, snapshot, snapshot.clusters, snapshot.Cols)
+			if isSelected {
+				compiler.installStyles = true
+				compiler.styleMapper = func(id uint32) uint32 { return historySelectionStyleMask | id }
+			}
+			if err := compiler.writeCells(viewportRow, start, snapshot.row(logicalRow)[start:column]); err != nil {
+				return err
+			}
+			if err := compiler.finish(); err != nil {
+				return err
+			}
+		}
+	}
+	compiler := newDisplayCompiler(output, snapshot, snapshot.clusters, snapshot.Cols)
+	if err := writeHistoryCounter(compiler, view, historyCounter(view)); err != nil {
+		return err
+	}
 	return output.present()
+}
+
+func historySelectionContains(selection *paneHistorySelection, row, column int) bool {
+	if selection == nil {
+		return false
+	}
+	start, end := normalizedHistorySelection(*selection)
+	if row < start.Row || row > end.Row {
+		return false
+	}
+	if start.Row == end.Row {
+		return column >= start.Col && column <= end.Col
+	}
+	if row == start.Row {
+		return column >= start.Col
+	}
+	if row == end.Row {
+		return column <= end.Col
+	}
+	return true
 }
 
 func writeHistoryMoveCells(compiler *displayCompiler, view *paneHistoryView, move historyMove) error {
@@ -540,7 +609,13 @@ func sendHistorySnapshot(output *renderOutput, pane *Pane, view *paneHistoryView
 	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: min(view.CursorCol, snapshot.Cols-1), Y: view.CursorRow - view.ViewTop}, Visible: true}}); err != nil {
 		return err
 	}
-	return output.present()
+	if err := output.present(); err != nil {
+		return err
+	}
+	if view.Selection != nil {
+		return renderHistorySelectionChange(output, view, nil, view.Selection)
+	}
+	return nil
 }
 
 func installStyle(output *renderOutput, id uint32, style protocol.Style) error {

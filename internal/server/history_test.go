@@ -60,6 +60,40 @@ func TestHistorySnapshotNeverSplitsClusterAcrossRows(t *testing.T) {
 	}
 }
 
+func TestHistorySelectionExtractsUTF8AndJoinsSoftWrappedRows(t *testing.T) {
+	term := newTerminal(5, 3)
+	setTestRows(term, nil, []decodedTestRow{
+		{Cells: []decodedTestCell{{Cluster: "h", Width: 1}, {Cluster: "e", Width: 1}, {Cluster: "l", Width: 1}, {Cluster: "l", Width: 1}, {Cluster: "o", Width: 1}}, WrapsNext: true},
+		{Cells: []decodedTestCell{{Cluster: "w", Width: 1}, {Cluster: "o", Width: 1}, {Cluster: "r", Width: 1}, {Cluster: "l", Width: 1}, {Cluster: "d", Width: 1}}},
+		{Cells: []decodedTestCell{{Cluster: "👩‍💻", Width: 2}, {Width: 0}, {Cluster: "!", Width: 1}, {Width: 1}, {Width: 1}}},
+	})
+	snapshot := captureTerminalHistorySnapshot(term)
+	defer snapshot.release()
+
+	data, err := extractHistorySelection(snapshot, paneHistorySelection{
+		Anchor: paneHistoryPosition{Row: 0, Col: 0},
+		Head:   paneHistoryPosition{Row: 2, Col: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), "helloworld\n👩‍💻!"; got != want {
+		t.Fatalf("selection = %q, want %q", got, want)
+	}
+}
+
+func TestHistorySelectionPositionSnapsWideContinuationToAnchor(t *testing.T) {
+	term := newTerminal(4, 1)
+	setTestRows(term, nil, []decodedTestRow{{Cells: []decodedTestCell{
+		{Cluster: "a", Width: 1}, {Cluster: "界", Width: 2}, {Width: 0}, {Cluster: "z", Width: 1},
+	}}})
+	view := &paneHistoryView{Snapshot: captureTerminalHistorySnapshot(term)}
+	defer view.Snapshot.release()
+	if got := view.pointerPosition(0, 2); got != (paneHistoryPosition{Row: 0, Col: 1}) {
+		t.Fatalf("continuation position = %#v", got)
+	}
+}
+
 func TestPanesRetainIndependentHistoryViews(t *testing.T) {
 	s := NewSession(0)
 	client := s.NewClient(0)
@@ -138,6 +172,62 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	}
 	if !displayCommandsContainText(decodePendingCommands(t, wire.Bytes()[historyBytes:]), "XYve") {
 		t.Fatal("exiting history did not render the pane's current terminal on the existing stream")
+	}
+}
+
+func TestHistoryKeyboardSelectionCopiesAndExits(t *testing.T) {
+	pane := &Pane{ID: 0, terminal: newTerminal(5, 2)}
+	row := func(text string) decodedTestRow {
+		cells := make([]decodedTestCell, 0, len(text))
+		for _, r := range text {
+			cells = append(cells, decodedTestCell{Cluster: string(r), Width: 1})
+		}
+		return decodedTestRow{Cells: cells}
+	}
+	setTestRows(pane.terminal, nil, []decodedTestRow{row("hello"), row("world")})
+	pane.terminal.CursorX = 0
+	pane.terminal.CursorY = 0
+	if result := pane.handleHistoryRequest(nil, &paneHistoryRequest{Action: paneHistoryEnter}); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+
+	data, err := pane.handleHistoryInput([]byte(" \x1b[C\x1b[C\x1b[C\x1b[C\r"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), "hello"; got != want {
+		t.Fatalf("keyboard selection = %q, want %q", got, want)
+	}
+	if pane.isHistoryMode() {
+		t.Fatal("keyboard copy did not exit history mode")
+	}
+}
+
+func TestHistoryMouseSelectionInstallsYellowHighlightStyle(t *testing.T) {
+	pane := &Pane{ID: 0, terminal: newTerminal(4, 1)}
+	setTestRows(pane.terminal, nil, []decodedTestRow{historyTestRow("text")})
+	var wire bytes.Buffer
+	output := newRenderOutput(&wire)
+	if result := pane.beginHistorySelectionNow(output, 0, 0, true); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	if result := pane.updateHistorySelectionNow(output, 0, 2); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+
+	var found bool
+	for _, command := range decodePendingCommands(t, wire.Bytes()) {
+		wantStyle := protocol.Style{
+			FG: protocol.Color{Mode: "indexed", Index: 0},
+			BG: protocol.Color{Mode: "indexed", Index: 226},
+		}
+		if command.Opcode == protocol.DisplayOpcodeStyleInstall && command.StyleID&historySelectionStyleMask != 0 && command.Style == wantStyle {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("selection did not install a black-on-yellow highlight style")
 	}
 }
 

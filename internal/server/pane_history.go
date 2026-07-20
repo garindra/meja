@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"strconv"
@@ -24,7 +25,22 @@ type paneHistoryView struct {
 	ViewTop   int
 	CursorRow int
 	CursorCol int
+	Selection *paneHistorySelection
 }
+
+type paneHistoryPosition struct {
+	Row int
+	Col int
+}
+
+type paneHistorySelection struct {
+	Anchor       paneHistoryPosition
+	Head         paneHistoryPosition
+	ExitOnFinish bool
+	CopySingle   bool
+}
+
+const maxClipboardSelectionBytes = 1 << 20
 
 type historyMove struct {
 	Delta      int
@@ -75,6 +91,17 @@ func (s *paneHistorySnapshot) row(row int) []cellWord {
 }
 
 func (s *paneHistorySnapshot) LookupStyle(id uint32) (protocol.Style, bool) {
+	if id&historySelectionStyleMask != 0 {
+		style, ok := s.LookupStyle(id &^ historySelectionStyleMask)
+		if !ok {
+			return protocol.Style{}, false
+		}
+		style = protocol.Style{
+			FG: protocol.Color{Mode: "indexed", Index: 0},
+			BG: protocol.Color{Mode: "indexed", Index: 226},
+		}
+		return style, true
+	}
 	if uint64(id) >= uint64(len(s.styles)) || s.styles[id].ID != id {
 		return protocol.Style{}, false
 	}
@@ -188,9 +215,9 @@ func (p *Pane) exitHistoryMode() (bool, error) {
 	return result.Changed, err
 }
 
-func (p *Pane) handleHistoryInput(data []byte) error {
-	_, err := p.sendHistoryRequest(paneHistoryRequest{Action: paneHistoryInput, Data: append([]byte(nil), data...)})
-	return err
+func (p *Pane) handleHistoryInput(data []byte) ([]byte, error) {
+	result, err := p.sendHistoryRequest(paneHistoryRequest{Action: paneHistoryInput, Data: append([]byte(nil), data...)})
+	return result.Data, err
 }
 
 func (p *Pane) sendHistoryRequest(request paneHistoryRequest) (paneHistoryResult, error) {
@@ -237,13 +264,241 @@ func (p *Pane) handleHistoryRequest(output *renderOutput, request *paneHistoryRe
 		return paneHistoryResult{Changed: changed, Err: err}
 	case paneHistoryInput:
 		return p.handleHistoryInputNow(output, request.Data)
+	case paneHistorySelectionBegin:
+		return p.beginHistorySelectionNow(output, request.Row, request.Column, request.Auto)
+	case paneHistorySelectionUpdate:
+		return p.updateHistorySelectionNow(output, request.Row, request.Column)
+	case paneHistorySelectionFinish:
+		return p.finishHistorySelectionNow(output)
+	case paneHistorySelectionCancel:
+		return p.cancelHistorySelectionNow()
 	default:
 		return paneHistoryResult{Err: fmt.Errorf("pane %d received invalid history action %d", p.ID, request.Action)}
 	}
 }
 
+func (p *Pane) beginHistorySelection(row, column int, auto bool) error {
+	result, err := p.sendHistoryRequest(paneHistoryRequest{Action: paneHistorySelectionBegin, Row: row, Column: column, Auto: auto})
+	if err != nil {
+		return err
+	}
+	return result.Err
+}
+
+func (p *Pane) updateHistorySelection(row, column int) error {
+	_, err := p.sendHistoryRequest(paneHistoryRequest{Action: paneHistorySelectionUpdate, Row: row, Column: column})
+	return err
+}
+
+func (p *Pane) finishHistorySelection() ([]byte, error) {
+	result, err := p.sendHistoryRequest(paneHistoryRequest{Action: paneHistorySelectionFinish})
+	if err != nil {
+		return nil, err
+	}
+	return result.Data, result.Err
+}
+
+func (p *Pane) cancelHistorySelection() error {
+	_, err := p.sendHistoryRequest(paneHistoryRequest{Action: paneHistorySelectionCancel})
+	return err
+}
+
+func (p *Pane) beginHistorySelectionNow(output *renderOutput, row, column int, auto bool) paneHistoryResult {
+	if !p.isHistoryMode() {
+		if err := p.installHistoryView(captureTerminalHistorySnapshot(p.terminal)); err != nil {
+			return paneHistoryResult{Err: err}
+		}
+		if output != nil {
+			if err := p.renderHistorySnapshot(output); err != nil {
+				p.exitHistoryModeNow()
+				return paneHistoryResult{Err: err}
+			}
+		}
+	}
+	view := p.historyView
+	position := view.pointerPosition(row, column)
+	old := view.Selection
+	view.Selection = &paneHistorySelection{Anchor: position, Head: position, ExitOnFinish: auto}
+	if output != nil {
+		if err := renderHistorySelectionChange(output, view, old, view.Selection); err != nil {
+			return paneHistoryResult{Err: err}
+		}
+	}
+	return paneHistoryResult{Changed: true}
+}
+
+func (p *Pane) updateHistorySelectionNow(output *renderOutput, row, column int) paneHistoryResult {
+	view := p.historyView
+	if view == nil || view.Selection == nil {
+		return paneHistoryResult{}
+	}
+	position := view.pointerPosition(row, column)
+	if position == view.Selection.Head {
+		return paneHistoryResult{}
+	}
+	old := *view.Selection
+	view.Selection.Head = position
+	if output != nil {
+		if err := renderHistorySelectionChange(output, view, &old, view.Selection); err != nil {
+			return paneHistoryResult{Err: err}
+		}
+	}
+	return paneHistoryResult{Changed: true}
+}
+
+func (p *Pane) finishHistorySelectionNow(output *renderOutput) paneHistoryResult {
+	view := p.historyView
+	if view == nil || view.Selection == nil {
+		return paneHistoryResult{}
+	}
+	selection := *view.Selection
+	var data []byte
+	var err error
+	if selection.Anchor != selection.Head || selection.CopySingle {
+		data, err = extractHistorySelection(view.Snapshot, selection)
+	}
+	resultErr := err
+	if selection.ExitOnFinish {
+		p.exitHistoryModeNow()
+		if output != nil {
+			if cleanupErr := sendFullRender(output, p); resultErr == nil {
+				resultErr = cleanupErr
+			}
+		}
+	} else {
+		view.Selection = nil
+		if output != nil {
+			if cleanupErr := renderHistorySelectionChange(output, view, &selection, nil); resultErr == nil {
+				resultErr = cleanupErr
+			}
+		}
+	}
+	return paneHistoryResult{Changed: true, Data: data, Err: resultErr}
+}
+
+func (p *Pane) cancelHistorySelectionNow() paneHistoryResult {
+	view := p.historyView
+	if view == nil || view.Selection == nil {
+		return paneHistoryResult{}
+	}
+	if view.Selection.ExitOnFinish {
+		p.exitHistoryModeNow()
+	} else {
+		view.Selection = nil
+	}
+	return paneHistoryResult{Changed: true}
+}
+
+func (v *paneHistoryView) pointerPosition(row, column int) paneHistoryPosition {
+	row = min(max(row, 0), v.Snapshot.ViewportRows-1)
+	column = min(max(column, 0), v.Snapshot.Cols-1)
+	logicalRow := v.ViewTop + row
+	cells := v.Snapshot.row(logicalRow)
+	for column > 0 && cells[column].width() == 0 {
+		column--
+	}
+	return paneHistoryPosition{Row: logicalRow, Col: column}
+}
+
+func (v *paneHistoryView) cursorPosition() paneHistoryPosition {
+	column := min(max(v.CursorCol, 0), v.Snapshot.Cols-1)
+	cells := v.Snapshot.row(v.CursorRow)
+	for column > 0 && cells[column].width() == 0 {
+		column--
+	}
+	return paneHistoryPosition{Row: v.CursorRow, Col: column}
+}
+
+func normalizedHistorySelection(selection paneHistorySelection) (paneHistoryPosition, paneHistoryPosition) {
+	start, end := selection.Anchor, selection.Head
+	if start.Row > end.Row || start.Row == end.Row && start.Col > end.Col {
+		start, end = end, start
+	}
+	return start, end
+}
+
+func extractHistorySelection(snapshot *paneHistorySnapshot, selection paneHistorySelection) ([]byte, error) {
+	start, end := normalizedHistorySelection(selection)
+	var out bytes.Buffer
+	for row := start.Row; row <= end.Row; row++ {
+		first, last := 0, snapshot.Cols-1
+		if row == start.Row {
+			first = start.Col
+		}
+		if row == end.Row {
+			last = end.Col
+		}
+		var line bytes.Buffer
+		cells := snapshot.row(row)
+		for column := first; column <= last; column++ {
+			cell := cells[column]
+			if cell.width() == 0 {
+				continue
+			}
+			text := cellTextFromStore(cell, snapshot.clusters)
+			if text == "" {
+				text = " "
+			}
+			line.WriteString(text)
+		}
+		lineBytes := line.Bytes()
+		if !snapshot.grid.logicalWrapped(row) || row == end.Row {
+			lineBytes = bytes.TrimRight(lineBytes, " ")
+		}
+		if out.Len()+len(lineBytes) > maxClipboardSelectionBytes {
+			return nil, fmt.Errorf("selection exceeds %d bytes", maxClipboardSelectionBytes)
+		}
+		out.Write(lineBytes)
+		if row < end.Row && !snapshot.grid.logicalWrapped(row) {
+			if out.Len()+1 > maxClipboardSelectionBytes {
+				return nil, fmt.Errorf("selection exceeds %d bytes", maxClipboardSelectionBytes)
+			}
+			out.WriteByte('\n')
+		}
+	}
+	return out.Bytes(), nil
+}
+
 func (p *Pane) handleHistoryInputNow(output *renderOutput, data []byte) paneHistoryResult {
 	for len(data) > 0 {
+		if data[0] == ' ' {
+			view := p.historyView
+			if view == nil {
+				return paneHistoryResult{}
+			}
+			old := view.Selection
+			position := view.cursorPosition()
+			view.Selection = &paneHistorySelection{Anchor: position, Head: position, ExitOnFinish: true, CopySingle: true}
+			if output != nil {
+				if err := renderHistorySelectionChange(output, view, old, view.Selection); err != nil {
+					return paneHistoryResult{Err: err}
+				}
+			}
+			data = data[1:]
+			continue
+		}
+		if data[0] == '\r' || data[0] == '\n' {
+			result := p.finishHistorySelectionNow(output)
+			if result.Changed || result.Err != nil {
+				return result
+			}
+			data = data[1:]
+			continue
+		}
+		if delta, consumed := decodeHistoryHorizontalInput(data); consumed > 0 {
+			view := p.historyView
+			view.CursorCol = min(max(view.CursorCol+delta, 0), view.Snapshot.Cols-1)
+			if view.Selection != nil {
+				view.Selection.Head = view.cursorPosition()
+			}
+			if output != nil {
+				if err := p.renderHistorySnapshot(output); err != nil {
+					return paneHistoryResult{Err: err}
+				}
+			}
+			data = data[min(consumed, len(data)):]
+			continue
+		}
 		direction, count, exit, consumed := decodeHistoryInput(data)
 		if consumed <= 0 {
 			consumed = 1
@@ -259,6 +514,9 @@ func (p *Pane) handleHistoryInputNow(output *renderOutput, data []byte) paneHist
 		}
 		if count < 0 {
 			if p.jumpHistory(count == -1) {
+				if p.historyView.Selection != nil {
+					p.historyView.Selection.Head = p.historyView.cursorPosition()
+				}
 				if output != nil {
 					if err := p.renderHistorySnapshot(output); err != nil {
 						return paneHistoryResult{Err: err}
@@ -267,6 +525,8 @@ func (p *Pane) handleHistoryInputNow(output *renderOutput, data []byte) paneHist
 			}
 			continue
 		}
+		selectionActive := p.historyView.Selection != nil
+		selectionMoved := false
 		for i := 0; i < count; i++ {
 			move, ok := p.moveHistory(direction)
 			if !ok {
@@ -275,14 +535,45 @@ func (p *Pane) handleHistoryInputNow(output *renderOutput, data []byte) paneHist
 			if !move.Changed {
 				break
 			}
-			if output != nil {
+			if p.historyView.Selection != nil {
+				p.historyView.Selection.Head = p.historyView.cursorPosition()
+				selectionMoved = true
+			}
+			if output != nil && !selectionActive {
 				if err := renderHistoryMove(output, p.historyView, move); err != nil {
 					return paneHistoryResult{Err: err}
 				}
 			}
 		}
+		if output != nil && selectionMoved {
+			if err := p.renderHistorySnapshot(output); err != nil {
+				return paneHistoryResult{Err: err}
+			}
+		}
 	}
 	return paneHistoryResult{}
+}
+
+func decodeHistoryHorizontalInput(data []byte) (delta, consumed int) {
+	if len(data) == 0 {
+		return 0, 0
+	}
+	switch data[0] {
+	case 'h':
+		return -1, 1
+	case 'l':
+		return 1, 1
+	case 0x1b:
+		if len(data) >= 3 && data[1] == '[' {
+			switch data[2] {
+			case 'D':
+				return -1, 3
+			case 'C':
+				return 1, 3
+			}
+		}
+	}
+	return 0, 0
 }
 
 func (p *Pane) renderHistorySnapshot(output *renderOutput) error {
@@ -323,6 +614,10 @@ func decodeHistoryInput(data []byte) (direction, count int, exit bool, consumed 
 		return 0, -1, false, 1
 	case 'G':
 		return 0, -2, false, 1
+	case 'k':
+		return -1, 1, false, 1
+	case 'j':
+		return 1, 1, false, 1
 	default:
 		return 0, 0, false, 1
 	}

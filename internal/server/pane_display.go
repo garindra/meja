@@ -29,12 +29,21 @@ type displayCompiler struct {
 	styles        displayStyleSource
 	installStyles bool
 	clusters      *clusterStore
+	styleMapper   func(uint32) uint32
 	pendingOpcode protocol.DisplayOpcode
 	pendingWidth  uint8
 	pendingStyle  uint32
 	pendingLength int
 	pendingStart  int
 	pendingFill   protocol.Fill
+}
+
+func (d *displayCompiler) cellStyleID(cell cellWord) uint32 {
+	id := uint32(cell.styleID())
+	if d.styleMapper != nil {
+		return d.styleMapper(id)
+	}
+	return id
 }
 
 type displayStyleSource interface {
@@ -64,7 +73,7 @@ func (d *displayCompiler) writeCells(row, column int, cells []cellWord) error {
 			if err := d.finish(); err != nil {
 				return err
 			}
-			if err := d.selectStyle(uint32(cell.styleID())); err != nil {
+			if err := d.selectStyle(d.cellStyleID(cell)); err != nil {
 				return err
 			}
 			if err := d.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteCluster, Width: cell.width(), Text: []byte(text)}); err != nil {
@@ -82,7 +91,7 @@ func (d *displayCompiler) writeCells(row, column int, cells []cellWord) error {
 			if j-i >= 3 {
 				count := j - i
 				r, _ := displayRune(cell, d.clusters)
-				if err := d.queueFill(protocol.Fill{Columns: count, Rune: r, Width: 1}, uint32(cell.styleID())); err != nil {
+				if err := d.queueFill(protocol.Fill{Columns: count, Rune: r, Width: 1}, d.cellStyleID(cell)); err != nil {
 					return err
 				}
 				d.advance(count)
@@ -91,7 +100,7 @@ func (d *displayCompiler) writeCells(row, column int, cells []cellWord) error {
 			}
 		}
 		width := cell.width()
-		styleID := uint32(cell.styleID())
+		styleID := d.cellStyleID(cell)
 		start := i
 		for i < len(cells) {
 			current := cells[i]
@@ -102,7 +111,7 @@ func (d *displayCompiler) writeCells(row, column int, cells []cellWord) error {
 			if !singleRune {
 				break
 			}
-			if uint32(current.styleID()) != styleID {
+			if d.cellStyleID(current) != styleID {
 				end, ok := d.blankBridgeEnd(cells, i, styleID)
 				if !ok {
 					break
@@ -146,11 +155,12 @@ func (d *displayCompiler) blankBridgeEnd(cells []cellWord, start int, targetStyl
 		if cell.width() != 1 || !singleRune || r != ' ' {
 			break
 		}
-		if !checked || uint32(cell.styleID()) != checkedStyle {
-			if !d.blankStylesEquivalent(uint32(cell.styleID()), targetStyle) {
+		cellStyle := d.cellStyleID(cell)
+		if !checked || cellStyle != checkedStyle {
+			if !d.blankStylesEquivalent(cellStyle, targetStyle) {
 				break
 			}
-			checkedStyle, checked = uint32(cell.styleID()), true
+			checkedStyle, checked = cellStyle, true
 		}
 		end++
 	}
@@ -159,7 +169,7 @@ func (d *displayCompiler) blankBridgeEnd(cells []cellWord, start int, targetStyl
 	}
 	next := cells[end]
 	r, singleRune := displayRune(next, d.clusters)
-	return end, next.width() > 0 && singleRune && r != ' ' && uint32(next.styleID()) == targetStyle
+	return end, next.width() > 0 && singleRune && r != ' ' && d.cellStyleID(next) == targetStyle
 }
 
 func (d *displayCompiler) blankStylesEquivalent(leftID, rightID uint32) bool {

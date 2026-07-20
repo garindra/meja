@@ -208,17 +208,17 @@ func (s *Session) publishWindowLayout() error {
 	}
 	client := s.clientInstance
 	if client != nil {
+		client.rememberLayout(layout)
 		for previous := client.highestLayoutRevision.Load(); layout.LayoutRevision > previous; previous = client.highestLayoutRevision.Load() {
 			if client.highestLayoutRevision.CompareAndSwap(previous, layout.LayoutRevision) {
 				break
 			}
 		}
 	}
-	mgmtFrames := s.currentManagementFrames()
-	if mgmtFrames == nil {
+	if client == nil || client.controlOut == nil {
 		return nil
 	}
-	return sendEncoded(mgmtFrames, protocol.MsgWindowLayout, layout, protocol.EncodeWindowLayout)
+	return sendEncoded(client.controlOut, protocol.MsgWindowLayout, layout, protocol.EncodeWindowLayout)
 }
 
 type outputHandoff struct {

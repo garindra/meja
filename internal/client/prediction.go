@@ -1,6 +1,185 @@
 package client
 
-import "github.com/garindra/meja/internal/protocol"
+import (
+	"bytes"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/garindra/meja/internal/protocol"
+)
+
+type predictionDecodeState uint8
+
+const (
+	predictionDecodeGround predictionDecodeState = iota
+	predictionDecodeEscape
+	predictionDecodeCSI
+	predictionDecodeSS3
+	predictionDecodeUTF8
+	predictionDecodePaste
+)
+
+var predictionPasteEnd = []byte("\x1b[201~")
+
+// predictionInputDecoder recognizes only input that the display-only predictor
+// can model safely. The original frontend bytes are still sent unchanged to the
+// server, which remains authoritative for input meaning and pane routing.
+type predictionInputDecoder struct {
+	state   predictionDecodeState
+	pending []byte
+}
+
+type kittyPredictionDisposition uint8
+
+const (
+	kittyPredictionBoundary kittyPredictionDisposition = iota
+	kittyPredictionKey
+	kittyPredictionIgnore
+)
+
+func (d *predictionInputDecoder) Feed(data []byte) []byte {
+	out := make([]byte, 0, len(data))
+	for _, b := range data {
+		switch d.state {
+		case predictionDecodePaste:
+			d.pending = append(d.pending, b)
+			if len(d.pending) > len(predictionPasteEnd) {
+				d.pending = append(d.pending[:0], d.pending[len(d.pending)-len(predictionPasteEnd):]...)
+			}
+			if bytes.Equal(d.pending, predictionPasteEnd) {
+				d.reset()
+			}
+		case predictionDecodeGround:
+			switch {
+			case b == 0x1b:
+				d.state = predictionDecodeEscape
+				d.pending = append(d.pending[:0], b)
+			case b < utf8.RuneSelf:
+				out = append(out, b)
+			default:
+				d.state = predictionDecodeUTF8
+				d.pending = append(d.pending[:0], b)
+			}
+		case predictionDecodeEscape:
+			d.pending = append(d.pending, b)
+			switch b {
+			case '[':
+				d.state = predictionDecodeCSI
+			case 'O':
+				d.state = predictionDecodeSS3
+			default:
+				out = append(out, 0)
+				d.reset()
+			}
+		case predictionDecodeSS3:
+			out = append(out, 0)
+			d.reset()
+		case predictionDecodeCSI:
+			d.pending = append(d.pending, b)
+			if len(d.pending) > maxPredictionSequenceBytes {
+				out = append(out, 0)
+				d.reset()
+				continue
+			}
+			if b < 0x40 || b > 0x7e {
+				continue
+			}
+			if bytes.Equal(d.pending, []byte("\x1b[200~")) {
+				out = append(out, 0)
+				d.state = predictionDecodePaste
+				d.pending = d.pending[:0]
+				continue
+			}
+			if isPredictionNeutralCSI(d.pending) {
+				// Pointer and focus reports do not themselves invalidate a
+				// keyboard prediction. Any resulting layout or pane render does.
+			} else if key, disposition := decodePredictableKittyKey(d.pending); disposition == kittyPredictionKey {
+				out = append(out, key)
+			} else if disposition == kittyPredictionBoundary {
+				out = append(out, 0)
+			}
+			d.reset()
+		case predictionDecodeUTF8:
+			d.pending = append(d.pending, b)
+			if !utf8.FullRune(d.pending) && len(d.pending) < utf8.UTFMax {
+				continue
+			}
+			out = append(out, 0)
+			d.reset()
+		}
+	}
+	return out
+}
+
+func (d *predictionInputDecoder) reset() {
+	d.state = predictionDecodeGround
+	d.pending = d.pending[:0]
+}
+
+const maxPredictionSequenceBytes = 512
+
+func isPredictionNeutralCSI(sequence []byte) bool {
+	if len(sequence) < 4 || sequence[0] != 0x1b || sequence[1] != '[' || sequence[2] != '<' ||
+		(sequence[len(sequence)-1] != 'M' && sequence[len(sequence)-1] != 'm') {
+		return false
+	}
+	params := strings.Split(string(sequence[3:len(sequence)-1]), ";")
+	if len(params) != 3 {
+		return false
+	}
+	button, err := strconv.ParseUint(params[0], 10, 8)
+	if err != nil {
+		return false
+	}
+	// A button press can change the focused pane, so it is a boundary.
+	// Releases, motion/drag, and wheel reports preserve the current keyboard
+	// prediction until an authoritative layout or render says otherwise.
+	return sequence[len(sequence)-1] == 'm' || button&(32|64) != 0
+}
+
+func decodePredictableKittyKey(sequence []byte) (byte, kittyPredictionDisposition) {
+	if len(sequence) < 4 || sequence[0] != 0x1b || sequence[1] != '[' || sequence[len(sequence)-1] != 'u' {
+		return 0, kittyPredictionBoundary
+	}
+	params := strings.Split(string(sequence[2:len(sequence)-1]), ";")
+	if len(params) == 0 || len(params) > 2 || strings.Contains(params[0], ":") {
+		return 0, kittyPredictionBoundary
+	}
+	codepoint, err := strconv.ParseUint(params[0], 10, 32)
+	if err != nil {
+		return 0, kittyPredictionBoundary
+	}
+	if len(params) == 2 {
+		modifierAndEvent := strings.Split(params[1], ":")
+		if len(modifierAndEvent) > 2 {
+			return 0, kittyPredictionBoundary
+		}
+		if len(modifierAndEvent) == 2 {
+			event, err := strconv.ParseUint(modifierAndEvent[1], 10, 32)
+			if err != nil {
+				return 0, kittyPredictionBoundary
+			}
+			if event == 3 {
+				return 0, kittyPredictionIgnore
+			}
+			if event != 1 && event != 2 {
+				return 0, kittyPredictionBoundary
+			}
+		}
+		modifiers, err := strconv.ParseUint(modifierAndEvent[0], 10, 32)
+		if err != nil || modifiers != 1 {
+			return 0, kittyPredictionBoundary
+		}
+	}
+	if codepoint == 0x7f {
+		return 0x7f, kittyPredictionKey
+	}
+	if codepoint < 0x20 || codepoint > 0x7e {
+		return 0, kittyPredictionBoundary
+	}
+	return byte(codepoint), kittyPredictionKey
+}
 
 type predictionTarget struct {
 	paneID         uint64

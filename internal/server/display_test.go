@@ -205,7 +205,7 @@ func testOutputLease(slot int, stream io.Writer) *OutputLease {
 }
 
 func testClientInstance(frames chan protocol.Frame, leases map[int]*OutputLease, status ...io.Writer) *ClientInstance {
-	connection := &ClientInstance{managementOut: frames}
+	connection := &ClientInstance{controlOut: frames}
 	if len(status) > 0 {
 		connection.StatusOutput = status[0]
 	}

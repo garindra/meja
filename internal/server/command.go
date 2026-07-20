@@ -320,7 +320,7 @@ func registeredCommands() []commandDefinition {
 		{name: "last-window", aliases: []string{"last"}, usage: "last-window [-t session]", description: "Select the last active window.", execute: sessionCommand(sessionTarget, handleLastWindowCommand)},
 		{name: "select-window", aliases: []string{"selectw"}, usage: "select-window -t session:window", description: "Select a window by index.", execute: sessionCommand(windowTarget, handleSelectWindowCommand)},
 		{name: "kill-pane", aliases: []string{"killp"}, usage: "kill-pane [-t session]", description: "Close the active pane.", execute: sessionCommand(sessionTarget, handleKillPaneCommand)},
-		{name: "copy-mode", usage: "copy-mode [-t session]", description: "Open history mode for the active pane.", execute: sessionCommand(sessionTarget, handleCopyModeCommand)},
+		{name: "copy-mode", usage: "copy-mode [-t session]", description: "Browse pane history; Space starts a selection and Enter copies it.", execute: sessionCommand(sessionTarget, handleCopyModeCommand)},
 		{name: "swap-pane", aliases: []string{"swapp"}, usage: "swap-pane [-t session] (-U | -D)", description: "Swap the active pane with its neighbor.", execute: sessionCommand(sessionTarget, handleSwapPaneCommand)},
 		{name: "select-pane", aliases: []string{"selectp"}, usage: "select-pane [-t session] (-U | -D | -L | -R)", description: "Select an adjacent pane.", execute: sessionCommand(sessionTarget, handleSelectPaneCommand)},
 		{name: "resize-pane", aliases: []string{"resizep"}, usage: "resize-pane [-t session] ((-U | -D | -L | -R) [amount] | -Z)", description: "Resize the active pane or toggle zoom.", execute: sessionCommand(sessionTarget, handleResizePaneCommand)},

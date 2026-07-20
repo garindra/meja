@@ -108,16 +108,24 @@ const (
 	paneHistoryEnter paneHistoryAction = iota + 1
 	paneHistoryInput
 	paneHistoryExit
+	paneHistorySelectionBegin
+	paneHistorySelectionUpdate
+	paneHistorySelectionFinish
+	paneHistorySelectionCancel
 )
 
 type paneHistoryRequest struct {
 	Action paneHistoryAction
 	Data   []byte
+	Row    int
+	Column int
+	Auto   bool
 	Result chan<- paneHistoryResult
 }
 
 type paneHistoryResult struct {
 	Changed bool
+	Data    []byte
 	Err     error
 }
 
@@ -130,6 +138,11 @@ type paneTerminalMetadata struct {
 	cols                  int
 	rows                  int
 	applicationCursorKeys bool
+	bracketedPaste        bool
+	focusReporting        bool
+	mouseTracking         MouseTrackingMode
+	mouseEncoding         MouseEncoding
+	kittyFlags            uint32
 }
 
 type paneOutputRelease struct {
@@ -162,9 +175,11 @@ func (p *Pane) TerminalSize() (int, int) {
 	return 0, 0
 }
 
-func (p *Pane) UsesApplicationCursorKeys() bool {
-	metadata := p.metadata.Load()
-	return metadata != nil && metadata.applicationCursorKeys
+func (p *Pane) InputMode() paneTerminalMetadata {
+	if metadata := p.metadata.Load(); metadata != nil {
+		return *metadata
+	}
+	return paneTerminalMetadata{}
 }
 
 func (p *Pane) initializeRuntime() {
@@ -188,6 +203,11 @@ func (p *Pane) publishTerminalMetadata() {
 		cols:                  p.terminal.Cols,
 		rows:                  p.terminal.Rows,
 		applicationCursorKeys: p.terminal.ApplicationCursorKeys,
+		bracketedPaste:        p.terminal.BracketedPaste,
+		focusReporting:        p.terminal.FocusReporting,
+		mouseTracking:         p.terminal.MouseTracking,
+		mouseEncoding:         p.terminal.MouseEncoding,
+		kittyFlags:            p.terminal.KittyFlags,
 	}
 	if current := p.metadata.Load(); current != nil && *current == next {
 		return

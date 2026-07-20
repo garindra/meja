@@ -18,7 +18,7 @@ import (
 // width; clients must not split or remeasure its UTF-8 text.
 // Style fields are flags uvarint followed by two colors, each [color kind
 // byte][kind-specific bytes].
-// DisplayOpcode values are independent from framed management message IDs.
+// DisplayOpcode values are independent from framed control message IDs.
 type DisplayOpcode byte
 
 const (

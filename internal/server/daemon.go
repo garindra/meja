@@ -395,37 +395,6 @@ func terminatePane(pane *Pane) error {
 	return nil
 }
 
-func expectStreamOpen(decoder *protocol.Decoder, opener uint64, streamType string) error {
-	frame, err := decoder.ReadFrame()
-	if err != nil {
-		return fmt.Errorf("read stream opener: %w", err)
-	}
-	if frame.Type != opener {
-		return fmt.Errorf("unexpected stream opener %d", frame.Type)
-	}
-	open, err := protocol.DecodeStreamOpen(frame.Payload)
-	if err != nil {
-		return err
-	}
-	if open.StreamType != streamType {
-		return fmt.Errorf("unexpected stream type %q", open.StreamType)
-	}
-	return nil
-}
-
-func expectDecoded[T any](decoder *protocol.Decoder, msgType uint64, decode func([]byte) (T, error)) (T, error) {
-	frame, err := decoder.ReadFrame()
-	if err != nil {
-		var zero T
-		return zero, err
-	}
-	if frame.Type != msgType {
-		var zero T
-		return zero, fmt.Errorf("unexpected message type %d", frame.Type)
-	}
-	return decode(frame.Payload)
-}
-
 func sendEncoded[T any](ch chan<- protocol.Frame, msgType uint64, msg T, encode func([]byte, T) ([]byte, error)) error {
 	payload, err := encode(nil, msg)
 	if err != nil {

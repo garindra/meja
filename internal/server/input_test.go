@@ -17,6 +17,22 @@ func isCommandInput(event serverInputEvent, args ...string) bool {
 	return event.Command == serverCommandExecute && slices.Equal(event.CommandArgs, args)
 }
 
+func handleTestControlFrames(s *Session, client *ClientInstance, decoder *protocol.Decoder) error {
+	for {
+		frame, err := decoder.ReadFrame()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		stopped, err := s.handleControlFrame(client, frame)
+		if err != nil || stopped {
+			return err
+		}
+	}
+}
+
 func resizeDirectionFlag(direction PaneResizeDirection) string {
 	switch direction {
 	case ResizePaneUp:
@@ -178,18 +194,16 @@ func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	s.NewClient(0)
 	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash", terminal: newTerminal(80, 24)}, 0)
 	var input bytes.Buffer
-	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: []byte{0x02, 'd', 0x02, 'd'}})
+	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: []byte{0x02, 'd', 0x02, 'd'}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
 	handler := &ClientInstance{}
 	s.clientInstance = handler
-	done := make(chan error, 1)
-	s.readInputFrames(handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
-	if err := <-done; err != nil {
+	if err := handleTestControlFrames(s, handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -210,18 +224,16 @@ func TestSwitchSessionPromptReturnsInputHandoff(t *testing.T) {
 	client := &ClientInstance{Daemon: d}
 	source.clientInstance = client
 
-	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: append([]byte{0x02, ':'}, []byte("switch-session -t logs\r")...)})
+	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: append([]byte{0x02, ':'}, []byte("switch-session -t logs\r")...)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var input bytes.Buffer
-	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	source.readInputFrames(client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize), done)
 	var request *sessionSwitchRequest
-	if err := <-done; !errors.As(err, &request) || request.rawTarget != "logs" {
+	if err := handleTestControlFrames(source, client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize)); !errors.As(err, &request) || request.rawTarget != "logs" {
 		t.Fatalf("input handoff = %#v, error = %v", request, err)
 	}
 }
@@ -373,7 +385,7 @@ func TestHandleInputBytesAppliesRepeatedPaneResize(t *testing.T) {
 		t.Fatal(err)
 	}
 	input := append([]byte{0x02}, []byte("\x1b[1;5C\x1b[1;5C")...)
-	if detach, err := s.handleInputBytes(&ClientInstance{}, input); err != nil || detach {
+	if detach, err := s.handleInputBytes(&ClientInstance{heldKeys: make(map[frontendHeldKey]uint64)}, 0, input); err != nil || detach {
 		t.Fatalf("handleInputBytes() detach=%v err=%v", detach, err)
 	}
 	placements := s.Windows[client.ActiveWindowID].Layout.Compute(Rect{Width: 80, Height: 24})
@@ -483,19 +495,17 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 	}
 
 	var input bytes.Buffer
-	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: []byte("x\rLEAK")})
+	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: []byte("x\rLEAK")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
 	state := s
-	handler := &ClientInstance{managementOut: make(chan protocol.Frame, 8)}
+	handler := &ClientInstance{controlOut: make(chan protocol.Frame, 8)}
 	state.clientInstance = handler
-	done := make(chan error, 1)
-	state.readInputFrames(handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
-	if err := <-done; err != nil {
+	if err := handleTestControlFrames(state, handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
@@ -526,20 +536,18 @@ func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
 	s.CreateWindow(pane, 0)
 
 	want := []byte("你好，世界")
-	payload, err := protocol.EncodeInputBytes(nil, protocol.InputBytes{Data: want})
+	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: want})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var input bytes.Buffer
-	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgInputBytes, Payload: payload}); err != nil {
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
 	state := s
-	handler := &ClientInstance{managementOut: make(chan protocol.Frame, 1)}
+	handler := &ClientInstance{controlOut: make(chan protocol.Frame, 1)}
 	state.clientInstance = handler
-	done := make(chan error, 1)
-	state.readInputFrames(handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize), done)
-	if err := <-done; err != nil {
+	if err := handleTestControlFrames(state, handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
@@ -563,17 +571,15 @@ func TestStaleTransportInputIsIgnoredAfterReconnect(t *testing.T) {
 	currentClient := &ClientInstance{}
 	s.clientInstance = currentClient
 
-	payload, err := protocol.EncodeResizePane(nil, protocol.ResizePane{Cols: 40, Rows: 12})
+	payload, err := protocol.EncodeFrontendResize(nil, protocol.FrontendResize{Cols: 40, Rows: 12})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var input bytes.Buffer
-	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgResizePane, Payload: payload}); err != nil {
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendResize, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	s.readInputFrames(client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize), done)
-	if err := <-done; err != nil {
+	if err := handleTestControlFrames(s, client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
 	}
 	clientState = s.SnapshotClient(clientID0)

@@ -4,34 +4,14 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 
 	"github.com/garindra/meja/internal/protocol"
 )
 
-func (s *Session) readInputFrames(client *ClientInstance, decoder *protocol.Decoder, done chan<- error) {
-	for {
-		frame, err := decoder.ReadFrame()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				done <- nil
-				return
-			}
-			done <- fmt.Errorf("read input frame: %w", err)
-			return
-		}
-		stopped, err := s.handleInputFrame(client, frame)
-		if err != nil || stopped {
-			done <- err
-			return
-		}
-	}
-}
-
-func (s *Session) handleInputFrame(client *ClientInstance, frame protocol.Frame) (bool, error) {
+func (s *Session) handleControlFrame(client *ClientInstance, frame protocol.Frame) (bool, error) {
 	switch frame.Type {
-	case protocol.MsgInputBytes:
-		msg, err := protocol.DecodeInputBytes(frame.Payload)
+	case protocol.MsgFrontendInputBytes:
+		msg, err := protocol.DecodeFrontendInputBytes(frame.Payload)
 		if err != nil {
 			return false, err
 		}
@@ -41,7 +21,7 @@ func (s *Session) handleInputFrame(client *ClientInstance, frame protocol.Frame)
 				return nil
 			}
 			var processErr error
-			detach, processErr = s.handleInputBytes(client, msg.Data)
+			detach, processErr = s.handleInputBytes(client, msg.LayoutRevision, msg.Data)
 			stopped = s.stopping
 			return processErr
 		}); err != nil {
@@ -50,8 +30,8 @@ func (s *Session) handleInputFrame(client *ClientInstance, frame protocol.Frame)
 		if detach || stopped {
 			return true, nil
 		}
-	case protocol.MsgResizePane:
-		msg, err := protocol.DecodeResizePane(frame.Payload)
+	case protocol.MsgFrontendResize:
+		msg, err := protocol.DecodeFrontendResize(frame.Payload)
 		if err != nil {
 			return false, err
 		}
@@ -64,7 +44,7 @@ func (s *Session) handleInputFrame(client *ClientInstance, frame protocol.Frame)
 			return false, err
 		}
 	default:
-		return false, fmt.Errorf("unexpected input frame %d", frame.Type)
+		return false, fmt.Errorf("unexpected control frame %d", frame.Type)
 	}
 	return false, nil
 }
@@ -140,10 +120,57 @@ func (s *Session) resizeSessionToClient(clientState *ClientState) {
 	}
 }
 
-func (s *Session) handleInputBytes(c *ClientInstance, data []byte) (bool, error) {
+func (s *Session) handleInputBytes(c *ClientInstance, layoutRevision uint64, data []byte) (bool, error) {
+	if c == nil {
+		return false, nil
+	}
+	// Plain legacy text remains the overwhelmingly common path, including
+	// printable text while Kitty flags 1|2 are active. Preserve batching and
+	// the existing prompt/prefix behavior when no escape sequence is pending.
+	if c.frontendInput.state == frontendParserGround && bytes.IndexByte(data, 0x1b) < 0 {
+		return s.handleLegacyInputBytes(c, data)
+	}
+	dispatch := func(event frontendInputEvent) (bool, bool, error) {
+		hadPrompt := s.ActivePrompt(clientID0) != nil
+		detach, err := s.handleFrontendInputEvent(c, event)
+		if err != nil || detach {
+			return detach, false, err
+		}
+		if hadPrompt && s.ActivePrompt(clientID0) == nil {
+			return false, true, nil
+		}
+		return false, false, nil
+	}
+	var pendingMotion *frontendInputEvent
+	events := s.coalesceFrontendWheelBursts(c, c.frontendInput.Feed(layoutRevision, data))
+	for _, event := range events {
+		if event.Kind == frontendEventPointer && event.Pointer.Action == frontendPointerMove {
+			copy := event
+			pendingMotion = &copy
+			continue
+		}
+		if pendingMotion != nil {
+			if detach, stop, err := dispatch(*pendingMotion); err != nil || detach || stop {
+				return detach, err
+			}
+			pendingMotion = nil
+		}
+		if detach, stop, err := dispatch(event); err != nil || detach || stop {
+			return detach, err
+		}
+	}
+	if pendingMotion != nil {
+		if detach, _, err := dispatch(*pendingMotion); err != nil || detach {
+			return detach, err
+		}
+	}
+	return false, nil
+}
+
+func (s *Session) handleLegacyInputBytes(c *ClientInstance, data []byte) (bool, error) {
 	pane, _ := s.ActivePane(clientID0)
 	if pane != nil && s.InputIsNormal(clientID0) && !pane.isHistoryMode() &&
-		bytes.IndexByte(data, 0x02) < 0 && (!pane.UsesApplicationCursorKeys() || bytes.IndexByte(data, 0x1b) < 0) {
+		bytes.IndexByte(data, 0x02) < 0 && (!pane.InputMode().applicationCursorKeys || bytes.IndexByte(data, 0x1b) < 0) {
 		if err := pane.sendInput(data); err != nil {
 			return false, fmt.Errorf("write pty input: %w", err)
 		}
@@ -171,9 +198,13 @@ func (s *Session) handleInputBytes(c *ClientInstance, data []byte) (bool, error)
 			break
 		}
 		if pane.isHistoryMode() {
-			return false, pane.handleHistoryInput(data[index:])
+			copied, err := pane.handleHistoryInput(data[index:])
+			if err != nil || len(copied) == 0 {
+				return false, err
+			}
+			return false, c.writeFrontendTerminal(osc52ClipboardWrite(copied))
 		}
-		if translated, consumed, ok := translateApplicationCursor(data[index:], s.InputIsNormal(clientID0) && pane.UsesApplicationCursorKeys()); ok {
+		if translated, consumed, ok := translateApplicationCursor(data[index:], s.InputIsNormal(clientID0) && pane.InputMode().applicationCursorKeys); ok {
 			if err := pane.sendInput(translated); err != nil {
 				return false, fmt.Errorf("write application cursor input: %w", err)
 			}
@@ -217,7 +248,7 @@ func (s *Session) handleServerInputEvent(c *ClientInstance, event serverInputEve
 		data := event.Data
 		if len(data) == 0 {
 			data = []byte{event.Byte}
-		} else if translated, consumed, ok := translateApplicationCursor(data, pane.UsesApplicationCursorKeys()); ok && consumed == len(data) {
+		} else if translated, consumed, ok := translateApplicationCursor(data, pane.InputMode().applicationCursorKeys); ok && consumed == len(data) {
 			data = translated
 		}
 		if err := pane.sendInput(data); err != nil {

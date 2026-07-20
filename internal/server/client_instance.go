@@ -31,14 +31,25 @@ type ClientInstance struct {
 	Daemon                *Daemon
 
 	QUIC         quic.Connection
-	Input        quic.Stream
 	Output       [protocol.MaxRenderSlots]*OutputLease
 	StatusOutput io.Writer
 
-	managementOut   chan protocol.Frame
+	controlOut      chan protocol.Frame
 	sessionSwitches chan *sessionSwitchRequest
 	lifetimeDone    chan struct{}
 	shell           string
+	frontendInput   frontendInputParser
+	layouts         map[uint64]protocol.WindowLayout
+	heldKeys        map[frontendHeldKey]uint64
+	pointerCapture  frontendPaneCapture
+	pasteCapture    frontendPaneCapture
+}
+
+type frontendPaneCapture struct {
+	paneID    uint64
+	active    bool
+	selecting bool
+	rect      protocol.Rect
 }
 
 // reconnectCredential is the small, indefinitely retained daemon record for
@@ -57,7 +68,56 @@ func newClientInstance(d *Daemon, credential *reconnectCredential) *ClientInstan
 		sessionSwitches: make(chan *sessionSwitchRequest, 1),
 		lifetimeDone:    make(chan struct{}),
 		shell:           defaultShell(),
+		layouts:         make(map[uint64]protocol.WindowLayout),
+		heldKeys:        make(map[frontendHeldKey]uint64),
 	}
+}
+
+func (c *ClientInstance) rememberLayout(layout protocol.WindowLayout) {
+	if c == nil || layout.LayoutRevision == 0 {
+		return
+	}
+	if c.layouts == nil {
+		c.layouts = make(map[uint64]protocol.WindowLayout)
+	}
+	c.layouts[layout.LayoutRevision] = layout
+	if len(c.layouts) <= 8 {
+		return
+	}
+	oldest := layout.LayoutRevision
+	for revision := range c.layouts {
+		if revision < oldest {
+			oldest = revision
+		}
+	}
+	delete(c.layouts, oldest)
+}
+
+func (c *ClientInstance) resetInputForSessionSwitch() {
+	c.frontendInput.reset()
+	clear(c.heldKeys)
+	c.pointerCapture = frontendPaneCapture{}
+	c.pasteCapture = frontendPaneCapture{}
+	latestRevision := c.highestLayoutRevision.Load()
+	latestLayout, keepLatest := c.layouts[latestRevision]
+	clear(c.layouts)
+	if keepLatest {
+		c.layouts[latestRevision] = latestLayout
+	}
+}
+
+func (c *ClientInstance) registerFrontendTerminalExitCommand(data []byte) error {
+	if c == nil || c.controlOut == nil {
+		return nil
+	}
+	return sendEncoded(c.controlOut, protocol.MsgFrontendRegisterTerminalExitCommand, protocol.FrontendRegisterTerminalExitCommand{Data: data}, protocol.EncodeFrontendRegisterTerminalExitCommand)
+}
+
+func (c *ClientInstance) writeFrontendTerminal(data []byte) error {
+	if c == nil || c.controlOut == nil || len(data) == 0 {
+		return nil
+	}
+	return sendEncoded(c.controlOut, protocol.MsgFrontendTerminalWrite, protocol.FrontendTerminalWrite{Data: data}, protocol.EncodeFrontendTerminalWrite)
 }
 
 func (c *ClientInstance) requestSessionSwitch(request *sessionSwitchRequest) error {
@@ -89,15 +149,15 @@ func completeSessionSwitch(request *sessionSwitchRequest, err error) {
 	request.result <- err
 }
 
-type clientInputEvent struct {
+type clientControlEvent struct {
 	frame protocol.Frame
 	err   error
 }
 
-func readClientInput(decoder *protocol.Decoder, events chan<- clientInputEvent) {
+func readClientControl(decoder *protocol.Decoder, events chan<- clientControlEvent) {
 	for {
 		frame, err := decoder.ReadFrame()
-		events <- clientInputEvent{frame: frame, err: err}
+		events <- clientControlEvent{frame: frame, err: err}
 		if err != nil {
 			return
 		}
@@ -332,7 +392,7 @@ func (d *Daemon) resumeClientInstance(encodedToken string) (*ClientInstance, *Se
 	return instance, session, resumeErr
 }
 
-func (d *Daemon) attachClientInstance(instance *ClientInstance, conn quic.Connection, input quic.Stream, status io.Writer, output map[int]*OutputLease, managementOut chan protocol.Frame, cols, rows uint16) (*Session, error) {
+func (d *Daemon) attachClientInstance(instance *ClientInstance, conn quic.Connection, status io.Writer, output map[int]*OutputLease, controlOut chan protocol.Frame, cols, rows uint16) (*Session, error) {
 	var session *Session
 	var activateErr error
 	d.call(func() {
@@ -355,9 +415,8 @@ func (d *Daemon) attachClientInstance(instance *ClientInstance, conn quic.Connec
 			return
 		}
 		instance.QUIC = conn
-		instance.Input = input
 		instance.StatusOutput = status
-		instance.managementOut = managementOut
+		instance.controlOut = controlOut
 		for slot := range instance.Output {
 			instance.Output[slot] = output[slot]
 		}
@@ -465,30 +524,24 @@ type OutputLease struct {
 const (
 	quicMaxIdleTimeout  = 6 * time.Second
 	quicKeepAlivePeriod = 2 * time.Second
+	// The frontend stays in one rich, attachment-scoped capture mode. Terminals
+	// that do not implement Kitty keyboard enhancements safely ignore CSI > u.
+	frontendTerminalSetup       = "\x1b[>3u\x1b[?1003;1006;1004;2004s\x1b[?1003;1006;1004;2004h"
+	frontendTerminalExitCommand = "\x1b[?1003;1006;1004;2004r\x1b[<u"
+	frontendEscapeDelay         = 25 * time.Millisecond
 )
 
 func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) error {
 	defer conn.CloseWithError(0, "")
 
 	var err error
-	mgmtStream, err := conn.AcceptStream(ctx)
+	controlStream, err := conn.AcceptStream(ctx)
 	if err != nil {
-		return fmt.Errorf("accept management stream: %w", err)
+		return fmt.Errorf("accept control stream: %w", err)
 	}
-	inputStream, err := conn.AcceptStream(ctx)
-	if err != nil {
-		return fmt.Errorf("accept input stream: %w", err)
-	}
-	mgmtDecoder := protocol.NewDecoder(mgmtStream, protocol.DefaultMaxFrameSize)
-	inputDecoder := protocol.NewDecoder(inputStream, protocol.DefaultMaxFrameSize)
-	if err := expectStreamOpen(mgmtDecoder, protocol.MsgOpenManagementStream, protocol.StreamTypeManagement); err != nil {
-		return err
-	}
-	if err := expectStreamOpen(inputDecoder, protocol.MsgOpenInputStream, protocol.StreamTypeInput); err != nil {
-		return err
-	}
+	controlDecoder := protocol.NewDecoder(controlStream, protocol.DefaultMaxFrameSize)
 
-	first, err := mgmtDecoder.ReadFrame()
+	first, err := controlDecoder.ReadFrame()
 	if err != nil {
 		return fmt.Errorf("read session attachment: %w", err)
 	}
@@ -527,7 +580,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		if errors.As(err, &attachErr) {
 			reason = attachErr.reason
 		}
-		_ = sendEncodedDirect(mgmtStream, protocol.MsgSessionAttachFailed, protocol.SessionAttachFailed{Reason: reason}, protocol.EncodeSessionAttachFailed)
+		_ = sendEncodedDirect(controlStream, protocol.MsgSessionAttachFailed, protocol.SessionAttachFailed{Reason: reason}, protocol.EncodeSessionAttachFailed)
 		return err
 	}
 	defer close(clientInstance.lifetimeDone)
@@ -537,15 +590,26 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 			d.discardUnattachedClientInstance(clientInstance)
 		}
 	}()
-	mgmtFrames := make(chan protocol.Frame, 64)
+	controlFrames := make(chan protocol.Frame, 256)
+	clientInstance.controlOut = controlFrames
 	writerErrs := make(chan error, 4)
-	go writeStream(mgmtStream, mgmtFrames, writerErrs)
-	defer close(mgmtFrames)
+	go writeStream(controlStream, controlFrames, writerErrs)
+	defer close(controlFrames)
 	if responseType == protocol.MsgSessionResumeOK {
-		if err := sendEncoded(mgmtFrames, protocol.MsgSessionResumeOK, protocol.SessionResumeOK{Version: protocol.ProtocolVersion}, protocol.EncodeSessionResumeOK); err != nil {
+		if err := sendEncoded(controlFrames, protocol.MsgSessionResumeOK, protocol.SessionResumeOK{
+			Version: protocol.ProtocolVersion,
+		}, protocol.EncodeSessionResumeOK); err != nil {
 			return err
 		}
-	} else if err := sendEncoded(mgmtFrames, protocol.MsgSessionAttachOK, protocol.SessionAttachOK{Version: protocol.ProtocolVersion, ResumeToken: clientInstance.credential.EncodedToken}, protocol.EncodeSessionAttachOK); err != nil {
+	} else if err := sendEncoded(controlFrames, protocol.MsgSessionAttachOK, protocol.SessionAttachOK{
+		Version: protocol.ProtocolVersion, ResumeToken: clientInstance.credential.EncodedToken,
+	}, protocol.EncodeSessionAttachOK); err != nil {
+		return err
+	}
+	if err := clientInstance.registerFrontendTerminalExitCommand([]byte(frontendTerminalExitCommand)); err != nil {
+		return err
+	}
+	if err := clientInstance.writeFrontendTerminal([]byte(frontendTerminalSetup)); err != nil {
 		return err
 	}
 	d.logSessionAttached(s.ID)
@@ -574,7 +638,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		outputLeases[slot] = &OutputLease{Slot: slot, Stream: outputStream}
 	}
 
-	s, err = d.attachClientInstance(clientInstance, conn, inputStream, statusOutput, outputLeases, mgmtFrames, attachCols, attachRows)
+	s, err = d.attachClientInstance(clientInstance, conn, statusOutput, outputLeases, controlFrames, attachCols, attachRows)
 	if err != nil {
 		_ = conn.CloseWithError(protocol.SessionReplacedErrorCode, err.Error())
 		return err
@@ -584,14 +648,39 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		_ = conn.CloseWithError(0, "")
 		d.detachClientInstance(clientInstance, s)
 	}()
-	inputEvents := make(chan clientInputEvent, 1)
-	go readClientInput(inputDecoder, inputEvents)
+	controlEvents := make(chan clientControlEvent, 1)
+	go readClientControl(controlDecoder, controlEvents)
+	var escapeTimer *time.Timer
+	var escapeTimerC <-chan time.Time
+	stopEscapeTimer := func() {
+		if escapeTimer != nil && !escapeTimer.Stop() {
+			select {
+			case <-escapeTimer.C:
+			default:
+			}
+		}
+		escapeTimerC = nil
+	}
+	armEscapeTimer := func() {
+		stopEscapeTimer()
+		if !clientInstance.frontendInput.hasLoneEscape() {
+			return
+		}
+		if escapeTimer == nil {
+			escapeTimer = time.NewTimer(frontendEscapeDelay)
+		} else {
+			escapeTimer.Reset(frontendEscapeDelay)
+		}
+		escapeTimerC = escapeTimer.C
+	}
+	defer stopEscapeTimer()
 	applySwitch := func(request *sessionSwitchRequest) error {
 		target, switchErr := d.switchClientInstance(clientInstance, s, request.rawTarget, request.cols, request.rows)
 		if switchErr != nil {
 			completeSessionSwitch(request, switchErr)
 			if target != nil {
 				s = target
+				clientInstance.resetInputForSessionSwitch()
 				return switchErr
 			}
 			_ = s.coordinate(func() error {
@@ -601,6 +690,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 			return nil
 		}
 		s = target
+		clientInstance.resetInputForSessionSwitch()
 		completeSessionSwitch(request, nil)
 		return nil
 	}
@@ -608,14 +698,15 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		select {
 		case err := <-writerErrs:
 			return err
-		case event := <-inputEvents:
+		case event := <-controlEvents:
 			if event.err != nil {
 				if errors.Is(event.err, io.EOF) {
 					return nil
 				}
-				return fmt.Errorf("read input frame: %w", event.err)
+				return fmt.Errorf("read control frame: %w", event.err)
 			}
-			stopped, err := s.handleInputFrame(clientInstance, event.frame)
+			stopped, err := s.handleControlFrame(clientInstance, event.frame)
+			armEscapeTimer()
 			if stopped {
 				return nil
 			}
@@ -628,6 +719,19 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 			}
 			if err := applySwitch(request); err != nil {
 				return err
+			}
+		case <-escapeTimerC:
+			escapeTimerC = nil
+			if event, ok := clientInstance.frontendInput.flushLoneEscape(); ok {
+				if err := s.coordinate(func() error {
+					if s.clientInstance != clientInstance {
+						return nil
+					}
+					_, inputErr := s.handleFrontendInputEvent(clientInstance, event)
+					return inputErr
+				}); err != nil {
+					return err
+				}
 			}
 		case request := <-clientInstance.sessionSwitches:
 			if err := applySwitch(request); err != nil {

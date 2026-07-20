@@ -1,11 +1,41 @@
 package client
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
 	"github.com/garindra/meja/internal/protocol"
 )
+
+func TestPredictionInputDecoderAcceptsLegacyAndKittyText(t *testing.T) {
+	var decoder predictionInputDecoder
+	var got []byte
+	for _, part := range [][]byte{
+		[]byte("ab"),
+		[]byte("\x1b[9"),
+		[]byte("9;1:1u"),
+		[]byte("\x1b[100;1:2u"),
+		[]byte("\x1b[100;1:3u"),
+		[]byte("\x1b[127u"),
+	} {
+		got = append(got, decoder.Feed(part)...)
+	}
+	if want := []byte("abcd\x7f"); !bytes.Equal(got, want) {
+		t.Fatalf("decoded prediction input = %q, want %q", got, want)
+	}
+}
+
+func TestPredictionInputDecoderRejectsPaneDependentInput(t *testing.T) {
+	var decoder predictionInputDecoder
+	got := decoder.Feed([]byte("\x1b[<64;20;10M\x1b[<0;2;2M\x1b[<32;3;3M\x1b[I\x1b[200~not predicted\x1b[201~\x1b[97;1:3u\x1b[98;5u"))
+	if want := []byte{0, 0, 0, 0}; !bytes.Equal(got, want) {
+		t.Fatalf("prediction boundaries = %v, want %v", got, want)
+	}
+	if decoder.state != predictionDecodeGround {
+		t.Fatalf("decoder state = %v", decoder.state)
+	}
+}
 
 func testPredictionContext() predictionContext {
 	return predictionContext{

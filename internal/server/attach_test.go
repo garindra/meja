@@ -273,7 +273,7 @@ func TestLiveSwitchMovesClientAssignmentWithoutChangingReconnectToken(t *testing
 
 	credential := &reconnectCredential{EncodedToken: "stable-token"}
 	instance := newClientInstance(d, credential)
-	instance.managementOut = make(chan protocol.Frame, 8)
+	instance.controlOut = make(chan protocol.Frame, 8)
 	credential.Instance = instance
 	d.reconnectCredentials[credential.EncodedToken] = credential
 	d.clientSessions[credential] = source.ID
@@ -328,7 +328,7 @@ window {
 
 	credential := &reconnectCredential{EncodedToken: "stable-token"}
 	instance := newClientInstance(d, credential)
-	instance.managementOut = make(chan protocol.Frame, 8)
+	instance.controlOut = make(chan protocol.Frame, 8)
 	credential.Instance = instance
 	d.reconnectCredentials[credential.EncodedToken] = credential
 	d.clientSessions[credential] = source.ID
@@ -402,7 +402,7 @@ func TestContextualCLIAttachUsesGenericOuterClientHandoff(t *testing.T) {
 
 	credential := &reconnectCredential{EncodedToken: "stable-token"}
 	instance := newClientInstance(d, credential)
-	instance.managementOut = make(chan protocol.Frame, 8)
+	instance.controlOut = make(chan protocol.Frame, 8)
 	credential.Instance = instance
 	d.clientSessions[credential] = source.ID
 	d.attachments[source.ID] = credential
@@ -447,7 +447,7 @@ func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 
 	credential := &reconnectCredential{EncodedToken: "stable-token"}
 	instance := newClientInstance(d, credential)
-	instance.managementOut = make(chan protocol.Frame, 8)
+	instance.controlOut = make(chan protocol.Frame, 8)
 	credential.Instance = instance
 	d.clientSessions[credential] = source.ID
 	d.attachments[source.ID] = credential
@@ -455,13 +455,13 @@ func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 	if err := source.attachClientInstance(instance, 80, 23); err != nil {
 		t.Fatal(err)
 	}
-	first := decodeTestWindowLayout(t, <-instance.managementOut)
+	first := decodeTestWindowLayout(t, <-instance.controlOut)
 
 	switched, err := d.switchClientInstance(instance, source, "2", 80, 23)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second := decodeTestWindowLayout(t, <-instance.managementOut)
+	second := decodeTestWindowLayout(t, <-instance.controlOut)
 	if second.LayoutRevision <= first.LayoutRevision {
 		t.Fatalf("first switch revision = %d, want greater than %d", second.LayoutRevision, first.LayoutRevision)
 	}
@@ -469,7 +469,7 @@ func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 	if _, err := d.switchClientInstance(instance, switched, "1", 80, 23); err != nil {
 		t.Fatal(err)
 	}
-	third := decodeTestWindowLayout(t, <-instance.managementOut)
+	third := decodeTestWindowLayout(t, <-instance.controlOut)
 	if third.LayoutRevision <= second.LayoutRevision {
 		t.Fatalf("second switch revision = %d, want greater than %d", third.LayoutRevision, second.LayoutRevision)
 	}
@@ -478,7 +478,7 @@ func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 func decodeTestWindowLayout(t *testing.T, frame protocol.Frame) protocol.WindowLayout {
 	t.Helper()
 	if frame.Type != protocol.MsgWindowLayout {
-		t.Fatalf("management frame type = %d, want WINDOW_LAYOUT", frame.Type)
+		t.Fatalf("control frame type = %d, want WINDOW_LAYOUT", frame.Type)
 	}
 	layout, err := protocol.DecodeWindowLayout(frame.Payload)
 	if err != nil {
@@ -546,7 +546,7 @@ window {
 		t.Fatal("contextual restore did not create target")
 	}
 
-	resize := encodedTestFrame(t, protocol.MsgResizePane, protocol.ResizePane{Cols: 99, Rows: 31}, protocol.EncodeResizePane)
+	resize := encodedTestFrame(t, protocol.MsgFrontendResize, protocol.FrontendResize{Cols: 99, Rows: 31}, protocol.EncodeFrontendResize)
 	if err := protocol.NewEncoder(input).WriteFrame(resize); err != nil {
 		t.Fatal(err)
 	}
@@ -631,32 +631,24 @@ func dialTestClientInstance(t *testing.T, bootstrap protocol.CommandBootstrap, t
 	if err != nil {
 		t.Fatal(err)
 	}
-	management, err := conn.OpenStreamSync(ctx)
+	control, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	input, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	managementEncoder := protocol.NewEncoder(management)
-	if err := managementEncoder.WriteFrame(encodedTestFrame(t, protocol.MsgOpenManagementStream, protocol.StreamOpen{StreamType: protocol.StreamTypeManagement}, protocol.EncodeStreamOpen)); err != nil {
-		t.Fatal(err)
-	}
+	controlEncoder := protocol.NewEncoder(control)
 	if token == "" {
-		if err := managementEncoder.WriteFrame(encodedTestFrame(t, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, Token: bootstrap.AttachToken, Cols: 80, Rows: 23}, protocol.EncodeSessionAttach)); err != nil {
+		if err := controlEncoder.WriteFrame(encodedTestFrame(t, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, Token: bootstrap.AttachToken, Cols: 80, Rows: 23}, protocol.EncodeSessionAttach)); err != nil {
 			t.Fatal(err)
 		}
-	} else if err := managementEncoder.WriteFrame(encodedTestFrame(t, protocol.MsgSessionResume, protocol.SessionResume{Version: protocol.ProtocolVersion, ResumeToken: token, Cols: 80, Rows: 23}, protocol.EncodeSessionResume)); err != nil {
+	} else if err := controlEncoder.WriteFrame(encodedTestFrame(t, protocol.MsgSessionResume, protocol.SessionResume{Version: protocol.ProtocolVersion, ResumeToken: token, Cols: 80, Rows: 23}, protocol.EncodeSessionResume)); err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.NewEncoder(input).WriteFrame(encodedTestFrame(t, protocol.MsgOpenInputStream, protocol.StreamOpen{StreamType: protocol.StreamTypeInput}, protocol.EncodeStreamOpen)); err != nil {
-		t.Fatal(err)
-	}
-	frame, err := protocol.NewDecoder(management, protocol.DefaultMaxFrameSize).ReadFrame()
+	controlDecoder := protocol.NewDecoder(control, protocol.DefaultMaxFrameSize)
+	frame, err := controlDecoder.ReadFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
+	resumeToken := token
 	if token == "" {
 		if frame.Type != protocol.MsgSessionAttachOK {
 			t.Fatalf("attach frame type = %d", frame.Type)
@@ -665,19 +657,48 @@ func dialTestClientInstance(t *testing.T, bootstrap protocol.CommandBootstrap, t
 		if err != nil {
 			t.Fatal(err)
 		}
-		return conn, input, attached.ResumeToken
+		resumeToken = attached.ResumeToken
+	} else {
+		if frame.Type != protocol.MsgSessionResumeOK {
+			t.Fatalf("resume frame type = %d", frame.Type)
+		}
+		resumed, err := protocol.DecodeSessionResumeOK(frame.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resumed.Version != protocol.ProtocolVersion {
+			t.Fatalf("resume response = %#v", resumed)
+		}
 	}
-	if frame.Type != protocol.MsgSessionResumeOK {
-		t.Fatalf("resume frame type = %d", frame.Type)
-	}
-	resumed, err := protocol.DecodeSessionResumeOK(frame.Payload)
+	exitCommandFrame, err := controlDecoder.ReadFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resumed.Version != protocol.ProtocolVersion {
-		t.Fatalf("resume response = %#v", resumed)
+	if exitCommandFrame.Type != protocol.MsgFrontendRegisterTerminalExitCommand {
+		t.Fatalf("frontend terminal exit command frame type = %d", exitCommandFrame.Type)
 	}
-	return conn, input, token
+	exitCommand, err := protocol.DecodeFrontendRegisterTerminalExitCommand(exitCommandFrame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exitCommand.Data) == 0 {
+		t.Fatal("frontend terminal exit command was empty")
+	}
+	setupFrame, err := controlDecoder.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setupFrame.Type != protocol.MsgFrontendTerminalWrite {
+		t.Fatalf("frontend terminal setup frame type = %d", setupFrame.Type)
+	}
+	setup, err := protocol.DecodeFrontendTerminalWrite(setupFrame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(setup.Data) == 0 {
+		t.Fatal("frontend terminal setup was empty")
+	}
+	return conn, control, resumeToken
 }
 
 func encodedTestFrame[T any](t *testing.T, frameType uint64, message T, encode func([]byte, T) ([]byte, error)) protocol.Frame {

@@ -952,14 +952,14 @@ func TestStaleTransportCleanupDoesNotDetachReconnectedClientInstance(t *testing.
 }
 
 func TestSessionReplacementCloseIsNotLoggable(t *testing.T) {
-	err := fmt.Errorf("read input frame: %w", &quic.ApplicationError{
+	err := fmt.Errorf("read control frame: %w", &quic.ApplicationError{
 		ErrorCode:    protocol.SessionReplacedErrorCode,
 		ErrorMessage: "session attached elsewhere",
 	})
 	if !isSessionReplacedClose(err) {
 		t.Fatal("wrapped session replacement close was not recognized")
 	}
-	if isSessionReplacedClose(errors.New("read input frame: connection lost")) {
+	if isSessionReplacedClose(errors.New("read control frame: connection lost")) {
 		t.Fatal("ordinary connection error was recognized as session replacement")
 	}
 }

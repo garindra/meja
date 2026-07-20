@@ -194,6 +194,12 @@ type TerminalState struct {
 	Alternate             bool
 	Primary               *savedScreen
 	ApplicationCursorKeys bool
+	BracketedPaste        bool
+	FocusReporting        bool
+	MouseTracking         MouseTrackingMode
+	MouseEncoding         MouseEncoding
+	KittyFlags            uint32
+	KittyStack            []uint32
 	AutoWrap              bool
 	OriginMode            bool
 	InsertMode            bool
@@ -214,6 +220,25 @@ type TerminalState struct {
 	cachedStyleID uint32
 	clusters      clusterStore
 }
+
+type MouseTrackingMode uint8
+
+const (
+	MouseTrackingNone MouseTrackingMode = iota
+	MouseTrackingX10
+	MouseTrackingButton
+	MouseTrackingDrag
+	MouseTrackingMotion
+)
+
+type MouseEncoding uint8
+
+const (
+	MouseEncodingClassic MouseEncoding = iota
+	MouseEncodingSGR
+)
+
+const supportedKittyKeyboardFlags uint32 = 1 | 2
 
 type savedScreen struct {
 	grid               rowStore
@@ -296,6 +321,12 @@ func (t *TerminalState) Resize(cols, rows int) {
 	next.wrapPending = t.wrapPending
 	next.SavedCursor = t.SavedCursor
 	next.ApplicationCursorKeys = t.ApplicationCursorKeys
+	next.BracketedPaste = t.BracketedPaste
+	next.FocusReporting = t.FocusReporting
+	next.MouseTracking = t.MouseTracking
+	next.MouseEncoding = t.MouseEncoding
+	next.KittyFlags = t.KittyFlags
+	next.KittyStack = append([]uint32(nil), t.KittyStack...)
 	next.AutoWrap = t.AutoWrap
 	next.OriginMode = t.OriginMode
 	next.InsertMode = t.InsertMode
@@ -919,9 +950,18 @@ func (t *TerminalState) executeCSI(seq []byte, update *Update) {
 			t.setPrivateModes(params, true, update)
 		case 'l':
 			t.setPrivateModes(params, false, update)
+		case 'u':
+			update.Replies = append(update.Replies, []byte(fmt.Sprintf("\x1b[?%du", t.KittyFlags)))
 		default:
 			logUnsupportedf("unsupported private CSI ?%s", seq)
 		}
+		return
+	case '>', '<', '=':
+		if parsed.Final == 'u' {
+			t.applyKittyKeyboardMode(parsed.PrivatePrefix, params)
+			return
+		}
+		logUnsupportedf("unsupported prefixed CSI %s", seq)
 		return
 	case 0:
 	default:
@@ -1583,6 +1623,24 @@ func (t *TerminalState) setPrivateModes(modes []int, enabled bool, update *Updat
 		case 25:
 			t.CursorVisible = enabled
 			update.VisibleChange = true
+		case 9:
+			t.setMouseTracking(MouseTrackingX10, enabled)
+		case 1000:
+			t.setMouseTracking(MouseTrackingButton, enabled)
+		case 1002:
+			t.setMouseTracking(MouseTrackingDrag, enabled)
+		case 1003:
+			t.setMouseTracking(MouseTrackingMotion, enabled)
+		case 1004:
+			t.FocusReporting = enabled
+		case 1006:
+			if enabled {
+				t.MouseEncoding = MouseEncodingSGR
+			} else {
+				t.MouseEncoding = MouseEncodingClassic
+			}
+		case 2004:
+			t.BracketedPaste = enabled
 		case 47, 1047, 1049:
 			if enabled {
 				t.enterAlternateScreen()
@@ -1599,11 +1657,47 @@ func (t *TerminalState) setPrivateModes(modes []int, enabled bool, update *Updat
 				t.restoreCursor()
 			}
 			update.CursorChanged = true
-		case 3, 4, 12:
-			// Pane width, smooth scrolling, and cursor blinking are controlled
-			// outside the emulated terminal. Consume common xterm init modes.
+		case 3, 4, 12, 1007:
+			// Pane width, smooth scrolling, cursor blinking, and alternate
+			// scroll are handled outside terminal screen state. Consume these
+			// common xterm modes without retaining duplicate state.
 		default:
 			logUnsupportedf("unsupported private mode ?%d%c", mode, map[bool]byte{true: 'h', false: 'l'}[enabled])
+		}
+	}
+}
+
+func (t *TerminalState) setMouseTracking(mode MouseTrackingMode, enabled bool) {
+	if enabled {
+		t.MouseTracking = mode
+	} else if t.MouseTracking == mode {
+		t.MouseTracking = MouseTrackingNone
+	}
+}
+
+func (t *TerminalState) applyKittyKeyboardMode(prefix byte, params []int) {
+	switch prefix {
+	case '>':
+		if len(t.KittyStack) < 32 {
+			t.KittyStack = append(t.KittyStack, t.KittyFlags)
+		}
+		t.KittyFlags = uint32(paramOr(params, 0, 0)) & supportedKittyKeyboardFlags
+	case '<':
+		count := max1(params, 1)
+		for count > 0 && len(t.KittyStack) > 0 {
+			t.KittyFlags = t.KittyStack[len(t.KittyStack)-1]
+			t.KittyStack = t.KittyStack[:len(t.KittyStack)-1]
+			count--
+		}
+	case '=':
+		flags := uint32(paramOr(params, 0, 0)) & supportedKittyKeyboardFlags
+		switch paramOr(params, 1, 1) {
+		case 2:
+			t.KittyFlags |= flags
+		case 3:
+			t.KittyFlags &^= flags
+		default:
+			t.KittyFlags = flags
 		}
 	}
 }
@@ -1617,6 +1711,12 @@ func (t *TerminalState) softReset() {
 	t.OriginMode = false
 	t.AutoWrap = true
 	t.ApplicationCursorKeys = false
+	t.BracketedPaste = false
+	t.FocusReporting = false
+	t.MouseTracking = MouseTrackingNone
+	t.MouseEncoding = MouseEncodingClassic
+	t.KittyFlags = 0
+	t.KittyStack = nil
 	t.G0Charset = 'B'
 	t.G1Charset = 'B'
 	t.ActiveCharset = 0

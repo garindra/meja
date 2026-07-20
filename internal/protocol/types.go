@@ -2,7 +2,7 @@ package protocol
 
 const (
 	ALPN            = "meja/1"
-	ProtocolVersion = 8
+	ProtocolVersion = 9
 
 	// SessionReplacedErrorCode is a terminal QUIC application close: another
 	// client has taken ownership of the session, so the displaced client must
@@ -11,28 +11,17 @@ const (
 )
 
 const (
-	MsgOpenManagementStream uint64 = iota + 1
-	MsgOpenInputStream
-	_ // former create-pane message; initial panes are command-engine owned
-	_ // former pane-created response
-	MsgInputBytes
-	MsgResizePane
+	MsgFrontendInputBytes uint64 = iota + 1
+	MsgFrontendResize
 	MsgWindowLayout
 	MsgSessionAttach
 	MsgSessionAttachOK
 	MsgSessionAttachFailed
 	MsgSessionResume
 	MsgSessionResumeOK
+	MsgFrontendTerminalWrite
+	MsgFrontendRegisterTerminalExitCommand
 )
-
-const (
-	StreamTypeManagement = "management"
-	StreamTypeInput      = "input"
-)
-
-type StreamOpen struct {
-	StreamType string
-}
 
 type SessionAttach struct {
 	Version int
@@ -61,17 +50,22 @@ type SessionResumeOK struct {
 	Version int
 }
 
-type InputBytes struct {
-	Data []byte
+type FrontendInputBytes struct {
+	LayoutRevision uint64
+	Data           []byte
 }
 
-type InputBytesView struct {
-	Data []byte
-}
-
-type ResizePane struct {
+type FrontendResize struct {
 	Cols uint16
 	Rows uint16
+}
+
+type FrontendTerminalWrite struct {
+	Data []byte
+}
+
+type FrontendRegisterTerminalExitCommand struct {
+	Data []byte
 }
 
 type Rect struct {
