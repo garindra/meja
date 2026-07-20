@@ -3,7 +3,11 @@ package server
 import (
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/quic-go/quic-go"
 
@@ -899,6 +903,74 @@ func TestSessionShutdownCleanlyClosesConnection(t *testing.T) {
 	}
 	if closeErr != nil {
 		t.Fatal(closeErr)
+	}
+}
+
+func TestSessionShutdownEscalatesAndReapsPaneProcess(t *testing.T) {
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh is unavailable")
+	}
+	directory := t.TempDir()
+	ready := filepath.Join(directory, "ready")
+	s := NewSession(1)
+	timeouts := paneTerminationTimeouts{
+		hangup:    25 * time.Millisecond,
+		terminate: 25 * time.Millisecond,
+		kill:      time.Second,
+	}
+	var pane *Pane
+	if err := s.coordinate(func() error {
+		s.EnsureClient(clientID0)
+		s.SetClientSize(clientID0, 80, 24)
+		var createErr error
+		pane, _, _, createErr = s.createWindow(directory, []string{
+			shell,
+			"-c",
+			`trap '' HUP TERM; : > "$1"; while :; do sleep 1; done`,
+			"meja-pane-test",
+			ready,
+		}, 80, 24, shell)
+		if createErr == nil {
+			s.startPane(pane)
+		}
+		return createErr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.shutdownWithTimeouts(timeouts) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pane process did not become ready")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	started := time.Now()
+	if err := s.shutdownWithTimeouts(timeouts); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	if elapsed < timeouts.hangup+timeouts.terminate {
+		t.Fatalf("shutdown completed in %v before signal escalation deadlines elapsed", elapsed)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("shutdown took %v after SIGKILL", elapsed)
+	}
+	if pane.Process.ProcessState == nil {
+		t.Fatalf("pane process was not reaped: %#v", pane.Process.ProcessState)
+	}
+	select {
+	case <-pane.processDone:
+	default:
+		t.Fatal("pane process waiter did not complete")
 	}
 }
 

@@ -123,6 +123,15 @@ func TestBuildEnvPreservesUTF8Locale(t *testing.T) {
 	}
 }
 
+func TestBuildEnvPreservesPath(t *testing.T) {
+	t.Setenv("PATH", "/home/test/bin:/opt/tools/bin")
+
+	env := buildEnv(&user.User{HomeDir: "/home/test", Username: "test"}, "/bin/sh")
+	if !slices.Contains(env, "PATH=/home/test/bin:/opt/tools/bin") {
+		t.Fatalf("pane environment omitted inherited PATH: %#v", env)
+	}
+}
+
 func TestBuildPaneEnvInjectsStableMejaContext(t *testing.T) {
 	env := buildPaneEnv(&user.User{HomeDir: "/home/test", Username: "test"}, "/bin/sh", 4, paneRequest{
 		MejaSocket:        "/srv/meja.sock",

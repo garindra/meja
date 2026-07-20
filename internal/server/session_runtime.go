@@ -69,6 +69,7 @@ func (s *Session) startPane(pane *Pane) {
 	go func() {
 		_ = pane.Process.Wait()
 		pane.stop()
+		close(pane.processDone)
 		_ = s.handlePaneProcessExit(pane.ID)
 	}()
 }

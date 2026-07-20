@@ -31,6 +31,14 @@ func (s *Session) coordinate(run func() error) error {
 	if s.operations == nil {
 		return run()
 	}
+	// Prefer the terminal state deterministically. A select between a closed
+	// operationsDone channel and a writable buffered mailbox may otherwise
+	// enqueue work after the actor has stopped.
+	select {
+	case <-s.operationsDone:
+		return nil
+	default:
+	}
 	done := make(chan error, 1)
 	select {
 	case s.operations <- sessionOperation{run: run, done: done}:
@@ -80,6 +88,11 @@ func (s *Session) post(run func() error) {
 		return
 	}
 	select {
+	case <-s.operationsDone:
+		return
+	default:
+	}
+	select {
 	case s.operations <- sessionOperation{run: run}:
 	case <-s.operationsDone:
 	}
@@ -119,15 +132,38 @@ func (s *Session) shutdownNow() {
 }
 
 func (s *Session) shutdown() error {
-	err := s.coordinate(func() error {
-		s.shutdownNow()
-		return nil
+	return s.shutdownWithTimeouts(defaultPaneTerminationTimeouts)
+}
+
+func (s *Session) shutdownWithTimeouts(timeouts paneTerminationTimeouts) error {
+	s.shutdownOnce.Do(func() {
+		var panes []*Pane
+		s.shutdownErr = s.coordinate(func() error {
+			if s.stopping {
+				return nil
+			}
+			panes = make([]*Pane, 0, len(s.Panes))
+			for _, pane := range s.Panes {
+				panes = append(panes, pane)
+			}
+			s.shutdownNow()
+			return nil
+		})
+		<-s.operationsDone
+		if remaining := terminatePanesAndWait(panes, timeouts); len(remaining) > 0 {
+			cleanupErr := fmt.Errorf("%d pane process(es) did not exit before the shutdown deadline", len(remaining))
+			if s.daemon != nil {
+				s.daemon.logf("meja server: shut down session %d: %v\n", s.ID, cleanupErr)
+			}
+			s.shutdownErr = errors.Join(s.shutdownErr, cleanupErr)
+		}
+		// Persistence stops independently when operationsDone closes. Wait after
+		// pane cleanup so any in-flight write overlaps the termination grace period.
+		if s.persistenceStarted.Load() {
+			<-s.persistenceDone
+		}
 	})
-	<-s.operationsDone
-	if s.persistenceStarted.Load() {
-		<-s.persistenceDone
-	}
-	return err
+	return s.shutdownErr
 }
 
 func (s *Session) attachClientInstance(client *ClientInstance, cols, rows uint16) error {
@@ -243,6 +279,8 @@ type Session struct {
 	operationsDone            chan struct{}
 	statusCommands            chan statusCommand
 	stopOnce                  sync.Once
+	shutdownOnce              sync.Once
+	shutdownErr               error
 	processObserver           ProcessObserver
 	processMonitor            *ProcessMonitor
 	processSaveCandidates     map[uint64]processSaveCandidate
