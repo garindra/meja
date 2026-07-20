@@ -360,15 +360,20 @@ func assertStatusText(t *testing.T, status testStatusBar, want string) {
 		}
 	}
 	got := strings.TrimRight(text.String(), " ")
-	if hostname, err := os.Hostname(); err == nil && hostname != "" {
-		suffix := "[" + hostname + "]"
-		if !strings.HasSuffix(got, suffix) {
-			t.Fatalf("status text = %q, want hostname suffix %q", got, suffix)
-		}
-		got = strings.TrimRight(strings.TrimSuffix(got, suffix), " ")
+	hostname := ""
+	if value, err := os.Hostname(); err == nil && value != "" {
+		hostname = "[" + value + "]"
 	}
-	if strings.TrimRight(want, " ") != got {
-		t.Fatalf("status text = %q, want %q", got, strings.TrimRight(want, " "))
+	left, right := statusLineParts(len(status.Cells), strings.TrimRight(want, " "), hostname)
+	wantCells := make([]rune, len(status.Cells))
+	for i := range wantCells {
+		wantCells[i] = ' '
+	}
+	copy(wantCells, left)
+	copy(wantCells[len(wantCells)-len(right):], right)
+	wantRendered := strings.TrimRight(string(wantCells), " ")
+	if wantRendered != got {
+		t.Fatalf("status text = %q, want %q", got, wantRendered)
 	}
 }
 

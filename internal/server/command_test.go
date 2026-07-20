@@ -16,6 +16,16 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
+func shortUnixSocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "meja-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func TestNewSessionCommandCreatesInitialPaneBeforeAttach(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	d.sessionPersistenceDir = t.TempDir()
@@ -432,7 +442,7 @@ func TestCommandServerLockIsExclusivePerSocket(t *testing.T) {
 }
 
 func TestStaleCommandSocketCleanupPreservesActiveSocket(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "profile")
+	dir := filepath.Join(shortUnixSocketDir(t), "profile")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +461,7 @@ func TestStaleCommandSocketCleanupPreservesActiveSocket(t *testing.T) {
 }
 
 func TestStaleCommandSocketCleanupDeletesUnboundSocket(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "profile")
+	dir := filepath.Join(shortUnixSocketDir(t), "profile")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
