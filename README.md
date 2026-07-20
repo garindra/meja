@@ -116,14 +116,14 @@ version control and team workflows.
 ### Linux x86-64
 
 ``` sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.2/meja_0.0.2_linux_amd64.tar.gz \
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.4/meja_0.0.4_linux_amd64.tar.gz \
   | sudo tar -xz -C /usr/local/bin meja
 ```
 
 ### macOS Apple Silicon
 
 ``` sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.2/meja_0.0.2_darwin_arm64.tar.gz \
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.4/meja_0.0.4_darwin_arm64.tar.gz \
   | sudo tar -xz -C /usr/local/bin meja
 ```
 
