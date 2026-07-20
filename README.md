@@ -78,14 +78,14 @@ The file is readable and editable. Check it into version control so your team ca
 On Linux x86-64:
 
 ```sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.5/meja_0.0.5_linux_amd64.tar.gz \
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.6/meja_0.0.6_linux_amd64.tar.gz \
   | sudo tar -xz -C /usr/local/bin meja
 ```
 
 On macOS with Apple Silicon:
 
 ```sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.5/meja_0.0.5_darwin_arm64.tar.gz \
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.6/meja_0.0.6_darwin_arm64.tar.gz \
   | sudo tar -xz -C /usr/local/bin meja
 ```
 
