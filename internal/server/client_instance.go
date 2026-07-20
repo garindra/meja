@@ -526,9 +526,8 @@ const (
 	quicKeepAlivePeriod = 2 * time.Second
 	// The frontend stays in one rich, attachment-scoped capture mode. Terminals
 	// that do not implement Kitty keyboard enhancements safely ignore CSI > u.
-	frontendTerminalSetup       = "\x1b[>3u\x1b[?1003;1006;1004;2004s\x1b[?1003;1006;1004;2004h"
-	frontendTerminalExitCommand = "\x1b[?1003;1006;1004;2004r\x1b[<u"
-	frontendEscapeDelay         = 25 * time.Millisecond
+	frontendTerminalSetup       = "\x1b[>3u\x1b[?1003;1006;1004;2004h"
+	frontendTerminalExitCommand = "\x1b[?1003;1006;1004;2004l\x1b[<u"
 )
 
 func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) error {
@@ -650,30 +649,6 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 	}()
 	controlEvents := make(chan clientControlEvent, 1)
 	go readClientControl(controlDecoder, controlEvents)
-	var escapeTimer *time.Timer
-	var escapeTimerC <-chan time.Time
-	stopEscapeTimer := func() {
-		if escapeTimer != nil && !escapeTimer.Stop() {
-			select {
-			case <-escapeTimer.C:
-			default:
-			}
-		}
-		escapeTimerC = nil
-	}
-	armEscapeTimer := func() {
-		stopEscapeTimer()
-		if !clientInstance.frontendInput.hasLoneEscape() {
-			return
-		}
-		if escapeTimer == nil {
-			escapeTimer = time.NewTimer(frontendEscapeDelay)
-		} else {
-			escapeTimer.Reset(frontendEscapeDelay)
-		}
-		escapeTimerC = escapeTimer.C
-	}
-	defer stopEscapeTimer()
 	applySwitch := func(request *sessionSwitchRequest) error {
 		target, switchErr := d.switchClientInstance(clientInstance, s, request.rawTarget, request.cols, request.rows)
 		if switchErr != nil {
@@ -706,7 +681,6 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 				return fmt.Errorf("read control frame: %w", event.err)
 			}
 			stopped, err := s.handleControlFrame(clientInstance, event.frame)
-			armEscapeTimer()
 			if stopped {
 				return nil
 			}
@@ -719,19 +693,6 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 			}
 			if err := applySwitch(request); err != nil {
 				return err
-			}
-		case <-escapeTimerC:
-			escapeTimerC = nil
-			if event, ok := clientInstance.frontendInput.flushLoneEscape(); ok {
-				if err := s.coordinate(func() error {
-					if s.clientInstance != clientInstance {
-						return nil
-					}
-					_, inputErr := s.handleFrontendInputEvent(clientInstance, event)
-					return inputErr
-				}); err != nil {
-					return err
-				}
 			}
 		case request := <-clientInstance.sessionSwitches:
 			if err := applySwitch(request); err != nil {

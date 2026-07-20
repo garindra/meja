@@ -5,6 +5,18 @@ import (
 	"testing"
 )
 
+func TestFrontendInputBytesSourceIdleRoundTrip(t *testing.T) {
+	want := FrontendInputBytes{LayoutRevision: 42, SourceIdle: true, Data: []byte{0x1b}}
+	payload, err := EncodeFrontendInputBytes(nil, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeFrontendInputBytes(payload)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("frontend input = %#v, err = %v", got, err)
+	}
+}
+
 func TestFrontendTerminalWriteRoundTrip(t *testing.T) {
 	want := FrontendTerminalWrite{Data: []byte("\x1b[?1003h")}
 	payload, err := EncodeFrontendTerminalWrite(nil, want)

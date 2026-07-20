@@ -5,6 +5,7 @@ import "fmt"
 func EncodeFrontendInputBytes(dst []byte, msg FrontendInputBytes) ([]byte, error) {
 	w := PayloadWriter{Buf: dst}
 	w.Uvarint(msg.LayoutRevision)
+	w.Bool(msg.SourceIdle)
 	w.Raw(msg.Data)
 	return w.Buf, nil
 }
@@ -15,7 +16,11 @@ func DecodeFrontendInputBytes(payload []byte) (FrontendInputBytes, error) {
 	if err != nil {
 		return FrontendInputBytes{}, fmt.Errorf("decode FrontendInputBytes: %w", err)
 	}
-	return FrontendInputBytes{LayoutRevision: layoutRevision, Data: r.Remaining()}, nil
+	sourceIdle, err := r.Bool()
+	if err != nil {
+		return FrontendInputBytes{}, fmt.Errorf("decode FrontendInputBytes: %w", err)
+	}
+	return FrontendInputBytes{LayoutRevision: layoutRevision, SourceIdle: sourceIdle, Data: r.Remaining()}, nil
 }
 
 func EncodeFrontendResize(dst []byte, msg FrontendResize) ([]byte, error) {

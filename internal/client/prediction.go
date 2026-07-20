@@ -15,6 +15,7 @@ const (
 	predictionDecodeGround predictionDecodeState = iota
 	predictionDecodeEscape
 	predictionDecodeCSI
+	predictionDecodeCSIDiscard
 	predictionDecodeSS3
 	predictionDecodeUTF8
 	predictionDecodePaste
@@ -41,6 +42,10 @@ const (
 func (d *predictionInputDecoder) Feed(data []byte) []byte {
 	out := make([]byte, 0, len(data))
 	for _, b := range data {
+		if b == 0x1b && d.state != predictionDecodePaste {
+			d.startEscape()
+			continue
+		}
 		switch d.state {
 		case predictionDecodePaste:
 			d.pending = append(d.pending, b)
@@ -52,9 +57,6 @@ func (d *predictionInputDecoder) Feed(data []byte) []byte {
 			}
 		case predictionDecodeGround:
 			switch {
-			case b == 0x1b:
-				d.state = predictionDecodeEscape
-				d.pending = append(d.pending[:0], b)
 			case b < utf8.RuneSelf:
 				out = append(out, b)
 			default:
@@ -79,10 +81,15 @@ func (d *predictionInputDecoder) Feed(data []byte) []byte {
 			d.pending = append(d.pending, b)
 			if len(d.pending) > maxPredictionSequenceBytes {
 				out = append(out, 0)
-				d.reset()
+				d.pending = d.pending[:0]
+				if isPredictionSequenceFinal(b) {
+					d.reset()
+				} else {
+					d.state = predictionDecodeCSIDiscard
+				}
 				continue
 			}
-			if b < 0x40 || b > 0x7e {
+			if !isPredictionSequenceFinal(b) {
 				continue
 			}
 			if bytes.Equal(d.pending, []byte("\x1b[200~")) {
@@ -100,6 +107,10 @@ func (d *predictionInputDecoder) Feed(data []byte) []byte {
 				out = append(out, 0)
 			}
 			d.reset()
+		case predictionDecodeCSIDiscard:
+			if isPredictionSequenceFinal(b) {
+				d.reset()
+			}
 		case predictionDecodeUTF8:
 			d.pending = append(d.pending, b)
 			if !utf8.FullRune(d.pending) && len(d.pending) < utf8.UTFMax {
@@ -112,9 +123,26 @@ func (d *predictionInputDecoder) Feed(data []byte) []byte {
 	return out
 }
 
+func (d *predictionInputDecoder) startEscape() {
+	d.state = predictionDecodeEscape
+	d.pending = append(d.pending[:0], 0x1b)
+}
+
+func isPredictionSequenceFinal(b byte) bool {
+	return b >= 0x40 && b <= 0x7e
+}
+
 func (d *predictionInputDecoder) reset() {
 	d.state = predictionDecodeGround
 	d.pending = d.pending[:0]
+}
+
+func (d *predictionInputDecoder) FlushLoneEscape() []byte {
+	if d.state != predictionDecodeEscape || len(d.pending) != 1 {
+		return nil
+	}
+	d.reset()
+	return []byte{0}
 }
 
 const maxPredictionSequenceBytes = 512
