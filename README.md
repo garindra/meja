@@ -1,6 +1,6 @@
 # meja
 
-meja is a light tmux-style multiplexer with native remote capability and restorable & shareable sessions
+meja is a light tmux-style multiplexer with native remote capability and restorable & shareable sessions.
 
 ![Meja screenshot](screenshot.png)
 
@@ -166,7 +166,7 @@ Normal typing continues to go to the focused pane.
 | `Ctrl+b`, `Ctrl+b`                                  | Send a literal `Ctrl+b` to the focused pane.                            |
 
 
-### Windows and names
+### Windows
 
 | Keys              | Behavior                                      |
 | ----------------- | --------------------------------------------- |
@@ -178,3 +178,9 @@ Normal typing continues to go to the focused pane.
 | `Ctrl+b`, `$`     | Name or rename the current session.           |
 
 ---
+
+## Documentation
+
+See [REFERENCE.md](REFERENCE.md) for the complete command, option, keybinding, profile, socket, autosave, and diagnostics reference.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of Meja's internals, including the SSH bootstrap flow, QUIC transport layer, reconnection model, latency compensation strategy, rendering pipeline, session lifecycle, persistence format, protocol design, and security considerations.

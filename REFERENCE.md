@@ -1,0 +1,532 @@
+# Meja Reference
+
+This is the complete user-facing command, file-format, and interaction reference for Meja. See [README.md](README.md) for the introduction and installation instructions.
+
+## Contents
+
+- [Invocation and transport](#invocation-and-transport)
+- [Session lifecycle commands](#session-lifecycle-commands)
+- [Attached-session commands](#attached-session-commands)
+- [Targets and in-pane context](#targets-and-in-pane-context)
+- [Named-session recovery](#named-session-recovery)
+- [Project `.meja` files](#project-meja-files)
+- [In-session interaction](#in-session-interaction)
+- [Server and remote behavior](#server-and-remote-behavior)
+- [Pane environment and diagnostics](#pane-environment-and-diagnostics)
+- [Private SSH command](#private-ssh-command)
+
+---
+
+# Invocation and transport
+
+## Synopsis
+
+```text
+meja version
+meja [transport-options] [command [command-args...]]
+```
+
+With no command, Meja runs `new-session` (`new`).
+
+Transport options may appear anywhere before `--`. The client removes them before forwarding the command to the selected server:
+
+```sh
+meja -h prod new -s work
+meja new -s work -h prod        # equivalent
+meja new -h prod -- journalctl -f
+```
+
+Everything at and after `--` is preserved as command input.
+
+## Server selection
+
+```text
+-L <profile>       Select a named server profile.
+-S <socket-path>   Select an exact server socket.
+```
+
+`-L` and `-S` are mutually exclusive. The default profile resolves to:
+
+```text
+~/.meja/default/meja.sock
+```
+
+Other profiles use `~/.meja/<profile>/meja.sock`. Profile names may contain letters, digits, `.`, `_`, and `-`. Exact socket paths must be absolute. For remote commands, profiles and socket paths are resolved on the remote machine.
+
+Each profile or exact socket has an isolated server, session-ID sequence, live sessions, reconnect credentials, and recovery files.
+
+## Remote options
+
+```text
+-h, --host <host>       Hostname, user@host, or OpenSSH alias.
+-i <identity-file>      SSH identity file.
+--port <port>           SSH port.
+--remote-path <path>    Remote meja executable (default: meja).
+```
+
+Meja invokes the system `ssh` executable, so OpenSSH handles aliases, authentication, agents, host keys, jump hosts, and proxy commands. The remote executable must already exist; Meja does not install or upload it.
+
+## Help
+
+```sh
+meja help
+meja --help
+meja help resize-pane
+meja resize-pane --help
+meja help -h prod
+```
+
+Help is server-backed and may start the selected server. `version` is a local client command and prints `meja <version>`.
+
+## Public names and aliases
+
+| Command | Aliases |
+| --- | --- |
+| `new-session` | `new` |
+| `attach-session` | `attach`, `a` |
+| `restore-session` | `restore` |
+| `save-session` | `save` |
+| `list-sessions` | `ls` |
+| `new-window` | `neww` |
+| `split-window` | `splitw` |
+| `detach-client` | `detach` |
+| `next-window` | `next` |
+| `previous-window` | `prev` |
+| `last-window` | `last` |
+| `select-window` | `selectw` |
+| `kill-pane` | `killp` |
+| `swap-pane` | `swapp` |
+| `select-pane` | `selectp` |
+| `resize-pane` | `resizep` |
+| `rename-window` | `renamew` |
+| `rename-session` | `rename`, `renames` |
+
+---
+
+# Session lifecycle commands
+
+## `new-session` / `new`
+
+```text
+meja [transport-options] new-session
+     [-s name]
+     [-r directory | --root directory]
+     [-- initial-command args...]
+
+meja [transport-options] new-session
+     -f file.meja
+     [-s name]
+     [--commands=prepare|skip|run]
+```
+
+Examples:
+
+```sh
+meja
+meja new -s work
+meja new -s deploy -r /srv/app -h prod
+meja new -s logs -h prod -- journalctl -f
+meja new -f dev.meja -s dev-alice
+```
+
+`-s` assigns a unique name and enables private recovery persistence. `-r`/`--root` accepts an absolute path, `~`, `~/...`, or a path relative to the invoking directory on the selected machine. The resolved directory must exist.
+
+Without `-r`, a local session uses the caller's directory. A remote session normally starts in the remote forwarding process's directory, usually the remote user's home.
+
+The command after `--` runs directly as the first pane process. Later windows and splits start login shells.
+
+`-f` creates a fresh session from a project file. It cannot be combined with a root or initial command. Relative file paths are resolved on the selected machine. The filename without its extension is the default session name; `-s` overrides it.
+
+Project-file commands use:
+
+```text
+prepare   Type without Enter for review (default).
+skip      Leave the new shell prompt empty.
+run       Type and press Enter immediately.
+```
+
+`new` starts the selected server when needed.
+
+## `attach-session` / `attach` / `a`
+
+```text
+meja [transport-options] attach-session -t session-id-or-name
+```
+
+```sh
+meja attach -t 12
+meja a -t work -h prod
+```
+
+`-t` is required. Attach returns to the same live processes. A session has at most one attached client; a new attach replaces the previous client cleanly. Attach does not start a missing server.
+
+## `restore-session` / `restore`
+
+```text
+meja [transport-options] restore-session
+     -t session-name
+     [-s new-name]
+     [--commands=prepare|skip|run]
+```
+
+```sh
+meja restore -t work
+meja restore -t deploy -h prod
+meja restore -t work -s recovered --commands=run
+```
+
+`-t` must be a name, not a numeric ID. Restore reads the selected server's private recovery file, creates a new live session and processes, and attaches. `-s` changes the new name. It fails if a live session already uses that name.
+
+Restore does not read arbitrary project files; use `new -f`. It starts the selected server when needed, but restoration is always explicit.
+
+## `save-session` / `save`
+
+```text
+meja [transport-options] save-session
+     -t session-id-or-name
+     -o file.meja
+     [-f]
+```
+
+```sh
+meja save -t work -o dev.meja
+meja save -t work -o ~/projects/acme/dev.meja -h prod
+```
+
+A relative output path is resolved from the captured session root. Remote output is written remotely; Meja does not transfer it to the client.
+
+Existing files are refused unless `-f` is supplied. Parent directories are created. Files are atomically replaced with mode `0644`.
+
+Save normalizes inherited paths, preset layouts, custom geometry, commands, and non-default shells. Paths under the session root become relative where practical. Absolute pane paths outside the root are retained with a portability warning. Inspect commands for secrets before sharing.
+
+Save requires a running server and live session.
+
+## `list-sessions` / `ls`
+
+```text
+meja [transport-options] list-sessions
+```
+
+```text
+Active Sessions
+ID  NAME       STATUS
+1   <unnamed>  detached
+2   work       attached
+```
+
+Rows are ordered by ID. Only live sessions are listed. `ls` does not start a missing server.
+
+## Server commands
+
+```text
+meja [-L profile | -S socket] start-server
+meja [transport-options] kill-server
+```
+
+`start-server` runs a selected local server in the foreground. To start one remotely, invoke it through SSH yourself. `kill-server` may be forwarded with `-h`; it cleanly disconnects clients, stops the daemon, and reports its PID. It does not start a missing server.
+
+---
+
+# Attached-session commands
+
+Prefix bindings and the `Ctrl+b, :` prompt use the same command engine. Most commands can also be run from an outside shell by supplying `-t`.
+
+| Command | Usage | Effect |
+| --- | --- | --- |
+| `new-window` | `new-window [-t session]` | Create a window at the session root. |
+| `next-layout` | `next-layout [-t session]` | Cycle the active window's preset layout. |
+| `split-window` | `split-window [-t session] [-h|-v]` | Split left/right (`-h`) or top/bottom (`-v`, also the default). |
+| `detach-client` | `detach-client [-t session]` | Detach the client. |
+| `next-window` | `next-window [-t session]` | Select the next window. |
+| `previous-window` | `previous-window [-t session]` | Select the previous window. |
+| `last-window` | `last-window [-t session]` | Return to the last window. |
+| `select-window` | `select-window -t session:window` | Select a zero-based window index. |
+| `kill-pane` | `kill-pane [-t session]` | Close the active pane. |
+| `copy-mode` | `copy-mode [-t session]` | Enter history/copy mode. |
+| `swap-pane` | `swap-pane [-t session] (-U|-D)` | Swap with the previous or next pane. |
+| `select-pane` | `select-pane [-t session] (-U|-D|-L|-R)` | Focus an adjacent pane. |
+| `resize-pane` | `resize-pane [-t session] ((-U|-D|-L|-R) [amount] | -Z)` | Resize by cells or toggle zoom. |
+| `rename-window` | `rename-window [-t session:window] [name]` | Rename, or prompt when attached and omitted. |
+| `rename-session` | `rename-session [-t session] [name]` | Name/rename, or prompt when attached and omitted. |
+| `set-root` | `set-root [-t session] [directory]` | Change the session root. |
+| `switch-session` | `switch-session -t session` | Move the current client to another live session. |
+| `confirm-before` | `confirm-before command [args...]` | Confirm before another attached command. |
+| `command-prompt` | `command-prompt` | Open the status-bar command prompt. |
+
+Direction flags are `-U`, `-D`, `-L`, and `-R`. Resize defaults to one cell; an optional amount must be positive. `swap-pane` accepts only `-U` and `-D` for previous/next pane order.
+
+`set-root` without a path uses the active pane's observed directory. A relative path is resolved there; `~` and `~/...` are supported. Existing panes keep their directories, while future windows, splits, recovery files, and saves use the new root.
+
+`switch-session` retains the current QUIC connection and reconnect credential while changing the attached live session.
+
+Confirmation accepts `y`/`Y`; `n`, Enter, Escape, or `Ctrl+c` cancels.
+
+## Targets and in-pane context
+
+External session commands generally require `-t <id-or-name>`. External window targets use:
+
+```text
+<session-id-or-name>:<zero-based-window-index>
+```
+
+Meja injects `MEJA_SOCKET` and `MEJA_SESSION_TARGET` into panes. A plain local command with no explicit `-L`, `-S`, or `-h` automatically targets the current server and session:
+
+```sh
+meja set-root .
+meja rename work
+meja new-window
+```
+
+Session-producing CLI commands run from a pane can hand the existing client to the new/restored session instead of nesting a client:
+
+```sh
+meja new -s experiment
+meja restore -t work
+meja new -f dev.meja
+```
+
+An explicit profile, socket, or host disables this injected context.
+
+---
+
+# Named-session recovery
+
+Only named sessions are persisted. Profile recovery files are stored at:
+
+```text
+~/.meja/<profile>/sessions/<name>.session.meja
+```
+
+For `-S /path/to/meja.sock`, they are stored under `/path/to/sessions/`. Directories use `0700`; files use `0600`.
+
+Persistence is change-driven rather than timer-based. Meja writes after recoverable structure changes and after stable process observations change a pane's recorded command or directory.
+
+Recovery records include the root, windows, panes, layout, active window/panes, directories, shells, explicit commands, and stable detected foreground commands. They do not contain process memory, terminal contents, scrollback, descriptors, connections, or application state.
+
+Use `attach` while the original session exists. Use `restore -t <name>` after it is gone. Private recovery files are implementation records; use `save` for a normalized project file.
+
+---
+
+# Project `.meja` files
+
+Project files are readable KDL. `save` writes them; `new -f` reads them. Remote commands read/write files on the remote machine and never transfer them automatically.
+
+User-owned files omit private metadata such as session IDs, timestamps, active window, and active pane. Sessions created from project files start in the first window and first pane. Files are limited to 4 MiB.
+
+## Example
+
+```kdl
+root "."
+
+window name="editor" {
+    layout "main-vertical"
+
+    pane {
+        cwd "frontend"
+        cmd "npm run dev"
+    }
+
+    pane {
+        cwd "backend"
+        cmd "go run ."
+    }
+}
+
+window name="tests" {
+    pane {
+        cmd "go test ./..."
+    }
+}
+```
+
+Current files use top-level `root` and `window` nodes; no `session` wrapper or version declaration is required. A legacy leading `meja` node is tolerated. Unknown nodes are ignored, while duplicate or invalid known values are rejected.
+
+## Nodes
+
+### `root`
+
+Exactly one root is required. It may be absolute, `~`/`~/...`, or relative to the file's directory. It must resolve to an existing directory when the session is created.
+
+### `window`
+
+```kdl
+window name="editor" {
+    cwd "services"
+    layout "tiled"
+    pane { /* ... */ }
+}
+```
+
+A file needs at least one window. `name` is optional. Each window accepts one optional `cwd`, one optional `layout`, and one to eight panes.
+
+### `pane`
+
+```kdl
+pane {
+    cwd "api"
+    shell "/bin/zsh"
+    cmd "npm run dev"
+    tile x=0 y=0 w=50 h=100
+}
+```
+
+A pane accepts at most one each of `cwd`, `shell`, `cmd`, and `tile`. With one pane, no layout or tile is needed. Relative window paths use `root`; relative pane paths use the window path.
+
+The shell defaults to the selected user's shell. `cmd` is typed into that interactive shell and is controlled by `--commands=prepare|skip|run`. Shell and command strings may not contain control characters.
+
+## Layouts
+
+Supported named layouts are:
+
+```text
+even-horizontal
+even-vertical
+main-horizontal
+main-vertical
+tiled
+```
+
+For custom layouts, every pane supplies `tile x= y= w= h=` values on a `100 × 100` surface. Values are integers from 0 through 100; widths/heights are positive. Tiles must stay in bounds, not overlap, cover the full surface, and form a recursively splittable tiling.
+
+An unsupported layout name is accepted only when valid tile fallback data exists.
+
+## Save normalization
+
+Save makes the root relative to the output file, removes redundant inherited directories/default shells, uses named presets when recognized, and writes custom layouts as tiles. Output is deterministic, but regeneration does not preserve comments or unknown formatting.
+
+---
+
+# In-session interaction
+
+## Prefix keys
+
+Meja uses `Ctrl+b`. Press it, release it, then press the command key.
+
+| Keys | Behavior |
+| --- | --- |
+| `Ctrl+b`, `Ctrl+b` | Send literal `Ctrl+b`. |
+| `Ctrl+b`, `d` | Detach. |
+| `Ctrl+b`, `c` | Create a window. |
+| `Ctrl+b`, `Space` | Cycle layouts. |
+| `Ctrl+b`, `%` | Split left/right. |
+| `Ctrl+b`, `"` | Split top/bottom. |
+| `Ctrl+b`, arrows | Focus a pane. |
+| `Ctrl+b`, Ctrl+arrows | Resize by one cell. |
+| `Ctrl+b`, Alt+arrows | Resize by five cells. |
+| `Ctrl+b`, `z` | Toggle zoom. |
+| `Ctrl+b`, `{` / `}` | Swap previous/next pane. |
+| `Ctrl+b`, `x` | Confirm and close pane. |
+| `Ctrl+b`, `[` | Enter history/copy mode. |
+| `Ctrl+b`, `:` | Open command prompt. |
+| `Ctrl+b`, `n` / `p` / `l` | Next/previous/last window. |
+| `Ctrl+b`, `0`–`9` | Select window index. |
+| `Ctrl+b`, `,` | Rename window. |
+| `Ctrl+b`, `$` | Name/rename session. |
+
+A window supports eight visible panes. Closing the final pane ends the session. Resize arrows repeat without another prefix for 500 ms after a prefixed resize. Zoom preserves the split layout and hidden processes.
+
+## Command and rename prompts
+
+The command prompt accepts shell-like word splitting, quotes, and backslash escapes, but performs no variables, globs, redirection, substitution, or shell execution.
+
+```text
+set-root .
+rename-window "api server"
+resize-pane -R 5
+switch-session -t staging
+restore-session -t work
+```
+
+Type UTF-8 text; Backspace/Delete removes the previous character; `Ctrl+u` clears; Enter submits; Escape/`Ctrl+c` cancels. Cursor movement is not currently bound.
+
+## History and copy
+
+In history mode:
+
+| Keys | Behavior |
+| --- | --- |
+| arrows or `h`/`j`/`k`/`l` | Move cursor. |
+| Page Up/Down | Move 12 rows. |
+| `Ctrl+u` / `Ctrl+d` | Move 6 rows. |
+| `g` / `G` | Oldest/newest position. |
+| Space | Start selection. |
+| Enter | Copy selection and exit. |
+| `q`, Escape, `Ctrl+c` | Exit without copying. |
+
+Movement after Space extends the selection. Enter without movement copies the cursor cell. Selection is rendered black on yellow and copied with OSC 52; terminal clipboard policy must permit it. Maximum copied data is 1 MiB.
+
+## Mouse
+
+Clicking focuses a pane. When its application is not using mouse tracking, left-drag selects from a frozen history snapshot and copies with OSC 52 on release. Wheel input scrolls history in copy mode; in a normal pane without mouse tracking it is delivered as Up/Down keys.
+
+When an application enables mouse reporting, Meja routes supported press, release, drag/motion, modifier, and wheel events to the application instead of starting selection.
+
+## Terminal input modes
+
+Per-pane routing supports application cursor keys, bracketed paste, focus reporting, classic/SGR mouse encodings, X10/button/drag/motion tracking, and Kitty keyboard flags/event types. Paste remains targeted at the pane active when it began. The server owns prefix handling; the client uses only conservative local prediction for eligible printable input.
+
+---
+
+# Server and remote behavior
+
+## Automatic startup
+
+| Command | Starts missing server |
+| --- | --- |
+| help, new, restore | yes |
+| attach, save, ls, kill-server | no |
+| start-server | runs directly |
+
+Meja removes stale owned sockets for commands allowed to start a server.
+
+Socket directories must be owned by the user with exact mode `0700`; sockets and locks use `0600`. An exact socket cannot live directly in a shared directory such as `/tmp`. A file lock prevents duplicate servers.
+
+Session IDs start at 1 for each server lifetime. Detached sessions continue while they have panes. The final pane ending closes the session. Stopping the server ends live sessions but leaves named recovery files.
+
+## SSH and QUIC
+
+Remote CLI commands use SSH briefly to forward the command request and receive attach data. The active terminal then connects directly using QUIC/TLS 1.3 to the first available UDP port in `60000-61000`.
+
+The client pins the server public key fingerprint delivered through authenticated SSH, so no user CA configuration is required. Firewalls, VPNs, proxies, NAT, and security groups must permit the direct UDP path.
+
+## Reconnection
+
+On transport loss, the client keeps the last confirmed screen, shows reconnecting status, drops input, and retries with exponential backoff up to two seconds. It resumes after receiving the current layout and full visible state.
+
+Reconnect uses an in-memory credential and does not repeat SSH or contact the Unix socket. Session end, server stop, or client replacement produces a terminal reason and clean exit rather than endless reconnect.
+
+---
+
+# Pane environment and diagnostics
+
+Panes start login shells unless the initial pane received an explicit command. The base environment includes:
+
+```text
+HOME USER LOGNAME SHELL
+TERM=xterm-256color
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+`LANG`, `LC_ALL`, and `LC_CTYPE` are copied when set. Meja also injects `MEJA_SOCKET`, `MEJA_SESSION_TARGET`, and `MEJA_PANE_ID` for in-pane context.
+
+Render diagnostics:
+
+```sh
+MEJA_DEBUG=1 meja
+MEJA_DEBUG_RENDER=1 meja attach -t work
+MEJA_DEBUG_LOG=/tmp/meja-render.log meja attach -t work
+```
+
+`MEJA_DEBUG_LOG` also enables diagnostics. Without it, output goes to stderr. Boolean values use Go parsing; `1` and `true` are predictable enabled values.
+
+On Linux, low UDP socket-buffer limits may produce a QUIC warning and limit throughput. Administrators may raise `net.core.rmem_max` and `net.core.wmem_max` through normal sysctl configuration.
+
+---
+
+# Private SSH command
+
+```text
+meja [-L profile | -S socket-path] __ssh-forward-v1
+```
+
+This private, versioned command reads a framed request from stdin, resolves/optionally starts the selected server, forwards the request to its Unix socket, and writes framed output plus optional attach bootstrap data to stdout. It is not intended for interactive use.
