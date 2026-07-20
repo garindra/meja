@@ -63,7 +63,8 @@ if ! rg -q "releases/download/$version/meja_${version#v}_" README.md; then
   exit 1
 fi
 
-ci="$(gh run list --workflow ci.yml --commit "$head" --limit 1 --json status,conclusion,url --jq '.[0] | [.status, .conclusion, .url] | @tsv')"
+ci="$(gh run list --workflow ci.yml --limit 20 --json headSha,status,conclusion,url \
+  --jq "(map(select(.headSha == \"$head\"))[0] // empty) | [.status, .conclusion, .url] | @tsv")"
 if [[ -z "$ci" ]]; then
   echo "no CI run found for main commit $head" >&2
   exit 1
