@@ -2,7 +2,7 @@ package protocol
 
 const (
 	ALPN            = "meja/1"
-	ProtocolVersion = 9
+	ProtocolVersion = 10
 
 	// SessionReplacedErrorCode is a terminal QUIC application close: another
 	// client has taken ownership of the session, so the displaced client must
@@ -52,7 +52,11 @@ type SessionResumeOK struct {
 
 type FrontendInputBytes struct {
 	LayoutRevision uint64
-	Data           []byte
+	// SourceIdle says the client observed a complete local terminal ambiguity
+	// window after Data. It is set only for a deferred standalone Escape; frame
+	// boundaries themselves remain semantically irrelevant.
+	SourceIdle bool
+	Data       []byte
 }
 
 type FrontendResize struct {

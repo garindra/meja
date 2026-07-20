@@ -37,6 +37,48 @@ func TestPredictionInputDecoderRejectsPaneDependentInput(t *testing.T) {
 	}
 }
 
+func TestPredictionInputDecoderFlushesStandaloneEscapeAsBoundary(t *testing.T) {
+	var decoder predictionInputDecoder
+	if got := decoder.Feed([]byte{0x1b}); len(got) != 0 {
+		t.Fatalf("pending Escape prediction = %v", got)
+	}
+	if got := decoder.FlushLoneEscape(); !bytes.Equal(got, []byte{0}) {
+		t.Fatalf("flushed Escape prediction = %v", got)
+	}
+	if decoder.state != predictionDecodeGround || len(decoder.pending) != 0 {
+		t.Fatalf("decoder remained pending after Escape flush: %#v", decoder)
+	}
+}
+
+func TestPredictionInputDecoderEscapeResynchronizesIncompleteInput(t *testing.T) {
+	var decoder predictionInputDecoder
+	if got := decoder.Feed([]byte("\x1b[123")); len(got) != 0 {
+		t.Fatalf("damaged CSI prediction = %v", got)
+	}
+	if got := decoder.Feed([]byte{0x1b}); len(got) != 0 {
+		t.Fatalf("replacement Escape prediction = %v", got)
+	}
+	if got := decoder.FlushLoneEscape(); !bytes.Equal(got, []byte{0}) {
+		t.Fatalf("replacement Escape boundary = %v", got)
+	}
+	if got := decoder.Feed([]byte("x")); !bytes.Equal(got, []byte("x")) {
+		t.Fatalf("prediction after recovery = %q", got)
+	}
+}
+
+func TestPredictionInputDecoderDiscardsOversizedCSIThroughFinalByte(t *testing.T) {
+	var decoder predictionInputDecoder
+	input := append([]byte("\x1b["), bytes.Repeat([]byte{'1'}, maxPredictionSequenceBytes+32)...)
+	input = append(input, []byte(";35;69M")...)
+	input = append(input, 'x')
+	if got, want := decoder.Feed(input), []byte{0, 'x'}; !bytes.Equal(got, want) {
+		t.Fatalf("prediction after oversized CSI = %v, want %v", got, want)
+	}
+	if decoder.state != predictionDecodeGround || len(decoder.pending) != 0 {
+		t.Fatalf("decoder retained oversized CSI: %#v", decoder)
+	}
+}
+
 func testPredictionContext() predictionContext {
 	return predictionContext{
 		target: predictionTarget{paneID: 1, slot: 0, layoutRevision: 1},

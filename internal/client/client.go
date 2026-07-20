@@ -32,6 +32,11 @@ import (
 const (
 	quicMaxIdleTimeout  = 6 * time.Second
 	quicKeepAlivePeriod = 2 * time.Second
+	// frontendEscapeDelay resolves the legacy ambiguity between a standalone
+	// Escape key and the prefix of a longer terminal sequence. It is measured
+	// at the local TTY boundary so transport latency cannot change input
+	// semantics.
+	frontendEscapeDelay = 25 * time.Millisecond
 )
 
 var errDisconnectedInterrupt = errors.New("interrupted while disconnected")
@@ -258,7 +263,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return nil
 	}
 	restoreTerminal := func() {
-		fixedExit := []byte(fmt.Sprintf("\x1b[r\x1b[1;%ds\x1b[?69l\x1b[?25h\x1b[0m\x1b[?1049l", cols))
+		fixedExit := fixedTerminalExit(cols)
 		fallback := false
 		if terminalActive {
 			if err := ui.shutdownTerminal(context.Background(), fixedExit); err != nil {
@@ -351,6 +356,10 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+func fixedTerminalExit(cols uint16) []byte {
+	return []byte(fmt.Sprintf("\x1b[?1003;1006;1004;2004l\x1b[r\x1b[1;%ds\x1b[?69l\x1b[?25h\x1b[0m\x1b[?1049l", cols))
+}
+
 func clientExitError(ctx context.Context) error {
 	if errors.Is(context.Cause(ctx), errDisconnectedInterrupt) {
 		return nil
@@ -398,8 +407,16 @@ func sendCurrentFrontendInput(current *atomic.Pointer[controlDestination], ui *r
 	if destination == nil {
 		return false, nil
 	}
+	return sendFrontendInput(destination, ui, ui.appliedLayoutRevision.Load(), false, data, prediction)
+}
+
+func sendFrontendInput(destination *controlDestination, ui *runtimeState, layoutRevision uint64, sourceIdle bool, data, prediction []byte) (bool, error) {
+	if destination == nil {
+		return false, nil
+	}
 	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{
-		LayoutRevision: ui.appliedLayoutRevision.Load(),
+		LayoutRevision: layoutRevision,
+		SourceIdle:     sourceIdle,
 		Data:           data,
 	})
 	if err != nil {
@@ -958,31 +975,184 @@ func isTerminalQUICClose(err error) bool {
 }
 
 func forwardInput(ctx context.Context, stdin *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error, cancel context.CancelCauseFunc) {
+	reads := make(chan terminalInputRead, 16)
+	go readTerminalInput(ctx, stdin, reads)
+	forwardInputReads(ctx, reads, control, ui, errs, cancel, frontendEscapeDelay)
+}
+
+type terminalInputRead struct {
+	data []byte
+	err  error
+}
+
+func readTerminalInput(ctx context.Context, stdin *os.File, reads chan<- terminalInputRead) {
+	defer close(reads)
 	buf := make([]byte, 4096)
-	var predictionDecoder predictionInputDecoder
 	for {
 		n, err := stdin.Read(buf)
+		if n == 0 && err == nil {
+			continue
+		}
+		read := terminalInputRead{err: err}
 		if n > 0 {
-			data := append([]byte(nil), buf[:n]...)
-			prediction := predictionDecoder.Feed(data)
-			connected, sendErr := sendCurrentFrontendInput(control, ui, data, prediction)
-			if sendErr != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				errs <- sendErr
-				return
-			}
-			if !connected && bytes.IndexByte(data, 0x03) >= 0 {
-				cancel(errDisconnectedInterrupt)
-				return
-			}
+			read.data = append([]byte(nil), buf[:n]...)
+		}
+		select {
+		case reads <- read:
+		case <-ctx.Done():
+			return
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) || ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+func forwardInputReads(ctx context.Context, reads <-chan terminalInputRead, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error, cancel context.CancelCauseFunc, escapeDelay time.Duration) {
+	var predictionDecoder predictionInputDecoder
+	var predictionDestination *controlDestination
+	var pendingDestination *controlDestination
+	var pendingRevision uint64
+	var escapeTimer *time.Timer
+	var escapeTimerC <-chan time.Time
+	stopEscapeTimer := func() {
+		if escapeTimer != nil && !escapeTimer.Stop() {
+			select {
+			case <-escapeTimer.C:
+			default:
+			}
+		}
+		escapeTimerC = nil
+	}
+	armEscapeTimer := func() {
+		stopEscapeTimer()
+		if escapeTimer == nil {
+			escapeTimer = time.NewTimer(escapeDelay)
+		} else {
+			escapeTimer.Reset(escapeDelay)
+		}
+		escapeTimerC = escapeTimer.C
+	}
+	defer stopEscapeTimer()
+
+	sendBytes := func(destination *controlDestination, revision uint64, sourceIdle bool, data []byte) (bool, error) {
+		prediction := predictionDecoder.Feed(data)
+		if sourceIdle {
+			prediction = append(prediction, predictionDecoder.FlushLoneEscape()...)
+		}
+		return sendFrontendInput(destination, ui, revision, sourceIdle, data, prediction)
+	}
+	flushPendingEscape := func() error {
+		stopEscapeTimer()
+		destination, revision := pendingDestination, pendingRevision
+		pendingDestination = nil
+		pendingRevision = 0
+		if destination == nil || control.Load() != destination {
+			predictionDecoder.reset()
+			predictionDestination = nil
+			return nil
+		}
+		_, err := sendBytes(destination, revision, true, []byte{0x1b})
+		return err
+	}
+	handleRead := func(data []byte) error {
+		destination := control.Load()
+		if destination == nil {
+			pendingDestination = nil
+			pendingRevision = 0
+			stopEscapeTimer()
+			predictionDecoder.reset()
+			predictionDestination = nil
+			if bytes.IndexByte(data, 0x03) >= 0 {
+				cancel(errDisconnectedInterrupt)
+			}
+			return nil
+		}
+		if predictionDestination != destination {
+			predictionDecoder.reset()
+			predictionDestination = destination
+		}
+		stopEscapeTimer()
+		revision := ui.appliedLayoutRevision.Load()
+		if pendingDestination != nil {
+			if pendingDestination == destination {
+				data = append([]byte{0x1b}, data...)
+				revision = pendingRevision
+			} else {
+				predictionDecoder.reset()
+				predictionDestination = destination
+			}
+		}
+		pendingDestination = nil
+		pendingRevision = 0
+
+		if len(data) > 0 && data[len(data)-1] == 0x1b {
+			if len(data) > 1 {
+				sent, err := sendBytes(destination, revision, false, data[:len(data)-1])
+				if err != nil || !sent {
+					return err
+				}
+			}
+			pendingDestination = destination
+			pendingRevision = revision
+			armEscapeTimer()
+			return nil
+		}
+		_, err := sendBytes(destination, revision, false, data)
+		return err
+	}
+	report := func(err error) {
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		select {
+		case errs <- err:
+		case <-ctx.Done():
+		}
+	}
+	handleReadResult := func(read terminalInputRead, ok bool) bool {
+		if !ok {
+			report(flushPendingEscape())
+			return true
+		}
+		if len(read.data) > 0 {
+			if err := handleRead(read.data); err != nil {
+				report(err)
+				return true
+			}
+		}
+		if read.err == nil {
+			return false
+		}
+		report(flushPendingEscape())
+		if !errors.Is(read.err, io.EOF) {
+			report(fmt.Errorf("read stdin: %w", read.err))
+		}
+		return true
+	}
+
+	for {
+		select {
+		case read, ok := <-reads:
+			if handleReadResult(read, ok) {
 				return
 			}
-			errs <- fmt.Errorf("read stdin: %w", err)
+		case <-escapeTimerC:
+			escapeTimerC = nil
+			// Prefer bytes already read from the local TTY over an idle timeout
+			// whose delivery happened to win the scheduler race.
+			select {
+			case read, ok := <-reads:
+				if handleReadResult(read, ok) {
+					return
+				}
+			default:
+				if err := flushPendingEscape(); err != nil {
+					report(err)
+					return
+				}
+			}
+		case <-ctx.Done():
 			return
 		}
 	}

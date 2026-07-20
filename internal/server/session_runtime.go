@@ -15,6 +15,9 @@ func (s *Session) handleControlFrame(client *ClientInstance, frame protocol.Fram
 		if err != nil {
 			return false, err
 		}
+		if msg.SourceIdle && !bytes.Equal(msg.Data, []byte{0x1b}) {
+			return false, errors.New("source-idle frontend input must contain one Escape byte")
+		}
 		var detach, stopped bool
 		if err := s.coordinate(func() error {
 			if s.clientInstance != client {
@@ -22,6 +25,11 @@ func (s *Session) handleControlFrame(client *ClientInstance, frame protocol.Fram
 			}
 			var processErr error
 			detach, processErr = s.handleInputBytes(client, msg.LayoutRevision, msg.Data)
+			if processErr == nil && !detach && msg.SourceIdle {
+				if event, ok := client.frontendInput.flushLoneEscape(); ok {
+					detach, processErr = s.handleFrontendInputEvent(client, event)
+				}
+			}
 			stopped = s.stopping
 			return processErr
 		}); err != nil {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"testing"
+	"time"
 
 	"github.com/garindra/meja/internal/protocol"
 )
@@ -111,6 +112,137 @@ func TestFrontendParserFlushesLoneEscape(t *testing.T) {
 	}
 }
 
+func TestFrontendParserEscapeResynchronizesIncompleteInput(t *testing.T) {
+	for _, damaged := range [][]byte{
+		[]byte("\x1b[123"),
+		[]byte("\x1bO"),
+		{0xc3},
+	} {
+		var parser frontendInputParser
+		if events := parser.Feed(3, damaged); len(events) != 0 {
+			t.Fatalf("damaged prefix %q produced events %#v", damaged, events)
+		}
+		if events := parser.Feed(4, []byte{0x1b}); len(events) != 0 {
+			t.Fatalf("replacement Escape after %q produced events %#v", damaged, events)
+		}
+		event, ok := parser.flushLoneEscape()
+		if !ok || event.Key.Code != frontendKeyEscape || event.LayoutRevision != 4 {
+			t.Fatalf("replacement Escape after %q = %#v, %v", damaged, event, ok)
+		}
+	}
+}
+
+func TestFrontendParserDiscardsUnknownControlSequenceAndRecovers(t *testing.T) {
+	for _, unknown := range [][]byte{
+		[]byte("\x1b[s"),
+		[]byte("\x1bOz"),
+	} {
+		var parser frontendInputParser
+		events := parser.Feed(7, append(append([]byte(nil), unknown...), 'x'))
+		if len(events) != 1 || events[0].Key.Code != frontendKeyRune || events[0].Key.Rune != 'x' {
+			t.Fatalf("events after unknown sequence %q = %#v", unknown, events)
+		}
+	}
+}
+
+func TestFrontendParserDiscardsOversizedCSIThroughFinalByte(t *testing.T) {
+	var parser frontendInputParser
+	input := append([]byte("\x1b["), bytes.Repeat([]byte{'1'}, maxFrontendSequenceBytes+32)...)
+	input = append(input, []byte(";35;69M")...)
+	input = append(input, 'x')
+	events := parser.Feed(9, input)
+	if len(events) != 1 || events[0].Key.Code != frontendKeyRune || events[0].Key.Rune != 'x' {
+		t.Fatalf("events after oversized CSI = %#v", events)
+	}
+	if parser.state != frontendParserGround || len(parser.pending) != 0 {
+		t.Fatalf("parser retained oversized CSI: %#v", parser)
+	}
+}
+
+func TestFrontendTransportDelayDoesNotLeakFragmentedSequences(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		sequence string
+	}{
+		{name: "Kitty key release", sequence: "\x1b[115;1:3u"},
+		{name: "SGR mouse motion", sequence: "\x1b[<35;69;42M"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := NewSession(1)
+			s.NewClient(clientID0)
+			pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(20, 5)}
+			pane.initializeRuntime()
+			s.CreateWindow(pane, clientID0)
+			frontend := newClientInstance(nil, nil)
+			s.clientInstance = frontend
+			layout, err := s.WindowLayout(clientID0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frontend.rememberLayout(layout)
+
+			escapePayload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{LayoutRevision: layout.LayoutRevision, Data: []byte{0x1b}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stopped, err := s.handleControlFrame(frontend, protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: escapePayload}); err != nil || stopped {
+				t.Fatalf("Escape fragment stopped=%v err=%v", stopped, err)
+			}
+			if !frontend.frontendInput.hasLoneEscape() {
+				t.Fatal("Escape fragment was not retained")
+			}
+
+			// This is twice the old production timeout. Wall-clock or transport
+			// delay must not resolve the parser's pending Escape.
+			time.Sleep(50 * time.Millisecond)
+			select {
+			case got := <-pane.ptyInput:
+				t.Fatalf("transport delay leaked input %q", got)
+			default:
+			}
+
+			suffixPayload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{LayoutRevision: layout.LayoutRevision, Data: []byte(test.sequence[1:])})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stopped, err := s.handleControlFrame(frontend, protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: suffixPayload}); err != nil || stopped {
+				t.Fatalf("sequence suffix stopped=%v err=%v", stopped, err)
+			}
+			select {
+			case got := <-pane.ptyInput:
+				t.Fatalf("fragmented %s leaked input %q", test.name, got)
+			default:
+			}
+		})
+	}
+}
+
+func TestFrontendSourceIdleResolvesStandaloneEscape(t *testing.T) {
+	s := NewSession(1)
+	s.NewClient(clientID0)
+	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(20, 5)}
+	pane.initializeRuntime()
+	s.CreateWindow(pane, clientID0)
+	frontend := newClientInstance(nil, nil)
+	s.clientInstance = frontend
+
+	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{SourceIdle: true, Data: []byte{0x1b}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped, err := s.handleControlFrame(frontend, protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil || stopped {
+		t.Fatalf("source-idle Escape stopped=%v err=%v", stopped, err)
+	}
+	select {
+	case got := <-pane.ptyInput:
+		if !bytes.Equal(got, []byte{0x1b}) {
+			t.Fatalf("resolved Escape = %q", got)
+		}
+	default:
+		t.Fatal("source idle did not resolve Escape")
+	}
+}
+
 func TestPaneInputModesAndKittyQueryAreVirtualized(t *testing.T) {
 	term := newTerminal(80, 24)
 	update := term.Apply([]byte("\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[>3u\x1b[?u"))
@@ -123,6 +255,19 @@ func TestPaneInputModesAndKittyQueryAreVirtualized(t *testing.T) {
 	term.Apply([]byte("\x1b[<u\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l"))
 	if term.KittyFlags != 0 || term.MouseTracking != MouseTrackingNone || term.MouseEncoding != MouseEncodingClassic || term.FocusReporting || term.BracketedPaste {
 		t.Fatalf("restored terminal input modes = %#v", term)
+	}
+}
+
+func TestFrontendAttachmentCleanupDisablesCaptureWithoutXTermModeRestore(t *testing.T) {
+	term := newTerminal(80, 24)
+	term.Apply([]byte(frontendTerminalSetup))
+	if term.MouseTracking != MouseTrackingMotion || term.MouseEncoding != MouseEncodingSGR || !term.FocusReporting || !term.BracketedPaste || term.KittyFlags != 3 {
+		t.Fatalf("frontend setup modes = %#v", term)
+	}
+
+	term.Apply([]byte(frontendTerminalExitCommand))
+	if term.MouseTracking != MouseTrackingNone || term.MouseEncoding != MouseEncodingClassic || term.FocusReporting || term.BracketedPaste || term.KittyFlags != 0 {
+		t.Fatalf("frontend cleanup left capture active = %#v", term)
 	}
 }
 

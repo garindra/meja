@@ -465,7 +465,7 @@ After attach or resume succeeds, the server sends two control messages before or
 1. a terminal exit command that the client registers for cleanup; and
 2. a terminal setup write that enables the attachment's input-capture modes.
 
-The current setup requests Kitty keyboard event reporting, SGR mouse coordinates and motion, focus events, and bracketed paste. The client serializes these terminal writes through the same UI loop that owns rendering. On disconnect, failed attachment, or normal shutdown, it executes the registered exit command and then applies its fixed raw-mode and alternate-screen cleanup.
+The current setup requests Kitty keyboard event reporting, SGR mouse coordinates and motion, focus events, and bracketed paste. The client serializes these terminal writes through the same UI loop that owns rendering. On disconnect, failed attachment, or normal shutdown, it executes the registered exit command and then applies its fixed raw-mode and alternate-screen cleanup. Both paths explicitly reset the frontend capture modes instead of depending on xterm-private saved-mode restoration.
 
 Keeping setup server-driven lets a protocol-compatible server define the frontend capabilities required by its input router while keeping cleanup paired with the exact setup that was installed.
 
@@ -478,7 +478,7 @@ The client sends frontend bytes on the control stream together with the layout r
 * focus in and focus out; and
 * SGR pointer press, release, motion, and wheel events.
 
-A lone Escape is held briefly so it can be distinguished from the prefix of an Alt or control sequence. Sequence and paste buffers are bounded; malformed or oversized input is discarded rather than retained indefinitely.
+A trailing Escape is held for 25 milliseconds at the client's local TTY boundary so it can be distinguished from the prefix of an Alt or control sequence without making QUIC latency part of input semantics. More local bytes cancel the delay and are sent with the Escape. If the source stays idle, the client sends the Escape with an explicit `SourceIdle` flag; only that flag lets the server resolve its pending lone Escape. Outside bracketed paste, every new Escape starts a fresh input transaction and abandons any incomplete sequence. Sequence and paste buffers are bounded; unknown, malformed, or oversized control input is discarded through its final byte rather than retained or reinterpreted as pane text.
 
 ## Server-side routing and re-encoding
 

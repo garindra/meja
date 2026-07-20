@@ -116,6 +116,7 @@ const (
 	frontendParserGround frontendParserState = iota
 	frontendParserEscape
 	frontendParserCSI
+	frontendParserCSIDiscard
 	frontendParserSS3
 	frontendParserUTF8
 	frontendParserPaste
@@ -137,6 +138,13 @@ var bracketedPasteEnd = []byte("\x1b[201~")
 func (p *frontendInputParser) Feed(layoutRevision uint64, data []byte) []frontendInputEvent {
 	events := make([]frontendInputEvent, 0, min(len(data), 64))
 	for _, b := range data {
+		// Outside bracketed paste, Escape always starts a new input
+		// transaction. In particular, it abandons an incomplete or malformed
+		// sequence instead of allowing that sequence to consume later input.
+		if b == 0x1b && p.state != frontendParserPaste {
+			p.startEscape(layoutRevision)
+			continue
+		}
 		switch p.state {
 		case frontendParserPaste:
 			p.paste = append(p.paste, b)
@@ -155,9 +163,6 @@ func (p *frontendInputParser) Feed(layoutRevision uint64, data []byte) []fronten
 		case frontendParserGround:
 			p.revision = layoutRevision
 			switch {
-			case b == 0x1b:
-				p.state = frontendParserEscape
-				p.pending = append(p.pending[:0], b)
 			case b < utf8.RuneSelf:
 				events = append(events, keyInputEvent(layoutRevision, decodeGroundByte(b)))
 			default:
@@ -177,15 +182,23 @@ func (p *frontendInputParser) Feed(layoutRevision uint64, data []byte) []fronten
 			}
 		case frontendParserSS3:
 			p.pending = append(p.pending, b)
-			events = append(events, keyInputEvent(p.revision, decodeLegacySequence(p.pending)))
+			key := decodeLegacySequence(p.pending)
+			if key.Code != 0 {
+				events = append(events, keyInputEvent(p.revision, key))
+			}
 			p.reset()
 		case frontendParserCSI:
 			p.pending = append(p.pending, b)
 			if len(p.pending) > maxFrontendSequenceBytes {
-				p.reset()
+				p.pending = p.pending[:0]
+				if isFrontendSequenceFinal(b) {
+					p.reset()
+				} else {
+					p.state = frontendParserCSIDiscard
+				}
 				continue
 			}
-			if b >= 0x40 && b <= 0x7e {
+			if isFrontendSequenceFinal(b) {
 				if string(p.pending) == "\x1b[200~" {
 					events = append(events, frontendInputEvent{Kind: frontendEventPasteStart, LayoutRevision: p.revision})
 					p.state = frontendParserPaste
@@ -194,6 +207,10 @@ func (p *frontendInputParser) Feed(layoutRevision uint64, data []byte) []fronten
 					continue
 				}
 				events = append(events, decodeCSIInput(p.revision, p.pending)...)
+				p.reset()
+			}
+		case frontendParserCSIDiscard:
+			if isFrontendSequenceFinal(b) {
 				p.reset()
 			}
 		case frontendParserUTF8:
@@ -212,6 +229,18 @@ func (p *frontendInputParser) Feed(layoutRevision uint64, data []byte) []fronten
 		}
 	}
 	return events
+}
+
+func (p *frontendInputParser) startEscape(layoutRevision uint64) {
+	p.state = frontendParserEscape
+	p.revision = layoutRevision
+	p.pending = append(p.pending[:0], 0x1b)
+	p.paste = p.paste[:0]
+	p.pasteOverflow = false
+}
+
+func isFrontendSequenceFinal(b byte) bool {
+	return b >= 0x40 && b <= 0x7e
 }
 
 func (p *frontendInputParser) reset() {
@@ -312,8 +341,12 @@ func decodeCSIInput(revision uint64, raw []byte) []frontendInputEvent {
 		if key, ok := decodeKittyKey(body); ok {
 			return []frontendInputEvent{keyInputEvent(revision, key)}
 		}
+		return nil
 	}
 	key := decodeLegacyCSI(body, final, raw)
+	if key.Code == 0 {
+		return nil
+	}
 	return []frontendInputEvent{keyInputEvent(revision, key)}
 }
 

@@ -413,6 +413,142 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 
 }
 
+func TestForwardInputKeepsFragmentedTerminalSequencesTogetherAcrossTransportDelay(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		sequence string
+	}{
+		{name: "Kitty key release", sequence: "\x1b[115;1:3u"},
+		{name: "SGR mouse motion", sequence: "\x1b[<35;69;42M"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			frames := make(chan protocol.Frame, 4)
+			reads := make(chan terminalInputRead, 2)
+			var control atomic.Pointer[controlDestination]
+			control.Store(&controlDestination{frames: frames, done: ctx.Done()})
+			ui := &runtimeState{events: make(chan renderEvent, 4)}
+			errs := make(chan error, 1)
+			go forwardInputReads(ctx, reads, &control, ui, errs, cancel, time.Hour)
+
+			reads <- terminalInputRead{data: []byte{0x1b}}
+			time.Sleep(10 * time.Millisecond)
+			select {
+			case frame := <-frames:
+				t.Fatalf("trailing Escape was sent before its local ambiguity window: %#v", frame)
+			default:
+			}
+
+			reads <- terminalInputRead{data: []byte(test.sequence[1:])}
+			close(reads)
+			select {
+			case err := <-errs:
+				t.Fatalf("forwardInputReads() error = %v", err)
+			case frame := <-frames:
+				msg, err := protocol.DecodeFrontendInputBytes(frame.Payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(msg.Data) != test.sequence || msg.SourceIdle {
+					t.Fatalf("forwarded sequence = data %q sourceIdle=%v, want %q without idle", msg.Data, msg.SourceIdle, test.sequence)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("fragmented terminal sequence was not forwarded")
+			}
+			select {
+			case frame := <-frames:
+				t.Fatalf("fragmented sequence was split into another frame: %#v", frame)
+			default:
+			}
+		})
+	}
+}
+
+func TestForwardInputFlushesStandaloneEscapeAtLocalTTYBoundary(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	frames := make(chan protocol.Frame, 2)
+	reads := make(chan terminalInputRead, 1)
+	var control atomic.Pointer[controlDestination]
+	control.Store(&controlDestination{frames: frames, done: ctx.Done()})
+	ui := &runtimeState{events: make(chan renderEvent, 2)}
+	errs := make(chan error, 1)
+	go forwardInputReads(ctx, reads, &control, ui, errs, cancel, 5*time.Millisecond)
+
+	reads <- terminalInputRead{data: []byte{0x1b}}
+	select {
+	case err := <-errs:
+		t.Fatalf("forwardInputReads() error = %v", err)
+	case frame := <-frames:
+		if frame.Type != protocol.MsgFrontendInputBytes {
+			t.Fatalf("first frame type = %d", frame.Type)
+		}
+		msg, err := protocol.DecodeFrontendInputBytes(frame.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(msg.Data, []byte{0x1b}) {
+			t.Fatalf("standalone Escape = %q", msg.Data)
+		}
+		if !msg.SourceIdle {
+			t.Fatal("standalone Escape did not carry its source-idle boundary")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("standalone Escape was not forwarded after its local ambiguity window")
+	}
+	select {
+	case event := <-ui.events:
+		input, ok := event.(localInputEvent)
+		if !ok || !bytes.Equal(input.data, []byte{0}) {
+			t.Fatalf("standalone Escape prediction boundary = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("standalone Escape did not reset prediction")
+	}
+}
+
+func TestForwardInputDoesNotReplayPendingEscapeAcrossConnectionChange(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	oldFrames := make(chan protocol.Frame, 2)
+	newFrames := make(chan protocol.Frame, 2)
+	reads := make(chan terminalInputRead, 2)
+	oldDestination := &controlDestination{frames: oldFrames, done: ctx.Done()}
+	newDestination := &controlDestination{frames: newFrames, done: ctx.Done()}
+	var control atomic.Pointer[controlDestination]
+	control.Store(oldDestination)
+	ui := &runtimeState{events: make(chan renderEvent, 2)}
+	errs := make(chan error, 1)
+	go forwardInputReads(ctx, reads, &control, ui, errs, cancel, time.Hour)
+
+	reads <- terminalInputRead{data: []byte{0x1b}}
+	time.Sleep(10 * time.Millisecond)
+	control.Store(newDestination)
+	reads <- terminalInputRead{data: []byte("x")}
+	close(reads)
+
+	select {
+	case frame := <-newFrames:
+		msg, err := protocol.DecodeFrontendInputBytes(frame.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(msg.Data) != "x" || msg.SourceIdle {
+			t.Fatalf("new connection input = data %q sourceIdle=%v", msg.Data, msg.SourceIdle)
+		}
+	case err := <-errs:
+		t.Fatalf("forwardInputReads() error = %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("new connection input was not forwarded")
+	}
+	select {
+	case frame := <-oldFrames:
+		t.Fatalf("pending Escape was replayed to old connection: %#v", frame)
+	default:
+	}
+}
+
 func TestInputRouterDropsInputWhileDisconnected(t *testing.T) {
 	var control atomic.Pointer[controlDestination]
 	if err := sendCurrentControlEncoded(&control, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: []byte("dropped")}, protocol.EncodeFrontendInputBytes); err != nil {
@@ -626,6 +762,17 @@ func TestTerminalShutdownEndsSingleWriter(t *testing.T) {
 	}
 	if got := stdout.String(); got != "registered-exitfixed-exit" {
 		t.Fatalf("late output reached terminal: %q", got)
+	}
+}
+
+func TestFixedTerminalExitExplicitlyDisablesFrontendCaptureModes(t *testing.T) {
+	exit := string(fixedTerminalExit(80))
+	reset := "\x1b[?1003;1006;1004;2004l"
+	if !strings.HasPrefix(exit, reset) {
+		t.Fatalf("fixed terminal exit %q does not begin with capture reset %q", exit, reset)
+	}
+	if !strings.HasSuffix(exit, "\x1b[?1049l") {
+		t.Fatalf("fixed terminal exit does not leave alternate screen: %q", exit)
 	}
 }
 
