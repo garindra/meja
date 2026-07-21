@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/garindra/meja/internal/protocol"
 )
@@ -192,6 +193,63 @@ type countingBuffer struct {
 	bytes.Buffer
 	writes   int
 	maxWrite int
+}
+
+type renderBatchWriter struct {
+	batches [][]byte
+}
+
+func (w *renderBatchWriter) Write(data []byte) (int, error) {
+	w.batches = append(w.batches, append([]byte(nil), data...))
+	return len(data), nil
+}
+
+func TestFixedLeaseBufferPresentsLargeRedrawInBoundedBatches(t *testing.T) {
+	pane := &Pane{ID: 1, terminal: newTerminal(int(protocol.MaxGridCols), 64)}
+	for row := 0; row < pane.terminal.Rows; row++ {
+		cells := pane.terminal.gridRow(row)
+		for column := 0; column < pane.terminal.Cols; column++ {
+			pane.terminal.replaceTextCell(cells, column, string(rune('a'+column%26)), 1, 0)
+		}
+	}
+	ptyOutput := startTestPaneLoop(pane)
+	defer close(ptyOutput)
+
+	wire := &renderBatchWriter{}
+	if err := pane.attachOutputStream(testOutputLease(0, wire), 1); err != nil {
+		t.Fatal(err)
+	}
+	syncPaneRenderer(t, pane)
+	if len(wire.batches) < 2 {
+		t.Fatalf("large redraw used %d batch, want progressive presentation", len(wire.batches))
+	}
+	renderedCells := 0
+	for index, batch := range wire.batches {
+		if len(batch) > paneRenderBufferCapacity {
+			t.Fatalf("batch %d has %d bytes, capacity %d", index, len(batch), paneRenderBufferCapacity)
+		}
+		commands := decodePendingCommands(t, batch)
+		if len(commands) == 0 || commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
+			t.Fatalf("batch %d is not PRESENT-terminated: %#v", index, commands)
+		}
+		for _, command := range commands {
+			switch command.Opcode {
+			case protocol.DisplayOpcodeWriteText, protocol.DisplayOpcodeWriteTextUTF8, protocol.DisplayOpcodeWriteTextUTF8Default:
+				width := int(command.Width)
+				if command.Opcode != protocol.DisplayOpcodeWriteText {
+					width = 1
+				}
+				renderedCells += utf8.RuneCount(command.Text) * width
+			case protocol.DisplayOpcodeWriteCluster:
+				renderedCells += int(command.Width)
+			case protocol.DisplayOpcodeFill:
+				renderedCells += command.Fill.Columns
+			}
+		}
+	}
+	if want := pane.terminal.Cols * pane.terminal.Rows; renderedCells != want {
+		t.Fatalf("rendered %d cells across batches, want %d", renderedCells, want)
+	}
 }
 
 func (b *countingBuffer) Write(data []byte) (int, error) {
@@ -751,6 +809,33 @@ func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("attach waited for the snapshot write")
+	}
+	ptyBytes := ptyReadBuffers.Get().([]byte)
+	n := copy(ptyBytes, "still-live")
+	output <- ptyBytes[:n]
+	captured := make(chan []byte, 1)
+	go func() {
+		data, _ := pane.capturePane(capturePaneOptions{})
+		captured <- data
+	}()
+	select {
+	case data := <-captured:
+		joined := bytes.ReplaceAll(data, []byte{'\n'}, nil)
+		if !bytes.Contains(joined, []byte("still-live")) {
+			t.Fatalf("pane actor processed capture but not blocked-write PTY data: %q", data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked output writer also blocked pane PTY processing")
+	}
+	released := make(chan *OutputLease, 1)
+	pane.releaseOutputStream(released)
+	select {
+	case lease := <-released:
+		if lease == nil || lease.Stream != stream {
+			t.Fatalf("released lease = %#v, want blocked output lease", lease)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked output writer also blocked lease handoff")
 	}
 	close(stream.release)
 	syncPaneRenderer(t, pane)

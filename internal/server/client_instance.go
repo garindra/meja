@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -528,6 +529,13 @@ func (d *Daemon) discardUnattachedClientInstance(instance *ClientInstance) {
 type OutputLease struct {
 	Slot   int
 	Stream io.Writer
+
+	workerOnce sync.Once
+	available  chan *paneRenderBuffer
+	ready      chan paneRenderBatch
+	failed     chan error
+	done       <-chan struct{}
+	onFailure  func(error)
 }
 
 const (
@@ -646,7 +654,15 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		if _, err := outputStream.Write([]byte{byte(protocol.DisplayOpcodeNoop)}); err != nil {
 			return fmt.Errorf("materialize pane output stream %d: %w", slot, err)
 		}
-		outputLeases[slot] = &OutputLease{Slot: slot, Stream: outputStream}
+		leaseSlot := slot
+		outputLeases[slot] = &OutputLease{
+			Slot:   slot,
+			Stream: outputStream,
+			done:   conn.Context().Done(),
+			onFailure: func(writeErr error) {
+				_ = conn.CloseWithError(protocol.RenderOutputErrorCode, fmt.Sprintf("pane output slot %d failed: %v", leaseSlot, writeErr))
+			},
+		}
 	}
 
 	s, err = d.attachClientInstance(clientInstance, conn, statusOutput, outputLeases, controlFrames, attachCols, attachRows)

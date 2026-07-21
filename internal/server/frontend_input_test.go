@@ -851,7 +851,7 @@ func TestMouseWheelScrollsMejaHistoryBeforePaneMouseMode(t *testing.T) {
 	frontend := newClientInstance(nil, nil)
 	frontend.rememberLayout(layout)
 	request := paneHistoryRequest{Action: paneHistoryEnter}
-	if result := pane.handleHistoryRequest(nil, &request); result.Err != nil {
+	if result := pane.handleHistoryRequest(&request); result.Err != nil {
 		t.Fatal(result.Err)
 	}
 	// This unit fixture has no pane owner goroutine. Use the synchronous

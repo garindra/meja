@@ -776,6 +776,22 @@ func TestAlternateScreenRestoresPrimaryGrid(t *testing.T) {
 	}
 }
 
+func TestGraphemeClusterStorageIsBounded(t *testing.T) {
+	term := newTerminal(8, 2)
+	input := []byte("a")
+	for i := 0; i < maxGraphemeClusterBytes; i++ {
+		input = append(input, []byte("\u0301")...)
+	}
+	term.Apply(input)
+	cluster := term.cellText(term.gridRow(0)[0])
+	if len(cluster) > maxGraphemeClusterBytes {
+		t.Fatalf("cluster retained %d bytes, limit %d", len(cluster), maxGraphemeClusterBytes)
+	}
+	if term.CursorX != 1 {
+		t.Fatalf("excess combining marks advanced cursor to %d", term.CursorX)
+	}
+}
+
 func TestAlternateResizePreservesPrimary(t *testing.T) {
 	term := newTerminal(8, 3)
 	term.Apply([]byte("primary"))

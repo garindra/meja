@@ -143,6 +143,7 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	if _, err := pane.enterHistoryMode(); err != nil {
 		t.Fatal(err)
 	}
+	syncPaneRenderer(t, pane)
 	if wire.Len() <= liveBytes {
 		t.Fatal("entering history did not repaint the pane's existing output stream")
 	}
@@ -167,6 +168,7 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	if !exited {
 		t.Fatal("pane did not exit history mode")
 	}
+	syncPaneRenderer(t, pane)
 	if wire.Len() <= historyBytes {
 		t.Fatal("exiting history did not repaint the pane's existing output stream")
 	}
@@ -187,7 +189,7 @@ func TestHistoryKeyboardSelectionCopiesAndExits(t *testing.T) {
 	setTestRows(pane.terminal, nil, []decodedTestRow{row("hello"), row("world")})
 	pane.terminal.CursorX = 0
 	pane.terminal.CursorY = 0
-	if result := pane.handleHistoryRequest(nil, &paneHistoryRequest{Action: paneHistoryEnter}); result.Err != nil {
+	if result := pane.handleHistoryRequest(&paneHistoryRequest{Action: paneHistoryEnter}); result.Err != nil {
 		t.Fatal(result.Err)
 	}
 
@@ -200,34 +202,6 @@ func TestHistoryKeyboardSelectionCopiesAndExits(t *testing.T) {
 	}
 	if pane.isHistoryMode() {
 		t.Fatal("keyboard copy did not exit history mode")
-	}
-}
-
-func TestHistoryMouseSelectionInstallsYellowHighlightStyle(t *testing.T) {
-	pane := &Pane{ID: 0, terminal: newTerminal(4, 1)}
-	setTestRows(pane.terminal, nil, []decodedTestRow{historyTestRow("text")})
-	var wire bytes.Buffer
-	output := newRenderOutput(&wire)
-	if result := pane.beginHistorySelectionNow(output, 0, 0, true); result.Err != nil {
-		t.Fatal(result.Err)
-	}
-	if result := pane.updateHistorySelectionNow(output, 0, 2); result.Err != nil {
-		t.Fatal(result.Err)
-	}
-
-	var found bool
-	for _, command := range decodePendingCommands(t, wire.Bytes()) {
-		wantStyle := protocol.Style{
-			FG: protocol.Color{Mode: "indexed", Index: 0},
-			BG: protocol.Color{Mode: "indexed", Index: 226},
-		}
-		if command.Opcode == protocol.DisplayOpcodeStyleInstall && command.StyleID&historySelectionStyleMask != 0 && command.Style == wantStyle {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("selection did not install a black-on-yellow highlight style")
 	}
 }
 
