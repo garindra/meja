@@ -2,11 +2,7 @@
 
 Meja is a terminal multiplexer for local and remote sessions. This document explains how its client, server, transport, terminal model, renderer, and persistence machinery fit together.
 
-This is not a claim that Meja has found the only, or even the best, way to build such a system. It records the approach we chose, the constraints that shaped it, and the invariants we currently rely on. Some decisions will have holes. Some will become mistakes as the project grows. Corrections, counterexamples, and simpler designs are welcome.
-
-Within that qualification, several parts of the design deserve a precise account: the actor-owned server, the SSH-to-QUIC bootstrap, per-pane render streams, the custom display protocol and relayout barrier, grapheme-cluster-safe terminal state, and client-side latency compensation. These mechanisms carry most of Meja's correctness and responsiveness.
-
-For an introduction and quick start, see [README.md](README.md). For commands, keys, file formats, and exact user-visible behavior, see [USAGE.md](USAGE.md).
+For an introduction and quick start, see [README.md](README.md). For a comprehensive reference covering commands, options, keybindings, profiles, sockets, autosave, and diagnostics, see REFERENCE.md.
 
 ## Table of Contents
 
@@ -555,6 +551,8 @@ The current in-memory layout is:
 This is a logical bit layout inside a `uint32`; `cellWord` values are not copied directly onto the wire, so host byte order is not part of the protocol.
 
 The low 12 bits select one of at most 4,096 pane-local styles. The middle 16 bits hold either the low bits of a Unicode scalar or the low bits of a cluster handle. The high four bits describe how to interpret the payload and whether the anchor occupies one or two terminal columns.
+
+The order is deliberate. Keeping `kind` in the high bits allows it to be read with a shift and no mask; keeping the style ID in the low bits makes style application a simple OR and lets a styled blank be represented by its style bits alone. The payload occupies the middle, where extracting its `uint16` value requires a shift but no separate mask. Other field orders can make the payload low or half-word aligned, but they add masking or shifting to the more frequently used kind or style operations.
 
 The defined kinds distinguish:
 
@@ -1132,7 +1130,7 @@ Terminal output and frontend input can both be high-volume or adversarial. Meja 
 * render batches have both an idle flush and a maximum age; and
 * each pane output lease owns one fixed 32 KiB render buffer and every submitted batch ends in `PRESENT`.
 
-The current terminal store uses four-byte cells split into a 4-bit kind, 16-bit payload, and 12-bit style ID. It retains at most 2,048 logical rows in sixteen lazily allocated 128-row blocks, interns at most 4,096 styles and 131,072 live cluster handles per pane, limits one cluster to 1 KiB, and reference-counts cluster text across grids and history snapshots. PTY reads use pooled 32 KiB buffers. Each pane render slot contributes one fixed 32 KiB buffer owned by its output lease, rather than every long-lived pane retaining a render scratch buffer. Detached panes stop tracking damage, and attached panes retain only row spans and stream-local style state while the lease worker holds the buffer. These are implementation constants rather than wire guarantees, but they make the intended memory shape and degradation points explicit.
+The current terminal store uses four-byte cells laid out as a 4-bit kind, 16-bit payload, and 12-bit style ID from most-significant to least-significant bits. It retains at most 2,048 logical rows in sixteen lazily allocated 128-row blocks, interns at most 4,096 styles and 131,072 live cluster handles per pane, limits one cluster to 1 KiB, and reference-counts cluster text across grids and history snapshots. PTY reads use pooled 32 KiB buffers. Each pane render slot contributes one fixed 32 KiB buffer owned by its output lease, rather than every long-lived pane retaining a render scratch buffer. Detached panes stop tracking damage, and attached panes retain only row spans and stream-local style state while the lease worker holds the buffer. These are implementation constants rather than wire guarantees, but they make the intended memory shape and degradation points explicit.
 
 The QUIC handshake uses the 1,200-byte minimum initial packet size. This leaves room on common 1,280-byte network paths without relying on IP fragmentation during connection establishment.
 

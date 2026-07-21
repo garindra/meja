@@ -1,8 +1,41 @@
 # meja
 
-meja is a light tmux-style multiplexer with native remote capability and restorable & shareable sessions.
+meja is a tmux-style multiplexer with native remote capability and restorable & shareable sessions.
 
 ![Meja screenshot](screenshot.png)
+
+---
+
+
+## Installation
+
+On Linux x86-64:
+
+```sh
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.6/meja_0.0.6_linux_amd64.tar.gz \
+  | sudo tar -xz -C /usr/local/bin meja
+```
+
+On macOS with Apple Silicon:
+
+```sh
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.6/meja_0.0.6_darwin_arm64.tar.gz \
+  | sudo tar -xz -C /usr/local/bin meja
+```
+
+You can also install the latest version with Go:
+
+```sh
+go install github.com/garindra/meja@latest
+```
+
+Check that your meja installation is successful:
+
+```sh
+meja version
+```
+
+For remote `meja -h <host>` sessions, make sure to also install the binary on the target machine, reachable on `$PATH`.
 
 ---
 
@@ -73,50 +106,20 @@ The file is readable and editable. Check it into version control so your team ca
 
 ---
 
-## Installation
-
-On Linux x86-64:
-
-```sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.6/meja_0.0.6_linux_amd64.tar.gz \
-  | sudo tar -xz -C /usr/local/bin meja
-```
-
-On macOS with Apple Silicon:
-
-```sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.6/meja_0.0.6_darwin_arm64.tar.gz \
-  | sudo tar -xz -C /usr/local/bin meja
-```
-
-You can also install the latest version with Go:
-
-```sh
-go install github.com/garindra/meja@latest
-```
-
-Check that your meja installation is successful:
-
-```sh
-meja version
-```
-
-For remote `meja -h <host>` sessions, make sure to also install the binary on the target machine, reachable on `$PATH`.
-
-
 ## Why `meja`
 
 ### Familiar by design
 
 Meja follows tmux wherever practical.
 
-It uses the same `Ctrl+b` prefix and the familiar model of sessions, windows, panes, splits, history, detaching, and attaching. Existing tmux knowledge transfers directly.
+It uses the same `Ctrl+b` prefix, command set, and the familiar model of sessions, windows, panes, splits, history, detaching, and attaching. Existing tmux knowledge transfers directly.
 
 ### Editable `.meja` files
 
 `meja save` writes a live session's plan to a readable `.meja` file.
 
 These files can be edited, kept with a project, checked into version control, and used by other people to create the same session arrangement.
+
 
 
 ### Named-session recovery
