@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -257,7 +256,7 @@ func TestSuccessfulSetRootPromptRestoresNormalStatus(t *testing.T) {
 	if err := s.publishStatusBar(); err != nil {
 		t.Fatal(err)
 	}
-	assertStatusText(t, statusClient.read(t), ":")
+	assertStatusTextWithLocation(t, statusClient.read(t), ":", currentStatusLocation(root))
 
 	for _, b := range []byte("set-root .\r") {
 		event := s.ConsumeInputByte(clientID0, b)
@@ -269,7 +268,7 @@ func TestSuccessfulSetRootPromptRestoresNormalStatus(t *testing.T) {
 		}
 		status := statusClient.read(t)
 		if b == '\r' {
-			assertStatusText(t, status, "[0] 0:bash* ")
+			assertStatusTextWithLocation(t, status, "[0] 0:bash* ", currentStatusLocation(root))
 			for i, cell := range status.Cells {
 				if cell.StyleID != statusNormalStyleID {
 					t.Fatalf("submitted status cell %d style=%d, want %d", i, cell.StyleID, statusNormalStyleID)
@@ -351,6 +350,11 @@ func (c *statusTestClient) read(t *testing.T) testStatusBar {
 
 func assertStatusText(t *testing.T, status testStatusBar, want string) {
 	t.Helper()
+	assertStatusTextWithLocation(t, status, want, currentStatusLocation(""))
+}
+
+func assertStatusTextWithLocation(t *testing.T, status testStatusBar, want, location string) {
+	t.Helper()
 	var text strings.Builder
 	for _, cell := range status.Cells {
 		if cell.Cluster == "" {
@@ -360,11 +364,7 @@ func assertStatusText(t *testing.T, status testStatusBar, want string) {
 		}
 	}
 	got := strings.TrimRight(text.String(), " ")
-	hostname := ""
-	if value, err := os.Hostname(); err == nil && value != "" {
-		hostname = "[" + value + "]"
-	}
-	left, right := statusLineParts(len(status.Cells), strings.TrimRight(want, " "), hostname)
+	left, right := statusLineParts(len(status.Cells), want, location)
 	wantCells := make([]rune, len(status.Cells))
 	for i := range wantCells {
 		wantCells[i] = ' '
@@ -374,6 +374,35 @@ func assertStatusText(t *testing.T, status testStatusBar, want string) {
 	wantRendered := strings.TrimRight(string(wantCells), " ")
 	if wantRendered != got {
 		t.Fatalf("status text = %q, want %q", got, wantRendered)
+	}
+}
+
+func TestStatusLocationNormalizesHome(t *testing.T) {
+	tests := []struct {
+		name string
+		root string
+		want string
+	}{
+		{name: "home", root: "/home/tester", want: "[host:~]"},
+		{name: "under home", root: "/home/tester/projects/test", want: "[host:~/projects/test]"},
+		{name: "outside home", root: "/srv/projects/test", want: "[host:/srv/projects/test]"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := statusLocation("host", test.root, "/home/tester"); got != test.want {
+				t.Fatalf("status location = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestStatusLinePartsSharesOverflowAndKeepsLocationTail(t *testing.T) {
+	left, right := statusLineParts(30, "left status is long", "[host:~/projects/a/last]")
+	if got := string(left); got != "left status is…" {
+		t.Fatalf("left status = %q, want %q", got, "left status is…")
+	}
+	if got := string(right); got != "[host:…/a/last]" {
+		t.Fatalf("right status = %q, want %q", got, "[host:…/a/last]")
 	}
 }
 

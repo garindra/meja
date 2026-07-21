@@ -1044,12 +1044,8 @@ func (s *Session) CloseFocusedPane(clientID uint64) (closedPane *Pane, window *W
 			s.markSessionChangedForPersistence()
 			return closedPane, nil, cloneClientState(c), true, closedWindowID, true, nil
 		}
-		ids := s.windowIDsLocked()
-		nextWindow := s.Windows[ids[0]]
-		c.ActiveWindowID = nextWindow.ID
-		nextWindow.ActivePaneID = windowActivePaneID(nextWindow)
-		c.setFocusedPane(nextWindow.ActivePaneID)
-		s.rebuildBindingsLocked(c, nextWindow)
+		nextWindow := s.replacementWindowLocked(c, window.ID)
+		s.activateReplacementWindowLocked(c, nextWindow)
 		s.markSessionChangedForPersistence()
 		return closedPane, cloneWindow(nextWindow), cloneClientState(c), true, closedWindowID, false, nil
 	}
@@ -1120,11 +1116,11 @@ func (s *Session) RemovePane(paneID, clientID uint64) (window *Window, client *C
 			return nil, cloneClientState(c), true, true, nil
 		}
 		if c.ActiveWindowID == owner.ID {
-			ids := s.windowIDsLocked()
-			c.ActiveWindowID = ids[0]
-			nextWindow := s.Windows[ids[0]]
-			nextWindow.ActivePaneID = windowActivePaneID(nextWindow)
-			c.setFocusedPane(nextWindow.ActivePaneID)
+			nextWindow := s.replacementWindowLocked(c, owner.ID)
+			s.activateReplacementWindowLocked(c, nextWindow)
+		} else if c.HasLastWindow && c.LastWindowID == owner.ID {
+			c.LastWindowID = 0
+			c.HasLastWindow = false
 		}
 	}
 	active := s.Windows[c.ActiveWindowID]
@@ -1149,6 +1145,7 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 	if len(paneIDs) == 0 {
 		return 0, nil, nil, nil, nil, false, fmt.Errorf("window %d has no panes", windowID)
 	}
+	wasActive := c.ActiveWindowID == windowID
 	closedPanes = make([]*Pane, 0, len(paneIDs))
 	for _, paneID := range paneIDs {
 		if p := s.Panes[paneID]; p != nil {
@@ -1164,15 +1161,47 @@ func (s *Session) CloseWindow(clientID, windowID uint64) (closed uint64, closedP
 		s.markSessionChangedForPersistence()
 		return closed, closedPanes, nil, nil, cloneClientState(c), true, nil
 	}
-	ids := s.windowIDsLocked()
-	nextWindow := s.Windows[ids[0]]
-	c.ActiveWindowID = nextWindow.ID
-	nextWindow.ActivePaneID = windowActivePaneID(nextWindow)
-	c.setFocusedPane(nextWindow.ActivePaneID)
-	s.rebuildBindingsLocked(c, nextWindow)
+	if wasActive {
+		nextWindow := s.replacementWindowLocked(c, windowID)
+		s.activateReplacementWindowLocked(c, nextWindow)
+		replacement = cloneWindow(nextWindow)
+	} else {
+		if c.HasLastWindow && c.LastWindowID == windowID {
+			c.LastWindowID = 0
+			c.HasLastWindow = false
+		}
+		activeWindow := s.Windows[c.ActiveWindowID]
+		if activeWindow == nil {
+			return 0, nil, nil, nil, nil, false, fmt.Errorf("client %d has no active window after closing window %d", clientID, windowID)
+		}
+		s.rebuildBindingsLocked(c, activeWindow)
+		replacement = cloneWindow(activeWindow)
+	}
 	s.markSessionChangedForPersistence()
 	pane = s.Panes[c.FocusedPaneID]
-	return closed, closedPanes, cloneWindow(nextWindow), pane, cloneClientState(c), false, nil
+	return closed, closedPanes, replacement, pane, cloneClientState(c), false, nil
+}
+
+func (s *Session) replacementWindowLocked(client *ClientState, closedWindowID uint64) *Window {
+	if client.HasLastWindow && client.LastWindowID != closedWindowID {
+		if window := s.Windows[client.LastWindowID]; window != nil {
+			return window
+		}
+	}
+	ids := s.windowIDsLocked()
+	if len(ids) == 0 {
+		return nil
+	}
+	return s.Windows[ids[0]]
+}
+
+func (s *Session) activateReplacementWindowLocked(client *ClientState, window *Window) {
+	client.ActiveWindowID = window.ID
+	window.ActivePaneID = windowActivePaneID(window)
+	client.setFocusedPane(window.ActivePaneID)
+	client.LastWindowID = 0
+	client.HasLastWindow = false
+	s.rebuildBindingsLocked(client, window)
 }
 
 type WindowStatus struct {
