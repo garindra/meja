@@ -241,6 +241,7 @@ Prefix bindings and the `Ctrl+b, :` prompt use the same command engine. Most com
 | `previous-window` | `previous-window [-t session]` | Select the previous window. |
 | `last-window` | `last-window [-t session]` | Return to the last window. |
 | `select-window` | `select-window -t session:window` | Select a zero-based window index. |
+| `kill-session` | `kill-session -t session` | Terminate a session and its panes. |
 | `kill-pane` | `kill-pane [-t session]` | Close the active pane. |
 | `copy-mode` | `copy-mode [-t session]` | Enter history/copy mode. |
 | `send-keys` | `send-keys [-t session] [-X copy-mode-command | -l] key...` | Send keys or run a copy-mode command in the active pane. |

@@ -125,6 +125,36 @@ func TestCommandAliasesAreResolvedByDaemon(t *testing.T) {
 	}
 }
 
+func TestKillSessionCommandTargetsByNameAndID(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	first, err := d.executeSessionOperation("create-session", commandSessionTarget{name: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := d.executeSessionOperation("create-session", commandSessionTarget{name: "other"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	killedByName := d.executeCommand(protocol.CommandRequest{Args: []string{"kill-session", "-t", "work"}})
+	if killedByName.exitCode != 0 || d.sessionByName("work") != nil {
+		t.Fatalf("kill-session by name = %#v", killedByName)
+	}
+
+	killedByID := d.executeCommand(protocol.CommandRequest{Args: []string{"kill-session", "-t", strconv.FormatUint(second.session.ID, 10)}})
+	if killedByID.exitCode != 0 || d.session(second.session.ID) != nil {
+		t.Fatalf("kill-session by ID = %#v", killedByID)
+	}
+
+	if first.session == second.session {
+		t.Fatal("test sessions unexpectedly share state")
+	}
+	missingTarget := d.executeCommand(protocol.CommandRequest{Args: []string{"kill-session"}})
+	if missingTarget.exitCode == 0 || !strings.Contains(string(missingTarget.stderr), "requires -t") {
+		t.Fatalf("kill-session missing target = %#v", missingTarget)
+	}
+}
+
 func TestHelpIsGeneratedFromRegisteredCommands(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	result := d.executeCommand(protocol.CommandRequest{Args: []string{"--help"}})
