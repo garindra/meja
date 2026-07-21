@@ -309,6 +309,7 @@ func registeredCommands() []commandDefinition {
 		{name: "restore-session", aliases: []string{"restore"}, usage: "restore-session -t name [-s new-name] [--commands=prepare|skip|run]", description: "Restore a named session's automatic snapshot and attach.", sessionResult: true, execute: restoreCommand()},
 		{name: "save-session", aliases: []string{"save"}, usage: "save-session -t session-id-or-name -o file [-f]", description: "Save a live session to a .meja file.", execute: daemonCommand(handleDaemonSaveSessionCommand)},
 		{name: "list-sessions", aliases: []string{"ls"}, usage: "list-sessions", description: "List active sessions.", execute: daemonCommand(handleDaemonListSessionsCommand)},
+		{name: "kill-session", usage: "kill-session -t session", description: "Terminate a session and its panes.", execute: daemonCommand(handleDaemonKillSessionCommand)},
 		{name: "kill-server", usage: "kill-server", description: "Stop the selected server.", execute: daemonCommand(handleDaemonKillServerCommand)},
 		{name: "server", hidden: true, execute: daemonCommand(handleLegacyDaemonServerCommand)},
 		{name: "new-window", aliases: []string{"neww"}, usage: "new-window [-t session]", description: "Create a window in a session.", execute: sessionCommand(sessionTarget, handleNewWindowCommand)},
@@ -677,6 +678,36 @@ func handleDaemonSaveSessionCommand(d *Daemon, request protocol.CommandRequest, 
 
 func handleDaemonListSessionsCommand(d *Daemon, _ protocol.CommandRequest, args []string) (commandResult, error) {
 	return d.commandListSessions(args)
+}
+
+func handleDaemonKillSessionCommand(d *Daemon, _ protocol.CommandRequest, args []string) (commandResult, error) {
+	fs := commandFlagSet("kill-session")
+	target := fs.String("t", "", "session target")
+	if err := fs.Parse(args); err != nil {
+		return commandResult{}, err
+	}
+	if *target == "" || len(fs.Args()) != 0 {
+		return commandResult{}, errors.New("kill-session requires -t <session-id-or-name>")
+	}
+	parsed, err := parseSessionTarget(*target)
+	if err != nil {
+		return commandResult{}, err
+	}
+	var session *Session
+	d.call(func() {
+		if parsed.id != 0 {
+			session = d.sessions[parsed.id]
+		} else {
+			session = d.sessionByName(parsed.name)
+		}
+	})
+	if session == nil {
+		return commandResult{}, fmt.Errorf("unknown session %q", *target)
+	}
+	if err := session.shutdown(); err != nil {
+		return commandResult{}, fmt.Errorf("kill-session: %w", err)
+	}
+	return commandResult{}, nil
 }
 
 func handleDaemonKillServerCommand(_ *Daemon, _ protocol.CommandRequest, args []string) (commandResult, error) {
