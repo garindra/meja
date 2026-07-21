@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/quic-go/quic-go"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
 	"github.com/garindra/meja/internal/protocol"
@@ -76,7 +77,6 @@ type runtimeState struct {
 	renderExitCommand     chan []byte
 	dropConnectionEvents  atomic.Bool
 	appliedLayoutRevision atomic.Uint64
-	rectangularScroll     bool
 }
 
 func writeAll(w io.Writer, data []byte) error {
@@ -152,6 +152,11 @@ type terminalExitEvent struct{ done chan error }
 type terminalShutdownEvent struct {
 	data []byte
 	done chan error
+}
+
+type rectangularScrollEvent struct {
+	enabled bool
+	done    chan struct{}
 }
 
 var errRenderShutdown = errors.New("render loop shutdown")
@@ -237,7 +242,6 @@ func Run(ctx context.Context, cfg Config) error {
 		diagnostics:       diagnostics,
 		renderDone:        make(chan struct{}),
 		renderExitCommand: make(chan []byte, 1),
-		rectangularScroll: true,
 	}
 	ui.dropConnectionEvents.Store(false)
 	renderCtx, stopRender := context.WithCancel(context.Background())
@@ -246,6 +250,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	var rawState *term.State
 	terminalActive := false
+	var pendingFrontendInput []byte
 	enterTerminal := func() error {
 		if terminalActive {
 			return nil
@@ -254,9 +259,32 @@ func Run(ctx context.Context, cfg Config) error {
 		if err != nil {
 			return fmt.Errorf("set terminal raw mode: %w", err)
 		}
-		if err := ui.writeTerminal(clientCtx, []byte("\x1b[?1049h\x1b[?69h\x1b[H\x1b[2J")); err != nil {
+		if err := ui.writeTerminal(clientCtx, []byte("\x1b[?1049h\x1b[H\x1b[2J")); err != nil {
 			_ = term.Restore(int(cfg.Stdin.Fd()), state)
 			return fmt.Errorf("enter alternate screen: %w", err)
+		}
+		supported, pending, probeErr := probeRectangularScroll(clientCtx, cfg.Stdin, ui)
+		if probeErr != nil {
+			_ = term.Restore(int(cfg.Stdin.Fd()), state)
+			return fmt.Errorf("probe rectangular scrolling: %w", probeErr)
+		}
+		pendingFrontendInput = append(pendingFrontendInput, pending...)
+		// Some terminals mishandle an unsupported DECRQM query by displaying
+		// its final character. Clear the untouched startup row before content
+		// rendering begins.
+		if err := ui.writeTerminal(clientCtx, []byte("\x1b[H\x1b[2K")); err != nil {
+			_ = term.Restore(int(cfg.Stdin.Fd()), state)
+			return fmt.Errorf("clear capability probe residue: %w", err)
+		}
+		if supported {
+			if err := ui.writeTerminal(clientCtx, []byte("\x1b[?69h")); err != nil {
+				_ = term.Restore(int(cfg.Stdin.Fd()), state)
+				return fmt.Errorf("enable rectangular scrolling: %w", err)
+			}
+		}
+		if err := ui.setRectangularScroll(clientCtx, supported); err != nil {
+			_ = term.Restore(int(cfg.Stdin.Fd()), state)
+			return err
 		}
 		rawState = state
 		terminalActive = true
@@ -293,7 +321,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	control.Store(live.controlDestination())
-	go forwardInput(clientCtx, cfg.Stdin, &control, ui, streamErrs, cancelClient)
+	go forwardInputWithInitial(clientCtx, cfg.Stdin, &control, ui, streamErrs, cancelClient, pendingFrontendInput)
 	go forwardResize(clientCtx, cfg.Stdin, &control, ui, streamErrs)
 
 	for {
@@ -1012,9 +1040,88 @@ func isTerminalQUICClose(err error) bool {
 }
 
 func forwardInput(ctx context.Context, stdin *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error, cancel context.CancelCauseFunc) {
+	forwardInputWithInitial(ctx, stdin, control, ui, errs, cancel, nil)
+}
+
+func forwardInputWithInitial(ctx context.Context, stdin *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error, cancel context.CancelCauseFunc, initial []byte) {
 	reads := make(chan terminalInputRead, 16)
+	if len(initial) > 0 {
+		reads <- terminalInputRead{data: append([]byte(nil), initial...)}
+	}
 	go readTerminalInput(ctx, stdin, reads)
 	forwardInputReads(ctx, reads, control, ui, errs, cancel, frontendEscapeDelay)
+}
+
+const rectangularScrollProbeTimeout = 250 * time.Millisecond
+
+// probeRectangularScroll asks the frontend whether DEC private mode 69 is
+// recognized. It runs before the normal stdin reader starts so the response is
+// consumed locally rather than forwarded to a pane. Any unrelated bytes read
+// alongside the response are returned to the normal input path.
+func probeRectangularScroll(ctx context.Context, stdin *os.File, ui *runtimeState) (bool, []byte, error) {
+	if err := ui.writeTerminal(ctx, []byte("\x1b[?69$p")); err != nil {
+		return false, nil, err
+	}
+
+	deadline := time.Now().Add(rectangularScrollProbeTimeout)
+	var data []byte
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, data, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		timeout := int((remaining + time.Millisecond - 1) / time.Millisecond)
+		if timeout < 1 {
+			timeout = 1
+		}
+		pollfds := []unix.PollFd{{Fd: int32(stdin.Fd()), Events: unix.POLLIN}}
+		n, err := unix.Poll(pollfds, timeout)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil || n == 0 {
+			break
+		}
+		if pollfds[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) == 0 {
+			continue
+		}
+
+		buf := make([]byte, 4096)
+		count, readErr := stdin.Read(buf)
+		if count > 0 {
+			data = append(data, buf[:count]...)
+			if supported, found, remaining := takeRectangularScrollReply(data); found {
+				return supported, remaining, nil
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	return false, data, nil
+}
+
+func takeRectangularScrollReply(data []byte) (supported, found bool, remaining []byte) {
+	const prefix = "\x1b[?69;"
+	start := bytes.Index(data, []byte(prefix))
+	if start < 0 {
+		return false, false, nil
+	}
+	statusStart := start + len(prefix)
+	endOffset := bytes.Index(data[statusStart:], []byte("$y"))
+	if endOffset < 0 {
+		return false, false, nil
+	}
+	status, err := strconv.Atoi(string(data[statusStart : statusStart+endOffset]))
+	if err != nil {
+		return false, false, nil
+	}
+	end := statusStart + endOffset + len("$y")
+	remaining = append(append([]byte(nil), data[:start]...), data[end:]...)
+	return status >= 1 && status <= 3, true, remaining
 }
 
 type terminalInputRead struct {
@@ -1606,19 +1713,30 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 	display := result.frame
 	s.ansi.WriteString("\x1b[?25l")
 	fullPaneEmitted := false
+	fullWidth := rect.X == 0 && rect.Width == s.cols
+	nativeScroll := !result.repaintPane && (fullWidth || s.rectangularScroll)
 	if delta := display.scrollDelta; delta != 0 {
-		if s.rectangularScroll && !result.repaintPane {
-			// DECLRMM is enabled for the session. Margins are reset immediately.
-			fmt.Fprintf(&s.ansi, "\x1b[%d;%dr\x1b[%d;%ds\x1b[%d;%dH", rect.Y+1, rect.Y+rect.Height, rect.X+1, rect.X+rect.Width, rect.Y+1, rect.X+1)
+		if nativeScroll {
+			// Vertical margins are sufficient when the pane spans the full
+			// terminal width. Non-full-width panes additionally require
+			// DECLRMM/DECSLRM, which is gated by rectangularScroll.
+			fmt.Fprintf(&s.ansi, "\x1b[%d;%dr", rect.Y+1, rect.Y+rect.Height)
+			if !fullWidth {
+				fmt.Fprintf(&s.ansi, "\x1b[%d;%ds", rect.X+1, rect.X+rect.Width)
+			}
+			fmt.Fprintf(&s.ansi, "\x1b[%d;%dH", rect.Y+1, rect.X+1)
 			if delta < 0 {
 				fmt.Fprintf(&s.ansi, "\x1b[%dS", -delta)
 			} else {
 				fmt.Fprintf(&s.ansi, "\x1b[%dT", delta)
 			}
-			fmt.Fprintf(&s.ansi, "\x1b[r\x1b[1;%ds", s.cols)
+			fmt.Fprintf(&s.ansi, "\x1b[r")
+			if !fullWidth {
+				fmt.Fprintf(&s.ansi, "\x1b[1;%ds", s.cols)
+			}
 		}
 	}
-	if cache != nil && display.scrollDelta != 0 && (!s.rectangularScroll || result.repaintPane) {
+	if cache != nil && display.scrollDelta != 0 && !nativeScroll {
 		if err := s.emitCachedPane(rect, cache, styles); err != nil {
 			return err
 		}
@@ -1850,7 +1968,7 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 			r.renderExitCommand <- append([]byte(nil), terminalExitCommand...)
 		}
 	}()
-	state := newScanoutState(r.rectangularScroll)
+	state := newScanoutState(false)
 	present := func(reason string) error {
 		buf := state.takeANSI()
 		if r.diagnostics != nil {
@@ -1938,6 +2056,9 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 			if err == nil {
 				return false, "", errRenderShutdown
 			}
+		case rectangularScrollEvent:
+			state.rectangularScroll = e.enabled
+			close(e.done)
 		case layoutEvent:
 			if r.dropConnectionEvents.Load() {
 				return false, "", nil
@@ -2121,6 +2242,25 @@ func (r *runtimeState) sync(ctx context.Context) {
 	case <-done:
 	case <-r.renderDone:
 	case <-ctx.Done():
+	}
+}
+
+func (r *runtimeState) setRectangularScroll(ctx context.Context, enabled bool) error {
+	done := make(chan struct{})
+	select {
+	case r.events <- rectangularScrollEvent{enabled: enabled, done: done}:
+	case <-r.renderDone:
+		return io.ErrClosedPipe
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-r.renderDone:
+		return io.ErrClosedPipe
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
