@@ -47,7 +47,7 @@ transport options (removed before forwarding):
   --port port             use an SSH port
   --remote-path path      remote meja executable (default: meja)
 
-transport options may appear anywhere before --. With no command, Meja runs
+Transport options must appear before the command. With no command, Meja runs
 new-session. Use --help for the server-backed command reference.`
 
 func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.Writer) error {
@@ -119,8 +119,11 @@ func parseInvocation(args []string, stdin *os.File, stdout, stderr io.Writer) (c
 		}
 		name, inlineValue, hasInlineValue, recognized := transportOption(arg)
 		if !recognized {
-			commandArgs = append(commandArgs, arg)
-			continue
+			// The first non-transport argument is the command name. From this
+			// point on, command flags are opaque to the transport parser; in
+			// particular, -h and -S may belong to the sub-command.
+			commandArgs = append(commandArgs, args[index:]...)
+			break
 		}
 		value := inlineValue
 		if !hasInlineValue {

@@ -78,13 +78,13 @@ meja detach
 Meja keeps the session and its processes running. Return to it later:
 
 ```sh
-meja attach -t work -h devbox
+meja -h devbox attach -t work
 ```
 
 If the machine reboots—or the session otherwise ends—recover it from its latest recorded state:
 
 ```sh
-meja restore -t work -h devbox
+meja -h devbox restore -t work
 ```
 
 Meja creates and enters a new session with the saved windows, panes, directories, and prepared commands.
