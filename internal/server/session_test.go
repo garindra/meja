@@ -752,7 +752,7 @@ func TestLayoutRevisionsAreUniqueAcrossWindows(t *testing.T) {
 	}
 }
 
-func TestReattachAdvancesActiveWindowLayoutRevision(t *testing.T) {
+func TestReattachPreservesActiveWindowLayoutRevision(t *testing.T) {
 	s := NewSession(0)
 	s.NewClient(0)
 	pane := &Pane{ID: s.AddPaneID(), Title: "one"}
@@ -766,8 +766,8 @@ func TestReattachAdvancesActiveWindowLayoutRevision(t *testing.T) {
 	if activePane != pane {
 		t.Fatalf("active pane = %#v, want %#v", activePane, pane)
 	}
-	if reattached.LayoutRevision <= previousRevision {
-		t.Fatalf("reattach revision = %d, want greater than %d", reattached.LayoutRevision, previousRevision)
+	if reattached.LayoutRevision != previousRevision {
+		t.Fatalf("reattach revision = %d, want unchanged at %d", reattached.LayoutRevision, previousRevision)
 	}
 }
 
@@ -1019,7 +1019,7 @@ func TestSessionClosesExistingConnectionBeforeAttachingReplacement(t *testing.T)
 	}}}
 	s.clientInstance = existing
 
-	if err := s.attachClientInstance(replacement, 80, 24); err != nil {
+	if err := s.attachClientInstance(replacement, 80, 24, false); err != nil {
 		t.Fatal(err)
 	}
 

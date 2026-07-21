@@ -672,7 +672,7 @@ Display streams use an opcode grammar rather than the generic control-frame enve
 | Command | Stream-state effect | Payload and purpose |
 |---|---|---|
 | `NOOP` | None | Materializes a QUIC output stream without creating a visible frame. |
-| `RELAYOUT_BARRIER` | Resets pane compiler state | Declares a layout revision and pane grid dimensions. It resets position, style selection, installed-style assumptions, and pending frame state for a newly bound slot. |
+| `START_RENDER` | Resets pane compiler state | Declares the current layout revision and pane grid dimensions. It resets position, style selection, installed-style assumptions, and pending frame state for a newly bound slot. It is sent on every stream bind, even when the revision is unchanged. |
 | `STYLE_INSTALL` | Adds or replaces a stream-local style definition | Associates a compact ID with the complete style needed by later writes. ID zero must be the canonical default style. |
 | `SET_WRITE_POSITION` | Changes the implicit row and column | Starts the next write at an explicit pane-relative coordinate. |
 | `SET_WRITE_STYLE` | Changes the implicit style ID | Selects the style used by ordinary text, cluster, and fill commands. |
@@ -685,7 +685,7 @@ Display streams use an opcode grammar rather than the generic control-frame enve
 | `CURSOR_UPDATE` | Replaces remembered cursor state | Publishes pane-relative cursor position and visibility. |
 | `PRESENT` | Ends the current semantic frame | Makes all commands since the previous presentation eligible for the client UI loop. |
 
-The command stream is stateful, but the state is deliberately small and reconstructable. The relayout barrier supplies the grid needed to validate implicit advancement. Style installations and selection are local to the physical render stream. Position advances after writes, including an exact wrap from the last column to column zero of the next row. Cursor state is remembered separately and copied into the completed frame at `PRESENT`.
+The command stream is stateful, but the state is deliberately small and reconstructable. `START_RENDER` supplies the grid needed to validate implicit advancement. Style installations and selection are local to the physical render stream. Position advances after writes, including an exact wrap from the last column to column zero of the next row. Cursor state is remembered separately and copied into the completed frame at `PRESENT`.
 
 `PRESENT` is the atomic publication boundary. Every pane buffer submitted to an output worker ends with cursor state and `PRESENT`, so every successful write produces a complete client frame. A large update may intentionally become several early-presented frames: for example rows 0–8, then rows 9–17, while damage for later rows remains pending. The client never exposes a half-built batch, but it may visibly make progressive forward progress through a full refresh rather than waiting for the whole viewport to be encoded and transported.
 
@@ -725,7 +725,7 @@ Full rendering still uses the same display operations, but it may be split into 
 
 # Layouts, render slots, output leases, and relayout
 
-Layouts and pane output travel on different streams. QUIC may deliver those streams independently, so the client needs a way to know which geometry makes a pane frame meaningful. Layout revisions, relayout barriers, and output leases provide that contract.
+Layouts and pane output travel on different streams. QUIC may deliver those streams independently, so the client needs a way to know which geometry makes a pane frame meaningful. Layout revisions, `START_RENDER` commands, and output leases provide that contract.
 
 ## Render slots
 
@@ -767,8 +767,8 @@ sequenceDiagram
     O-->>S: Return physical slot lease
     S->>S: Rebuild pane-to-slot bindings
     S->>N: Attach lease with new layout revision
-    N->>C: RELAYOUT_BARRIER revision
-    N->>C: RELAYOUT_BARRIER + first bounded pane batch + PRESENT
+    N->>C: START_RENDER revision
+    N->>C: START_RENDER + first bounded pane batch + PRESENT
     S->>C: WINDOW_LAYOUT revision and rectangles
     C->>C: Activate after layout and one presented frame per visible pane
     N->>C: Remaining authoritative batches, each ending in PRESENT
@@ -776,11 +776,11 @@ sequenceDiagram
 
 The old pane stops submitting new work before the new pane receives the lease. Any already-submitted old-pane batch finishes first in stream order; only then can the worker offer the shared buffer to the newly attached pane. This prevents bytes from two logical panes from being interleaved on one ordered QUIC stream.
 
-## Relayout barrier
+## Start render
 
-The first command after a pane acquires a render stream is a relayout barrier carrying the new layout revision and the pane grid dimensions. The barrier resets the display compiler's stream-local position, style selection, installed styles, and pending frame state. It says that all subsequent commands belong to a new coordinate space and cannot be interpreted as a continuation of the previous pane binding. The client validates that the barrier dimensions match the rectangle later activated for that slot.
+The first command after a pane acquires a render stream is `START_RENDER`, carrying the current layout revision and pane grid dimensions. It resets the display compiler's stream-local position, style selection, installed styles, and pending frame state. It says that all subsequent commands belong to the current coordinate space and cannot be interpreted as a continuation of the previous pane binding. The revision may be unchanged when a client reconnects to an unchanged layout. The client validates that the dimensions match the rectangle later activated for that slot.
 
-The pane then installs canonical styles and begins a complete refresh. The first bounded batch carries the barrier and ends in `PRESENT`; later batches progressively fill any remaining dirty rows. The barrier is not itself a control-stream layout message; it is the render stream's declaration of which layout the following pixels belong to.
+The pane then installs canonical styles and begins a complete refresh. The first bounded batch carries `START_RENDER` and ends in `PRESENT`; later batches progressively fill any remaining dirty rows. `START_RENDER` is not itself a control-stream layout message; it is the render stream's declaration of which layout the following pixels belong to.
 
 ## Client activation
 
@@ -799,7 +799,7 @@ This yields the main relayout invariant:
 
 # Client rendering
 
-The client deliberately separates parallel stream decoding from serialized terminal output. QUIC gives each status or pane output stream independent ordering, so each accepted output stream receives its own decoder worker. For pane streams this is one goroutine per fixed pane output stream/render slot, whether that slot is currently bound or idle—not one goroutine per long-lived server pane. An output lease may later bind the same stream and worker to a different pane, with `RELAYOUT_BARRIER` resetting the stream-local compiler.
+The client deliberately separates parallel stream decoding from serialized terminal output. QUIC gives each status or pane output stream independent ordering, so each accepted output stream receives its own decoder worker. For pane streams this is one goroutine per fixed pane output stream/render slot, whether that slot is currently bound or idle—not one goroutine per long-lived server pane. An output lease may later bind the same stream and worker to a different pane, with `START_RENDER` resetting the stream-local compiler.
 
 There is one additional worker for the status stream. These workers may block and decode independently, which preserves QUIC's cross-stream isolation, but none of them writes to the user's terminal.
 
@@ -812,9 +812,9 @@ Each decoder goroutine owns one `displayFrameCompiler`. It reads commands in ord
 * current row, column, and style ID;
 * installed style definitions;
 * remembered cursor position and visibility; and
-* whether a relayout barrier and paint operation have occurred.
+* whether `START_RENDER` and a paint operation have occurred.
 
-It validates the stream while compiling: pane commands require a barrier; positions and implicit writes must stay inside the declared grid; styles must be defined before use; clusters and fills must have valid widths; a width-two cell cannot be split at a row edge; and a frame cannot contain multiple `SCROLL` commands.
+It validates the stream while compiling: pane commands require `START_RENDER`; positions and implicit writes must stay inside the declared grid; styles must be defined before use; clusters and fills must have valid widths; a width-two cell cannot be split at a row edge; and a frame cannot contain multiple `SCROLL` commands.
 
 Text commands become pane-relative `paintSpan` values. A multi-row text command is split into row-local spans while the compiler's implicit position continues across the boundary. Fills are similarly split at row edges. `STYLE_INSTALL` definitions are collected in the frame rather than immediately affecting the physical terminal. Cursor updates change the compiler's remembered cursor and mark whether the frame explicitly changed it.
 
@@ -1225,7 +1225,7 @@ The suite includes:
 * stale-controller rejection after reconnect or takeover;
 * attach-token expiry, single use, resume, takeover, and live session switching;
 * frontend setup, registered cleanup, disconnect cleanup, and render-loop terminal ownership;
-* output-lease release, relayout barriers, grid validation, and revision activation;
+* output-lease release, `START_RENDER`, grid validation, and revision activation;
 * blocked output workers without blocked pane actors;
 * bounded progressive render batches, retained dirty suffixes, and a terminating `PRESENT` in every batch;
 * prediction confirmation, partial confirmation, conflict, and repair;
@@ -1256,7 +1256,7 @@ The following statements summarize the contracts contributors should preserve:
 13. An output lease is owned by at most one pane actor, and its render buffer is owned by exactly one of that actor or the lease worker at a time.
 14. Blocking PTY reads, PTY writes, and pane-stream writes occur outside the pane actor and do not mutate its terminal state.
 15. A render slot is a transport resource, not a permanent pane identity.
-16. Every pane render after rebinding begins with a relayout barrier containing the revision and grid dimensions, followed by a complete refresh that may span multiple presented frames.
+16. Every pane render after rebinding begins with `START_RENDER` containing the revision and grid dimensions, followed by a complete refresh that may span multiple presented frames. Reconnection may reuse the existing revision when the layout is unchanged.
 17. Every submitted pane render buffer ends with `PRESENT`; no partial batch becomes visible in the UI.
 18. Damage not encoded into one batch remains dirty, and later PTY damage is merged before another borrowed buffer is rendered.
 19. The client activates a layout revision only with initial frames for all its visible panes.

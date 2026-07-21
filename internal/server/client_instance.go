@@ -434,7 +434,7 @@ func (d *Daemon) attachClientInstance(instance *ClientInstance, conn quic.Connec
 	if activateErr != nil {
 		return nil, activateErr
 	}
-	if err := session.attachClientInstance(instance, cols, rows); err != nil {
+	if err := session.attachClientInstance(instance, cols, rows, false); err != nil {
 		d.detachClientInstance(instance, session)
 		return nil, err
 	}
@@ -505,7 +505,7 @@ func (d *Daemon) switchClientInstance(instance *ClientInstance, source *Session,
 
 	source.detachClientInstance()
 	instance.switching.Store(false)
-	if err := target.attachClientInstance(instance, cols, rows); err != nil {
+	if err := target.attachClientInstance(instance, cols, rows, true); err != nil {
 		// The daemon assignment has already moved. Return the target with the
 		// error so transport cleanup detaches from the correct session and a
 		// later reconnect uses the new target hint.

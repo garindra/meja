@@ -10,7 +10,7 @@ import (
 
 func TestDisplayWireBytesHaveNoGenericFrameLength(t *testing.T) {
 	encoder := NewDisplayEncoder(nil)
-	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 7, Cols: 80, Rows: 24}); err != nil {
+	if err := encoder.AppendStartRender(StartRender{LayoutRevision: 7, Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
 	}
 	if err := encoder.AppendSetWritePosition(SetWritePosition{Row: 4, Column: 9}); err != nil {
@@ -29,9 +29,9 @@ func TestDisplayWireBytesHaveNoGenericFrameLength(t *testing.T) {
 	}
 }
 
-func TestRelayoutBarrierCarriesDisplayGrid(t *testing.T) {
+func TestStartRenderCarriesDisplayGrid(t *testing.T) {
 	encoder := NewDisplayEncoder(nil)
-	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 9, Cols: 120, Rows: 40}); err != nil {
+	if err := encoder.AppendStartRender(StartRender{LayoutRevision: 9, Cols: 120, Rows: 40}); err != nil {
 		t.Fatal(err)
 	}
 	decoder := NewDisplayDecoder(bytes.NewReader(encoder.Bytes()))
@@ -42,7 +42,7 @@ func TestRelayoutBarrierCarriesDisplayGrid(t *testing.T) {
 	if command.LayoutRevision != 9 || command.GridCols != 120 || command.GridRows != 40 {
 		t.Fatalf("barrier = %#v", command)
 	}
-	if err := NewDisplayEncoder(nil).AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 1}); err == nil {
+	if err := NewDisplayEncoder(nil).AppendStartRender(StartRender{LayoutRevision: 1}); err == nil {
 		t.Fatal("barrier without a display grid was accepted")
 	}
 }
@@ -87,7 +87,7 @@ func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
 		{Opcode: DisplayOpcodeCursorUpdate, Cursor: CursorUpdate{Cursor: Cursor{X: 2, Y: 3}, Visible: true}},
 		{Opcode: DisplayOpcodeScroll, Delta: -1},
 	}
-	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 7, Cols: 80, Rows: 24}); err != nil {
+	if err := encoder.AppendStartRender(StartRender{LayoutRevision: 7, Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
 	}
 	for _, command := range commands {
@@ -96,7 +96,7 @@ func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
 		}
 	}
 	encoder.AppendPresent()
-	want := append([]DisplayCommand{{Opcode: DisplayOpcodeRelayoutBarrier, LayoutRevision: 7, GridCols: 80, GridRows: 24}}, commands...)
+	want := append([]DisplayCommand{{Opcode: DisplayOpcodeStartRender, LayoutRevision: 7, GridCols: 80, GridRows: 24}}, commands...)
 	want = append(want, DisplayCommand{Opcode: DisplayOpcodePresent})
 	got := decodeDisplayCommands(t, oneByteReader{Reader: bytes.NewReader(encoder.Bytes())})
 	if !reflect.DeepEqual(got, want) {
@@ -115,7 +115,7 @@ func TestDiverseClustersRoundTripAsOpaqueDisplayUnits(t *testing.T) {
 		{Opcode: DisplayOpcodeWriteCluster, Width: 2, Text: []byte("葛\U000e0100")},
 	}
 	encoder := NewDisplayEncoder(nil)
-	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 19, Cols: 80, Rows: 24}); err != nil {
+	if err := encoder.AppendStartRender(StartRender{LayoutRevision: 19, Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
 	}
 	for _, command := range clusters {
@@ -124,7 +124,7 @@ func TestDiverseClustersRoundTripAsOpaqueDisplayUnits(t *testing.T) {
 		}
 	}
 	encoder.AppendPresent()
-	want := append([]DisplayCommand{{Opcode: DisplayOpcodeRelayoutBarrier, LayoutRevision: 19, GridCols: 80, GridRows: 24}}, clusters...)
+	want := append([]DisplayCommand{{Opcode: DisplayOpcodeStartRender, LayoutRevision: 19, GridCols: 80, GridRows: 24}}, clusters...)
 	want = append(want, DisplayCommand{Opcode: DisplayOpcodePresent})
 	got := decodeDisplayCommands(t, oneByteReader{Reader: bytes.NewReader(encoder.Bytes())})
 	if !reflect.DeepEqual(got, want) {
@@ -135,7 +135,7 @@ func TestDiverseClustersRoundTripAsOpaqueDisplayUnits(t *testing.T) {
 func TestDisplayStyleRoundTripsExtendedAttributesWithoutChangingOldFlags(t *testing.T) {
 	style := Style{Bold: true, Dim: true, Blink: true, Italic: true, Underline: true, Reverse: true, Invisible: true, FG: Color{Mode: "default"}, BG: Color{Mode: "default"}}
 	encoder := NewDisplayEncoder(nil)
-	if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 1, Cols: 80, Rows: 24}); err != nil {
+	if err := encoder.AppendStartRender(StartRender{LayoutRevision: 1, Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
 	}
 	if err := encoder.AppendStyleInstall(StyleInstall{ID: 1, Style: style}); err != nil {
@@ -171,7 +171,7 @@ func TestDisplayEncoderStyleInstallFailurePreservesBytes(t *testing.T) {
 func TestDisplayDecoderMultipleBatches(t *testing.T) {
 	encoder := NewDisplayEncoder(nil)
 	for _, text := range []string{"one", "two"} {
-		if err := encoder.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: 3, Cols: 80, Rows: 24}); err != nil {
+		if err := encoder.AppendStartRender(StartRender{LayoutRevision: 3, Cols: 80, Rows: 24}); err != nil {
 			t.Fatal(err)
 		}
 		if err := encoder.AppendWriteTextUTF8([]byte(text)); err != nil {
@@ -182,7 +182,7 @@ func TestDisplayDecoderMultipleBatches(t *testing.T) {
 	decoder := NewDisplayDecoder(bytes.NewReader(encoder.Bytes()))
 	for _, want := range []string{"one", "two"} {
 		barrier, _, err := decoder.ReadCommand()
-		if err != nil || barrier.Opcode != DisplayOpcodeRelayoutBarrier {
+		if err != nil || barrier.Opcode != DisplayOpcodeStartRender {
 			t.Fatalf("barrier=%#v err=%v", barrier, err)
 		}
 		text, _, err := decoder.ReadCommand()

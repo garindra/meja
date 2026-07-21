@@ -418,7 +418,7 @@ func (s *paneRenderState) render(buffer *paneRenderBuffer) error {
 
 	output := newBoundedRenderOutput(buffer, s.installedStyles, paneRenderBufferCapacity-paneRenderTrailerReserve)
 	if s.barrierPending {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: s.layoutRevision, GridCols: s.cols(), GridRows: s.rows()}); err != nil {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: s.layoutRevision, GridCols: s.cols(), GridRows: s.rows()}); err != nil {
 			rollback()
 			return err
 		}

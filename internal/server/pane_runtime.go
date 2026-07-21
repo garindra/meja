@@ -69,7 +69,7 @@ func (p *Pane) attachOutputStream(lease *OutputLease, layoutRevision uint64) err
 }
 
 func (p *Pane) renderAttachedView(output *renderOutput, layoutRevision uint64) error {
-	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: layoutRevision, GridCols: p.terminal.Cols, GridRows: p.terminal.Rows}); err != nil {
+	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: layoutRevision, GridCols: p.terminal.Cols, GridRows: p.terminal.Rows}); err != nil {
 		return err
 	}
 	if err := installStyle(output, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {

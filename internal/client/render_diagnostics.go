@@ -292,8 +292,8 @@ func incomingRenderOpcodeName(opcode protocol.DisplayOpcode) string {
 	switch opcode {
 	case protocol.DisplayOpcodeNoop:
 		return "Noop"
-	case protocol.DisplayOpcodeRelayoutBarrier:
-		return "RelayoutBarrier"
+	case protocol.DisplayOpcodeStartRender:
+		return "StartRender"
 	case protocol.DisplayOpcodeStyleInstall:
 		return "StyleInstall"
 	case protocol.DisplayOpcodeSetWritePosition:

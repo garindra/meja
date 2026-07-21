@@ -452,7 +452,7 @@ func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 	d.clientSessions[credential] = source.ID
 	d.attachments[source.ID] = credential
 
-	if err := source.attachClientInstance(instance, 80, 23); err != nil {
+	if err := source.attachClientInstance(instance, 80, 23, false); err != nil {
 		t.Fatal(err)
 	}
 	first := decodeTestWindowLayout(t, <-instance.controlOut)
