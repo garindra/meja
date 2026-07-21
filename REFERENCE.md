@@ -28,12 +28,12 @@ meja [transport-options] [command [command-args...]]
 
 With no command, Meja runs `new-session` (`new`).
 
-Transport options may appear anywhere before `--`. The client removes them before forwarding the command to the selected server:
+Transport options must precede the command name. The client removes the leading transport options before forwarding the command and all remaining arguments to the selected server:
 
 ```sh
 meja -h prod new -s work
-meja new -s work -h prod        # equivalent
-meja new -h prod -- journalctl -f
+meja -h prod new -s work        # transport options must stay before `new`
+meja -h prod new -- journalctl -f
 ```
 
 Everything at and after `--` is preserved as command input.
@@ -73,7 +73,7 @@ meja help
 meja --help
 meja help resize-pane
 meja resize-pane --help
-meja help -h prod
+meja -h prod help
 ```
 
 Help is server-backed and may start the selected server. `version` is a local client command and prints `meja <version>`.
@@ -124,8 +124,8 @@ Examples:
 ```sh
 meja
 meja new -s work
-meja new -s deploy -r /srv/app -h prod
-meja new -s logs -h prod -- journalctl -f
+meja -h prod new -s deploy -r /srv/app
+meja -h prod new -s logs -- journalctl -f
 meja new -f dev.meja -s dev-alice
 ```
 
@@ -155,7 +155,7 @@ meja [transport-options] attach-session -t session-id-or-name
 
 ```sh
 meja attach -t 12
-meja a -t work -h prod
+meja -h prod a -t work
 ```
 
 `-t` is required. Attach returns to the same live processes. A session has at most one attached client; a new attach replaces the previous client cleanly. Attach does not start a missing server.
@@ -171,7 +171,7 @@ meja [transport-options] restore-session
 
 ```sh
 meja restore -t work
-meja restore -t deploy -h prod
+meja -h prod restore -t deploy
 meja restore -t work -s recovered --commands=run
 ```
 
@@ -190,7 +190,7 @@ meja [transport-options] save-session
 
 ```sh
 meja save -t work -o dev.meja
-meja save -t work -o ~/projects/acme/dev.meja -h prod
+meja -h prod save -t work -o ~/projects/acme/dev.meja
 ```
 
 A relative output path is resolved from the captured session root. Remote output is written remotely; Meja does not transfer it to the client.

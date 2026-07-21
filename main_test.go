@@ -35,14 +35,14 @@ func TestInvocationForwardsCommandArgumentsWithoutCommandParsing(t *testing.T) {
 	}
 }
 
-func TestInvocationExtractsTransportOptionsAnywhereBeforeSeparator(t *testing.T) {
+func TestInvocationExtractsTransportOptionsBeforeCommand(t *testing.T) {
 	cfg := parseTestInvocation(t,
-		"restore", "-t", "work",
 		"-h", "alice@example.com",
 		"-L", "dev",
 		"-i", "/keys/meja",
 		"--port=2202",
 		"--remote-path", "/opt/meja",
+		"restore", "-t", "work",
 	)
 	if cfg.Local || cfg.Target.Original != "alice@example.com" || cfg.SocketSelector.Profile != "dev" {
 		t.Fatalf("remote transport = %#v", cfg)
@@ -53,6 +53,27 @@ func TestInvocationExtractsTransportOptionsAnywhereBeforeSeparator(t *testing.T)
 	want := []string{"restore", "-t", "work"}
 	if !reflect.DeepEqual(cfg.CommandArgs, want) {
 		t.Fatalf("forwarded argv = %v, want %v", cfg.CommandArgs, want)
+	}
+}
+
+func TestInvocationPreservesCommandFlagsThatCollideWithTransportOptions(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{name: "horizontal split", args: []string{"split-window", "-h"}, want: []string{"split-window", "-h"}},
+		{name: "capture start line", args: []string{"capture-pane", "-S", "10"}, want: []string{"capture-pane", "-S", "10"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := parseTestInvocation(t, test.args...)
+			if !cfg.Local {
+				t.Fatalf("invocation selected remote transport: %#v", cfg)
+			}
+			if !reflect.DeepEqual(cfg.CommandArgs, test.want) {
+				t.Fatalf("forwarded argv = %v, want %v", cfg.CommandArgs, test.want)
+			}
+		})
 	}
 }
 
@@ -98,7 +119,7 @@ func TestTrailingPositionalArgumentIsForwardedToCommand(t *testing.T) {
 }
 
 func TestInvocationAcceptsProfileAndSocketSelectors(t *testing.T) {
-	profile := parseTestInvocation(t, "list-sessions", "-L", "dev")
+	profile := parseTestInvocation(t, "-L", "dev", "list-sessions")
 	if profile.SocketSelector.Profile != "dev" {
 		t.Fatalf("profile selector = %#v", profile.SocketSelector)
 	}
