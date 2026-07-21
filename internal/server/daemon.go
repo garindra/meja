@@ -57,6 +57,7 @@ type Daemon struct {
 	serverCtx             context.Context
 	stop                  context.CancelFunc
 	processMonitor        *ProcessMonitor
+	pasteBuffers          pasteBufferStore
 	stderr                io.Writer
 	controlPath           string
 	sessionPersistenceDir string
