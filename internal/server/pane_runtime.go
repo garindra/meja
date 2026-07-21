@@ -288,6 +288,15 @@ func (pane *Pane) run() {
 	for {
 		select {
 		case command := <-pane.commands:
+			if command.capture != nil {
+				// Capture is an authoritative terminal read. Flush any pending
+				// render update first so servicing the command cannot discard
+				// damage that the attached client still needs.
+				flush()
+				data, err := captureTerminalViewport(pane.terminal, command.capture.Options)
+				command.capture.Result <- paneCaptureResult{Data: data, Err: err}
+				continue
+			}
 			disarm(idle, &idleC)
 			disarm(maxAge, &maxC)
 			aggregate.Reset(pane.terminal.Rows)

@@ -90,6 +90,7 @@ func TestEveryPrefixBindingExpandsToCanonicalCommandArgs(t *testing.T) {
 		{'x', []string{"confirm-before", "kill-pane"}},
 		{'z', []string{"resize-pane", "-Z"}},
 		{'[', []string{"copy-mode"}},
+		{']', []string{"paste-buffer"}},
 		{'{', []string{"swap-pane", "-U"}},
 		{'}', []string{"swap-pane", "-D"}},
 		{',', []string{"rename-window"}},

@@ -200,7 +200,7 @@ func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	errorStatus := statusClient.read(t)
-	assertStatusText(t, errorStatus, `unknown command "send-keys"`)
+	assertStatusText(t, errorStatus, `send-keys requires at least one key`)
 	for i, cell := range errorStatus.Cells {
 		if cell.StyleID != statusPromptStyleID {
 			t.Fatalf("error status cell %d style=%d, want %d", i, cell.StyleID, statusPromptStyleID)

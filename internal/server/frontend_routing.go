@@ -222,6 +222,10 @@ func encodeLegacyKey(key frontendKeyEvent, mode paneTerminalMetadata) []byte {
 				data = []byte{byte(r-'A') + 1}
 			case r == ' ':
 				data = []byte{0}
+			case r >= '@' && r <= '_':
+				data = []byte{byte(r - '@')}
+			case r == '?':
+				data = []byte{0x7f}
 			}
 		}
 		if data == nil && utf8.ValidRune(r) {
@@ -543,6 +547,11 @@ func (s *Session) handleFrontendPointer(c *ClientInstance, revision uint64, poin
 			data, err := pane.finishHistorySelection()
 			if err != nil || len(data) == 0 {
 				return err
+			}
+			if c != nil && c.Daemon != nil {
+				if _, bufferErr := c.Daemon.pasteBuffers.addAutomatic(data); bufferErr != nil {
+					return bufferErr
+				}
 			}
 			return c.writeFrontendTerminal(osc52ClipboardWrite(data))
 		default:

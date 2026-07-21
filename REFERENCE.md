@@ -243,6 +243,16 @@ Prefix bindings and the `Ctrl+b, :` prompt use the same command engine. Most com
 | `select-window` | `select-window -t session:window` | Select a zero-based window index. |
 | `kill-pane` | `kill-pane [-t session]` | Close the active pane. |
 | `copy-mode` | `copy-mode [-t session]` | Enter history/copy mode. |
+| `send-keys` | `send-keys [-t session] [-X copy-mode-command | -l] key...` | Send keys or run a copy-mode command in the active pane. |
+| `capture-pane` | `capture-pane [-t session] [-p] [-b buffer-name] [-S start-line] [-E end-line] [-e] [-C] [-J] [-N]` | Capture the active pane into stdout or a paste buffer. |
+| `list-panes` | `list-panes [-t session] [-F format]` | List panes and pane mode values. |
+| `set-buffer` | `set-buffer [-a] [-b buffer-name] [-n new-buffer-name] data` | Create or update a paste buffer. |
+| `show-buffer` | `show-buffer [-b buffer-name]` | Print a paste buffer. |
+| `list-buffers` | `list-buffers` | List paste buffers. |
+| `delete-buffer` | `delete-buffer [-b buffer-name]` | Delete a paste buffer. |
+| `load-buffer` | `load-buffer [-b buffer-name] path` | Load a file into a paste buffer. |
+| `save-buffer` | `save-buffer [-a] [-b buffer-name] path` | Save a paste buffer to a file. |
+| `paste-buffer` | `paste-buffer [-t session] [-b buffer-name] [-dprS] [-s separator]` | Paste a buffer into the active pane. |
 | `swap-pane` | `swap-pane [-t session] (-U|-D)` | Swap with the previous or next pane. |
 | `select-pane` | `select-pane [-t session] (-U|-D|-L|-R)` | Focus an adjacent pane. |
 | `resize-pane` | `resize-pane [-t session] ((-U|-D|-L|-R) [amount] | -Z)` | Resize by cells or toggle zoom. |
@@ -260,6 +270,35 @@ Direction flags are `-U`, `-D`, `-L`, and `-R`. Resize defaults to one cell; an 
 `switch-session` retains the current QUIC connection and reconnect credential while changing the attached live session.
 
 Confirmation accepts `y`/`Y`; `n`, Enter, Escape, or `Ctrl+c` cancels.
+
+`send-keys` accepts ordinary UTF-8 text, named keys such as `Enter`, `Escape`,
+`Tab`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `Delete`, and `F1` through
+`F12`, plus modifier forms such as `C-c` and `M-x`. `-l` sends its arguments
+literally. Use `--` when a literal key argument begins with `-`.
+
+In copy mode, `send-keys -X` accepts `scroll-up`, `scroll-down`, `page-up`,
+`page-down`, `halfpage-up`, `halfpage-down`, `history-top`, `history-bottom`,
+`begin-selection`, `clear-selection`, `copy-selection`,
+`copy-selection-and-cancel`, and `cancel`.
+
+`capture-pane` captures the active pane's visible screen by default. `-S` and
+`-E` select line ranges; zero is the first visible line, negative values refer
+to history, `-S -` starts at the oldest retained history, and `-E -` ends at
+the bottom of the visible screen. `-p` prints to stdout; without `-p`, output
+is stored in a new or named paste buffer. `-e` includes ANSI style escapes and
+`-C` octal-escapes non-printable bytes. `-J` joins terminal-wrapped rows and
+`-N` preserves trailing spaces.
+
+`list-panes -F` supports `#{pane_in_mode}`, which is `1` while the pane is in
+copy mode and `0` otherwise.
+
+Paste buffers are daemon-wide. Buffers created without `-b` receive automatic
+names such as `buffer0001`; the newest automatic buffer is used when `-b` is
+omitted. Up to 50 automatic buffers are retained, while named buffers persist
+until deleted. `paste-buffer` replaces linefeeds with carriage returns by
+default, `-r` preserves linefeeds, `-s` selects a separator, `-p` requests
+bracketed paste when the application supports it, and `-d` deletes the buffer
+after a successful paste. The default `Ctrl+b ]` binding runs `paste-buffer`.
 
 ## Targets and in-pane context
 

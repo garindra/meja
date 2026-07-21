@@ -89,6 +89,8 @@ func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) server
 			return commandInputEvent("resize-pane", "-Z")
 		case '[':
 			return commandInputEvent("copy-mode")
+		case ']':
+			return commandInputEvent("paste-buffer")
 		case '{':
 			return commandInputEvent("swap-pane", "-U")
 		case '}':

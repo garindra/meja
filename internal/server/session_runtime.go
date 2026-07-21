@@ -211,6 +211,11 @@ func (s *Session) handleLegacyInputBytes(c *ClientInstance, data []byte) (bool, 
 			if err != nil || len(copied) == 0 {
 				return false, err
 			}
+			if c != nil && c.Daemon != nil {
+				if _, bufferErr := c.Daemon.pasteBuffers.addAutomatic(copied); bufferErr != nil {
+					return false, bufferErr
+				}
+			}
 			return false, c.writeFrontendTerminal(osc52ClipboardWrite(copied))
 		}
 		if translated, consumed, ok := translateApplicationCursor(data[index:], s.InputIsNormal(clientID0) && pane.InputMode().applicationCursorKeys); ok {

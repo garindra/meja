@@ -85,6 +85,7 @@ type paneCommand struct {
 	detach  io.Writer
 	release *paneOutputRelease
 	apply   func(*renderOutput) error
+	capture *paneCaptureRequest
 	resize  *paneResize
 	history *paneHistoryRequest
 	done    chan error
@@ -113,6 +114,9 @@ const (
 	paneHistorySelectionUpdate
 	paneHistorySelectionFinish
 	paneHistorySelectionCancel
+	paneHistorySelectionBeginCursor
+	paneHistorySelectionCopy
+	paneHistorySelectionClear
 )
 
 type paneHistoryRequest struct {
@@ -121,6 +125,7 @@ type paneHistoryRequest struct {
 	Row    int
 	Column int
 	Auto   bool
+	Cancel bool
 	Result chan<- paneHistoryResult
 }
 
