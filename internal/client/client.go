@@ -804,9 +804,9 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		c.frameReady = false
 		c.cursorUpdated = false
 	}
-	if command.Opcode == protocol.DisplayOpcodeRelayoutBarrier {
+	if command.Opcode == protocol.DisplayOpcodeStartRender {
 		if c.slot == protocol.StatusRenderSlot {
-			return false, errors.New("RELAYOUT_BARRIER on status output")
+			return false, errors.New("START_RENDER on status output")
 		}
 		if command.GridCols <= 0 || command.GridRows <= 0 || uint64(command.GridCols) > protocol.MaxGridCols || uint64(command.GridRows) > protocol.MaxGridRows {
 			return false, fmt.Errorf("invalid display grid %dx%d on slot %d", command.GridCols, command.GridRows, c.slot)
@@ -822,7 +822,7 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		return false, nil
 	}
 	if !c.hasBarrier && c.slot != protocol.StatusRenderSlot {
-		return false, fmt.Errorf("display command 0x%02x on slot %d before RELAYOUT_BARRIER", byte(command.Opcode), c.slot)
+		return false, fmt.Errorf("display command 0x%02x on slot %d before START_RENDER", byte(command.Opcode), c.slot)
 	}
 
 	switch command.Opcode {

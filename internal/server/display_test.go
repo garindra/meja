@@ -291,7 +291,7 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	commands := decodePendingCommands(t, wire.Bytes())
-	if len(commands) < 2 || commands[0].Opcode != protocol.DisplayOpcodeRelayoutBarrier || commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
+	if len(commands) < 2 || commands[0].Opcode != protocol.DisplayOpcodeStartRender || commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
 		t.Fatalf("commands=%#v", commands)
 	}
 	if commands[0].GridCols != 8 || commands[0].GridRows != 3 {
@@ -307,7 +307,7 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 	var first, second bytes.Buffer
 	firstLease := testOutputLease(0, &first)
 	if err := pane.attachOutputWithRefresh(firstLease, func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1, GridCols: 80, GridRows: 24}); err != nil {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 80, GridRows: 24}); err != nil {
 			return err
 		}
 		return output.present()
@@ -340,7 +340,7 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 	}
 
 	if err := pane.attachOutputWithRefresh(testOutputLease(0, &second), func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 2, GridCols: 80, GridRows: 24}); err != nil {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 2, GridCols: 80, GridRows: 24}); err != nil {
 			return err
 		}
 		return output.present()

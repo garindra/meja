@@ -166,7 +166,7 @@ func (s *Session) shutdownWithTimeouts(timeouts paneTerminationTimeouts) error {
 	return s.shutdownErr
 }
 
-func (s *Session) attachClientInstance(client *ClientInstance, cols, rows uint16) error {
+func (s *Session) attachClientInstance(client *ClientInstance, cols, rows uint16, advanceLayoutRevision bool) error {
 	return s.coordinate(func() error {
 		previous := s.clientInstance
 		if previous != nil && previous != client && previous.QUIC != nil {
@@ -196,9 +196,13 @@ func (s *Session) attachClientInstance(client *ClientInstance, cols, rows uint16
 			cols, rows = uint16(paneCols), uint16(paneRows)
 		}
 		handoff := s.beginOutputHandoff()
+		clientState := s.Clients[clientID0]
+		sizeChanged := clientState == nil || clientState.TerminalCols != cols || clientState.TerminalRows != rows
 		s.SetClientSize(clientID0, cols, rows)
-		s.ResizeAll(cols, rows)
-		if _, _, _, err := s.ReattachClient(clientID0); err != nil {
+		if sizeChanged {
+			s.ResizeAll(cols, rows)
+		}
+		if _, _, _, err := s.reattachClient(clientID0, advanceLayoutRevision); err != nil {
 			return err
 		}
 		return s.rebindOutputsAndPublishLayout(handoff)
@@ -705,6 +709,10 @@ func (s *Session) Pane(id uint64) *Pane {
 }
 
 func (s *Session) ReattachClient(clientID uint64) (*Window, *Pane, *ClientState, error) {
+	return s.reattachClient(clientID, false)
+}
+
+func (s *Session) reattachClient(clientID uint64, advanceLayoutRevision bool) (*Window, *Pane, *ClientState, error) {
 	client := s.ensureClientLocked(clientID)
 	if len(s.Windows) == 0 {
 		return nil, nil, nil, fmt.Errorf("session has no windows")
@@ -714,7 +722,10 @@ func (s *Session) ReattachClient(clientID uint64) (*Window, *Pane, *ClientState,
 		ids := s.windowIDsLocked()
 		window = s.Windows[ids[0]]
 	}
-	s.selectWindowLocked(client, window)
+	s.setWindowLocked(client, window)
+	if advanceLayoutRevision {
+		window.LayoutRevision = s.nextLayoutRevisionLocked()
+	}
 	pane := s.Panes[client.FocusedPaneID]
 	return cloneWindow(window), pane, cloneClientState(client), nil
 }
@@ -791,6 +802,11 @@ func (s *Session) SelectWindow(clientID, windowID uint64) (*Window, *ClientState
 }
 
 func (s *Session) selectWindowLocked(client *ClientState, window *Window) {
+	s.setWindowLocked(client, window)
+	window.LayoutRevision = s.nextLayoutRevisionLocked()
+}
+
+func (s *Session) setWindowLocked(client *ClientState, window *Window) {
 	changed := client.ActiveWindowID != window.ID
 	if client.ActiveWindowID != window.ID {
 		if previous := s.Windows[client.ActiveWindowID]; previous != nil && windowHasPane(previous, client.FocusedPaneID) {
@@ -805,7 +821,6 @@ func (s *Session) selectWindowLocked(client *ClientState, window *Window) {
 	changed = changed || window.ActivePaneID != activePaneID
 	window.ActivePaneID = activePaneID
 	client.setFocusedPane(window.ActivePaneID)
-	window.LayoutRevision = s.nextLayoutRevisionLocked()
 	s.rebuildBindingsLocked(client, window)
 	if changed {
 		s.markSessionChangedForPersistence()

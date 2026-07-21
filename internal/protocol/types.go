@@ -97,7 +97,7 @@ type WindowLayout struct {
 	Panes          []PanePlacement
 }
 
-type RelayoutBarrier struct {
+type StartRender struct {
 	LayoutRevision uint64
 	Cols           int
 	Rows           int

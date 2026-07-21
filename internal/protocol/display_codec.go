@@ -23,7 +23,7 @@ type DisplayOpcode byte
 
 const (
 	DisplayOpcodeNoop                 DisplayOpcode = 0x00
-	DisplayOpcodeRelayoutBarrier      DisplayOpcode = 0x01
+	DisplayOpcodeStartRender          DisplayOpcode = 0x01
 	DisplayOpcodeStyleInstall         DisplayOpcode = 0x02
 	DisplayOpcodeSetWritePosition     DisplayOpcode = 0x03
 	DisplayOpcodeSetWriteStyle        DisplayOpcode = 0x04
@@ -66,8 +66,8 @@ func (e *DisplayEncoder) AppendCommand(cmd DisplayCommand) error {
 	case DisplayOpcodeNoop:
 		e.opcode(DisplayOpcodeNoop)
 		return nil
-	case DisplayOpcodeRelayoutBarrier:
-		return e.AppendRelayoutBarrier(RelayoutBarrier{LayoutRevision: cmd.LayoutRevision, Cols: cmd.GridCols, Rows: cmd.GridRows})
+	case DisplayOpcodeStartRender:
+		return e.AppendStartRender(StartRender{LayoutRevision: cmd.LayoutRevision, Cols: cmd.GridCols, Rows: cmd.GridRows})
 	case DisplayOpcodeStyleInstall:
 		return e.AppendStyleInstall(StyleInstall{ID: cmd.StyleID, Style: cmd.Style})
 	case DisplayOpcodeSetWritePosition:
@@ -98,11 +98,11 @@ func (e *DisplayEncoder) AppendCommand(cmd DisplayCommand) error {
 
 func (e *DisplayEncoder) opcode(op DisplayOpcode) { e.buf = append(e.buf, byte(op)) }
 
-func (e *DisplayEncoder) AppendRelayoutBarrier(msg RelayoutBarrier) error {
+func (e *DisplayEncoder) AppendStartRender(msg StartRender) error {
 	if msg.Cols <= 0 || msg.Rows <= 0 || uint64(msg.Cols) > MaxGridCols || uint64(msg.Rows) > MaxGridRows {
 		return fmt.Errorf("invalid display grid %dx%d", msg.Cols, msg.Rows)
 	}
-	e.opcode(DisplayOpcodeRelayoutBarrier)
+	e.opcode(DisplayOpcodeStartRender)
 	e.buf = appendUvarint(e.buf, msg.LayoutRevision)
 	e.buf = appendUvarint(e.buf, uint64(msg.Cols))
 	e.buf = appendUvarint(e.buf, uint64(msg.Rows))
@@ -260,7 +260,7 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 	cmd := DisplayCommand{Opcode: DisplayOpcode(op)}
 	switch cmd.Opcode {
 	case DisplayOpcodeNoop:
-	case DisplayOpcodeRelayoutBarrier:
+	case DisplayOpcodeStartRender:
 		cmd.LayoutRevision, err = d.readUvarint()
 		if err == nil {
 			cmd.GridCols, err = d.readCoord(MaxGridCols)

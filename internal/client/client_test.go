@@ -336,7 +336,7 @@ func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
 		}
 	}
 	encoder := protocol.NewDisplayEncoder(nil)
-	encoder.AppendRelayoutBarrier(protocol.RelayoutBarrier{LayoutRevision: 1, Cols: 8, Rows: 3})
+	encoder.AppendStartRender(protocol.StartRender{LayoutRevision: 1, Cols: 8, Rows: 3})
 	write(encoder.Bytes())
 	encoder.Reset(nil)
 	encoder.AppendSetWritePosition(protocol.SetWritePosition{})
@@ -1102,7 +1102,7 @@ func TestStatusOutputAcceptsBarrierlessDisplayFrame(t *testing.T) {
 	}
 }
 
-func TestPaneOutputStillRequiresRelayoutBarrier(t *testing.T) {
+func TestPaneOutputStillRequiresStartRender(t *testing.T) {
 	encoder := protocol.NewDisplayEncoder(nil)
 	if err := encoder.AppendCommand(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("pane")}); err != nil {
 		t.Fatal(err)
@@ -1112,7 +1112,7 @@ func TestPaneOutputStillRequiresRelayoutBarrier(t *testing.T) {
 	readOutputStream(0, protocol.NewDisplayDecoder(bytes.NewReader(encoder.Bytes())), ui, errs, nil, nil)
 	select {
 	case err := <-errs:
-		if !strings.Contains(err.Error(), "before RELAYOUT_BARRIER") {
+		if !strings.Contains(err.Error(), "before START_RENDER") {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	default:
@@ -1123,7 +1123,7 @@ func TestPaneOutputStillRequiresRelayoutBarrier(t *testing.T) {
 func TestDisplayFrameCompilerSplitsImplicitlyWrappedText(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
 	commands := []protocol.DisplayCommand{
-		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1, GridCols: 4, GridRows: 2},
+		{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2},
 		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 2},
 		{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("abcdef")},
 		{Opcode: protocol.DisplayOpcodePresent},
@@ -1148,7 +1148,7 @@ func TestDisplayFrameCompilerSplitsImplicitlyWrappedText(t *testing.T) {
 func TestDisplayFrameCompilerSplitsImplicitlyWrappedFill(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
 	for _, command := range []protocol.DisplayCommand{
-		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1, GridCols: 4, GridRows: 2},
+		{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2},
 		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0},
 		{Opcode: protocol.DisplayOpcodeFill, Fill: protocol.Fill{Columns: 8, Rune: ' ', Width: 1}},
 		{Opcode: protocol.DisplayOpcodePresent},
@@ -1164,7 +1164,7 @@ func TestDisplayFrameCompilerSplitsImplicitlyWrappedFill(t *testing.T) {
 
 func TestDisplayFrameCompilerRejectsWriteBeyondGrid(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
-	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1, GridCols: 4, GridRows: 2})
+	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2})
 	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 1, Column: 3})
 	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("ab")}); err == nil {
 		t.Fatal("write beyond grid was accepted")
@@ -1173,7 +1173,7 @@ func TestDisplayFrameCompilerRejectsWriteBeyondGrid(t *testing.T) {
 
 func TestDisplayFrameCompilerRejectsMultipleScrolls(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
-	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 1, GridCols: 4, GridRows: 2})
+	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2})
 	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: -1})
 	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: -1}); err == nil {
 		t.Fatal("multiple scroll commands in one frame were accepted")
@@ -1183,7 +1183,7 @@ func TestDisplayFrameCompilerRejectsMultipleScrolls(t *testing.T) {
 func TestDisplayFrameCompilerExpandsWireLatches(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
 	commands := []protocol.DisplayCommand{
-		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 4, GridCols: 80, GridRows: 24},
+		{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 4, GridCols: 80, GridRows: 24},
 		{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: 2, Style: protocol.Style{Bold: true}},
 		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 3, Column: 5},
 		{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: 2},
@@ -1209,7 +1209,7 @@ func TestDisplayFrameCompilerExpandsWireLatches(t *testing.T) {
 func TestDisplayFrameCompilerTreatsClusterAsOneDisplayUnit(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
 	commands := []protocol.DisplayCommand{
-		{Opcode: protocol.DisplayOpcodeRelayoutBarrier, LayoutRevision: 4, GridCols: 80, GridRows: 24},
+		{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 4, GridCols: 80, GridRows: 24},
 		{Opcode: protocol.DisplayOpcodeWriteCluster, Text: []byte("👩‍💻"), Width: 2},
 		{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("X")},
 		{Opcode: protocol.DisplayOpcodePresent},
