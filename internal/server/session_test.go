@@ -678,6 +678,31 @@ func TestCloseFocusedPaneCollapsesSplit(t *testing.T) {
 	}
 }
 
+func TestCloseFocusedPaneSelectsLatestSurvivingWindow(t *testing.T) {
+	s := NewSession(0)
+	s.NewClient(0)
+	first, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "first"}, 0)
+	second, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "second"}, 0)
+	third, _ := s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "third"}, 0)
+	if _, _, err := s.SelectWindow(0, third.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.LastWindowID(0); !ok || got != second.ID {
+		t.Fatalf("last window before close = %d, %v; want %d, true", got, ok, second.ID)
+	}
+
+	_, replacement, client, closed, _, _, err := s.CloseFocusedPane(0)
+	if err != nil || !closed {
+		t.Fatalf("CloseFocusedPane() replacement=%#v client=%#v closed=%v err=%v", replacement, client, closed, err)
+	}
+	if replacement == nil || replacement.ID != second.ID || client.ActiveWindowID != second.ID {
+		t.Fatalf("replacement window=%#v client=%#v; want window %d active", replacement, client, second.ID)
+	}
+	if client.ActiveWindowID == first.ID {
+		t.Fatalf("close selected window fell back to first window %d", first.ID)
+	}
+}
+
 func TestRemovePaneCollapsesSplitAndMovesFocus(t *testing.T) {
 	s := NewSession(0)
 	s.NewClient(0)

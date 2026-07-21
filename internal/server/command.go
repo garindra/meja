@@ -1044,7 +1044,11 @@ func handleSetRootCommand(s *Session, _ *ClientInstance, args []string) (bool, e
 	if err != nil {
 		return false, err
 	}
+	changed := resolved != s.rootDir
 	s.setRoot(resolved)
+	if changed {
+		return false, s.publishStatusBar()
+	}
 	return false, nil
 }
 

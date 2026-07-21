@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/garindra/meja/internal/protocol"
 	"github.com/garindra/meja/internal/theme"
@@ -15,9 +17,10 @@ const (
 )
 
 type statusModel struct {
-	width   int
-	text    string
-	styleID uint32
+	width    int
+	text     string
+	location string
+	styleID  uint32
 }
 
 type statusCommand struct {
@@ -55,14 +58,6 @@ func (s *Session) detachStatusOutput(client *ClientInstance) error {
 }
 
 func (s *Session) runStatusOutput() {
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = ""
-	}
-	if hostname != "" {
-		hostname = "[" + hostname + "]"
-	}
-
 	var client *ClientInstance
 	var output *renderOutput
 	initialized := false
@@ -78,7 +73,7 @@ func (s *Session) runStatusOutput() {
 				output = newRenderOutput(command.attach)
 				initialized = false
 				if hasLatest {
-					err = renderStatusModel(output, latest, hostname, true)
+					err = renderStatusModel(output, latest, true)
 					initialized = err == nil
 				}
 			case command.detach:
@@ -91,7 +86,7 @@ func (s *Session) runStatusOutput() {
 				latest = *command.model
 				hasLatest = true
 				if output != nil {
-					err = renderStatusModel(output, latest, hostname, !initialized)
+					err = renderStatusModel(output, latest, !initialized)
 					initialized = err == nil
 				}
 			}
@@ -106,7 +101,7 @@ func (s *Session) runStatusOutput() {
 	}
 }
 
-func renderStatusModel(output *renderOutput, model statusModel, hostname string, full bool) error {
+func renderStatusModel(output *renderOutput, model statusModel, full bool) error {
 	normal := protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 15}, BG: theme.AccentColor()}
 	prompt := protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 0}, BG: protocol.Color{Mode: "indexed", Index: 3}}
 	if full {
@@ -126,7 +121,7 @@ func renderStatusModel(output *renderOutput, model statusModel, hostname string,
 	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeFill, Fill: protocol.Fill{Columns: model.width, Rune: ' ', Width: 1}}); err != nil {
 		return err
 	}
-	left, right := statusLineParts(model.width, model.text, hostname)
+	left, right := statusLineParts(model.width, model.text, model.location)
 	if len(left) > 0 {
 		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0}); err != nil {
 			return err
@@ -146,21 +141,123 @@ func renderStatusModel(output *renderOutput, model statusModel, hostname string,
 	return output.present()
 }
 
-func statusLineParts(width int, text, hostname string) ([]rune, []rune) {
+func statusLineParts(width int, text, location string) ([]rune, []rune) {
 	if width <= 0 {
 		return nil, nil
 	}
 
-	right := []rune(hostname)
-	if len(right) > width {
-		right = right[len(right)-width:]
-	}
-	leftWidth := width - len(right)
 	left := []rune(text)
+	right := []rune(location)
+	if len(left)+len(right) <= width {
+		return left, right
+	}
+
+	// When the two sides compete for space, give each side half the bar first.
+	// Unused space from a short side is then made available to the other side.
+	leftWidth := width / 2
+	rightWidth := width - leftWidth
+	if len(left) < leftWidth {
+		rightWidth += leftWidth - len(left)
+		leftWidth = len(left)
+	}
+	if len(right) < rightWidth {
+		leftWidth += rightWidth - len(right)
+		rightWidth = len(right)
+	}
 	if len(left) > leftWidth {
-		left = left[:leftWidth]
+		left = ellipsizePrefix(left, leftWidth)
+	}
+	if len(right) > rightWidth {
+		right = ellipsizeLocation(right, rightWidth)
 	}
 	return left, right
+}
+
+func ellipsizePrefix(value []rune, width int) []rune {
+	if width <= 0 {
+		return nil
+	}
+	if width == 1 {
+		return []rune{'…'}
+	}
+	result := make([]rune, width)
+	copy(result, value[:width-1])
+	result[width-1] = '…'
+	return result
+}
+
+func ellipsizeLocation(value []rune, width int) []rune {
+	if width <= 0 {
+		return nil
+	}
+	if width == 1 {
+		return []rune{'…'}
+	}
+
+	// Keep the host prefix and closing bracket when the location is wide
+	// enough, while using the path suffix as the most valuable content.
+	colon := -1
+	for i, r := range value {
+		if r == ':' {
+			colon = i
+			break
+		}
+	}
+	if len(value) >= 3 && value[0] == '[' && value[len(value)-1] == ']' && colon > 0 {
+		const ellipsisWidth = 1
+		prefixWidth := colon + 1
+		suffixWidth := 1
+		// Avoid reducing the path to only a couple of characters just to
+		// preserve the host; a useful path suffix wins in very narrow bars.
+		tailWidth := width - prefixWidth - ellipsisWidth - suffixWidth
+		if tailWidth >= 4 {
+			result := make([]rune, 0, width)
+			result = append(result, value[:prefixWidth]...)
+			result = append(result, '…')
+			result = append(result, value[len(value)-suffixWidth-tailWidth:len(value)-suffixWidth]...)
+			result = append(result, value[len(value)-suffixWidth:]...)
+			return result
+		}
+	}
+
+	result := make([]rune, width)
+	result[0] = '…'
+	copy(result[1:], value[len(value)-width+1:])
+	return result
+}
+
+func currentStatusLocation(root string) string {
+	hostname, _ := os.Hostname()
+	home, _ := os.UserHomeDir()
+	return statusLocation(hostname, root, home)
+}
+
+func statusLocation(hostname, root, home string) string {
+	if root != "" {
+		root = filepath.Clean(root)
+	}
+	if home != "" {
+		home = filepath.Clean(home)
+	}
+	if root == "." {
+		root = ""
+	}
+	if root != "" && home != "" {
+		if relative, err := filepath.Rel(home, root); err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			if relative == "." {
+				root = "~"
+			} else {
+				root = "~/" + filepath.ToSlash(relative)
+			}
+		}
+	}
+	if hostname == "" {
+		hostname = "?"
+	}
+	if root == "" {
+		return "[" + hostname + "]"
+	}
+	return "[" + hostname + ":" + filepath.ToSlash(root) + "]"
 }
 
 func (s *Session) publishStatusBar() error {
@@ -198,7 +295,9 @@ func (s *Session) publishStatusBar() error {
 			text += fmt.Sprintf("%d:%s%s ", window.Index, window.Title, flags)
 		}
 	}
-	return s.sendStatusCommand(statusCommand{model: &statusModel{width: width, text: text, styleID: styleID}})
+	return s.sendStatusCommand(statusCommand{model: &statusModel{
+		width: width, text: text, location: currentStatusLocation(s.rootDir), styleID: styleID,
+	}})
 }
 
 func (s *Session) publishWindowLayout() error {
