@@ -351,7 +351,7 @@ func TestDaemonRestoresPersistenceWindowsLayoutsAndPanes(t *testing.T) {
 			return fmt.Errorf("restored session = %#v", session)
 		}
 		window := session.Windows[1]
-		if window == nil || window.Name != "editor" || window.ActivePaneID != 1 || window.Layout.PaneIDs()[0] != 0 {
+		if window == nil || window.Name != "editor" || window.ActivePaneID != 2 || window.Layout.PaneIDs()[0] != 1 {
 			return fmt.Errorf("restored window = %#v", window)
 		}
 		for _, pane := range session.Panes {
@@ -924,7 +924,7 @@ func TestMejaFlatFormatUsesDocumentOrderAndImplicitDefaultFocus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Name != "dev" || parsed.ActiveWindow != 1 || parsed.Windows[0].ActivePane != 0 || parsed.Windows[1].ActivePane != 1 {
+	if parsed.Name != "dev" || parsed.ActiveWindow != 1 || parsed.Windows[0].ActivePane != 0 || parsed.Windows[1].ActivePane != 0 {
 		t.Fatalf("parsed defaults/name = %#v", parsed)
 	}
 }
@@ -969,7 +969,7 @@ window active-pane=1 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.ActiveWindow != 1 || plan.Windows[0].ActivePane != 0 || plan.Windows[1].ActivePane != 1 {
+	if plan.ActiveWindow != 1 || plan.Windows[0].ActivePane != 0 || plan.Windows[1].ActivePane != 0 {
 		t.Fatalf("user plan retained private active state: %#v", plan)
 	}
 }
@@ -1002,7 +1002,7 @@ func TestPrivateMejaRetainsPositionalActiveState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Plan.ActiveWindow != 2 || parsed.Plan.Windows[1].ActivePane != 2 {
+	if parsed.Plan.ActiveWindow != 2 || parsed.Plan.Windows[1].ActivePane != 1 {
 		t.Fatalf("private active state did not round trip: %#v", parsed.Plan)
 	}
 }

@@ -262,14 +262,14 @@ func (s *Session) info() (name string, attached bool) {
 // attached ClientInstance, and panes remain alive across transport replacement
 // or a future client-instance session switch.
 type Session struct {
-	ID      uint64
-	Name    string
-	Windows map[uint64]*Window
-	Panes   map[uint64]*Pane
-	Clients map[uint64]*ClientState
+	ID        uint64
+	Name      string
+	CreatedAt int64
+	Windows   map[uint64]*Window
+	Panes     map[uint64]*Pane
+	Clients   map[uint64]*ClientState
 
 	NextWindowID       uint64
-	NextPaneID         uint64
 	NextLayoutRevision uint64
 
 	daemon                    *Daemon
@@ -283,6 +283,7 @@ type Session struct {
 	shutdownErr               error
 	processObserver           ProcessObserver
 	processMonitor            *ProcessMonitor
+	processObservations       map[uint64]ProcessObservation
 	processSaveCandidates     map[uint64]processSaveCandidate
 	processObservationUpdates chan monitoredProcessBatch
 	persistenceOnce           sync.Once
@@ -296,6 +297,7 @@ type Session struct {
 	statusMessageDuration     time.Duration
 	stopping                  bool
 	ended                     bool
+	nextStandalonePaneID      uint64
 }
 
 type Window struct {
@@ -396,6 +398,7 @@ func (c *ClientState) setFocusedPane(paneID uint64) {
 func NewSession(id uint64) *Session {
 	session := &Session{
 		ID:                        id,
+		CreatedAt:                 time.Now().Unix(),
 		Windows:                   map[uint64]*Window{},
 		Panes:                     map[uint64]*Pane{},
 		Clients:                   map[uint64]*ClientState{},
@@ -404,6 +407,7 @@ func NewSession(id uint64) *Session {
 		operationsDone:            make(chan struct{}),
 		statusCommands:            make(chan statusCommand, 64),
 		processObserver:           NewProcessObserver(),
+		processObservations:       make(map[uint64]ProcessObservation),
 		processSaveCandidates:     make(map[uint64]processSaveCandidate),
 		processObservationUpdates: make(chan monitoredProcessBatch, 8),
 		persistenceNow:            make(chan struct{}, 1),
@@ -716,9 +720,20 @@ func (s *Session) ReattachClient(clientID uint64) (*Window, *Pane, *ClientState,
 }
 
 func (s *Session) AddPaneID() uint64 {
-	id := s.NextPaneID
-	s.NextPaneID++
+	id, _ := s.allocatePaneID()
 	return id
+}
+
+func (s *Session) allocatePaneID() (uint64, error) {
+	if s.daemon != nil {
+		return s.daemon.allocatePaneID()
+	}
+	id := s.nextStandalonePaneID
+	if id == ^uint64(0) {
+		return 0, errors.New("pane ID exhausted")
+	}
+	s.nextStandalonePaneID++
+	return id, nil
 }
 
 func (s *Session) lowestAvailableWindowDisplayIndex() int {
@@ -1593,6 +1608,7 @@ func (s *Session) unwatchPaneProcesses(paneID uint64) {
 	if s.processMonitor != nil {
 		s.processMonitor.Unwatch(PaneKey{SessionID: s.ID, PaneID: paneID})
 	}
+	delete(s.processObservations, paneID)
 	delete(s.processSaveCandidates, paneID)
 }
 
@@ -1602,6 +1618,9 @@ func (s *Session) unwatchPaneProcesses(paneID uint64) {
 func (s *Session) applyMonitoredProcessObservations(batch monitoredProcessBatch) error {
 	if s.processSaveCandidates == nil {
 		s.processSaveCandidates = make(map[uint64]processSaveCandidate)
+	}
+	if s.processObservations == nil {
+		s.processObservations = make(map[uint64]ProcessObservation)
 	}
 	latest := map[uint64]processSaveProjection{}
 	if s.sessionPersistence != nil {
@@ -1617,6 +1636,7 @@ func (s *Session) applyMonitoredProcessObservations(batch monitoredProcessBatch)
 		if pane == nil || pane.Root != update.anchor.Root || pane.PTY != update.anchor.PTY {
 			continue
 		}
+		s.processObservations[paneID] = cloneProcessObservation(update.observation)
 		projection, valid := observedProcessSaveProjection(pane, update.observation, latest[paneID])
 		if valid {
 			candidate := s.processSaveCandidates[paneID]

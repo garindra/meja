@@ -102,7 +102,10 @@ func (s *Session) handlePaneProcessExitNow(paneID uint64) error {
 }
 
 func (s *Session) createWindow(cwd string, argv []string, cols, rows uint16, shell string) (*Pane, *Window, *ClientState, error) {
-	paneID := s.AddPaneID()
+	paneID, err := s.allocatePaneID()
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	pane, err := StartPane(paneID, s.contextualPaneRequest(paneRequest{Cwd: cwd, Command: argv, Cols: cols, Rows: rows, Shell: shell}))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("start pane: %w", err)
@@ -371,7 +374,10 @@ func (s *Session) commandSplit(c *ClientInstance, direction SplitDirection) erro
 		handoff := s.beginOutputHandoff()
 		return s.publishVisibleSnapshots(handoff)
 	}
-	paneID := s.AddPaneID()
+	paneID, err := s.allocatePaneID()
+	if err != nil {
+		return err
+	}
 	cols, rows := activePane.TerminalSize()
 	cwd := s.rootDir
 	newPane, err := StartPane(paneID, s.contextualPaneRequest(paneRequest{Cwd: cwd, Cols: uint16(cols), Rows: uint16(rows), Shell: c.shell}))

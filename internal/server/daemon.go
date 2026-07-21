@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -40,6 +41,8 @@ type Daemon struct {
 	logMu                sync.Mutex
 	requests             chan daemonRequest
 	nextID               uint64
+	nextPaneID           uint64
+	paneIDMu             sync.Mutex
 	sessions             map[uint64]*Session
 	names                map[string]*Session
 	reconnectCredentials map[string]*reconnectCredential
@@ -125,6 +128,7 @@ func Run(ctx context.Context, cfg Config) error {
 	d := &Daemon{
 		requests:              make(chan daemonRequest, 64),
 		nextID:                1,
+		nextPaneID:            1,
 		sessions:              make(map[uint64]*Session),
 		names:                 make(map[string]*Session),
 		reconnectCredentials:  make(map[string]*reconnectCredential),
@@ -237,6 +241,31 @@ func newSession(id uint64, name string) *Session {
 	session := NewSession(id)
 	session.setSessionName(name)
 	return session
+}
+
+func (d *Daemon) allocatePaneID() (uint64, error) {
+	var id uint64
+	var err error
+	d.call(func() {
+		id, err = d.allocatePaneIDNow()
+	})
+	return id, err
+}
+
+// allocatePaneIDNow runs on the daemon actor. IDs are intentionally never
+// decremented or recycled, including when pane creation or restoration fails.
+func (d *Daemon) allocatePaneIDNow() (uint64, error) {
+	d.paneIDMu.Lock()
+	defer d.paneIDMu.Unlock()
+	if d.nextPaneID == 0 {
+		d.nextPaneID = 1
+	}
+	if d.nextPaneID == ^uint64(0) {
+		return 0, errors.New("pane ID exhausted")
+	}
+	id := d.nextPaneID
+	d.nextPaneID++
+	return id, nil
 }
 
 // sessionByName runs only on the daemon actor.
@@ -376,22 +405,35 @@ func (d *Daemon) reserveSessionName(state *Session, name string) {
 // released its client instance; the Daemon only removes matching registry refs.
 func (d *Daemon) sessionExited(state *Session) {
 	remove := func() {
-		if d.sessions[state.ID] != state {
-			return
-		}
-		if credential := d.attachments[state.ID]; credential != nil {
-			delete(d.attachments, state.ID)
-			delete(d.clientSessions, credential)
-			credential.TerminalReason = "session is no longer available"
-		}
-		delete(d.sessions, state.ID)
-		d.reserveSessionName(state, "")
+		d.removeSession(state)
 	}
 	if d.requests == nil {
 		remove()
 		return
 	}
 	d.post(remove)
+}
+
+func (d *Daemon) removeSession(state *Session) {
+	if state == nil {
+		return
+	}
+	if d.sessions[state.ID] != state {
+		return
+	}
+	for index := 0; index < len(d.attachGrants); index++ {
+		if d.attachGrants[index].SessionID == state.ID {
+			d.attachGrants = append(d.attachGrants[:index], d.attachGrants[index+1:]...)
+			index--
+		}
+	}
+	if credential := d.attachments[state.ID]; credential != nil {
+		delete(d.attachments, state.ID)
+		delete(d.clientSessions, credential)
+		credential.TerminalReason = "session is no longer available"
+	}
+	delete(d.sessions, state.ID)
+	d.reserveSessionName(state, "")
 }
 
 func (d *Daemon) session(id uint64) *Session {
