@@ -1347,10 +1347,33 @@ func TestNativeScrollUsesRectangularMargins(t *testing.T) {
 	}
 }
 
+func TestFullWidthScrollUsesOnlyVerticalMargins(t *testing.T) {
+	s := newScanoutState(false)
+	s.cols, s.rows = 12, 5
+	layout := protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 12, Height: 4}}}}
+	if _, err := s.acceptLayout(layout); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.takeANSI()
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDelta: -1}); err != nil {
+		t.Fatal(err)
+	}
+	out := string(s.takeANSI())
+	if !strings.Contains(out, "\x1b[1;4r") || !strings.Contains(out, "\x1b[1S") {
+		t.Fatalf("full-width native scroll output = %q", out)
+	}
+	if strings.Contains(out, "\x1b[1;12s") {
+		t.Fatalf("full-width native scroll unexpectedly used horizontal margins: %q", out)
+	}
+}
+
 func TestFallbackScrollRetainsVisibleRows(t *testing.T) {
 	s := newScanoutState(false)
-	s.cols, s.rows = 4, 4
-	layout := protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 4, Height: 3}}}}
+	s.cols, s.rows = 6, 4
+	layout := protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{X: 2, Width: 4, Height: 3}}}}
 	_, _ = s.acceptLayout(layout)
 	full := renderFrame{layoutRevision: 1, spans: []paintSpan{
 		{kind: paintText, row: 0, styleID: 0, cellWidth: 1, text: []byte("aaaa")},
@@ -1367,6 +1390,30 @@ func TestFallbackScrollRetainsVisibleRows(t *testing.T) {
 	out := string(s.takeANSI())
 	if !strings.Contains(out, "bbbb") || !strings.Contains(out, "cccc") || !strings.Contains(out, "dddd") || strings.Contains(out, "\x1b[1S") {
 		t.Fatalf("fallback scroll output = %q", out)
+	}
+}
+
+func TestTakeRectangularScrollReply(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		supported bool
+		found     bool
+		remaining string
+	}{
+		{name: "reset means supported", input: "typed\x1b[?69;2$yafter", supported: true, found: true, remaining: "typedafter"},
+		{name: "set means supported", input: "\x1b[?69;1$y", supported: true, found: true},
+		{name: "not recognized", input: "\x1b[?69;0$y", found: true},
+		{name: "permanently reset", input: "\x1b[?69;4$y", found: true},
+		{name: "incomplete", input: "\x1b[?69;", found: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			supported, found, remaining := takeRectangularScrollReply([]byte(test.input))
+			if supported != test.supported || found != test.found || string(remaining) != test.remaining {
+				t.Fatalf("reply = (%t, %t, %q), want (%t, %t, %q)", supported, found, remaining, test.supported, test.found, test.remaining)
+			}
+		})
 	}
 }
 
