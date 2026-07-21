@@ -227,7 +227,10 @@ func (d *displayCompiler) queueRune(opcode protocol.DisplayOpcode, width uint8, 
 		}
 	}
 	runeBytes := utf8.RuneLen(r)
-	if len(d.output.pending)+runeBytes > renderStreamChunkSize && len(d.output.pending) > d.pendingStart {
+	if d.output.bufferedOnly && !d.output.hasRoom(runeBytes) {
+		return errRenderBufferFull
+	}
+	if !d.output.bufferedOnly && len(d.output.pending)+runeBytes > renderStreamChunkSize && len(d.output.pending) > d.pendingStart {
 		if err := d.finish(); err != nil {
 			return err
 		}
@@ -243,7 +246,14 @@ func (d *displayCompiler) queueRune(opcode protocol.DisplayOpcode, width uint8, 
 }
 
 func (d *displayCompiler) openText(opcode protocol.DisplayOpcode, width uint8, styleID uint32) error {
-	if len(d.output.pending) >= renderStreamChunkSize {
+	headerBytes := 6
+	if opcode == protocol.DisplayOpcodeWriteText {
+		headerBytes++
+	}
+	if d.output.bufferedOnly && !d.output.hasRoom(headerBytes) {
+		return errRenderBufferFull
+	}
+	if !d.output.bufferedOnly && len(d.output.pending) >= renderStreamChunkSize {
 		if err := d.output.commit(); err != nil {
 			return err
 		}

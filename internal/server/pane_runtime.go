@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -25,6 +26,8 @@ const (
 	paneOutputBytesPerSecond = 8 << 20
 	paneOutputBurstBytes     = 1 << 20
 )
+
+var errRenderBufferFull = errors.New("pane render buffer is full")
 
 type paneOutputRateLimiter struct {
 	tokens float64
@@ -76,7 +79,7 @@ func (p *Pane) renderAttachedView(output *renderOutput, layoutRevision uint64) e
 	case paneViewLive:
 		return sendFullRender(output, p)
 	case paneViewHistory:
-		return p.renderHistorySnapshot(output)
+		return fmt.Errorf("pane %d history output requires its actor", p.ID)
 	default:
 		return fmt.Errorf("pane %d has invalid view mode %d", p.ID, p.currentViewMode())
 	}
@@ -217,9 +220,14 @@ func runPTYWriter(pane *Pane, failed func(error)) {
 }
 
 func (pane *Pane) run() {
-	defer close(pane.mainDone)
-	var output *renderOutput
-	var aggregate Update
+	defer func() {
+		if pane.PTY != nil {
+			_ = pane.PTY.Close()
+		}
+		close(pane.mainDone)
+	}()
+	renderer := newPaneRenderState(pane)
+	var update Update
 	var idle, maxAge *time.Timer
 	var idleC, maxC <-chan time.Time
 	var startupIdle *time.Timer
@@ -232,7 +240,7 @@ func (pane *Pane) run() {
 		startupMax = time.NewTimer(startupInputMaxWait)
 		startupMaxC = startupMax.C
 	}
-	pending := false
+	batching := false
 	stop := func(timer *time.Timer) {
 		if timer != nil && !timer.Stop() {
 			select {
@@ -271,82 +279,72 @@ func (pane *Pane) run() {
 		return pane.sendOwnedInput(input)
 	}
 	flush := func() {
-		if !pending {
+		if !batching {
 			return
 		}
 		disarm(idle, &idleC)
 		disarm(maxAge, &maxC)
-		pending = false
-		if output != nil && pane.currentViewMode() == paneViewLive {
-			if err := emitTerminalUpdate(output, pane, aggregate); err != nil {
-				output = nil
-				pane.outputLease = nil
-			}
-		}
-		aggregate.Reset(pane.terminal.Rows)
+		batching = false
+		renderer.due = renderer.hasWork()
 	}
 	for {
+		available := renderer.available()
+		failures := renderer.failures()
 		select {
+		case buffer := <-available:
+			lease := pane.outputLease
+			if err := renderer.render(buffer); err != nil {
+				if lease != nil {
+					lease.recycle(buffer)
+					lease.reportFailure(fmt.Errorf("render pane %d: %w", pane.ID, err))
+				}
+				pane.outputLease = nil
+				renderer.detach()
+			}
+		case <-failures:
+			pane.outputLease = nil
+			renderer.detach()
 		case command := <-pane.commands:
 			if command.capture != nil {
-				// Capture is an authoritative terminal read. Flush any pending
-				// render update first so servicing the command cannot discard
-				// damage that the attached client still needs.
-				flush()
 				data, err := captureTerminalViewport(pane.terminal, command.capture.Options)
 				command.capture.Result <- paneCaptureResult{Data: data, Err: err}
 				continue
 			}
-			disarm(idle, &idleC)
-			disarm(maxAge, &maxC)
-			aggregate.Reset(pane.terminal.Rows)
-			pending = false
 			if command.release != nil {
 				lease := pane.outputLease
 				pane.outputLease = nil
-				output = nil
+				renderer.detach()
 				command.release.returnLease(lease)
 				continue
 			}
 			if command.detach != nil {
 				if pane.outputLease != nil && pane.outputLease.Stream == command.detach {
 					pane.outputLease = nil
-					output = nil
+					renderer.detach()
 				}
 				command.done <- nil
 				continue
 			}
 			if command.attach != nil {
 				pane.outputLease = command.attach.Lease
-				output = newRenderOutput(command.attach.Lease.Stream)
-				var err error
-				if command.attach.Refresh != nil {
-					err = command.attach.Refresh(output)
-				} else {
-					err = pane.renderAttachedView(output, command.attach.LayoutRevision)
-				}
-				if err != nil {
-					pane.outputLease = nil
-					output = nil
-				}
+				renderer.attach(command.attach.Lease, command.attach.LayoutRevision, command.attach.Refresh)
 				continue
 			}
 			if command.history != nil {
-				result := pane.handleHistoryRequest(output, command.history)
-				if result.Err != nil {
-					pane.outputLease = nil
-					output = nil
+				result := pane.handleHistoryRequest(command.history)
+				// History handlers historically rendered as a side effect even when
+				// their Changed result only described mode transitions. Repaint from
+				// the authoritative current view for every successful request.
+				if result.Err == nil && pane.outputLease != nil {
+					renderer.markFull()
+					renderer.due = true
 				}
 				command.history.Result <- result
 				continue
 			}
-			if command.apply != nil && output != nil {
-				err := command.apply(output)
-				if err != nil {
-					pane.outputLease = nil
-					output = nil
-				}
-				command.done <- err
+			if command.apply != nil && pane.outputLease != nil {
+				renderer.queued = append(renderer.queued, queuedPaneRender{render: command.apply, done: command.done})
+				renderer.due = true
 			} else if command.resize != nil {
 				err := error(nil)
 				if pane.PTY != nil {
@@ -354,6 +352,10 @@ func (pane *Pane) run() {
 				}
 				pane.terminal.Resize(int(command.resize.cols), int(command.resize.rows))
 				pane.publishTerminalMetadata()
+				if pane.outputLease != nil {
+					renderer.markFull()
+					renderer.due = true
+				}
 				command.done <- err
 			} else {
 				command.done <- nil
@@ -363,31 +365,31 @@ func (pane *Pane) run() {
 				flush()
 				return
 			}
-			trackDamage := output != nil && pane.currentViewMode() == paneViewLive
-			if !pending {
-				aggregate.ResetFor(pane.terminal.Rows, trackDamage)
-			}
-			pane.terminal.ApplyInto(data, &aggregate)
+			trackDamage := pane.outputLease != nil && pane.currentViewMode() == paneViewLive
+			update.ResetFor(pane.terminal.Rows, trackDamage)
+			pane.terminal.ApplyInto(data, &update)
 			if len(startupInput) > 0 {
 				arm(&startupIdle, &startupIdleC, startupInputIdle)
 			}
 			ptyReadBuffers.Put(data[:cap(data)])
-			for _, reply := range aggregate.Replies {
+			for _, reply := range update.Replies {
 				if err := pane.sendOwnedInput(reply); err != nil {
 					return
 				}
 			}
-			aggregate.Replies = aggregate.Replies[:0]
 			pane.publishTerminalMetadata()
 			if !trackDamage {
-				aggregate.ResetFor(pane.terminal.Rows, false)
 				continue
 			}
-			if !pending && !aggregate.HasRenderChange() {
+			renderer.merge(update)
+			if !renderer.hasWork() {
 				continue
 			}
-			if !pending {
-				pending = true
+			if renderer.due {
+				continue
+			}
+			if !batching {
+				batching = true
 				arm(&maxAge, &maxC, renderMaxBatchAge)
 			}
 			arm(&idle, &idleC, renderIdleFlush)
@@ -409,76 +411,7 @@ func (pane *Pane) run() {
 	}
 }
 
-func renderHistoryMove(output *renderOutput, view *paneHistoryView, move historyMove) error {
-	if move.Delta != 0 {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: move.Delta}); err != nil {
-			return err
-		}
-	}
-	compiler := newDisplayCompiler(output, view.Snapshot, view.Snapshot.clusters, view.Snapshot.Cols)
-	if err := writeHistoryMoveCells(compiler, view, move); err != nil {
-		return err
-	}
-	if err := compiler.finish(); err != nil {
-		return err
-	}
-	if err := writeHistoryCounter(compiler, view, move.NewCounter); err != nil {
-		return err
-	}
-	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: move.Cursor, Visible: true}}); err != nil {
-		return err
-	}
-	if err := output.present(); err != nil {
-		return err
-	}
-	if view.Selection != nil {
-		return renderHistorySelectionChange(output, view, nil, view.Selection)
-	}
-	return nil
-}
-
 const historySelectionStyleMask uint32 = 1 << 31
-
-func renderHistorySelectionChange(output *renderOutput, view *paneHistoryView, old, next *paneHistorySelection) error {
-	if view == nil || view.Snapshot == nil {
-		return nil
-	}
-	snapshot := view.Snapshot
-	for viewportRow := 0; viewportRow < snapshot.ViewportRows; viewportRow++ {
-		logicalRow := view.ViewTop + viewportRow
-		column := 0
-		for column < snapshot.Cols {
-			wasSelected := historySelectionContains(old, logicalRow, column)
-			isSelected := historySelectionContains(next, logicalRow, column)
-			if wasSelected == isSelected {
-				column++
-				continue
-			}
-			start := column
-			for column < snapshot.Cols &&
-				historySelectionContains(old, logicalRow, column) != historySelectionContains(next, logicalRow, column) &&
-				historySelectionContains(next, logicalRow, column) == isSelected {
-				column++
-			}
-			compiler := newDisplayCompiler(output, snapshot, snapshot.clusters, snapshot.Cols)
-			if isSelected {
-				compiler.installStyles = true
-				compiler.styleMapper = func(id uint32) uint32 { return historySelectionStyleMask | id }
-			}
-			if err := compiler.writeCells(viewportRow, start, snapshot.row(logicalRow)[start:column]); err != nil {
-				return err
-			}
-			if err := compiler.finish(); err != nil {
-				return err
-			}
-		}
-	}
-	compiler := newDisplayCompiler(output, snapshot, snapshot.clusters, snapshot.Cols)
-	if err := writeHistoryCounter(compiler, view, historyCounter(view)); err != nil {
-		return err
-	}
-	return output.present()
-}
 
 func historySelectionContains(selection *paneHistorySelection, row, column int) bool {
 	if selection == nil {
@@ -498,36 +431,6 @@ func historySelectionContains(selection *paneHistorySelection, row, column int) 
 		return column <= end.Col
 	}
 	return true
-}
-
-func writeHistoryMoveCells(compiler *displayCompiler, view *paneHistoryView, move historyMove) error {
-	snapshot := view.Snapshot
-	if move.Delta > 0 {
-		if err := compiler.writeCells(0, 0, snapshot.row(view.ViewTop)); err != nil {
-			return err
-		}
-		if snapshot.ViewportRows > 1 {
-			return writeHistoryCounterRow(compiler, view, 1, move.OldCounter, "")
-		}
-		return nil
-	}
-	if move.Delta == 0 {
-		return nil
-	}
-	bottom := snapshot.ViewportRows - 1
-	rowIndex := view.ViewTop + bottom
-	if err := compiler.writeCells(bottom, 0, snapshot.row(rowIndex)); err != nil {
-		return err
-	}
-	return writeHistoryCounterRow(compiler, view, 0, move.OldCounter, move.NewCounter)
-}
-
-func writeHistoryCounterRow(compiler *displayCompiler, view *paneHistoryView, viewportRow int, oldLabel, newLabel string) error {
-	snapshot := view.Snapshot
-	width := max(len(oldLabel), len(newLabel))
-	start := max(0, snapshot.Cols-width)
-	rowIndex := view.ViewTop + viewportRow
-	return compiler.writeCells(viewportRow, start, snapshot.row(rowIndex)[start:])
 }
 
 func writeHistoryCounter(compiler *displayCompiler, view *paneHistoryView, label string) error {
@@ -596,37 +499,6 @@ func sendFullRender(output *renderOutput, pane *Pane) error {
 	return output.present()
 }
 
-func sendHistorySnapshot(output *renderOutput, pane *Pane, view *paneHistoryView) error {
-	snapshot := view.Snapshot
-	for _, def := range snapshot.styles {
-		if err := installStyle(output, def.ID, def.Style); err != nil {
-			return err
-		}
-	}
-	compiler := newDisplayCompiler(output, snapshot, snapshot.clusters, snapshot.Cols)
-	for row := 0; row < snapshot.ViewportRows; row++ {
-		if err := compiler.writeCells(row, 0, snapshot.row(view.ViewTop+row)); err != nil {
-			return err
-		}
-	}
-	if err := compiler.finish(); err != nil {
-		return err
-	}
-	if err := writeHistoryCounter(compiler, view, historyCounter(view)); err != nil {
-		return err
-	}
-	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: min(view.CursorCol, snapshot.Cols-1), Y: view.CursorRow - view.ViewTop}, Visible: true}}); err != nil {
-		return err
-	}
-	if err := output.present(); err != nil {
-		return err
-	}
-	if view.Selection != nil {
-		return renderHistorySelectionChange(output, view, nil, view.Selection)
-	}
-	return nil
-}
-
 func installStyle(output *renderOutput, id uint32, style protocol.Style) error {
 	if id == protocol.CanonicalDefaultStyleID && !protocol.IsCanonicalDefaultStyle(style) {
 		return fmt.Errorf("style %d must be canonical default", id)
@@ -645,6 +517,8 @@ type renderOutput struct {
 	stream          io.Writer
 	pending         []byte
 	installedStyles map[uint32]protocol.Style
+	limit           int
+	bufferedOnly    bool
 }
 
 func newRenderOutput(stream ...io.Writer) *renderOutput {
@@ -655,15 +529,42 @@ func newRenderOutput(stream ...io.Writer) *renderOutput {
 	return output
 }
 
+func newBoundedRenderOutput(buffer *paneRenderBuffer, installed map[uint32]protocol.Style, limit int) *renderOutput {
+	if installed == nil {
+		installed = make(map[uint32]protocol.Style, 32)
+	}
+	buffer.data = buffer.data[:0]
+	return &renderOutput{
+		stream:          io.Discard,
+		pending:         buffer.data,
+		installedStyles: installed,
+		limit:           limit,
+		bufferedOnly:    true,
+	}
+}
+
+func (o *renderOutput) hasRoom(bytes int) bool {
+	return o.limit <= 0 || bytes <= o.limit-len(o.pending)
+}
+
 func (o *renderOutput) append(command protocol.DisplayCommand) error {
 	if o.pending == nil {
 		o.pending = make([]byte, 0, 4096)
 	}
-	encoder := protocol.NewDisplayEncoder(o.pending)
+	before := o.pending
+	encoder := protocol.NewDisplayEncoder(before)
 	if err := encoder.AppendCommand(command); err != nil {
 		return err
 	}
-	o.pending = encoder.Bytes()
+	encoded := encoder.Bytes()
+	if o.limit > 0 && len(encoded) > o.limit {
+		o.pending = before
+		return errRenderBufferFull
+	}
+	o.pending = encoded
+	if o.bufferedOnly {
+		return nil
+	}
 	if len(o.pending) >= renderStreamChunkSize {
 		return o.commit()
 	}
@@ -671,6 +572,9 @@ func (o *renderOutput) append(command protocol.DisplayCommand) error {
 }
 
 func (o *renderOutput) commit() error {
+	if o.bufferedOnly {
+		return nil
+	}
 	if len(o.pending) == 0 {
 		return nil
 	}
@@ -687,6 +591,9 @@ func (o *renderOutput) commit() error {
 func (o *renderOutput) present() error {
 	if err := o.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
 		return err
+	}
+	if o.bufferedOnly {
+		return nil
 	}
 	return o.commit()
 }

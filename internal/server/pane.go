@@ -391,6 +391,7 @@ func (p *Pane) stop() {
 	}
 	if p.done != nil {
 		close(p.done)
+		return
 	}
 	if p.PTY != nil {
 		_ = p.PTY.Close()

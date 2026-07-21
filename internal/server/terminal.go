@@ -18,6 +18,11 @@ const (
 	initialStyleCapacity = 32
 )
 
+// maxGraphemeClusterBytes bounds the text retained by one terminal cell.
+// Unicode does not define a maximum grapheme size, so without an explicit
+// limit an unbounded stream of combining marks could grow one cell forever.
+const maxGraphemeClusterBytes = 1 << 10
+
 var printableASCIIStrings = func() [utf8.RuneSelf]string {
 	var strings [utf8.RuneSelf]string
 	for b := byte(0x20); b <= 0x7e; b++ {
@@ -839,6 +844,20 @@ func (t *TerminalState) extendTail(r rune, update *Update) bool {
 	anchorText := t.cellText(anchor)
 	if anchor.width() == 0 || anchorText == "" {
 		t.invalidateTail()
+		return false
+	}
+	runeBytes := utf8.RuneLen(r)
+	if runeBytes < 0 {
+		runeBytes = len(string(r))
+	}
+	if len(anchorText)+runeBytes > maxGraphemeClusterBytes {
+		// Consume excess extenders instead of letting them become independent
+		// cells. The already retained prefix remains a valid grapheme and a
+		// deterministic representation of the bounded terminal cell.
+		candidate := anchorText + string(r)
+		if isSingleGrapheme(candidate) {
+			return true
+		}
 		return false
 	}
 	candidate := anchorText + string(r)

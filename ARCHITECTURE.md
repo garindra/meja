@@ -122,10 +122,10 @@ The most important architectural question is not which package contains an objec
 | Daemon | Server lifetime | Owns session identity, names, attach grants, reconnect credentials, assignments, and the QUIC listener |
 | Session | Until killed or its final pane exits | Owns windows, panes, focus, layouts, prompts, attached client, frontend routing, and snapshot coordination |
 | Window | Session lifetime | Owns a layout tree, pane membership, active pane, name, zoom state, and layout revision |
-| Pane | Child-process lifetime | Owns a PTY, packed terminal store, parser modes, history, process recipe, and at most one output lease |
+| Pane | Child-process lifetime | Actor-owns a PTY, packed terminal store, parser modes, history, process recipe, pending render damage, and at most one output lease |
 | Reconnect credential | Logical-client lifetime | Identifies one client across multiple transports and retains its target-session assignment |
 | Client instance | One live QUIC transport | Owns the control stream, status stream, pane output leases, frontend parser state, remembered layouts, and connection workers |
-| Output lease | One client transport | Gives one pane exclusive use of one render-slot stream |
+| Output lease | One client transport | Owns one render-slot stream, its fixed-capacity render buffer, and the worker that performs blocking stream writes |
 | Client pane cache | Current layout lifetime | Stores the last decoded authoritative scanout cells for one visible render slot |
 
 Two distinctions recur throughout the implementation:
@@ -316,7 +316,7 @@ On transport loss, the client:
 
 Dropping disconnected input is a correctness choice. Buffering and later replaying keystrokes would apply them to an application state the user could not observe. Reconnection restores visibility first.
 
-On resume, the server installs a fresh frontend-terminal setup, rebinds the new connection's output leases, reapplies the current terminal size, publishes the layout, and sends a complete visible view for every pane. The client does not depend on recovering the precise sequence of render bytes missed during the outage.
+On resume, the server installs a fresh frontend-terminal setup, rebinds the new connection's output leases, reapplies the current terminal size, publishes the layout, and starts a complete visible refresh for every pane. A refresh may arrive as several presented batches. The client does not depend on recovering the precise sequence of render bytes missed during the outage.
 
 ---
 
@@ -368,13 +368,28 @@ The actor model continues down to each pane. A pane's main goroutine exclusively
 * publication of application cursor, paste, focus, mouse, and Kitty keyboard modes;
 * aggregation of terminal damage;
 * the current output lease;
+* progress through damage that spans multiple presented batches;
 * live versus history view rendering and selection state;
 * output attachment, release, and refresh; and
 * PTY resize as coordinated with terminal resize.
 
-Separate narrow workers read the PTY, write the PTY, and wait for the process. They submit bytes or lifecycle events; they do not concurrently mutate the terminal grid.
+The main loop selects among PTY-output buffers, pane commands, render-buffer availability, output failures, batching timers, and shutdown. It never blocks on a PTY read or a QUIC write. There is no pane-side render mutex: terminal mutation, damage merging, resize, capture, history state, and render compilation all happen as turns of this one actor.
 
-The output lease is physically returned by the pane actor before the session gives it to another pane. This makes an ownership transfer observable and ordered rather than relying on a shared pointer swap.
+Separate narrow workers read the PTY, write the PTY, and wait for the process. The reader may block in `PTY.Read`, but it only owns raw pooled byte buffers and transfers them through a bounded channel. The writer may block while delivering user input or terminal-generated replies. Neither worker concurrently mutates the terminal grid. Keeping the blocking read outside the actor is essential: an idle child must not prevent attach, resize, capture, a returned render buffer, or shutdown from being processed.
+
+Each output lease has another narrow worker for its physical QUIC stream. That worker owns a single fixed-capacity render buffer whenever it is writing or idle. It offers the buffer to the pane actor, waits for the actor to return one complete `PRESENT`-terminated batch, performs the potentially blocking stream write, clears the buffer, and offers it again. While the worker is blocked, the pane actor remains free to parse PTY output and merge newer damage. At most one side owns the buffer at any instant.
+
+```mermaid
+flowchart LR
+    PR["PTY reader<br/>blocking read"] -->|"bounded pooled byte buffers"| PA["Pane actor<br/>terminal + damage"]
+    PA -->|"input and terminal replies"| PW["PTY writer<br/>blocking write"]
+    OW["Output-lease worker<br/>32 KiB buffer + QUIC write"] -->|"offer buffer"| PA
+    PA -->|"commands + cursor + PRESENT"| OW
+```
+
+The output lease is physically returned by the pane actor before the session gives it to another pane. If its worker is still writing the final old-pane batch, the newly attached pane cannot borrow the buffer until that ordered write completes. This makes stream rebinding observable and ordered rather than relying on a shared pointer swap.
+
+`capture-pane` is also submitted as a pane command. The actor formats the requested visible rows or history directly from the authoritative store while no PTY chunk, resize, or render compilation can mutate it. PTY reads can accumulate in the bounded input channel during that turn, but queued bytes are not part of the capture until the actor applies them. This produces a consistent actor-boundary capture without a terminal-grid mutex; a very large capture can temporarily delay that pane's actor.
 
 ## Status actor
 
@@ -607,7 +622,9 @@ Applying PTY bytes produces an `Update` describing visible consequences:
 * terminal replies; and
 * a full-redraw marker for transformations that cannot be expressed safely as local damage.
 
-The pane actor aggregates updates for a short interval. A brief idle period flushes interactive output quickly; a maximum batch age prevents a continuous stream from postponing rendering forever. Damage coordinates are client-relative visible rows, even though the underlying row store also contains history. Detached panes parse without tracking render damage because their authoritative grid is sufficient for the next full refresh.
+The pane actor merges updates into persistent per-row dirty spans. A brief idle period makes newly accumulated work eligible for rendering quickly; a maximum batch age prevents a continuous stream from postponing it forever. Damage coordinates are client-relative visible rows, even though the underlying row store also contains history. Detached panes parse without tracking render damage because their authoritative grid is sufficient for the next full refresh.
+
+Eligibility and buffer availability are separate. Once damage is due, the actor borrows the lease's buffer when the output worker offers it and encodes as much current grid state as fits. A successfully encoded prefix advances that row's dirty-span start; a complete span is cleared. A span that does not fit is left unchanged, and an encoded prefix leaves its suffix dirty. New PTY damage is unioned with any retained suffix, so later batches render the newest authoritative cells rather than an old cell snapshot. Scroll during a progressive multi-batch update promotes the work to a full redraw when shifting retained coordinates would be ambiguous.
 
 This separates terminal correctness from transport frequency. The parser can consume arbitrary chunks, while the renderer chooses a useful presentation cadence.
 
@@ -672,7 +689,7 @@ Display streams use an opcode grammar rather than the generic control-frame enve
 
 The command stream is stateful, but the state is deliberately small and reconstructable. The relayout barrier supplies the grid needed to validate implicit advancement. Style installations and selection are local to the physical render stream. Position advances after writes, including an exact wrap from the last column to column zero of the next row. Cursor state is remembered separately and copied into the completed frame at `PRESENT`.
 
-`PRESENT` is the atomic publication boundary, not necessarily the first network write for a batch. The server may commit finalized command bytes to the QUIC stream in bounded chunks before `PRESENT`. The per-stream client compiler applies those bytes only to its private in-progress `renderFrame`; it transfers the frame to the central render goroutine only when the terminating `PRESENT` arrives. A large full refresh can therefore be streamed without either side exposing a half-built pane.
+`PRESENT` is the atomic publication boundary. Every pane buffer submitted to an output worker ends with cursor state and `PRESENT`, so every successful write produces a complete client frame. A large update may intentionally become several early-presented frames: for example rows 0–8, then rows 9–17, while damage for later rows remains pending. The client never exposes a half-built batch, but it may visibly make progressive forward progress through a full refresh rather than waiting for the whole viewport to be encoded and transported.
 
 ## Server display-compiler strategy
 
@@ -687,9 +704,9 @@ Its main strategies are:
 5. **Bridge visually equivalent blanks.** A run may cross blank cells whose style IDs differ when their effective backgrounds are equal and neither style underlines the blank. This preserves what the user sees while allowing the following non-blank text to stay in one run. Reverse video is considered when computing the effective background.
 6. **Install styles lazily.** Live rendering installs a style when the compiler first selects that ID on the current output attachment. `renderOutput` remembers definitions already installed on the stream and suppresses duplicate installations. History and selection use the same compiler with a different style source and, when needed, a style-ID mapping.
 
-The compiler keeps one pending text or fill run. Changing opcode, width, or style closes the run. For text, it writes the opcode and width directly into the reusable output buffer, reserves a fixed five-byte valid uvarint for the byte length, appends UTF-8 bytes in place, and backpatches the length when the run closes. This avoids building a temporary string or moving the text after its length becomes known.
+The compiler keeps one pending text or fill run. Changing opcode, width, or style closes the run. For text, it writes the opcode and width directly into the borrowed output buffer, reserves a fixed five-byte valid uvarint for the byte length, appends UTF-8 bytes in place, and backpatches the length when the run closes. This avoids building a temporary string or moving the text after its length becomes known.
 
-Finalized bytes are committed around the render chunk threshold, currently 8 KiB. A command may therefore be on the wire while later commands in the same semantic frame are still being compiled. The buffer is reused when reasonably sized and discarded rather than retained if it grows beyond the retention ceiling. `present()` appends `PRESENT` and commits whatever remains.
+The hot pane path encodes into the output lease's fixed 32 KiB buffer. Cell commands use a limit below the physical capacity, reserving space for the batch trailer: the history counter when applicable, cursor state, and `PRESENT`. If a complete dirty span does not fit, the renderer shortens it only at a complete cell boundary. It commits damage progress only after encoding succeeds and rolls the render state back if trailer generation or lease submission fails. A single retained grapheme cluster is capped at 1 KiB, so one atomic display unit cannot consume or exceed an entire pane batch.
 
 This strategy compresses semantic regularity: stable position, shared styles, scalar runs, repeated fills, and known cluster boundaries. It does not attempt general-purpose compression of arbitrary PTY bytes, because those bytes have already been interpreted into more useful structure.
 
@@ -704,7 +721,7 @@ Ordinary PTY output compiles only accumulated damage. A full pane render is sent
 * entry into a frozen history view; and
 * recovery from transformations marked as full redraws.
 
-Full rendering still uses the same display operations and can stream in bounded chunks before its final `PRESENT`. There is no separate screenshot protocol.
+Full rendering still uses the same display operations, but it may be split into multiple bounded, individually presented batches. Each batch reads the latest cells from the authoritative grid; there is no separate screenshot protocol and no requirement to preserve a stale full-screen snapshot while later rows are pending.
 
 ---
 
@@ -725,7 +742,19 @@ Slots are reusable transport resources, not pane identities. Switching windows c
 
 ## Output leases
 
-An `OutputLease` pairs a slot with its physical QUIC stream. Exactly one pane actor or the session's unused pool owns a lease at a time. A pane can render only through the lease it currently owns.
+An `OutputLease` pairs a slot with its physical QUIC stream. It also owns the stream's one fixed-capacity render buffer and a worker goroutine that is allowed to block on that stream. Exactly one pane actor or the session's unused pool owns a lease at a time. A pane can render only through the lease it currently owns, and it can compile only while that lease's worker has offered its buffer.
+
+Buffer ownership alternates through bounded channels:
+
+```text
+output worker offers empty buffer
+    → pane actor encodes bounded damage + cursor + PRESENT
+    → pane actor submits buffer
+    → output worker writes the complete batch to QUIC
+    → output worker clears and offers the same buffer again
+```
+
+The pane actor does not wait for the write. While the buffer is unavailable it continues processing PTY bytes, commands, resize, capture, and damage. Remaining dirty spans are actor state rather than buffer contents, so detachment can discard the render progress safely; a later attachment begins with a complete view from the authoritative grid. A stream write error is reported back through the lease failure channel and invalidates the transport rather than freezing the pane actor behind a blocked write.
 
 Relayout uses an explicit handoff:
 
@@ -741,18 +770,19 @@ sequenceDiagram
     S->>S: Rebuild pane-to-slot bindings
     S->>N: Attach lease with new layout revision
     N->>C: RELAYOUT_BARRIER revision
-    N->>C: Full authoritative pane render + PRESENT
+    N->>C: RELAYOUT_BARRIER + first bounded pane batch + PRESENT
     S->>C: WINDOW_LAYOUT revision and rectangles
-    C->>C: Activate only after layout and every visible pane frame exist
+    C->>C: Activate after layout and one presented frame per visible pane
+    N->>C: Remaining authoritative batches, each ending in PRESENT
 ```
 
-The old pane physically stops using the stream before the new pane receives it. This prevents bytes from two logical panes from being interleaved on one ordered QUIC stream.
+The old pane stops submitting new work before the new pane receives the lease. Any already-submitted old-pane batch finishes first in stream order; only then can the worker offer the shared buffer to the newly attached pane. This prevents bytes from two logical panes from being interleaved on one ordered QUIC stream.
 
 ## Relayout barrier
 
 The first command after a pane acquires a render stream is a relayout barrier carrying the new layout revision and the pane grid dimensions. The barrier resets the display compiler's stream-local position, style selection, installed styles, and pending frame state. It says that all subsequent commands belong to a new coordinate space and cannot be interpreted as a continuation of the previous pane binding. The client validates that the barrier dimensions match the rectangle later activated for that slot.
 
-The pane then installs canonical styles and sends a complete view. The barrier is not itself a control-stream layout message; it is the render stream's declaration of which layout the following pixels belong to.
+The pane then installs canonical styles and begins a complete refresh. The first bounded batch carries the barrier and ends in `PRESENT`; later batches progressively fill any remaining dirty rows. The barrier is not itself a control-stream layout message; it is the render stream's declaration of which layout the following pixels belong to.
 
 ## Client activation
 
@@ -761,7 +791,7 @@ The control-stream layout message and pane frames may arrive in either order. Th
 1. the layout for that revision; and
 2. at least one complete presented frame for every pane named by the layout.
 
-Activation clears the previous pane caches, constructs caches with the new rectangles, draws borders, applies the initial frames, and only then exposes the new arrangement. Frames from older revisions are ignored. Frames for future revisions remain buffered.
+Activation clears the previous pane caches, constructs caches with the new rectangles, draws borders, applies the initial frames, and only then exposes the new arrangement. An initial frame may contain only the first bounded portion of a full refresh; untouched cells begin blank and subsequent frames complete the authoritative view. Frames from older revisions are ignored. Frames for future revisions remain buffered.
 
 This yields the main relayout invariant:
 
@@ -1093,15 +1123,16 @@ Terminal output and frontend input can both be high-volume or adversarial. Meja 
 * grid dimensions are bounded;
 * terminal rows are retained in a fixed-capacity circular store;
 * pane-local styles and complex grapheme clusters are bounded;
+* one retained grapheme cluster is bounded to 1 KiB;
 * parser control-sequence buffers are bounded;
 * history selection and clipboard extraction are bounded;
 * client ANSI output and retained protocol buffers are bounded;
 * PTY output uses pooled fixed-capacity buffers;
 * pane output is rate-limited with a burst allowance;
 * render batches have both an idle flush and a maximum age; and
-* finalized display commands are streamed in bounded chunks before `PRESENT`.
+* each pane output lease owns one fixed 32 KiB render buffer and every submitted batch ends in `PRESENT`.
 
-The current terminal store uses four-byte cells split into a 4-bit kind, 16-bit payload, and 12-bit style ID. It retains at most 2,048 logical rows in sixteen lazily allocated 128-row blocks, interns at most 4,096 styles and 131,072 live cluster handles per pane, and reference-counts cluster text across grids and history snapshots. The renderer uses 32 KiB pooled PTY reads, commits finalized display bytes around 8 KiB, avoids retaining output buffers above 64 KiB, and stops tracking damage while no live output lease needs it. These are implementation constants rather than wire guarantees, but they make the intended memory shape and degradation points explicit.
+The current terminal store uses four-byte cells split into a 4-bit kind, 16-bit payload, and 12-bit style ID. It retains at most 2,048 logical rows in sixteen lazily allocated 128-row blocks, interns at most 4,096 styles and 131,072 live cluster handles per pane, limits one cluster to 1 KiB, and reference-counts cluster text across grids and history snapshots. PTY reads use pooled 32 KiB buffers. Each pane render slot contributes one fixed 32 KiB buffer owned by its output lease, rather than every long-lived pane retaining a render scratch buffer. Detached panes stop tracking damage, and attached panes retain only row spans and stream-local style state while the lease worker holds the buffer. These are implementation constants rather than wire guarantees, but they make the intended memory shape and degradation points explicit.
 
 The QUIC handshake uses the 1,200-byte minimum initial packet size. This leaves room on common 1,280-byte network paths without relying on IP fragmentation during connection establishment.
 
@@ -1153,7 +1184,9 @@ The implementation is split by ownership and data flow rather than by public API
 * `daemon.go` and `client_instance.go` for daemon ownership, credentials, QUIC attachment, control streams, and session switching;
 * `session.go`, `session_runtime.go`, `session_input.go`, and `session_output.go` for session coordination;
 * `frontend_input.go` and `frontend_routing.go` for semantic frontend parsing, mode-aware input encoding, pointer routing, and OSC 52 copy;
-* `pane.go`, `pane_runtime.go`, `pane_display.go`, and `pane_history.go` for pane ownership, render batching, streamed display compilation, history, and selection;
+* `pane.go` and `pane_runtime.go` for pane ownership, PTY workers, and the pane actor loop;
+* `pane_render_state.go`, `output_lease.go`, and `pane_display.go` for persistent damage, leased fixed-capacity buffers, output workers, and display compilation;
+* `pane_commands.go` and `pane_history.go` for actor-serialized capture, history, and selection;
 * `terminal.go` and `parser.go` for terminal semantics, packed cells, bounded rows, Unicode clusters, and terminal modes;
 * `window_layout.go` for layout trees and geometry; and
 * `process_monitor.go`, `process_observer.go`, and `session_persistence.go` for process recipes and persistence.
@@ -1195,7 +1228,8 @@ The suite includes:
 * attach-token expiry, single use, resume, takeover, and live session switching;
 * frontend setup, registered cleanup, disconnect cleanup, and render-loop terminal ownership;
 * output-lease release, relayout barriers, grid validation, and revision activation;
-* pre-`PRESENT` command streaming without premature UI publication;
+* blocked output workers without blocked pane actors;
+* bounded progressive render batches, retained dirty suffixes, and a terminating `PRESENT` in every batch;
 * prediction confirmation, partial confirmation, conflict, and repair;
 * history independence, frozen projection, selection overlays, and extraction;
 * snapshot consistency, project-file versus recovery-snapshot separation, validation, and command modes; and
@@ -1211,7 +1245,7 @@ The following statements summarize the contracts contributors should preserve:
 
 1. The daemon actor alone mutates server-wide session and attachment registries.
 2. A session actor alone mutates that session's windows, layouts, client ownership, pane membership, prompts, and frontend routing decisions.
-3. A pane actor alone mutates its terminal state, packed row store, history view, and output lease.
+3. A pane actor alone mutates its terminal state, packed row store, history view, pending damage, and output lease.
 4. A pane and its PTY outlive replacement of the attached client transport.
 5. One reconnect credential represents one logical client across many disposable client instances.
 6. Only the current client instance may control its assigned session.
@@ -1221,21 +1255,24 @@ The following statements summarize the contracts contributors should preserve:
 10. Server-provided frontend setup has paired cleanup, and terminal writes are serialized by the client UI loop.
 11. Pane terminal modes are learned from authoritative PTY output; frontend events are encoded for the pane's current modes on the server.
 12. Pointer hit testing uses the layout revision the frontend reported, not an unrelated current geometry.
-13. An output lease is owned by at most one pane actor.
-14. A render slot is a transport resource, not a permanent pane identity.
-15. Every pane render after rebinding begins with a relayout barrier containing the revision and grid dimensions, followed by a complete view.
-16. The client activates a layout revision only with initial frames for all its visible panes.
-17. A pane frame is never painted with geometry or grid dimensions from another layout revision.
-18. Display bytes may stream before `PRESENT`, but no partially presented batch becomes visible in the UI.
-19. The server terminal grid and mode state are authoritative.
-20. Packed cells, cluster handles, continuation cells, and row eviction preserve valid reference and width relationships.
-21. Grapheme clusters remain atomic across parsing, storage, caching, rendering, history, selection, and resize.
-22. Client prediction decorates render output but never mutates authoritative cached state.
-23. Only authoritative server evidence confirms a prediction.
-24. History selection is view state; copying through OSC 52 does not inject bytes into the pane application.
-25. Snapshot observation performed outside an actor is revalidated before persistence.
-26. Recovery snapshots and `.meja` project files are restart recipes, not process images.
-27. `restore` consumes daemon-managed named-session snapshots; `new -f` consumes explicit project files.
-28. Initial remote attachment authority is transferred through SSH; the direct QUIC connection must match that bootstrap.
+13. An output lease is owned by at most one pane actor, and its render buffer is owned by exactly one of that actor or the lease worker at a time.
+14. Blocking PTY reads, PTY writes, and pane-stream writes occur outside the pane actor and do not mutate its terminal state.
+15. A render slot is a transport resource, not a permanent pane identity.
+16. Every pane render after rebinding begins with a relayout barrier containing the revision and grid dimensions, followed by a complete refresh that may span multiple presented frames.
+17. Every submitted pane render buffer ends with `PRESENT`; no partial batch becomes visible in the UI.
+18. Damage not encoded into one batch remains dirty, and later PTY damage is merged before another borrowed buffer is rendered.
+19. The client activates a layout revision only with initial frames for all its visible panes.
+20. A pane frame is never painted with geometry or grid dimensions from another layout revision.
+21. The server terminal grid and mode state are authoritative.
+22. `capture-pane` reads that grid as a serialized pane-actor operation rather than racing terminal mutation.
+23. Packed cells, cluster handles, continuation cells, and row eviction preserve valid reference and width relationships.
+24. Grapheme clusters remain atomic and bounded across parsing, storage, caching, rendering, history, selection, and resize.
+25. Client prediction decorates render output but never mutates authoritative cached state.
+26. Only authoritative server evidence confirms a prediction.
+27. History selection is view state; copying through OSC 52 does not inject bytes into the pane application.
+28. Snapshot observation performed outside an actor is revalidated before persistence.
+29. Recovery snapshots and `.meja` project files are restart recipes, not process images.
+30. `restore` consumes daemon-managed named-session snapshots; `new -f` consumes explicit project files.
+31. Initial remote attachment authority is transferred through SSH; the direct QUIC connection must match that bootstrap.
 
 These invariants are more stable than individual files, constants, or goroutine counts. When an implementation change preserves them—or deliberately revises them along with this document—the architecture remains understandable even as its internals evolve.

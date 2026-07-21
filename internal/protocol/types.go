@@ -8,6 +8,9 @@ const (
 	// client has taken ownership of the session, so the displaced client must
 	// exit instead of attempting to resume.
 	SessionReplacedErrorCode = 0x54414c49
+	// RenderOutputErrorCode is recoverable by reconnecting with the retained
+	// resume token and obtaining fresh output streams.
+	RenderOutputErrorCode = 0x52454e44
 )
 
 const (
