@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,6 +60,429 @@ func TestNewSessionCommandCreatesInitialPaneBeforeAttach(t *testing.T) {
 	}
 	if got := pane.Launch.RequestedArgv; !reflect.DeepEqual(got, []string{"/bin/sleep", "30"}) {
 		t.Fatalf("initial pane argv = %v", got)
+	}
+}
+
+func TestDetachedNewSessionPrintsInitialPaneWithoutBootstrapOrAttachment(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = t.TempDir()
+	root := t.TempDir()
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:             []string{"new-session", "-d", "-P", "-F", "#{session_id}:#{pane_id}", "-s", "worker", "--", "/bin/sleep", "30"},
+		WorkingDirectory: root,
+		TerminalCols:     80,
+		TerminalRows:     23,
+	})
+	defer d.disconnectActiveClients()
+	if result.exitCode != 0 || result.bootstrap != nil || string(result.stdout) != "1:1\n" {
+		t.Fatalf("detached new result = %#v", result)
+	}
+	if len(d.attachGrants) != 0 {
+		t.Fatalf("detached creation left attach grants: %#v", d.attachGrants)
+	}
+	session := d.sessionByName("worker")
+	if session == nil || session.clientInstance != nil || len(session.Panes) != 1 {
+		t.Fatalf("detached session state = %#v", session)
+	}
+}
+
+func TestDetachedNewSessionDoesNotContextuallyHandoff(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	defer d.disconnectActiveClients()
+	d.sessionPersistenceDir = t.TempDir()
+	source := NewSession(1)
+	source.daemon = d
+	source.setSessionName("source")
+	source.CreateWindow(&Pane{ID: source.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
+	source.SetClientSize(clientID0, 80, 23)
+	d.sessions[source.ID] = source
+	d.names[source.Name] = source
+	d.nextID = 2
+
+	credential := &reconnectCredential{EncodedToken: "detached-test"}
+	instance := newClientInstance(d, credential)
+	credential.Instance = instance
+	source.clientInstance = instance
+	d.clientSessions[credential] = source.ID
+	d.attachments[source.ID] = credential
+
+	switchSeen := make(chan *sessionSwitchRequest, 1)
+	stopWatcher := make(chan struct{})
+	t.Cleanup(func() { close(stopWatcher) })
+	go func() {
+		select {
+		case request := <-instance.sessionSwitches:
+			switchSeen <- request
+			completeSessionSwitch(request, errors.New("detached new-session must not switch the client"))
+		case <-stopWatcher:
+		}
+	}()
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"new-session", "-d", "-P", "-F", "#{session_id}:#{pane_id}", "-s", "detached"},
+		CallerSessionTarget: "source",
+		WorkingDirectory:    t.TempDir(),
+		TerminalCols:        80,
+		TerminalRows:        23,
+	})
+	if result.exitCode != 0 || result.bootstrap != nil || string(result.stdout) != "2:2\n" {
+		t.Fatalf("contextual detached new result = %#v", result)
+	}
+	if source.clientInstance != instance {
+		t.Fatal("source client was moved from the invoking session")
+	}
+	created := d.sessionByName("detached")
+	if created == nil || created.clientInstance != nil {
+		t.Fatalf("detached session state = %#v", created)
+	}
+	if len(d.attachGrants) != 0 {
+		t.Fatalf("detached creation left attach grants: %#v", d.attachGrants)
+	}
+	select {
+	case request := <-switchSeen:
+		t.Fatalf("detached new-session requested a contextual switch: %#v", request)
+	default:
+	}
+}
+
+func TestDetachedNewSessionDoesNotRequireAttachedSource(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	defer d.disconnectActiveClients()
+	d.sessionPersistenceDir = t.TempDir()
+	source := NewSession(1)
+	source.daemon = d
+	source.setSessionName("source")
+	source.CreateWindow(&Pane{ID: source.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
+	d.sessions[source.ID] = source
+	d.names[source.Name] = source
+	d.nextID = 2
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"new", "-d", "-P", "-F", "#{session_id}:#{pane_id}", "-s", "detached"},
+		CallerSessionTarget: "source",
+		WorkingDirectory:    t.TempDir(),
+		TerminalCols:        80,
+		TerminalRows:        23,
+	})
+	if result.exitCode != 0 || result.bootstrap != nil || string(result.stdout) != "2:2\n" {
+		t.Fatalf("detached new without attached source = %#v", result)
+	}
+	if source.clientInstance != nil || source.SessionName() != "source" || len(source.Panes) != 1 {
+		t.Fatalf("source session changed = %#v", source)
+	}
+	created := d.sessionByName("detached")
+	if created == nil || created.clientInstance != nil {
+		t.Fatalf("detached session state = %#v", created)
+	}
+	if len(d.attachGrants) != 0 {
+		t.Fatalf("detached creation left attach grants: %#v", d.attachGrants)
+	}
+}
+
+func TestNewSessionDetachedPreflightStopsAtCommandSeparator(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{args: []string{"-d"}, want: true},
+		{args: []string{"-d=true"}, want: true},
+		{args: []string{"--d"}, want: true},
+		{args: []string{"--", "-d"}, want: false},
+		{args: []string{"--", "editor", "-d"}, want: false},
+		{args: []string{"-d=false"}, want: false},
+	}
+	for _, test := range tests {
+		if got := newSessionRequestsDetached(test.args); got != test.want {
+			t.Errorf("newSessionRequestsDetached(%v) = %v, want %v", test.args, got, test.want)
+		}
+	}
+}
+
+func TestDetachedNewSessionRollbackRemovesFailedSession(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = t.TempDir()
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:         []string{"new", "-d", "-s", "broken", "--", "/does/not/exist"},
+		TerminalCols: 80,
+		TerminalRows: 23,
+	})
+	if result.exitCode == 0 || d.sessionByName("broken") != nil {
+		t.Fatalf("failed detached new result = %#v", result)
+	}
+}
+
+func TestPaneIDsAreDaemonWideMonotonicAndNotReused(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = t.TempDir()
+	defer d.disconnectActiveClients()
+	newDetached := func(name string) string {
+		result := d.executeCommand(protocol.CommandRequest{
+			Args:         []string{"new", "-d", "-P", "-F", "#{pane_id}", "-s", name},
+			TerminalCols: 80,
+			TerminalRows: 23,
+		})
+		if result.exitCode != 0 {
+			t.Fatalf("create %s = %#v", name, result)
+		}
+		return strings.TrimSpace(string(result.stdout))
+	}
+	if got := newDetached("one"); got != "1" {
+		t.Fatalf("first pane ID = %q, want 1", got)
+	}
+	if got := newDetached("two"); got != "2" {
+		t.Fatalf("second pane ID = %q, want 2", got)
+	}
+	killed := d.executeCommand(protocol.CommandRequest{Args: []string{"kill-session", "-t", "one"}})
+	if killed.exitCode != 0 {
+		t.Fatalf("kill first session = %#v", killed)
+	}
+	if got := newDetached("three"); got != "3" {
+		t.Fatalf("post-exit pane ID = %q, want 3", got)
+	}
+}
+
+func TestNewWindowAndSplitUseDaemonPaneIDs(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	d.sessionPersistenceDir = t.TempDir()
+	created := d.executeCommand(protocol.CommandRequest{
+		Args:         []string{"new", "-d", "-s", "work"},
+		TerminalCols: 80,
+		TerminalRows: 23,
+	})
+	defer d.disconnectActiveClients()
+	if created.exitCode != 0 {
+		t.Fatalf("initial session = %#v", created)
+	}
+	for _, args := range [][]string{{"new-window", "-t", "work"}, {"split-window", "-t", "work", "-v"}} {
+		result := d.executeCommand(protocol.CommandRequest{Args: args})
+		if result.exitCode != 0 {
+			t.Fatalf("%s = %#v", args[0], result)
+		}
+	}
+	listing := d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-a", "-F", "#{pane_id}"}})
+	if listing.exitCode != 0 || string(listing.stdout) != "1\n2\n3\n" {
+		t.Fatalf("new-window/split pane IDs = %#v", listing)
+	}
+}
+
+func TestPaneIDAllocationIsSerializedForConcurrentRequests(t *testing.T) {
+	d := newCommandTestDaemonWithActor(t)
+	const count = 24
+	ids := make(chan uint64, count)
+	errs := make(chan error, count)
+	var wait sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			id, err := d.allocatePaneID()
+			if err != nil {
+				errs <- err
+				return
+			}
+			ids <- id
+		}()
+	}
+	wait.Wait()
+	close(ids)
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	seen := make(map[uint64]struct{}, count)
+	for id := range ids {
+		if _, exists := seen[id]; exists {
+			t.Fatalf("duplicate concurrent pane ID %d", id)
+		}
+		seen[id] = struct{}{}
+	}
+	if len(seen) != count {
+		t.Fatalf("allocated %d unique IDs, want %d", len(seen), count)
+	}
+}
+
+func TestRestoreRemapsLayoutLocalPaneReferencesToFreshDaemonIDs(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	base := t.TempDir()
+	path := filepath.Join(t.TempDir(), "project.meja")
+	plan := SessionPlan{
+		Version: mejaFormatVersion, Name: "project", Root: base, ActiveWindow: 1,
+		Windows: []PlanWindow{
+			{Cwd: base, ActivePane: 0, Layout: PlanLayout{Pane: paneIDRef(0)}, Panes: []PlanPane{{ID: 0, Cwd: base}}},
+			{Cwd: base, ActivePane: 0, Layout: PlanLayout{Pane: paneIDRef(0)}, Panes: []PlanPane{{ID: 0, Cwd: base}}},
+		},
+	}
+	if _, err := writeUserMejaFile(path, plan, false); err != nil {
+		t.Fatal(err)
+	}
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"new", "-f", path, "--commands=skip"}})
+	defer d.disconnectActiveClients()
+	if result.exitCode != 0 {
+		t.Fatalf("restore project = %#v", result)
+	}
+	listing := d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-a", "-F", "#{pane_id}"}})
+	if listing.exitCode != 0 || string(listing.stdout) != "1\n2\n" {
+		t.Fatalf("restored pane IDs = %#v", listing)
+	}
+}
+
+func TestNewSessionFileRejectsDetachedFormatFlags(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	for _, args := range [][]string{
+		{"new", "-f", "project.meja", "-d"},
+		{"new", "-f", "project.meja", "-P"},
+		{"new", "-f", "project.meja", "-F", "#{session_id}:#{pane_id}"},
+		{"new", "-f", "project.meja", "-F", "#{session_id}"},
+	} {
+		result := d.executeCommand(protocol.CommandRequest{Args: args})
+		if result.exitCode == 0 || !strings.Contains(string(result.stderr), "does not support -d, -P, or -F") {
+			t.Fatalf("new file flags %v = %#v", args, result)
+		}
+	}
+}
+
+func newFormatTestSession(id uint64, name string, paneID uint64) *Session {
+	session := NewSession(id)
+	session.setSessionName(name)
+	pane := &Pane{ID: paneID, Launch: PaneLaunch{Shell: "/bin/bash", Cwd: "/launch"}, terminal: newTerminal(80, 24)}
+	session.CreateWindow(pane, clientID0)
+	session.processObservations[paneID] = ProcessObservation{
+		Status: StatusDetected,
+		Root:   &ObservedProcess{Cwd: "/observed"},
+		Candidate: &ObservedProcess{
+			Name: "editor",
+			Argv: []string{"editor", "--wait"},
+		},
+	}
+	return session
+}
+
+func TestSharedPaneFormatExpandsRequiredValuesAndStableCreationTime(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	first := newFormatTestSession(9, "work", 4)
+	first.CreatedAt = 1234567890
+	first.Windows[1].DisplayIndex = 3
+	second := newFormatTestSession(2, "other", 4)
+	second.CreatedAt = 1234567891
+	d.sessions[first.ID] = first
+	d.sessions[second.ID] = second
+	d.names[first.Name] = first
+	d.names[second.Name] = second
+	t.Cleanup(func() {
+		first.stopOperations()
+		second.stopOperations()
+	})
+
+	format := "#{session_id}|#{session_name}|#{session_created}|#{window_index}|#{pane_id}|#{pane_dead}|#{pane_current_command}|#{pane_current_path}|#{pane_in_mode}|#{pane_index}|#{pane_width}|#{pane_height}|#{pane_in_copy_mode}|#{unknown}"
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-t", "work", "-F", format}})
+	if result.exitCode != 0 {
+		t.Fatalf("formatted panes = %#v", result)
+	}
+	want := "9|work|1234567890|3|4|0|editor|/observed|0|4|80|24|0|#{unknown}\n"
+	if string(result.stdout) != want {
+		t.Fatalf("formatted pane = %q, want %q", result.stdout, want)
+	}
+	for i := 0; i < 2; i++ {
+		listed := d.executeCommand(protocol.CommandRequest{Args: []string{"list-sessions", "-F", "#{session_id}:#{session_created}"}})
+		if listed.exitCode != 0 || string(listed.stdout) != "2:1234567891\n9:1234567890\n" {
+			t.Fatalf("stable session listing = %#v", listed)
+		}
+	}
+}
+
+func TestPaneFormatUsesLaunchedCommandAndCwdFallbacks(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	session := NewSession(1)
+	session.setSessionName("fallback")
+	pane := &Pane{ID: 7, Launch: PaneLaunch{Shell: "/bin/zsh", RequestedArgv: []string{"/bin/sleep", "5"}, Cwd: "/launch"}, terminal: newTerminal(10, 2)}
+	session.CreateWindow(pane, clientID0)
+	d.sessions[session.ID] = session
+	d.names[session.Name] = session
+	t.Cleanup(session.stopOperations)
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-t", "fallback", "-F", "#{pane_current_command}|#{pane_current_path}"}})
+	if result.exitCode != 0 || string(result.stdout) != "sleep|/launch\n" {
+		t.Fatalf("launch fallback = %#v", result)
+	}
+	pane.Launch.RequestedArgv = nil
+	result = d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-t", "fallback", "-F", "#{pane_current_command}|#{pane_current_path}"}})
+	if result.exitCode != 0 || string(result.stdout) != "zsh|/launch\n" {
+		t.Fatalf("shell fallback = %#v", result)
+	}
+	pane.Launch.Shell = ""
+	pane.Process = &exec.Cmd{Path: "/opt/tool (deleted)"}
+	result = d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-t", "fallback", "-F", "#{pane_current_command}|#{pane_current_path}"}})
+	if result.exitCode != 0 || string(result.stdout) != "tool|/launch\n" {
+		t.Fatalf("process path fallback = %#v", result)
+	}
+	pane.Process = nil
+	result = d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-t", "fallback", "-F", "#{pane_current_command}|#{pane_current_path}"}})
+	if result.exitCode != 0 || string(result.stdout) != "|/launch\n" {
+		t.Fatalf("empty command metadata = %#v", result)
+	}
+}
+
+func TestListSessionsFormatUsesActiveWindowAndPane(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	session := newFormatTestSession(8, "active", 10)
+	session.CreatedAt = 987654321
+	secondPane := &Pane{ID: 11, Launch: PaneLaunch{Shell: "/bin/zsh", Cwd: "/second"}, terminal: newTerminal(90, 30)}
+	secondWindow, _ := session.CreateWindow(secondPane, clientID0)
+	secondWindow.DisplayIndex = 7
+	session.processObservations[secondPane.ID] = ProcessObservation{
+		Status: StatusDetected,
+		Root:   &ObservedProcess{Cwd: "/observed-second"},
+		Candidate: &ObservedProcess{
+			Argv: []string{"editor", "--wait"},
+		},
+	}
+	d.sessions[session.ID] = session
+	d.names[session.Name] = session
+	t.Cleanup(session.stopOperations)
+
+	format := "#{session_id}|#{session_name}|#{session_created}|#{window_index}|#{pane_id}|#{pane_dead}|#{pane_current_command}|#{pane_current_path}|#{pane_in_mode}"
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"list-sessions", "-F", format}})
+	want := fmt.Sprintf("8|active|987654321|7|11|0|editor|/observed-second|0\n")
+	if result.exitCode != 0 || string(result.stdout) != want {
+		t.Fatalf("active session format = %#v, want %q", result, want)
+	}
+}
+
+func TestListSessionsKeepsTableAndListPanesAllUsesDaemonWideIDs(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	first := newFormatTestSession(5, "five", 1)
+	second := newFormatTestSession(2, "two", 2)
+	d.sessions[first.ID] = first
+	d.sessions[second.ID] = second
+	d.names[first.Name] = first
+	d.names[second.Name] = second
+	t.Cleanup(func() {
+		first.stopOperations()
+		second.stopOperations()
+	})
+
+	table := d.executeCommand(protocol.CommandRequest{Args: []string{"list-sessions"}})
+	if table.exitCode != 0 || !strings.Contains(string(table.stdout), "Active Sessions\n") || strings.Contains(string(table.stdout), "#{") {
+		t.Fatalf("human session table = %#v", table)
+	}
+	nonEmpty := d.executeCommand(protocol.CommandRequest{Args: []string{"list-sessions", "-F", "#{session_id}"}})
+	if nonEmpty.exitCode != 0 || string(nonEmpty.stdout) != "2\n5\n" {
+		t.Fatalf("formatted session list = %#v", nonEmpty)
+	}
+	empty := d.executeCommand(protocol.CommandRequest{Args: []string{"list-sessions", "-F", ""}})
+	if empty.exitCode != 0 || string(empty.stdout) != "\n\n" {
+		t.Fatalf("explicit empty session format = %#v", empty)
+	}
+	emptyEquals := d.executeCommand(protocol.CommandRequest{Args: []string{"list-sessions", "-F="}})
+	if emptyEquals.exitCode != 0 || string(emptyEquals.stdout) != "\n\n" {
+		t.Fatalf("explicit equals-empty session format = %#v", emptyEquals)
+	}
+	all := d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-a", "-F", "#{session_id}:#{pane_id}"}})
+	if all.exitCode != 0 || string(all.stdout) != "2:2\n5:1\n" {
+		t.Fatalf("all panes = %#v", all)
+	}
+	conflict := d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-a", "-t", "five"}})
+	if conflict.exitCode == 0 || !strings.Contains(string(conflict.stderr), "cannot be combined with -t") {
+		t.Fatalf("all panes target conflict = %#v", conflict)
 	}
 }
 

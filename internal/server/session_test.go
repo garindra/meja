@@ -460,7 +460,7 @@ func TestResizeRebuildsVisualRenderBindings(t *testing.T) {
 	client.TerminalCols, client.TerminalRows = 16, 4
 	first := &Pane{ID: 2, terminal: newTerminal(16, 4)}
 	second := &Pane{ID: 1, terminal: newTerminal(16, 4)}
-	s.NextPaneID = 3
+	s.nextStandalonePaneID = 3
 	s.CreateWindow(first, 0)
 	window := s.Windows[client.ActiveWindowID]
 	s.Panes[second.ID] = second

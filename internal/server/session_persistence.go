@@ -419,7 +419,6 @@ func validateSessionPlan(plan SessionPlan) error {
 	if plan.ActiveWindow < 1 || plan.ActiveWindow > len(plan.Windows) {
 		return errors.New(".meja active window is out of range")
 	}
-	seenPanes := make(map[uint64]struct{})
 	for windowIndex, window := range plan.Windows {
 		if !filepath.IsAbs(window.Cwd) {
 			return fmt.Errorf(".meja window %d cwd must resolve to an absolute path", windowIndex+1)
@@ -432,10 +431,9 @@ func validateSessionPlan(plan SessionPlan) error {
 			if pane.ID == ^uint64(0) {
 				return fmt.Errorf(".meja pane ID %d cannot be restored", pane.ID)
 			}
-			if _, exists := seenPanes[pane.ID]; exists {
+			if _, exists := windowPanes[pane.ID]; exists {
 				return fmt.Errorf(".meja pane ID %d is duplicated", pane.ID)
 			}
-			seenPanes[pane.ID] = struct{}{}
 			windowPanes[pane.ID] = struct{}{}
 			if !filepath.IsAbs(pane.Cwd) {
 				return fmt.Errorf(".meja pane %d cwd must resolve to an absolute path", pane.ID)
@@ -785,6 +783,10 @@ func (s *Session) restoreSessionPlan(plan SessionPlan, mode restoreCommandMode) 
 	if mode != restoreCommandsPrepare && mode != restoreCommandsSkip && mode != restoreCommandsRun {
 		return fmt.Errorf("invalid restore command mode %q", mode)
 	}
+	plan = cloneSessionPlan(plan)
+	if err := s.allocateRestoredPaneIDs(&plan); err != nil {
+		return err
+	}
 	const defaultRestoreCols, defaultRestoreRows = 80, 24
 	type restoredPane struct {
 		pane    *Pane
@@ -802,7 +804,6 @@ func (s *Session) restoreSessionPlan(plan SessionPlan, mode restoreCommandMode) 
 			}
 		}
 	}
-	var maxPaneID uint64
 	for _, window := range plan.Windows {
 		for _, persistedPane := range window.Panes {
 			shell := persistedPane.Shell
@@ -820,15 +821,11 @@ func (s *Session) restoreSessionPlan(plan SessionPlan, mode restoreCommandMode) 
 				return fmt.Errorf("restore pane %d: %w", persistedPane.ID, err)
 			}
 			panes = append(panes, restoredPane{pane: pane, command: persistedPane.Command})
-			if persistedPane.ID > maxPaneID {
-				maxPaneID = persistedPane.ID
-			}
 		}
 	}
 
 	err := s.coordinate(func() error {
 		s.Name = plan.Name
-		s.NextPaneID = maxPaneID + 1
 		s.NextWindowID = uint64(len(plan.Windows) + 1)
 		for _, restored := range panes {
 			s.Panes[restored.pane.ID] = restored.pane
@@ -868,6 +865,34 @@ func (s *Session) restoreSessionPlan(plan SessionPlan, mode restoreCommandMode) 
 		input := restoredCommandInput(restored.command, mode)
 		restored.pane.startupInput = input
 		s.startPane(restored.pane)
+	}
+	return nil
+}
+
+// allocateRestoredPaneIDs converts layout-local project references into fresh
+// daemon-wide live IDs. Restoration is initiated on the daemon actor, so the
+// direct allocator call avoids re-entering that actor.
+func (s *Session) allocateRestoredPaneIDs(plan *SessionPlan) error {
+	for windowIndex := range plan.Windows {
+		window := &plan.Windows[windowIndex]
+		mapping := make(map[uint64]uint64, len(window.Panes))
+		for paneIndex := range window.Panes {
+			oldID := window.Panes[paneIndex].ID
+			var newID uint64
+			var err error
+			if s.daemon != nil {
+				newID, err = s.daemon.allocatePaneIDNow()
+			} else {
+				newID, err = s.allocatePaneID()
+			}
+			if err != nil {
+				return err
+			}
+			mapping[oldID] = newID
+			window.Panes[paneIndex].ID = newID
+		}
+		window.ActivePane = mapping[window.ActivePane]
+		remapLayoutPaneIDs(&window.Layout, mapping)
 	}
 	return nil
 }
@@ -1573,7 +1598,6 @@ func parsePlanNodes(nodes []*document.Node, parent, name string, userOwned bool)
 		plan.Windows = append(plan.Windows, window)
 	}
 	plan.ActiveWindow = int(activeWindowID) + 1
-	remapPaneIDs(&plan)
 	return plan, nil
 }
 
@@ -1835,22 +1859,6 @@ func splitTileLayout(panes []PlanPane, bounds MejaTile) (PlanLayout, error) {
 
 func tilesOverlap(a, b MejaTile) bool {
 	return a.X < b.X+b.W && b.X < a.X+a.W && a.Y < b.Y+b.H && b.Y < a.Y+a.H
-}
-
-func remapPaneIDs(plan *SessionPlan) {
-	var next uint64
-	for windowIndex := range plan.Windows {
-		window := &plan.Windows[windowIndex]
-		mapping := make(map[uint64]uint64, len(window.Panes))
-		for paneIndex := range window.Panes {
-			old := window.Panes[paneIndex].ID
-			mapping[old] = next
-			window.Panes[paneIndex].ID = next
-			next++
-		}
-		window.ActivePane = mapping[window.ActivePane]
-		remapLayoutPaneIDs(&window.Layout, mapping)
-	}
 }
 
 func remapLayoutPaneIDs(layout *PlanLayout, mapping map[uint64]uint64) {

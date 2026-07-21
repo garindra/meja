@@ -175,12 +175,14 @@ type commandSessionTarget struct {
 	file        string
 	newName     string
 	restoreMode restoreCommandMode
+	detached    bool
 }
 
 type commandSessionInfo struct {
 	id       uint64
 	name     string
 	attached bool
+	format   formatSessionSnapshot
 }
 
 type sessionOperationResult struct {
@@ -190,12 +192,13 @@ type sessionOperationResult struct {
 }
 
 type commandResult struct {
-	stdout     []byte
-	stderr     []byte
-	bootstrap  *protocol.CommandBootstrap
-	session    *Session
-	exitCode   int
-	stopServer bool
+	stdout                    []byte
+	stderr                    []byte
+	bootstrap                 *protocol.CommandBootstrap
+	session                   *Session
+	suppressContextualHandoff bool
+	exitCode                  int
+	stopServer                bool
 }
 
 func (d *Daemon) executeCommand(request protocol.CommandRequest) commandResult {
@@ -219,7 +222,8 @@ func (d *Daemon) executeCommandNow(request protocol.CommandRequest) (commandResu
 	}
 	ctx := &commandContext{daemon: d, request: request}
 	var handoff *contextualCommandHandoff
-	if request.CallerSessionTarget != "" && command.sessionResult {
+	skipHandoffPreparation := command.skipContextualHandoff != nil && command.skipContextualHandoff(request.Args[1:])
+	if request.CallerSessionTarget != "" && command.sessionResult && !skipHandoffPreparation {
 		prepared, err := d.prepareContextualCommandHandoff(ctx)
 		if err != nil {
 			return commandResult{}, err
@@ -230,7 +234,7 @@ func (d *Daemon) executeCommandNow(request protocol.CommandRequest) (commandResu
 	if err != nil {
 		return commandResult{}, err
 	}
-	if handoff != nil && execution.result.session != nil {
+	if handoff != nil && execution.result.session != nil && !execution.result.suppressContextualHandoff {
 		if err := d.handoffContextualCommand(handoff, execution.result.session); err != nil {
 			return commandResult{}, err
 		}
@@ -292,23 +296,24 @@ type commandExecution struct {
 }
 
 type commandDefinition struct {
-	name          string
-	aliases       []string
-	usage         string
-	description   string
-	hidden        bool
-	sessionResult bool
-	execute       commandHandler
+	name                  string
+	aliases               []string
+	usage                 string
+	description           string
+	hidden                bool
+	sessionResult         bool
+	skipContextualHandoff func([]string) bool
+	execute               commandHandler
 }
 
 func registeredCommands() []commandDefinition {
 	return []commandDefinition{
 		{name: "help", aliases: []string{"--help"}, usage: "help [command]", description: "Show this reference or help for one server command.", execute: daemonCommand(handleDaemonHelpCommand)},
-		{name: "new-session", aliases: []string{"new"}, usage: "new-session [-s name] [-r directory] [-- command args...] | new-session -f file [-s name] [--commands=prepare|skip|run]", description: "Create a session, optionally from a .meja file, and attach.", sessionResult: true, execute: daemonCommand(handleDaemonNewSessionCommand)},
+		{name: "new-session", aliases: []string{"new"}, usage: "new-session [-d] [-P] [-F format] [-s name] [-r directory] [-- command args...] | new-session -f file [-s name] [--commands=prepare|skip|run]", description: "Create a session, optionally from a .meja file, and attach unless -d is supplied.", sessionResult: true, skipContextualHandoff: newSessionRequestsDetached, execute: daemonCommand(handleDaemonNewSessionCommand)},
 		{name: "attach-session", aliases: []string{"attach", "a"}, usage: "attach-session -t session-id-or-name", description: "Attach to an existing session.", sessionResult: true, execute: daemonCommand(handleDaemonAttachSessionCommand)},
 		{name: "restore-session", aliases: []string{"restore"}, usage: "restore-session -t name [-s new-name] [--commands=prepare|skip|run]", description: "Restore a named session's automatic snapshot and attach.", sessionResult: true, execute: restoreCommand()},
 		{name: "save-session", aliases: []string{"save"}, usage: "save-session -t session-id-or-name -o file [-f]", description: "Save a live session to a .meja file.", execute: daemonCommand(handleDaemonSaveSessionCommand)},
-		{name: "list-sessions", aliases: []string{"ls"}, usage: "list-sessions", description: "List active sessions.", execute: daemonCommand(handleDaemonListSessionsCommand)},
+		{name: "list-sessions", aliases: []string{"ls"}, usage: "list-sessions [-F format]", description: "List active sessions.", execute: daemonCommand(handleDaemonListSessionsCommand)},
 		{name: "kill-session", usage: "kill-session -t session", description: "Terminate a session and its panes.", execute: daemonCommand(handleDaemonKillSessionCommand)},
 		{name: "kill-server", usage: "kill-server", description: "Stop the selected server.", execute: daemonCommand(handleDaemonKillServerCommand)},
 		{name: "server", hidden: true, execute: daemonCommand(handleLegacyDaemonServerCommand)},
@@ -1153,6 +1158,9 @@ func parseCommandLine(line string) ([]string, error) {
 
 func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []string) (commandResult, error) {
 	fs := commandFlagSet("new-session")
+	detached := fs.Bool("d", false, "create without attaching")
+	printOutput := fs.Bool("P", false, "print created session")
+	format := fs.String("F", "#{session_id}:#{pane_id}", "creation output format")
 	name := fs.String("s", "", "session name")
 	file := fs.String("f", "", ".meja file")
 	mode := fs.String("commands", "prepare", "restore command mode")
@@ -1168,6 +1176,9 @@ func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []strin
 		}
 	}
 	if *file != "" {
+		if *detached || *printOutput || commandArgsContainFlag(args, "-F") {
+			return commandResult{}, errors.New("new-session -f does not support -d, -P, or -F")
+		}
 		if root != "" || len(fs.Args()) != 0 {
 			return commandResult{}, errors.New("new-session -f cannot be combined with a root or initial command")
 		}
@@ -1202,7 +1213,7 @@ func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []strin
 	if rows == 0 {
 		rows = 23
 	}
-	operation, err := d.executeSessionOperation("create-session", commandSessionTarget{name: *name})
+	operation, err := d.executeSessionOperation("create-session", commandSessionTarget{name: *name, detached: *detached})
 	if err != nil {
 		return commandResult{}, err
 	}
@@ -1226,10 +1237,21 @@ func (d *Daemon) commandNewSession(request protocol.CommandRequest, args []strin
 		return nil
 	}); err != nil {
 		_ = s.shutdown()
-		d.sessionExited(s)
+		d.call(func() { d.removeSession(s) })
 		return commandResult{}, err
 	}
-	return commandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
+	result := commandResult{session: operation.session, suppressContextualHandoff: *detached}
+	if *printOutput {
+		snapshot := s.formatSnapshot()
+		if len(snapshot.Panes) == 0 {
+			return commandResult{}, errors.New("created session has no initial pane")
+		}
+		result.stdout = []byte(expandFormat(*format, formatContext{session: &snapshot, pane: &snapshot.Panes[0]}) + "\n")
+	}
+	if !*detached {
+		result.bootstrap = &operation.bootstrap
+	}
+	return result, nil
 }
 
 func (d *Daemon) commandAttachSession(args []string) (commandResult, error) {
@@ -1380,14 +1402,34 @@ func resolveCommandFilePath(path, workingDirectory string) (string, error) {
 }
 
 func (d *Daemon) commandListSessions(args []string) (commandResult, error) {
-	if len(args) != 0 {
-		return commandResult{}, errors.New("list-sessions accepts no arguments")
+	fs := commandFlagSet("list-sessions")
+	format := fs.String("F", "", "format")
+	if err := fs.Parse(args); err != nil {
+		return commandResult{}, err
+	}
+	if len(fs.Args()) != 0 {
+		return commandResult{}, errors.New("list-sessions accepts no positional arguments")
 	}
 	operation, err := d.executeSessionOperation("list-sessions", commandSessionTarget{})
 	if err != nil {
 		return commandResult{}, err
 	}
 	var output bytes.Buffer
+	formatProvided := false
+	fs.Visit(func(flag *flag.Flag) {
+		if flag.Name == "F" {
+			formatProvided = true
+		}
+	})
+	if formatProvided {
+		for _, session := range operation.sessions {
+			line := expandFormat(*format, formatContext{session: &session.format, pane: session.format.ActivePane})
+			if _, err := fmt.Fprintln(&output, line); err != nil {
+				return commandResult{}, err
+			}
+		}
+		return commandResult{stdout: output.Bytes()}, nil
+	}
 	if _, err := fmt.Fprintln(&output, "Active Sessions"); err != nil {
 		return commandResult{}, err
 	}
@@ -1418,6 +1460,34 @@ func commandFlagSet(name string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	return fs
+}
+
+func commandArgsContainFlag(args []string, flagName string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == flagName || strings.HasPrefix(arg, flagName+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func newSessionRequestsDetached(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		switch {
+		case arg == "-d" || arg == "--d":
+			return true
+		case strings.HasPrefix(arg, "-d=") || strings.HasPrefix(arg, "--d="):
+			value, err := strconv.ParseBool(strings.SplitN(arg, "=", 2)[1])
+			return err == nil && value
+		}
+	}
+	return false
 }
 
 func parseCommandSessionID(raw string) (uint64, error) {
@@ -1494,8 +1564,8 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 		sessions := make([]commandSessionInfo, 0, len(states))
 		for _, listed := range states {
 			if listed.state != nil {
-				name, attached := listed.state.info()
-				sessions = append(sessions, commandSessionInfo{id: listed.id, name: name, attached: attached})
+				snapshot := listed.state.formatSnapshot()
+				sessions = append(sessions, commandSessionInfo{id: listed.id, name: snapshot.Name, attached: snapshot.Attached, format: snapshot})
 			}
 		}
 		sort.Slice(sessions, func(i, j int) bool { return sessions[i].id < sessions[j].id })
@@ -1603,8 +1673,13 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 	if operationErr != nil {
 		return sessionOperationResult{}, operationErr
 	}
+	if target.detached {
+		return sessionOperationResult{session: session}, nil
+	}
 	port, encodedToken, expires, err := d.issueAttachGrant(session)
 	if err != nil {
+		_ = session.shutdown()
+		d.call(func() { d.removeSession(session) })
 		return sessionOperationResult{}, err
 	}
 	return sessionOperationResult{bootstrap: protocol.CommandBootstrap{

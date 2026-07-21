@@ -90,6 +90,18 @@ type ProcessObservation struct {
 	Issues         []string          `json:"issues,omitempty"`
 }
 
+func cloneProcessObservation(observation ProcessObservation) ProcessObservation {
+	clone := observation
+	clone.Root = cloneObservedProcess(observation.Root)
+	clone.Candidate = cloneObservedProcess(observation.Candidate)
+	clone.Processes = append([]ObservedProcess(nil), observation.Processes...)
+	for index := range clone.Processes {
+		clone.Processes[index].Argv = append([]string(nil), observation.Processes[index].Argv...)
+	}
+	clone.Issues = append([]string(nil), observation.Issues...)
+	return clone
+}
+
 type ProcessObserver interface {
 	Observe(context.Context, []Anchor) map[PaneKey]ProcessObservation
 }

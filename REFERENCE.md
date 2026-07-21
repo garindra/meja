@@ -109,6 +109,7 @@ Help is server-backed and may start the selected server. `version` is a local cl
 
 ```text
 meja [transport-options] new-session
+     [-d] [-P] [-F format]
      [-s name]
      [-r directory | --root directory]
      [-- initial-command args...]
@@ -146,6 +147,14 @@ run       Type and press Enter immediately.
 ```
 
 `new` starts the selected server when needed.
+
+`-d` creates the session and its initial pane without attaching, including
+when stdin is not a terminal. `-P` prints one line after successful creation;
+`-F` controls that line and defaults to `#{session_id}:#{pane_id}`. A normal
+new session's pane ID is its initial pane ID. These flags are supported for
+ordinary creation; they are rejected with `-f` project-file creation because
+the restored file may contain multiple panes and does not have one implicit
+initial pane for deterministic output.
 
 ## `attach-session` / `attach` / `a`
 
@@ -204,7 +213,7 @@ Save requires a running server and live session.
 ## `list-sessions` / `ls`
 
 ```text
-meja [transport-options] list-sessions
+meja [transport-options] list-sessions [-F format]
 ```
 
 ```text
@@ -215,6 +224,9 @@ ID  NAME       STATUS
 ```
 
 Rows are ordered by ID. Only live sessions are listed. `ls` does not start a missing server.
+
+With `-F`, the human-readable table is replaced by one expanded line per
+session, ordered by numeric session ID.
 
 ## Server commands
 
@@ -246,7 +258,7 @@ Prefix bindings and the `Ctrl+b, :` prompt use the same command engine. Most com
 | `copy-mode` | `copy-mode [-t session]` | Enter history/copy mode. |
 | `send-keys` | `send-keys [-t session] [-X copy-mode-command | -l] key...` | Send keys or run a copy-mode command in the active pane. |
 | `capture-pane` | `capture-pane [-t session] [-p] [-b buffer-name] [-S start-line] [-E end-line] [-e] [-C] [-J] [-N]` | Capture the active pane into stdout or a paste buffer. |
-| `list-panes` | `list-panes [-t session] [-F format]` | List panes and pane mode values. |
+| `list-panes` | `list-panes [-a] [-t session] [-F format]` | List panes and pane mode values. |
 | `set-buffer` | `set-buffer [-a] [-b buffer-name] [-n new-buffer-name] data` | Create or update a paste buffer. |
 | `show-buffer` | `show-buffer [-b buffer-name]` | Print a paste buffer. |
 | `list-buffers` | `list-buffers` | List paste buffers. |
@@ -290,8 +302,33 @@ is stored in a new or named paste buffer. `-e` includes ANSI style escapes and
 `-C` octal-escapes non-printable bytes. `-J` joins terminal-wrapped rows and
 `-N` preserves trailing spaces.
 
-`list-panes -F` supports `#{pane_in_mode}`, which is `1` while the pane is in
-copy mode and `0` otherwise.
+`list-panes -a` lists all live panes across all sessions. It cannot be combined
+with `-t`; use either a server-wide listing or a targeted listing. Targeted
+rows retain the existing behavior. Rows are ordered by session ID, window
+display index, and layout order, with pane ID as the deterministic fallback.
+
+`list-panes -F` and `new-session -P -F` share these format variables:
+
+```text
+#{session_id}             numeric session ID
+#{session_name}           session name, or empty for unnamed sessions
+#{session_created}        stable Unix creation timestamp
+#{window_index}            window display index
+#{pane_id}                 numeric daemon-wide pane ID
+#{pane_dead}               0 for currently listable panes
+#{pane_current_command}    current command name/basename
+#{pane_current_path}       observed current directory or launch directory
+#{pane_in_mode}            1 in copy/history mode, otherwise 0
+#{pane_index}              numeric pane ID (existing Meja compatibility)
+#{pane_width}              pane width in cells
+#{pane_height}             pane height in cells
+#{pane_in_copy_mode}       same value as pane_in_mode
+```
+
+Unknown variables are preserved literally. Pane IDs are daemon-wide,
+monotonically increasing, and are never reused after pane or session exit, so
+`#{pane_id}` alone is an unambiguous live-pane identity. Project-file pane
+references are layout-local and are remapped to fresh live IDs during restore.
 
 Paste buffers are daemon-wide. Buffers created without `-b` receive automatic
 names such as `buffer0001`; the newest automatic buffer is used when `-b` is
@@ -308,6 +345,10 @@ External session commands generally require `-t <id-or-name>`. External window t
 ```text
 <session-id-or-name>:<zero-based-window-index>
 ```
+
+Pane IDs are separate daemon-wide numeric identities. Current session-oriented
+`-t` targets continue to select sessions; future pane-specific commands can use
+the unique `#{pane_id}` value without a session-local disambiguation step.
 
 Meja injects `MEJA_SOCKET` and `MEJA_SESSION_TARGET` into panes. A plain local command with no explicit `-L`, `-S`, or `-h` automatically targets the current server and session:
 
