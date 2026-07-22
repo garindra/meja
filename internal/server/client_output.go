@@ -265,6 +265,10 @@ func (c *ClientInstance) publishStatusBar() error {
 	if client == nil || client.TerminalCols == 0 {
 		return nil
 	}
+	status, ok := c.Daemon.clientStatusSnapshot(c.sessionID)
+	if !ok {
+		return nil
+	}
 	width := int(client.TerminalCols)
 	styleID := statusNormalStyleID
 	text := ""
@@ -275,13 +279,12 @@ func (c *ClientInstance) publishStatusBar() error {
 		styleID = statusPromptStyleID
 		text = statusMessage
 	} else {
-		list := c.sessionState().WindowStatuses()
-		if name := c.sessionState().SessionName(); name != "" {
-			text = fmt.Sprintf("[%s] ", name)
+		if status.SessionName != "" {
+			text = fmt.Sprintf("[%s] ", status.SessionName)
 		} else {
-			text = fmt.Sprintf("[%d] ", c.sessionState().ID)
+			text = fmt.Sprintf("[%d] ", status.SessionID)
 		}
-		for _, window := range list {
+		for _, window := range status.Windows {
 			flags := ""
 			if window.Active {
 				flags += "*"
@@ -296,7 +299,7 @@ func (c *ClientInstance) publishStatusBar() error {
 		}
 	}
 	return c.sendStatusCommand(statusCommand{model: &statusModel{
-		width: width, text: text, location: currentStatusLocation(c.sessionState().rootDir), styleID: styleID,
+		width: width, text: text, location: currentStatusLocation(status.Root), styleID: styleID,
 	}})
 }
 

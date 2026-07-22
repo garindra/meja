@@ -110,6 +110,13 @@ type daemonRequest struct {
 	done chan struct{}
 }
 
+type clientStatusState struct {
+	SessionID   uint64
+	SessionName string
+	Root        string
+	Windows     []WindowStatus
+}
+
 func (d *Daemon) runRequests(ctx context.Context) {
 	for {
 		select {
@@ -129,6 +136,28 @@ func (d *Daemon) call(run func()) {
 	done := make(chan struct{})
 	d.requests <- daemonRequest{run: run, done: done}
 	<-done
+}
+
+// clientStatusSnapshot copies every daemon-owned value needed by status
+// rendering in one transaction. Client actors must not walk SessionState maps.
+func (d *Daemon) clientStatusSnapshot(sessionID uint64) (clientStatusState, bool) {
+	var snapshot clientStatusState
+	var ok bool
+	if d == nil {
+		return snapshot, false
+	}
+	d.call(func() {
+		state := d.sessions[sessionID]
+		if state == nil {
+			return
+		}
+		snapshot = clientStatusState{
+			SessionID: state.ID, SessionName: state.Name, Root: state.rootDir,
+			Windows: state.WindowStatuses(),
+		}
+		ok = true
+	})
+	return snapshot, ok
 }
 
 func (d *Daemon) ensureRequestLoop() {

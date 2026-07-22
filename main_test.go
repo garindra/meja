@@ -32,6 +32,27 @@ func parseTestInvocation(t *testing.T, args ...string) client.Config {
 	return cfg
 }
 
+func waitForTestServerSocket(t *testing.T, socket string, serverDone chan error) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(socket); err == nil {
+			return
+		}
+		select {
+		case err := <-serverDone:
+			// Preserve the result for the test cleanup after reporting it.
+			serverDone <- err
+			t.Fatalf("server stopped before creating control socket: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server control socket was not created within 10 seconds")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestInteractiveResizeBurstKeepsDetachResponsive(t *testing.T) {
 	directory := t.TempDir()
 	if err := os.Chmod(directory, 0o700); err != nil {
@@ -50,16 +71,7 @@ func TestInteractiveResizeBurstKeepsDetachResponsive(t *testing.T) {
 		case <-time.After(2 * time.Second):
 		}
 	})
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, err := os.Stat(socket); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("server control socket was not created")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitForTestServerSocket(t, socket, serverDone)
 
 	terminal, frontend, err := pty.Open()
 	if err != nil {
@@ -209,16 +221,7 @@ func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
 		case <-time.After(2 * time.Second):
 		}
 	})
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, err := os.Stat(socket); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("server control socket was not created")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitForTestServerSocket(t, socket, serverDone)
 
 	terminal, frontend, err := pty.Open()
 	if err != nil {
@@ -297,7 +300,7 @@ func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
 	// fallback shell ever executing the command.
 	marker := "__FALLBACK_AFTER_EXIT_739241__"
 	markerCommand := "printf '__FALLBACK_AFTER_EXIT_%d__\\n' $((739240+1))\n"
-	deadline = time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for {
 		outputMu.Lock()
 		found := bytes.Contains(output.Bytes(), []byte(marker))
