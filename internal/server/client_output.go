@@ -31,33 +31,33 @@ type statusCommand struct {
 	done   chan error
 }
 
-func (s *Session) sendStatusCommand(command statusCommand) error {
-	if s.statusCommands == nil {
+func (c *ClientInstance) sendStatusCommand(command statusCommand) error {
+	if c.statusCommands == nil {
 		return nil
 	}
 	command.done = make(chan error, 1)
 	select {
-	case s.statusCommands <- command:
-	case <-s.operationsDone:
+	case c.statusCommands <- command:
+	case <-c.lifetimeDone:
 		return nil
 	}
 	select {
 	case err := <-command.done:
 		return err
-	case <-s.operationsDone:
+	case <-c.lifetimeDone:
 		return nil
 	}
 }
 
-func (s *Session) attachStatusOutput(client *ClientInstance, stream io.Writer) error {
-	return s.sendStatusCommand(statusCommand{attach: stream, client: client})
+func (c *ClientInstance) attachStatusOutput(stream io.Writer) error {
+	return c.sendStatusCommand(statusCommand{attach: stream, client: c})
 }
 
-func (s *Session) detachStatusOutput(client *ClientInstance) error {
-	return s.sendStatusCommand(statusCommand{detach: true, client: client})
+func (c *ClientInstance) detachStatusOutput() error {
+	return c.sendStatusCommand(statusCommand{detach: true, client: c})
 }
 
-func (s *Session) runStatusOutput() {
+func (c *ClientInstance) runStatusOutput() {
 	var client *ClientInstance
 	var output *renderOutput
 	initialized := false
@@ -65,7 +65,7 @@ func (s *Session) runStatusOutput() {
 	var hasLatest bool
 	for {
 		select {
-		case command := <-s.statusCommands:
+		case command := <-c.statusCommands:
 			var err error
 			switch {
 			case command.attach != nil:
@@ -95,7 +95,7 @@ func (s *Session) runStatusOutput() {
 				initialized = false
 			}
 			command.done <- err
-		case <-s.operationsDone:
+		case <-c.lifetimeDone:
 			return
 		}
 	}
@@ -260,26 +260,26 @@ func statusLocation(hostname, root, home string) string {
 	return "[" + hostname + ":" + filepath.ToSlash(root) + "]"
 }
 
-func (s *Session) publishStatusBar() error {
-	client := s.SnapshotClient(clientID0)
+func (c *ClientInstance) publishStatusBar() error {
+	client := c.snapshotClient()
 	if client == nil || client.TerminalCols == 0 {
 		return nil
 	}
 	width := int(client.TerminalCols)
 	styleID := statusNormalStyleID
 	text := ""
-	if prompt := s.ActivePrompt(clientID0); prompt != nil {
+	if prompt := c.ActivePrompt(); prompt != nil {
 		styleID = statusPromptStyleID
 		text = prompt.Label + string(prompt.Text)
-	} else if client.StatusMessage != "" {
+	} else if statusMessage, _ := c.statusMessage.Load().(string); statusMessage != "" {
 		styleID = statusPromptStyleID
-		text = client.StatusMessage
+		text = statusMessage
 	} else {
-		list := s.WindowStatuses(clientID0)
-		if name := s.SessionName(); name != "" {
+		list := c.sessionState().WindowStatuses()
+		if name := c.sessionState().SessionName(); name != "" {
 			text = fmt.Sprintf("[%s] ", name)
 		} else {
-			text = fmt.Sprintf("[%d] ", s.ID)
+			text = fmt.Sprintf("[%d] ", c.sessionState().ID)
 		}
 		for _, window := range list {
 			flags := ""
@@ -295,20 +295,20 @@ func (s *Session) publishStatusBar() error {
 			text += fmt.Sprintf("%d:%s%s ", window.Index, window.Title, flags)
 		}
 	}
-	return s.sendStatusCommand(statusCommand{model: &statusModel{
-		width: width, text: text, location: currentStatusLocation(s.rootDir), styleID: styleID,
+	return c.sendStatusCommand(statusCommand{model: &statusModel{
+		width: width, text: text, location: currentStatusLocation(c.sessionState().rootDir), styleID: styleID,
 	}})
 }
 
-func (s *Session) publishWindowLayout() error {
-	if err := s.cancelFrontendPointerCapture(s.clientInstance); err != nil {
+func (c *ClientInstance) publishWindowLayout() error {
+	if err := c.cancelFrontendPointerCapture(); err != nil {
 		return err
 	}
-	layout, err := s.WindowLayout(clientID0)
+	layout, err := c.windowLayout()
 	if err != nil {
 		return err
 	}
-	client := s.clientInstance
+	client := c.sessionState().attachedClient()
 	if client != nil {
 		client.rememberLayout(layout)
 		for previous := client.highestLayoutRevision.Load(); layout.LayoutRevision > previous; previous = client.highestLayoutRevision.Load() {
@@ -323,28 +323,44 @@ func (s *Session) publishWindowLayout() error {
 	return sendEncoded(client.controlOut, protocol.MsgWindowLayout, layout, protocol.EncodeWindowLayout)
 }
 
+func (c *ClientInstance) publishPreparedWindowLayout(layout protocol.WindowLayout) error {
+	c.rememberLayout(layout)
+	if c.controlOut == nil {
+		return nil
+	}
+	return sendEncoded(c.controlOut, protocol.MsgWindowLayout, layout, protocol.EncodeWindowLayout)
+}
+
 type outputHandoff struct {
 	released chan *OutputLease
 	pending  map[int]struct{}
+	waited   bool
 }
 
-func (s *Session) windowForPane(paneID uint64) *Window {
-	for _, window := range s.Windows {
-		if windowHasPane(window, paneID) {
-			return cloneWindow(window)
-		}
+func (c *ClientInstance) beginOutputHandoffWithRemovedPanes(removedPanes []*Pane) *outputHandoff {
+	bindings := append([]RenderBinding(nil), c.installedBindings...)
+	if len(bindings) == 0 {
+		bindings = c.renderBindings()
 	}
-	return nil
-}
-
-func (s *Session) beginOutputHandoff() *outputHandoff {
-	bindings, _ := s.RenderBindings(clientID0)
 	handoff := &outputHandoff{
 		released: make(chan *OutputLease, len(bindings)),
 		pending:  make(map[int]struct{}, len(bindings)),
 	}
 	for _, binding := range bindings {
-		pane := s.Pane(binding.PaneID)
+		var pane *Pane
+		if c.Daemon != nil {
+			if value, ok := c.Daemon.paneIndex.Load(binding.PaneID); ok && value != nil {
+				pane = value.(*Pane)
+			}
+		}
+		if pane == nil {
+			for _, removed := range removedPanes {
+				if removed != nil && removed.ID == binding.PaneID {
+					pane = removed
+					break
+				}
+			}
+		}
 		if pane == nil {
 			continue
 		}
@@ -354,39 +370,39 @@ func (s *Session) beginOutputHandoff() *outputHandoff {
 	return handoff
 }
 
-func (s *Session) rebindOutputsAndPublishLayout(handoff *outputHandoff) error {
-	if err := s.cancelFrontendPointerCapture(s.clientInstance); err != nil {
-		return err
+func (c *ClientInstance) finishPreparedOutputHandoff(handoff *outputHandoff, prepared PreparedProjection) error {
+	bySlot := make(map[int]PreparedRenderBinding, len(prepared.Bindings))
+	bindings := make([]RenderBinding, 0, len(prepared.Bindings))
+	for _, binding := range prepared.Bindings {
+		bySlot[binding.Binding.Slot] = binding
+		bindings = append(bindings, binding.Binding)
 	}
-	bindings, _, _, err := s.RebuildRenderBindings(clientID0)
-	if err != nil {
-		return err
+	attach := func(binding PreparedRenderBinding) error {
+		lease := c.currentOutputLease(binding.Binding.Slot)
+		if lease == nil || binding.Pane == nil {
+			return nil
+		}
+		cols, rows := binding.Pane.TerminalSize()
+		if cols != binding.Rect.Width || rows != binding.Rect.Height {
+			return fmt.Errorf("pane %d grid changed from prepared layout %dx%d to %dx%d", binding.Pane.ID, binding.Rect.Width, binding.Rect.Height, cols, rows)
+		}
+		c.Daemon.logf("meja projection: bind attachment=%d session=%d window=%d pane=%d slot=%d revision=%d grid=%dx%d\n",
+			c.AttachmentID, prepared.Plan.SessionID, prepared.Plan.WindowID, binding.Pane.ID, binding.Binding.Slot,
+			prepared.Layout.LayoutRevision, cols, rows)
+		return binding.Pane.attachOutputStream(lease, prepared.Layout.LayoutRevision)
 	}
-	if err := s.finishOutputHandoff(handoff, bindings); err != nil {
-		return err
-	}
-	if err := s.publishStatusBar(); err != nil {
-		return err
-	}
-	return s.publishWindowLayout()
-}
-
-func (s *Session) finishOutputHandoff(handoff *outputHandoff, bindings []RenderBinding) error {
-	bySlot := make(map[int]RenderBinding, len(bindings))
-	for _, binding := range bindings {
-		bySlot[binding.Slot] = binding
-	}
-	if handoff == nil {
-		for _, binding := range bindings {
-			if err := s.attachBinding(binding); err != nil {
+	if handoff == nil || handoff.waited {
+		for _, binding := range prepared.Bindings {
+			if err := attach(binding); err != nil {
 				return err
 			}
 		}
+		c.installedBindings = append(c.installedBindings[:0], bindings...)
 		return nil
 	}
-	for _, binding := range bindings {
-		if _, waiting := handoff.pending[binding.Slot]; !waiting {
-			if err := s.attachBinding(binding); err != nil {
+	for _, binding := range prepared.Bindings {
+		if _, waiting := handoff.pending[binding.Binding.Slot]; !waiting {
+			if err := attach(binding); err != nil {
 				return err
 			}
 		}
@@ -395,52 +411,45 @@ func (s *Session) finishOutputHandoff(handoff *outputHandoff, bindings []RenderB
 	for slot := range handoff.pending {
 		stillPending[slot] = struct{}{}
 	}
-	for i := 0; i < len(handoff.pending); i++ {
+	for range handoff.pending {
 		lease := <-handoff.released
 		if lease == nil {
 			continue
 		}
 		delete(stillPending, lease.Slot)
 		if binding, ok := bySlot[lease.Slot]; ok {
-			if err := s.attachBinding(binding); err != nil {
+			if err := attach(binding); err != nil {
 				return err
 			}
 		}
 	}
-	// A pane can already have lost its old transport's lease before a
-	// reconnect begins. Its release then returns nil, but the handoff still
-	// completed and the replacement output for that logical slot must be
-	// attached. Wait for every release above, then attach those nil slots.
 	for slot := range stillPending {
 		if binding, ok := bySlot[slot]; ok {
-			if err := s.attachBinding(binding); err != nil {
+			if err := attach(binding); err != nil {
 				return err
 			}
 		}
 	}
+	c.installedBindings = append(c.installedBindings[:0], bindings...)
 	return nil
 }
 
-func (s *Session) attachBinding(binding RenderBinding) error {
-	pane := s.Pane(binding.PaneID)
-	window := s.windowForPane(binding.PaneID)
-	if pane == nil || window == nil {
+func (c *ClientInstance) waitOutputHandoff(handoff *outputHandoff) error {
+	if handoff == nil || handoff.waited {
 		return nil
 	}
-	lease := s.currentOutputLease(binding.Slot)
-	if lease == nil {
+	for range handoff.pending {
+		<-handoff.released
+	}
+	handoff.waited = true
+	return nil
+}
+
+func (c *ClientInstance) detachLeases(state *SessionState, leases map[int]*OutputLease) error {
+	if state == nil {
 		return nil
 	}
-	return pane.attachOutputStream(lease, window.LayoutRevision)
-}
-
-func (s *Session) publishVisibleSnapshots(handoff *outputHandoff) error {
-	bindings, _ := s.RenderBindings(clientID0)
-	return s.finishOutputHandoff(handoff, bindings)
-}
-
-func (s *Session) detachLeases(leases map[int]*OutputLease) error {
-	for _, pane := range s.PanesSnapshot() {
+	for _, pane := range state.PanesSnapshot() {
 		for _, lease := range leases {
 			if err := pane.detachOutputStream(lease.Stream); err != nil {
 				return err

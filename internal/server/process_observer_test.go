@@ -21,7 +21,7 @@ func TestParseProcStatHandlesClosingParenthesisInCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	if stat.Identity != (Identity{PID: 123, BirthToken: 999}) || stat.Name != "worker ) name" || stat.PPID != 10 ||
-		stat.PGID != 20 || stat.Session != 30 || stat.TTY != 40 || stat.TPGID != 50 || stat.State != 'S' {
+		stat.PGID != 20 || stat.SessionState != 30 || stat.TTY != 40 || stat.TPGID != 50 || stat.State != 'S' {
 		t.Fatalf("unexpected stat: %#v", stat)
 	}
 }
@@ -213,7 +213,7 @@ func startTestShell(t *testing.T) *testShell {
 		ptmx: ptmx,
 		cmd:  cmd,
 		anchor: Anchor{
-			Key:         PaneKey{SessionID: 1, PaneID: 1},
+			Key:         PaneKey{PaneID: 1},
 			Root:        identity,
 			PTY:         ptmx,
 			RootIsShell: true,

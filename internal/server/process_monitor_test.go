@@ -25,8 +25,8 @@ func (o *monitorRecordingObserver) Observe(_ context.Context, anchors []Anchor) 
 }
 
 func TestProcessMonitorBatchesDeepObservationsAndUsesCheapActivityProbes(t *testing.T) {
-	firstKey := PaneKey{SessionID: 1, PaneID: 1}
-	secondKey := PaneKey{SessionID: 2, PaneID: 1}
+	firstKey := PaneKey{PaneID: 1}
+	secondKey := PaneKey{PaneID: 2}
 	observer := &monitorRecordingObserver{
 		pgids:   map[PaneKey]int{firstKey: 101, secondKey: 202},
 		rootCwd: "/work",
@@ -39,16 +39,18 @@ func TestProcessMonitorBatchesDeepObservationsAndUsesCheapActivityProbes(t *test
 		},
 		reconcileInterval: time.Hour,
 	}
-	firstSession := &Session{processObservationUpdates: make(chan monitoredProcessBatch, 2)}
-	secondSession := &Session{processObservationUpdates: make(chan monitoredProcessBatch, 2)}
+	firstUpdates := make(chan monitoredProcessBatch, 2)
+	secondUpdates := make(chan monitoredProcessBatch, 2)
 	watches := map[PaneKey]*processWatch{
 		firstKey: {
-			anchor:  Anchor{Key: firstKey, Root: Identity{PID: 101, BirthToken: 1001}},
-			session: firstSession,
+			anchor:    Anchor{Key: firstKey, Root: Identity{PID: 101, BirthToken: 1001}},
+			sessionID: 1,
+			deliver:   func(batch monitoredProcessBatch) { firstUpdates <- batch },
 		},
 		secondKey: {
-			anchor:  Anchor{Key: secondKey, Root: Identity{PID: 202, BirthToken: 2002}},
-			session: secondSession,
+			anchor:    Anchor{Key: secondKey, Root: Identity{PID: 202, BirthToken: 2002}},
+			sessionID: 2,
+			deliver:   func(batch monitoredProcessBatch) { secondUpdates <- batch },
 		},
 	}
 	now := time.Now()
@@ -56,8 +58,8 @@ func TestProcessMonitorBatchesDeepObservationsAndUsesCheapActivityProbes(t *test
 	if len(observer.calls) != 1 || len(observer.calls[0]) != 2 {
 		t.Fatalf("initial observer calls = %#v, want one two-anchor batch", observer.calls)
 	}
-	<-firstSession.processObservationUpdates
-	<-secondSession.processObservationUpdates
+	<-firstUpdates
+	<-secondUpdates
 	for key, watch := range watches {
 		probes[key] = watch.fingerprint.foregroundPGID
 	}
@@ -79,7 +81,7 @@ func TestProcessMonitorBatchesDeepObservationsAndUsesCheapActivityProbes(t *test
 }
 
 func TestPaneActivityIsSourceCoalescedUntilMonitorProbe(t *testing.T) {
-	key := PaneKey{SessionID: 1, PaneID: 2}
+	key := PaneKey{PaneID: 2}
 	monitor := &ProcessMonitor{
 		commands: make(chan processMonitorCommand, 4),
 		done:     make(chan struct{}),
@@ -124,7 +126,7 @@ func TestForegroundProcessInputHints(t *testing.T) {
 }
 
 func TestShellReturnUsesCachedRootWithoutDeepObservation(t *testing.T) {
-	key := PaneKey{SessionID: 1, PaneID: 1}
+	key := PaneKey{PaneID: 1}
 	rootIdentity := Identity{PID: 100, BirthToken: 1000}
 	observer := &monitorRecordingObserver{pgids: map[PaneKey]int{key: 200}, rootCwd: "/work"}
 	monitor := &ProcessMonitor{
@@ -133,13 +135,14 @@ func TestShellReturnUsesCachedRootWithoutDeepObservation(t *testing.T) {
 			return rootIdentity.PID, nil
 		},
 	}
-	session := &Session{processObservationUpdates: make(chan monitoredProcessBatch, 2)}
+	updates := make(chan monitoredProcessBatch, 2)
 	watch := &processWatch{
-		anchor:  Anchor{Key: key, Root: rootIdentity, RootIsShell: true},
-		session: session,
+		anchor:    Anchor{Key: key, Root: rootIdentity, RootIsShell: true},
+		sessionID: 1,
+		deliver:   func(batch monitoredProcessBatch) { updates <- batch },
 	}
 	monitor.observeDeep(context.Background(), []*processWatch{watch}, time.Now())
-	<-session.processObservationUpdates
+	<-updates
 
 	now := time.Now()
 	watch.activityDue = now
@@ -147,7 +150,7 @@ func TestShellReturnUsesCachedRootWithoutDeepObservation(t *testing.T) {
 	if len(observer.calls) != 1 {
 		t.Fatalf("shell return caused %d deep observations, want initial observation only", len(observer.calls))
 	}
-	batch := <-session.processObservationUpdates
+	batch := <-updates
 	if len(batch) != 1 || batch[0].observation.Status != StatusShellOwned {
 		t.Fatalf("shell return batch = %#v, want one shell-owned observation", batch)
 	}
@@ -156,11 +159,11 @@ func TestShellReturnUsesCachedRootWithoutDeepObservation(t *testing.T) {
 func TestProcessMonitorUnwatchAndDropSession(t *testing.T) {
 	monitor := &ProcessMonitor{}
 	watches := map[PaneKey]*processWatch{
-		{SessionID: 1, PaneID: 1}: {},
-		{SessionID: 1, PaneID: 2}: {},
-		{SessionID: 2, PaneID: 1}: {},
+		{PaneID: 1}: {sessionID: 1},
+		{PaneID: 2}: {sessionID: 1},
+		{PaneID: 3}: {sessionID: 2},
 	}
-	key := PaneKey{SessionID: 1, PaneID: 1}
+	key := PaneKey{PaneID: 1}
 	monitor.applyCommand(watches, processMonitorCommand{unwatch: &key})
 	if _, ok := watches[key]; ok {
 		t.Fatal("unwatched pane remains registered")
@@ -169,27 +172,44 @@ func TestProcessMonitorUnwatchAndDropSession(t *testing.T) {
 	if len(watches) != 1 {
 		t.Fatalf("watches after dropping session = %#v", watches)
 	}
-	if _, ok := watches[PaneKey{SessionID: 2, PaneID: 1}]; !ok {
+	if _, ok := watches[PaneKey{PaneID: 3}]; !ok {
 		t.Fatal("dropping session removed another session's watch")
 	}
 }
 
+func TestProcessMonitorTransferKeepsSharedPaneWatch(t *testing.T) {
+	from, to := uint64(1), uint64(2)
+	key := PaneKey{PaneID: 9}
+	watches := map[PaneKey]*processWatch{
+		key: {anchor: Anchor{Key: key}, sessionID: from, deliver: func(monitoredProcessBatch) {}},
+	}
+	monitor := &ProcessMonitor{}
+	monitor.applyCommand(watches, processMonitorCommand{
+		transfer: &processMonitorTransfer{from: from, toID: to, to: func(monitoredProcessBatch) {}},
+	})
+	watch := watches[key]
+	if watch == nil || watch.sessionID != to {
+		t.Fatalf("transferred watch = %#v, want same pane watch delivered to session %d", watch, to)
+	}
+}
+
 func TestSessionAppliesCurrentMonitoredObservationAndRejectsStaleAnchor(t *testing.T) {
-	session := NewSession(9)
-	t.Cleanup(session.stopOperations)
+	session := NewSessionState(9)
+	session.daemon = testDaemonForState(session)
+	t.Cleanup(func() { stopState(session) })
 	pane := &Pane{
 		ID: 1, Root: Identity{PID: 101, BirthToken: 1001},
 		Launch: PaneLaunch{Shell: "/bin/sh", Cwd: "/work"},
 	}
-	if err := session.coordinate(func() error {
+	if err := runStateOperation(session, func() error {
 		session.setSessionName("work")
-		session.CreateWindow(pane, clientID0)
+		createTestWindow(session, pane)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 	default:
 	}
 	root := ObservedProcess{Identity: pane.Root, Name: "sh", Cwd: "/work"}
@@ -198,25 +218,25 @@ func TestSessionAppliesCurrentMonitoredObservationAndRejectsStaleAnchor(t *testi
 		Argv: []string{"nvim", "."}, ArgvAvailable: true, Cwd: "/work",
 	}
 	update := monitoredProcessObservation{
-		anchor: Anchor{Key: PaneKey{SessionID: session.ID, PaneID: pane.ID}, Root: pane.Root, PTY: pane.PTY, RootIsShell: true},
+		anchor: Anchor{Key: PaneKey{PaneID: pane.ID}, Root: pane.Root, PTY: pane.PTY, RootIsShell: true},
 		observation: ProcessObservation{
-			Key: PaneKey{SessionID: session.ID, PaneID: pane.ID}, ForegroundPGID: 102,
+			Key: PaneKey{PaneID: pane.ID}, ForegroundPGID: 102,
 			Status: StatusDetected, Root: &root, Candidate: &candidate,
 		},
 	}
 	for range processSaveStableSamples {
-		if err := session.coordinate(func() error {
-			return session.applyMonitoredProcessObservations(monitoredProcessBatch{update})
+		if err := runStateOperation(session, func() error {
+			return session.daemon.applyMonitoredProcessObservations(session, monitoredProcessBatch{update})
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := session.coordinate(func() error {
-		window, _ := session.ActiveWindow(clientID0)
+	if err := runStateOperation(session, func() error {
+		window, _ := testActiveWindow(session)
 		if window.Name != "nvim" {
 			t.Fatalf("automatic window name = %q", window.Name)
 		}
-		if got := plannedProcessLeaves(session.sessionPersistence.Plan.Windows)[pane.ID].Command; got != "nvim ." {
+		if got := plannedProcessLeaves(session.persistenceRecord().Plan.Windows)[pane.ID].Command; got != "nvim ." {
 			t.Fatalf("persisted command = %q", got)
 		}
 		return nil
@@ -227,13 +247,13 @@ func TestSessionAppliesCurrentMonitoredObservationAndRejectsStaleAnchor(t *testi
 	stale := update
 	stale.anchor.Root.BirthToken++
 	stale.observation.Candidate.Name = "vite"
-	if err := session.coordinate(func() error {
-		return session.applyMonitoredProcessObservations(monitoredProcessBatch{stale})
+	if err := runStateOperation(session, func() error {
+		return session.daemon.applyMonitoredProcessObservations(session, monitoredProcessBatch{stale})
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.coordinate(func() error {
-		window, _ := session.ActiveWindow(clientID0)
+	if err := runStateOperation(session, func() error {
+		window, _ := testActiveWindow(session)
 		if window.Name != "nvim" {
 			t.Fatalf("stale observation changed window name to %q", window.Name)
 		}
@@ -248,17 +268,17 @@ func TestSessionAppliesCurrentMonitoredObservationAndRejectsStaleAnchor(t *testi
 	shell.observation.Candidate = nil
 	shell.observation.Root.Name = "sh"
 	shell.observation.Root.Cwd = "/next"
-	if err := session.coordinate(func() error {
-		return session.applyMonitoredProcessObservations(monitoredProcessBatch{shell})
+	if err := runStateOperation(session, func() error {
+		return session.daemon.applyMonitoredProcessObservations(session, monitoredProcessBatch{shell})
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.coordinate(func() error {
-		window, _ := session.ActiveWindow(clientID0)
+	if err := runStateOperation(session, func() error {
+		window, _ := testActiveWindow(session)
 		if window.Name != "sh" {
 			t.Fatalf("shell return window name = %q", window.Name)
 		}
-		got := plannedProcessLeaves(session.sessionPersistence.Plan.Windows)[pane.ID]
+		got := plannedProcessLeaves(session.persistenceRecord().Plan.Windows)[pane.ID]
 		if got.Command != "nvim ." || got.Cwd != "/next" {
 			t.Fatalf("shell return persistence = %#v, want retained command and updated cwd", got)
 		}

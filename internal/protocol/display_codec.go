@@ -59,7 +59,6 @@ type DisplayEncoder struct{ buf []byte }
 
 func NewDisplayEncoder(dst []byte) *DisplayEncoder { return &DisplayEncoder{buf: dst} }
 func (e *DisplayEncoder) Bytes() []byte            { return e.buf }
-func (e *DisplayEncoder) Reset(dst []byte)         { e.buf = dst }
 
 func (e *DisplayEncoder) AppendCommand(cmd DisplayCommand) error {
 	switch cmd.Opcode {

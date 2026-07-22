@@ -34,32 +34,6 @@ func encodeColor(w *PayloadWriter, c Color) error {
 	}
 	return nil
 }
-func decodeColor(r *PayloadReader) (Color, error) {
-	kind, err := r.Byte()
-	if err != nil {
-		return Color{}, err
-	}
-	switch kind {
-	case colorKindDefault:
-		return Color{Mode: "default"}, nil
-	case colorKindIndexed:
-		v, e := r.Byte()
-		return Color{Mode: "indexed", Index: v}, e
-	case colorKindRGB:
-		a, e := r.Byte()
-		if e != nil {
-			return Color{}, e
-		}
-		b, e := r.Byte()
-		if e != nil {
-			return Color{}, e
-		}
-		c, e := r.Byte()
-		return Color{Mode: "rgb", R: a, G: b, B: c}, e
-	default:
-		return Color{}, fmt.Errorf("unknown color kind %d", kind)
-	}
-}
 func encodeStyle(w *PayloadWriter, s Style) error {
 	var f uint64
 	if s.Bold {
@@ -88,19 +62,4 @@ func encodeStyle(w *PayloadWriter, s Style) error {
 		return err
 	}
 	return encodeColor(w, s.BG)
-}
-func decodeStyle(r *PayloadReader) (Style, error) {
-	f, e := r.Uvarint()
-	if e != nil {
-		return Style{}, e
-	}
-	fg, e := decodeColor(r)
-	if e != nil {
-		return Style{}, e
-	}
-	bg, e := decodeColor(r)
-	if e != nil {
-		return Style{}, e
-	}
-	return Style{Bold: f&styleFlagBold != 0, Dim: f&styleFlagDim != 0, Blink: f&styleFlagBlink != 0, Italic: f&styleFlagItalic != 0, Underline: f&styleFlagUnderline != 0, Reverse: f&styleFlagReverse != 0, Invisible: f&styleFlagInvisible != 0, FG: fg, BG: bg}, nil
 }

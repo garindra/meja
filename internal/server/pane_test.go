@@ -29,7 +29,7 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	query := ptyReadBuffers.Get().([]byte)
+	query := takePTYReadBuffer()
 	n := copy(query, "\x1b[?1h\x1b[6n")
 	pane.ptyOutput <- query[:n]
 
@@ -87,7 +87,7 @@ func TestPaneStartupInputWaitsForInitialOutputToSettle(t *testing.T) {
 		<-pane.writerDone
 	}()
 
-	prompt := ptyReadBuffers.Get().([]byte)
+	prompt := takePTYReadBuffer()
 	n := copy(prompt, "user@host:~$ ")
 	pane.ptyOutput <- prompt[:n]
 

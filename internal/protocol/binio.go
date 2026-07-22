@@ -25,10 +25,6 @@ func (w *PayloadWriter) Uvarint(v uint64) {
 	w.Buf = binary.AppendUvarint(w.Buf, v)
 }
 
-func (w *PayloadWriter) Varint(v int64) {
-	w.Buf = binary.AppendVarint(w.Buf, v)
-}
-
 func (w *PayloadWriter) Byte(v byte) {
 	w.Buf = append(w.Buf, v)
 }
@@ -45,11 +41,6 @@ func (w *PayloadWriter) Raw(v []byte) {
 	w.Buf = append(w.Buf, v...)
 }
 
-func (w *PayloadWriter) Bytes(v []byte) {
-	w.Uvarint(uint64(len(v)))
-	w.Raw(v)
-}
-
 func (w *PayloadWriter) String(v string) {
 	w.Uvarint(uint64(len(v)))
 	w.Buf = append(w.Buf, v...)
@@ -62,18 +53,6 @@ type PayloadReader struct {
 
 func (r *PayloadReader) Uvarint() (uint64, error) {
 	v, n := binary.Uvarint(r.Data[r.Off:])
-	if n <= 0 {
-		if n == 0 {
-			return 0, ErrShortPayload
-		}
-		return 0, ErrLengthOverflow
-	}
-	r.Off += n
-	return v, nil
-}
-
-func (r *PayloadReader) Varint() (int64, error) {
-	v, n := binary.Varint(r.Data[r.Off:])
 	if n <= 0 {
 		if n == 0 {
 			return 0, ErrShortPayload
@@ -161,52 +140,6 @@ func readCount(r *PayloadReader, max uint64) (int, error) {
 	return int(n), nil
 }
 
-func readCoord(r *PayloadReader, max uint64) (int, error) {
-	n, err := r.Uvarint()
-	if err != nil {
-		return 0, err
-	}
-	if n > max || n > math.MaxInt {
-		return 0, fmt.Errorf("coordinate %d exceeds max %d", n, max)
-	}
-	return int(n), nil
-}
-
-func encodeArgv(dst []byte, argv []string) ([]byte, error) {
-	if uint64(len(argv)) > MaxArgvCount {
-		return nil, fmt.Errorf("argv count %d exceeds max %d", len(argv), MaxArgvCount)
-	}
-	w := PayloadWriter{Buf: dst}
-	w.Uvarint(uint64(len(argv)))
-	for _, arg := range argv {
-		if uint64(len(arg)) > MaxStringLen {
-			return nil, fmt.Errorf("argv string exceeds max %d", MaxStringLen)
-		}
-		w.String(arg)
-	}
-	return w.Buf, nil
-}
-
-func decodeArgv(r *PayloadReader) ([]string, error) {
-	n, err := readCount(r, MaxArgvCount)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		s, err := r.String(MaxStringLen)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, s)
-	}
-	return out, nil
-}
-
 func validRune(r rune) bool {
 	return r >= 0 && r <= utf8.MaxRune && !(r >= 0xD800 && r <= 0xDFFF)
-}
-
-func validCellWidth(width uint8) bool {
-	return width <= 2
 }

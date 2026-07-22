@@ -41,30 +41,41 @@ type paneCaptureResult struct {
 	Err  error
 }
 
-func handleSendKeysCommand(s *Session, c *ClientInstance, args []string) (bool, error) {
+func runSendKeysCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
+	_, client, remaining, err := resolveSessionCommandContextValue(d, ctx, sessionTarget, args)
+	if err != nil {
+		return commandOutcome{}, err
+	}
+	if client == nil {
+		return commandOutcome{}, errors.New("command requires an attached client")
+	}
+	return commandOutcome{}, sendKeysToClient(client, remaining)
+}
+
+func sendKeysToClient(s *ClientInstance, args []string) error {
 	modeArgs, mode, err := parseSendKeysModeArgs(args)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if mode {
-		return handleSendKeysCopyModeCommand(s, c, modeArgs)
+		return sendKeysCopyModeCommand(s, modeArgs)
 	}
 	literal, keys, err := parseSendKeysArgs(args)
 	if err != nil {
-		return false, err
+		return err
 	}
-	pane, _ := s.ActivePane(clientID0)
+	pane := s.activePane()
 	if pane == nil {
-		return false, errors.New("send-keys requires an active pane")
+		return errors.New("send-keys requires an active pane")
 	}
 	data, err := encodeSendKeys(keys, literal, pane.InputMode())
 	if err != nil {
-		return false, err
+		return err
 	}
 	if err := pane.sendInput(data); err != nil {
-		return false, fmt.Errorf("send-keys: %w", err)
+		return fmt.Errorf("send-keys: %w", err)
 	}
-	return false, nil
+	return nil
 }
 
 func parseSendKeysModeArgs(args []string) ([]string, bool, error) {
@@ -90,20 +101,20 @@ func parseSendKeysModeArgs(args []string) ([]string, bool, error) {
 	return nil, false, nil
 }
 
-func handleSendKeysCopyModeCommand(s *Session, c *ClientInstance, args []string) (bool, error) {
+func sendKeysCopyModeCommand(s *ClientInstance, args []string) error {
 	if len(args) == 0 {
-		return false, errors.New("send-keys -X requires a copy-mode command")
+		return errors.New("send-keys -X requires a copy-mode command")
 	}
-	pane, _ := s.ActivePane(clientID0)
+	pane := s.activePane()
 	if pane == nil {
-		return false, errors.New("send-keys -X requires an active pane")
+		return errors.New("send-keys -X requires an active pane")
 	}
 	if !pane.isHistoryMode() {
-		return false, errors.New("pane is not in copy mode")
+		return errors.New("pane is not in copy mode")
 	}
 	command := args[0]
 	if len(args) > 1 {
-		return false, fmt.Errorf("copy-mode command %q does not accept arguments", command)
+		return fmt.Errorf("copy-mode command %q does not accept arguments", command)
 	}
 	var err error
 	switch command {
@@ -132,24 +143,24 @@ func handleSendKeysCopyModeCommand(s *Session, c *ClientInstance, args []string)
 		data, err = pane.copyHistorySelection(command == "copy-selection-and-cancel")
 		if err == nil {
 			if len(data) == 0 {
-				return false, errors.New("copy-mode has no selection")
+				return errors.New("copy-mode has no selection")
 			}
-			if c != nil && c.Daemon != nil {
-				_, err = c.Daemon.pasteBuffers.addAutomatic(data)
+			if s != nil && s.Daemon != nil {
+				_, err = s.Daemon.pasteBuffers.addAutomatic(data)
 			}
-			if err == nil && c != nil {
-				err = c.writeFrontendTerminal(osc52ClipboardWrite(data))
+			if err == nil && s != nil {
+				err = s.writeFrontendTerminal(osc52ClipboardWrite(data))
 			}
 		}
 	case "cancel":
 		_, err = pane.exitHistoryMode()
 	default:
-		return false, fmt.Errorf("unknown copy-mode command %q", command)
+		return fmt.Errorf("unknown copy-mode command %q", command)
 	}
 	if err != nil {
-		return false, fmt.Errorf("send-keys -X %s: %w", command, err)
+		return fmt.Errorf("send-keys -X %s: %w", command, err)
 	}
-	return false, nil
+	return nil
 }
 
 func parseSendKeysArgs(args []string) (literal bool, keys []string, err error) {
@@ -339,38 +350,35 @@ func sendKeyName(raw string) (frontendKeyCode, bool) {
 }
 
 func capturePaneCommand() commandHandler {
-	return func(ctx *commandContext, args []string) (commandExecution, error) {
-		session, _, normalized, err := resolveSessionCommandContext(ctx, sessionTarget, args)
+	return func(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
+		session, _, normalized, err := resolveSessionCommandContextValue(d, ctx, sessionTarget, args)
 		if err != nil {
-			return commandExecution{}, err
+			return commandOutcome{}, err
 		}
 		options, err := parseCapturePaneArgs(normalized)
 		if err != nil {
-			return commandExecution{}, err
+			return commandOutcome{}, err
 		}
 		var data []byte
-		err = session.coordinate(func() error {
-			pane, _ := session.ActivePane(clientID0)
-			if pane == nil {
-				return errors.New("capture-pane requires an active pane")
-			}
-			data, err = pane.capturePane(options)
-			return err
-		})
+		pane := session.activePane()
+		if pane == nil {
+			return commandOutcome{}, errors.New("capture-pane requires an active pane")
+		}
+		data, err = pane.capturePane(options)
 		if err != nil {
-			return commandExecution{}, err
+			return commandOutcome{}, err
 		}
 		if options.print {
-			return commandExecution{result: commandResult{stdout: data}}, nil
+			return commandOutcome{Stdout: data}, nil
 		}
-		if ctx.daemon == nil {
-			return commandExecution{}, errors.New("capture-pane requires a running daemon")
+		if d == nil {
+			return commandOutcome{}, errors.New("capture-pane requires a running daemon")
 		}
-		_, err = ctx.daemon.pasteBuffers.set(options.bufferName, options.bufferName != "", data, false, "")
+		_, err = d.pasteBuffers.set(options.bufferName, options.bufferName != "", data, false, "")
 		if err != nil {
-			return commandExecution{}, err
+			return commandOutcome{}, err
 		}
-		return commandExecution{}, nil
+		return commandOutcome{}, nil
 	}
 }
 

@@ -220,91 +220,86 @@ func flagSetProvided(fs *flag.FlagSet, name string) bool {
 	return found
 }
 
-func handleSetBufferCommand(ctx *commandContext, args []string) (commandExecution, error) {
-	if ctx.daemon == nil {
-		return commandExecution{}, errors.New("set-buffer requires a running daemon")
+func handleSetBufferCommand(d *Daemon, _ CommandContext, args []string) (commandOutcome, error) {
+	if d == nil {
+		return commandOutcome{}, errors.New("set-buffer requires a running daemon")
 	}
 	fs := commandFlagSet("set-buffer")
 	appendData := fs.Bool("a", false, "append")
 	name := fs.String("b", "", "buffer name")
 	newName := fs.String("n", "", "new buffer name")
 	if err := fs.Parse(args); err != nil {
-		return commandExecution{}, err
+		return commandOutcome{}, err
 	}
 	if len(fs.Args()) != 1 {
-		return commandExecution{}, errors.New("set-buffer requires exactly one data argument")
+		return commandOutcome{}, errors.New("set-buffer requires exactly one data argument")
 	}
 	hasName := flagSetProvided(fs, "b")
 	if hasName {
 		if err := validatePasteBufferName(*name); err != nil {
-			return commandExecution{}, err
+			return commandOutcome{}, err
 		}
 	}
-	if _, err := ctx.daemon.pasteBuffers.set(*name, hasName, []byte(fs.Arg(0)), *appendData, *newName); err != nil {
-		return commandExecution{}, err
+	if _, err := d.pasteBuffers.set(*name, hasName, []byte(fs.Arg(0)), *appendData, *newName); err != nil {
+		return commandOutcome{}, err
 	}
-	return commandExecution{}, nil
+	return commandOutcome{}, nil
 }
 
-func handleShowBufferCommand(ctx *commandContext, args []string) (commandExecution, error) {
-	if ctx.daemon == nil {
-		return commandExecution{}, errors.New("show-buffer requires a running daemon")
+func handleShowBufferCommand(d *Daemon, _ CommandContext, args []string) (commandOutcome, error) {
+	if d == nil {
+		return commandOutcome{}, errors.New("show-buffer requires a running daemon")
 	}
 	fs := commandFlagSet("show-buffer")
 	name := fs.String("b", "", "buffer name")
 	if err := fs.Parse(args); err != nil {
-		return commandExecution{}, err
+		return commandOutcome{}, err
 	}
 	if len(fs.Args()) != 0 {
-		return commandExecution{}, errors.New("show-buffer accepts no positional arguments")
+		return commandOutcome{}, errors.New("show-buffer accepts no positional arguments")
 	}
-	data, resolved, exists := ctx.daemon.pasteBuffers.get(*name)
+	data, resolved, exists := d.pasteBuffers.get(*name)
 	if !exists {
-		return commandExecution{}, fmt.Errorf("no paste buffer %q", resolved)
+		return commandOutcome{}, fmt.Errorf("no paste buffer %q", resolved)
 	}
-	return commandExecution{result: commandResult{stdout: data}}, nil
+	return commandOutcome{Stdout: data}, nil
 }
 
-func handleListBuffersCommand(ctx *commandContext, args []string) (commandExecution, error) {
-	if ctx.daemon == nil {
-		return commandExecution{}, errors.New("list-buffers requires a running daemon")
+func handleListBuffersCommand(d *Daemon, _ CommandContext, args []string) (commandOutcome, error) {
+	if d == nil {
+		return commandOutcome{}, errors.New("list-buffers requires a running daemon")
 	}
 	if len(args) != 0 {
-		return commandExecution{}, errors.New("list-buffers accepts no arguments")
+		return commandOutcome{}, errors.New("list-buffers accepts no arguments")
 	}
 	var output strings.Builder
-	for _, buffer := range ctx.daemon.pasteBuffers.list() {
+	for _, buffer := range d.pasteBuffers.list() {
 		fmt.Fprintf(&output, "%s: %d bytes\n", buffer.name, len(buffer.data))
 	}
-	return commandExecution{result: commandResult{stdout: []byte(output.String())}}, nil
+	data := []byte(output.String())
+	return commandOutcome{Stdout: data}, nil
 }
 
-func handleDeleteBufferCommand(ctx *commandContext, args []string) (commandExecution, error) {
-	if ctx.daemon == nil {
-		return commandExecution{}, errors.New("delete-buffer requires a running daemon")
+func handleDeleteBufferCommand(d *Daemon, _ CommandContext, args []string) (commandOutcome, error) {
+	if d == nil {
+		return commandOutcome{}, errors.New("delete-buffer requires a running daemon")
 	}
 	fs := commandFlagSet("delete-buffer")
 	name := fs.String("b", "", "buffer name")
 	if err := fs.Parse(args); err != nil {
-		return commandExecution{}, err
+		return commandOutcome{}, err
 	}
 	if len(fs.Args()) != 0 {
-		return commandExecution{}, errors.New("delete-buffer accepts no positional arguments")
+		return commandOutcome{}, errors.New("delete-buffer accepts no positional arguments")
 	}
-	if err := ctx.daemon.pasteBuffers.delete(*name); err != nil {
-		return commandExecution{}, err
+	if err := d.pasteBuffers.delete(*name); err != nil {
+		return commandOutcome{}, err
 	}
-	return commandExecution{}, nil
+	return commandOutcome{}, nil
 }
 
-func commandWorkingDirectory(ctx *commandContext) string {
-	if ctx.request.WorkingDirectory != "" {
-		return ctx.request.WorkingDirectory
-	}
-	if ctx.session != nil && ctx.session.rootDir != "" {
-		return ctx.session.rootDir
-	}
-	return ""
+func commandWorkingDirectory(ctx CommandContext) string {
+	return ctx.Caller.WorkingDirectory
 }
 
 func readPasteBufferFile(path string) ([]byte, error) {
@@ -323,56 +318,56 @@ func readPasteBufferFile(path string) ([]byte, error) {
 	return data, nil
 }
 
-func handleLoadBufferCommand(ctx *commandContext, args []string) (commandExecution, error) {
-	if ctx.daemon == nil {
-		return commandExecution{}, errors.New("load-buffer requires a running daemon")
+func handleLoadBufferCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
+	if d == nil {
+		return commandOutcome{}, errors.New("load-buffer requires a running daemon")
 	}
 	fs := commandFlagSet("load-buffer")
 	name := fs.String("b", "", "buffer name")
 	if err := fs.Parse(args); err != nil {
-		return commandExecution{}, err
+		return commandOutcome{}, err
 	}
 	if len(fs.Args()) != 1 {
-		return commandExecution{}, errors.New("load-buffer requires a path")
+		return commandOutcome{}, errors.New("load-buffer requires a path")
 	}
 	if fs.Arg(0) == "-" {
-		return commandExecution{}, errors.New("load-buffer does not support stdin")
+		return commandOutcome{}, errors.New("load-buffer does not support stdin")
 	}
 	path, err := resolveCommandFilePath(fs.Arg(0), commandWorkingDirectory(ctx))
 	if err != nil {
-		return commandExecution{}, err
+		return commandOutcome{}, err
 	}
 	data, err := readPasteBufferFile(path)
 	if err != nil {
-		return commandExecution{}, err
+		return commandOutcome{}, err
 	}
-	_, err = ctx.daemon.pasteBuffers.set(*name, flagSetProvided(fs, "b"), data, false, "")
-	return commandExecution{}, err
+	_, err = d.pasteBuffers.set(*name, flagSetProvided(fs, "b"), data, false, "")
+	return commandOutcome{}, err
 }
 
-func handleSaveBufferCommand(ctx *commandContext, args []string) (commandExecution, error) {
-	if ctx.daemon == nil {
-		return commandExecution{}, errors.New("save-buffer requires a running daemon")
+func handleSaveBufferCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
+	if d == nil {
+		return commandOutcome{}, errors.New("save-buffer requires a running daemon")
 	}
 	fs := commandFlagSet("save-buffer")
 	appendFile := fs.Bool("a", false, "append")
 	name := fs.String("b", "", "buffer name")
 	if err := fs.Parse(args); err != nil {
-		return commandExecution{}, err
+		return commandOutcome{}, err
 	}
 	if len(fs.Args()) != 1 {
-		return commandExecution{}, errors.New("save-buffer requires a path")
+		return commandOutcome{}, errors.New("save-buffer requires a path")
 	}
-	data, resolved, exists := ctx.daemon.pasteBuffers.get(*name)
+	data, resolved, exists := d.pasteBuffers.get(*name)
 	if !exists {
-		return commandExecution{}, fmt.Errorf("no paste buffer %q", resolved)
+		return commandOutcome{}, fmt.Errorf("no paste buffer %q", resolved)
 	}
 	if fs.Arg(0) == "-" {
-		return commandExecution{result: commandResult{stdout: data}}, nil
+		return commandOutcome{Stdout: data}, nil
 	}
 	path, err := resolveCommandFilePath(fs.Arg(0), commandWorkingDirectory(ctx))
 	if err != nil {
-		return commandExecution{}, err
+		return commandOutcome{}, err
 	}
 	flags := os.O_CREATE | os.O_WRONLY
 	if *appendFile {
@@ -382,14 +377,14 @@ func handleSaveBufferCommand(ctx *commandContext, args []string) (commandExecuti
 	}
 	file, err := os.OpenFile(filepath.Clean(path), flags, 0o600)
 	if err != nil {
-		return commandExecution{}, err
+		return commandOutcome{}, err
 	}
 	_, writeErr := file.Write(data)
 	closeErr := file.Close()
 	if writeErr != nil {
-		return commandExecution{}, writeErr
+		return commandOutcome{}, writeErr
 	}
-	return commandExecution{}, closeErr
+	return commandOutcome{}, closeErr
 }
 
 type pasteBufferOptions struct {
@@ -464,30 +459,41 @@ func preparePasteBufferData(data []byte, options pasteBufferOptions, bracketedPa
 	return data
 }
 
-func handlePasteBufferCommand(s *Session, c *ClientInstance, args []string) (bool, error) {
+func runPasteBufferCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
+	_, client, remaining, err := resolveSessionCommandContextValue(d, ctx, sessionTarget, args)
+	if err != nil {
+		return commandOutcome{}, err
+	}
+	if client == nil {
+		return commandOutcome{}, errors.New("command requires an attached client")
+	}
+	return commandOutcome{}, pasteBufferToClient(client, remaining)
+}
+
+func pasteBufferToClient(s *ClientInstance, args []string) error {
 	options, err := parsePasteBufferArgs(args)
 	if err != nil {
-		return false, err
+		return err
 	}
-	if c == nil || c.Daemon == nil {
-		return false, errors.New("paste-buffer requires a running daemon")
+	if s == nil || s.Daemon == nil {
+		return errors.New("paste-buffer requires a running daemon")
 	}
-	data, resolved, exists := c.Daemon.pasteBuffers.get(options.name)
+	data, resolved, exists := s.Daemon.pasteBuffers.get(options.name)
 	if !exists {
-		return false, fmt.Errorf("no paste buffer %q", resolved)
+		return fmt.Errorf("no paste buffer %q", resolved)
 	}
-	pane, _ := s.ActivePane(clientID0)
+	pane := s.activePane()
 	if pane == nil {
-		return false, errors.New("paste-buffer requires an active pane")
+		return errors.New("paste-buffer requires an active pane")
 	}
 	data = preparePasteBufferData(data, options, pane.InputMode().bracketedPaste)
 	if err := pane.sendInput(data); err != nil {
-		return false, fmt.Errorf("paste-buffer: %w", err)
+		return fmt.Errorf("paste-buffer: %w", err)
 	}
 	if options.delete {
-		if err := c.Daemon.pasteBuffers.delete(resolved); err != nil {
-			return false, err
+		if err := s.Daemon.pasteBuffers.delete(resolved); err != nil {
+			return err
 		}
 	}
-	return false, nil
+	return nil
 }

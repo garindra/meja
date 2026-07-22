@@ -31,12 +31,20 @@ type processMonitorCommand struct {
 	watch       *processWatch
 	unwatch     *PaneKey
 	dropSession uint64
+	transfer    *processMonitorTransfer
 	activity    *processActivity
+}
+
+type processMonitorTransfer struct {
+	from uint64
+	toID uint64
+	to   func(monitoredProcessBatch)
 }
 
 type processWatch struct {
 	anchor         Anchor
-	session        *Session
+	sessionID      uint64
+	deliver        func(monitoredProcessBatch)
 	fingerprint    processFingerprint
 	hasFingerprint bool
 	observation    ProcessObservation
@@ -88,11 +96,11 @@ func NewProcessMonitor(ctx context.Context, observer ProcessObserver) *ProcessMo
 	return monitor
 }
 
-func (m *ProcessMonitor) Watch(session *Session, anchor Anchor) {
-	if m == nil || session == nil {
+func (m *ProcessMonitor) Watch(sessionID uint64, deliver func(monitoredProcessBatch), anchor Anchor) {
+	if m == nil || sessionID == 0 || deliver == nil {
 		return
 	}
-	watch := &processWatch{anchor: anchor, session: session}
+	watch := &processWatch{anchor: anchor, sessionID: sessionID, deliver: deliver}
 	select {
 	case m.commands <- processMonitorCommand{watch: watch}:
 	case <-m.done:
@@ -115,6 +123,18 @@ func (m *ProcessMonitor) DropSession(sessionID uint64) {
 	}
 	select {
 	case m.commands <- processMonitorCommand{dropSession: sessionID}:
+	case <-m.done:
+	}
+}
+
+// TransferSession keeps the one watch for each shared pane alive when the
+// session that originally created the execution graph is removed.
+func (m *ProcessMonitor) TransferSession(from uint64, sessionID uint64, deliver func(monitoredProcessBatch)) {
+	if m == nil || from == 0 || sessionID == 0 || sessionID == from || deliver == nil {
+		return
+	}
+	select {
+	case m.commands <- processMonitorCommand{transfer: &processMonitorTransfer{from: from, toID: sessionID, to: deliver}}:
 	case <-m.done:
 	}
 }
@@ -229,9 +249,19 @@ func (m *ProcessMonitor) applyCommand(watches map[PaneKey]*processWatch, command
 		}
 		delete(watches, *command.unwatch)
 	}
+	if command.transfer != nil {
+		for key, watch := range watches {
+			if watch.sessionID != command.transfer.from {
+				continue
+			}
+			watch.sessionID = command.transfer.toID
+			watch.deliver = command.transfer.to
+			watches[key] = watch
+		}
+	}
 	if command.dropSession != 0 {
 		for key, watch := range watches {
-			if key.SessionID == command.dropSession {
+			if watch.sessionID == command.dropSession {
 				watch.releaseActivityEdge()
 				delete(watches, key)
 			}
@@ -346,25 +376,16 @@ func (m *ProcessMonitor) observeDeep(ctx context.Context, watches []*processWatc
 }
 
 func (m *ProcessMonitor) deliver(watches []*processWatch) {
-	bySession := make(map[*Session]monitoredProcessBatch)
 	seen := make(map[*processWatch]struct{}, len(watches))
 	for _, watch := range watches {
-		if watch == nil || !watch.hasObservation || watch.session == nil {
+		if watch == nil || !watch.hasObservation || watch.deliver == nil {
 			continue
 		}
 		if _, ok := seen[watch]; ok {
 			continue
 		}
 		seen[watch] = struct{}{}
-		bySession[watch.session] = append(bySession[watch.session], monitoredProcessObservation{
-			anchor: watch.anchor, observation: watch.observation,
-		})
-	}
-	for session, batch := range bySession {
-		select {
-		case session.processObservationUpdates <- batch:
-		default:
-		}
+		watch.deliver(monitoredProcessBatch{{anchor: watch.anchor, observation: watch.observation}})
 	}
 }
 

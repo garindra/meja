@@ -11,6 +11,7 @@ func TestCommandRequestRoundTripPreservesArgumentsAndContext(t *testing.T) {
 		Args:                []string{"new", "-s", "my work", "--", "printf", "a b"},
 		WorkingDirectory:    "/srv/work tree",
 		CallerSessionTarget: "17",
+		CallerPaneID:        41,
 		TerminalCols:        123,
 		TerminalRows:        45,
 	}

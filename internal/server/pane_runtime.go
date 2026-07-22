@@ -12,7 +12,23 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
-var ptyReadBuffers = sync.Pool{New: func() any { return make([]byte, 32*1024) }}
+const ptyReadBufferSize = 32 * 1024
+
+type ptyReadBuffer [ptyReadBufferSize]byte
+
+var ptyReadBuffers = sync.Pool{New: func() any { return new(ptyReadBuffer) }}
+
+func takePTYReadBuffer() []byte {
+	return ptyReadBuffers.Get().(*ptyReadBuffer)[:]
+}
+
+func releasePTYReadBuffer(data []byte) {
+	if cap(data) < ptyReadBufferSize {
+		return
+	}
+	data = data[:ptyReadBufferSize]
+	ptyReadBuffers.Put((*ptyReadBuffer)(data[:ptyReadBufferSize]))
+}
 
 const (
 	renderIdleFlush   = time.Millisecond
@@ -85,26 +101,6 @@ func (p *Pane) renderAttachedView(output *renderOutput, layoutRevision uint64) e
 	}
 }
 
-// attachOutputWithRefresh is the low-level renderer hook used by pane tests.
-// Session layout code attaches through attachOutputStream instead.
-func (p *Pane) attachOutputWithRefresh(lease *OutputLease, refresh func(*renderOutput) error) error {
-	attachment := &paneOutputAttach{Lease: lease, Refresh: refresh}
-	if p.commands == nil {
-		if refresh == nil {
-			return nil
-		}
-		return refresh(newRenderOutput(lease.Stream))
-	}
-	select {
-	case p.commands <- paneCommand{attach: attachment}:
-		return nil
-	case <-p.mainDone:
-		return nil
-	case <-p.done:
-		return nil
-	}
-}
-
 func (p *Pane) detachOutputStream(stream io.Writer) error {
 	if p.commands == nil {
 		return nil
@@ -133,13 +129,6 @@ func (p *Pane) releaseOutputStream(done chan<- *OutputLease) {
 	case <-p.done:
 		release.acknowledge()
 	}
-}
-
-func (p *Pane) applyRender(render func(*renderOutput) error) error {
-	if p.commands == nil {
-		return nil
-	}
-	return p.sendRenderCommand(paneCommand{apply: render})
 }
 
 func (p *Pane) sendRenderCommand(command paneCommand) error {
@@ -172,7 +161,7 @@ func relayPTYOutput(pane *Pane) {
 		}
 	}()
 	for {
-		buf := ptyReadBuffers.Get().([]byte)
+		buf := takePTYReadBuffer()
 		n, err := pane.PTY.Read(buf)
 		if n > 0 {
 			pane.notifyProcessActivity()
@@ -185,18 +174,18 @@ func relayPTYOutput(pane *Pane) {
 				select {
 				case <-timer.C:
 				case <-pane.done:
-					ptyReadBuffers.Put(buf[:cap(buf)])
+					releasePTYReadBuffer(buf)
 					return
 				}
 			}
 			select {
 			case pane.ptyOutput <- buf[:n]:
 			case <-pane.done:
-				ptyReadBuffers.Put(buf[:cap(buf)])
+				releasePTYReadBuffer(buf)
 				return
 			}
 		} else {
-			ptyReadBuffers.Put(buf[:cap(buf)])
+			releasePTYReadBuffer(buf)
 		}
 		if err != nil {
 			return
@@ -219,21 +208,21 @@ func runPTYWriter(pane *Pane, failed func(error)) {
 	}
 }
 
-func (pane *Pane) run() {
+func (p *Pane) run() {
 	defer func() {
-		if pane.PTY != nil {
-			_ = pane.PTY.Close()
+		if p.PTY != nil {
+			_ = p.PTY.Close()
 		}
-		close(pane.mainDone)
+		close(p.mainDone)
 	}()
-	renderer := newPaneRenderState(pane)
+	renderer := newPaneRenderState(p)
 	var update Update
 	var idle, maxAge *time.Timer
 	var idleC, maxC <-chan time.Time
 	var startupIdle *time.Timer
 	var startupIdleC <-chan time.Time
-	startupInput := pane.startupInput
-	pane.startupInput = nil
+	startupInput := p.startupInput
+	p.startupInput = nil
 	var startupMax *time.Timer
 	var startupMaxC <-chan time.Time
 	if len(startupInput) > 0 {
@@ -276,7 +265,7 @@ func (pane *Pane) run() {
 		disarm(startupMax, &startupMaxC)
 		input := startupInput
 		startupInput = nil
-		return pane.sendOwnedInput(input)
+		return p.sendOwnedInput(input)
 	}
 	flush := func() {
 		if !batching {
@@ -292,67 +281,71 @@ func (pane *Pane) run() {
 		failures := renderer.failures()
 		select {
 		case buffer := <-available:
-			lease := pane.outputLease
+			lease := p.outputLease
 			if err := renderer.render(buffer); err != nil {
 				if lease != nil {
 					lease.recycle(buffer)
-					lease.reportFailure(fmt.Errorf("render pane %d: %w", pane.ID, err))
+					lease.reportFailure(fmt.Errorf("render pane %d: %w", p.ID, err))
 				}
-				pane.outputLease = nil
+				p.outputLease = nil
 				renderer.detach()
 			}
 		case <-failures:
-			pane.outputLease = nil
+			p.outputLease = nil
 			renderer.detach()
-		case command := <-pane.commands:
+		case command := <-p.commands:
 			if command.capture != nil {
-				data, err := captureTerminalViewport(pane.terminal, command.capture.Options)
+				data, err := captureTerminalViewport(p.terminal, command.capture.Options)
 				command.capture.Result <- paneCaptureResult{Data: data, Err: err}
 				continue
 			}
 			if command.release != nil {
-				lease := pane.outputLease
-				pane.outputLease = nil
+				lease := p.outputLease
+				p.outputLease = nil
 				renderer.detach()
 				command.release.returnLease(lease)
 				continue
 			}
 			if command.detach != nil {
-				if pane.outputLease != nil && pane.outputLease.Stream == command.detach {
-					pane.outputLease = nil
+				if p.outputLease != nil && p.outputLease.Stream == command.detach {
+					p.outputLease = nil
 					renderer.detach()
 				}
 				command.done <- nil
 				continue
 			}
 			if command.attach != nil {
-				pane.outputLease = command.attach.Lease
+				p.outputLease = command.attach.Lease
 				renderer.attach(command.attach.Lease, command.attach.LayoutRevision, command.attach.Refresh)
 				continue
 			}
 			if command.history != nil {
-				result := pane.handleHistoryRequest(command.history)
+				result := p.handleHistoryRequest(command.history)
 				// History handlers historically rendered as a side effect even when
 				// their Changed result only described mode transitions. Repaint from
 				// the authoritative current view for every successful request.
-				if result.Err == nil && pane.outputLease != nil {
+				if result.Err == nil && p.outputLease != nil {
 					renderer.markFull()
 					renderer.due = true
 				}
 				command.history.Result <- result
 				continue
 			}
-			if command.apply != nil && pane.outputLease != nil {
+			if command.apply != nil && p.outputLease != nil {
 				renderer.queued = append(renderer.queued, queuedPaneRender{render: command.apply, done: command.done})
 				renderer.due = true
 			} else if command.resize != nil {
 				err := error(nil)
-				if pane.PTY != nil {
-					err = pty.Setsize(pane.PTY, &pty.Winsize{Cols: command.resize.cols, Rows: command.resize.rows})
+				if p.outputLease != nil {
+					command.done <- fmt.Errorf("resize pane %d while its output grid is still attached", p.ID)
+					continue
 				}
-				pane.terminal.Resize(int(command.resize.cols), int(command.resize.rows))
-				pane.publishTerminalMetadata()
-				if pane.outputLease != nil {
+				if p.PTY != nil {
+					err = pty.Setsize(p.PTY, &pty.Winsize{Cols: command.resize.cols, Rows: command.resize.rows})
+				}
+				p.terminal.Resize(int(command.resize.cols), int(command.resize.rows))
+				p.publishTerminalMetadata()
+				if p.outputLease != nil {
 					renderer.markFull()
 					renderer.due = true
 				}
@@ -360,24 +353,24 @@ func (pane *Pane) run() {
 			} else {
 				command.done <- nil
 			}
-		case data, ok := <-pane.ptyOutput:
+		case data, ok := <-p.ptyOutput:
 			if !ok {
 				flush()
 				return
 			}
-			trackDamage := pane.outputLease != nil && pane.currentViewMode() == paneViewLive
-			update.ResetFor(pane.terminal.Rows, trackDamage)
-			pane.terminal.ApplyInto(data, &update)
+			trackDamage := p.outputLease != nil && p.currentViewMode() == paneViewLive
+			update.ResetFor(p.terminal.Rows, trackDamage)
+			p.terminal.ApplyInto(data, &update)
 			if len(startupInput) > 0 {
 				arm(&startupIdle, &startupIdleC, startupInputIdle)
 			}
-			ptyReadBuffers.Put(data[:cap(data)])
+			releasePTYReadBuffer(data)
 			for _, reply := range update.Replies {
-				if err := pane.sendOwnedInput(reply); err != nil {
+				if err := p.sendOwnedInput(reply); err != nil {
 					return
 				}
 			}
-			pane.publishTerminalMetadata()
+			p.publishTerminalMetadata()
 			if !trackDamage {
 				continue
 			}
@@ -405,7 +398,7 @@ func (pane *Pane) run() {
 			}
 		case <-maxC:
 			flush()
-		case <-pane.done:
+		case <-p.done:
 			return
 		}
 	}
@@ -445,42 +438,6 @@ func writeHistoryCounter(compiler *displayCompiler, view *paneHistoryView, label
 		return err
 	}
 	return compiler.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte(label)})
-}
-
-func emitTerminalUpdate(output *renderOutput, pane *Pane, update Update) error {
-	if update.FullRedraw {
-		return sendFullRender(output, pane)
-	}
-	if !update.HasDamage() && !update.CursorChanged && !update.VisibleChange {
-		if update.ScrollDelta == 0 {
-			return nil
-		}
-	}
-	if update.ScrollDelta != 0 {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: update.ScrollDelta}); err != nil {
-			return err
-		}
-	}
-	compiler := newLiveDisplayCompiler(output, pane.terminal)
-	for row := 0; row < pane.terminal.Rows; row++ {
-		span := update.DirtySpans[row]
-		if span.End == 0 {
-			continue
-		}
-		cells := pane.terminal.gridRow(row)[span.Start:span.End]
-		if err := compiler.writeCells(row, span.Start, cells); err != nil {
-			return err
-		}
-	}
-	if err := compiler.finish(); err != nil {
-		return err
-	}
-	if update.CursorChanged || update.VisibleChange {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.terminal.CursorX, Y: pane.terminal.CursorY}, Visible: pane.terminal.CursorVisible}}); err != nil {
-			return err
-		}
-	}
-	return output.present()
 }
 
 func sendFullRender(output *renderOutput, pane *Pane) error {

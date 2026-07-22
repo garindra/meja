@@ -92,11 +92,11 @@ func (s *paneHistorySnapshot) row(row int) []cellWord {
 
 func (s *paneHistorySnapshot) LookupStyle(id uint32) (protocol.Style, bool) {
 	if id&historySelectionStyleMask != 0 {
-		style, ok := s.LookupStyle(id &^ historySelectionStyleMask)
+		_, ok := s.LookupStyle(id &^ historySelectionStyleMask)
 		if !ok {
 			return protocol.Style{}, false
 		}
-		style = protocol.Style{
+		style := protocol.Style{
 			FG: protocol.Color{Mode: "indexed", Index: 0},
 			BG: protocol.Color{Mode: "indexed", Index: 226},
 		}
@@ -140,7 +140,7 @@ func (p *Pane) currentViewMode() paneViewMode {
 	return paneViewMode(p.viewMode.Load())
 }
 
-func (s *Session) exitAllPaneHistoryModes() error {
+func (s *SessionState) exitAllPaneHistoryModes() error {
 	for _, pane := range s.Panes {
 		if _, err := pane.exitHistoryMode(); err != nil {
 			return err

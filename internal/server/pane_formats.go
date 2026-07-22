@@ -34,92 +34,101 @@ type formatContext struct {
 	pane    *formatPaneSnapshot
 }
 
-// formatSnapshot is collected by the session actor. The command layer only
-// formats this immutable copy, so listing never reads live terminal or
+// formatSnapshot is collected from passive session state. The command layer
+// only formats this immutable copy, so listing never reads live terminal or
 // process-monitor state without synchronization.
-func (s *Session) formatSnapshot() formatSessionSnapshot {
+func (s *SessionState) formatSnapshot() formatSessionSnapshot {
 	snapshot := formatSessionSnapshot{}
 	if s == nil {
 		return snapshot
 	}
-	_ = s.coordinate(func() error {
-		snapshot.ID = s.ID
-		snapshot.Name = s.Name
-		snapshot.CreatedAt = s.CreatedAt
-		snapshot.Attached = s.clientInstance != nil
-		client := s.Clients[clientID0]
-		activeWindowID := uint64(0)
-		activePaneID := uint64(0)
-		if client != nil {
-			activeWindowID = client.ActiveWindowID
-			activePaneID = client.FocusedPaneID
+	snapshot.ID = s.ID
+	snapshot.Name = s.Name
+	snapshot.CreatedAt = s.CreatedAt
+	snapshot.Attached = s.attachedClient() != nil
+	activeWindowID := s.ActiveWindowID
+	activePaneID := uint64(0)
+	if view, ok := s.WindowViews[activeWindowID]; ok {
+		activePaneID = view.FocusedPaneID
+	}
+	if activeWindowID == 0 {
+		ids := s.orderedWindowIDs()
+		if len(ids) > 0 {
+			activeWindowID = ids[0]
 		}
+	}
+	if activePaneID == 0 {
+		if window := s.Windows[activeWindowID]; window != nil {
+			activePaneID = window.ActivePaneID
+		}
+	}
 
-		windows := make([]*Window, 0, len(s.Windows))
-		for _, window := range s.Windows {
-			if window != nil {
-				windows = append(windows, window)
-			}
+	windows := make([]*Window, 0, len(s.Windows))
+	for _, window := range s.Windows {
+		if window != nil {
+			windows = append(windows, window)
 		}
-		sort.Slice(windows, func(i, j int) bool {
-			if windows[i].DisplayIndex != windows[j].DisplayIndex {
-				return windows[i].DisplayIndex < windows[j].DisplayIndex
-			}
-			return windows[i].ID < windows[j].ID
-		})
-
-		seen := make(map[uint64]struct{}, len(s.Panes))
-		for _, window := range windows {
-			if window.ID == activeWindowID {
-				snapshot.ActiveWindowIndex = window.DisplayIndex
-				snapshot.HasActiveWindow = true
-			}
-			paneIDs := []uint64(nil)
-			if window.Layout != nil {
-				paneIDs = window.Layout.PaneIDs()
-			}
-			for _, paneID := range paneIDs {
-				pane := s.Panes[paneID]
-				if pane == nil {
-					continue
-				}
-				seen[paneID] = struct{}{}
-				snapshot.Panes = append(snapshot.Panes, s.formatPaneSnapshot(pane, window.DisplayIndex))
-			}
+	}
+	sort.Slice(windows, func(i, j int) bool {
+		if windows[i].DisplayIndex != windows[j].DisplayIndex {
+			return windows[i].DisplayIndex < windows[j].DisplayIndex
 		}
-
-		// A live pane should normally always be present in a window layout. Keep
-		// a deterministic fallback for transitional or test states.
-		remaining := make([]uint64, 0, len(s.Panes))
-		for paneID := range s.Panes {
-			if _, ok := seen[paneID]; !ok {
-				remaining = append(remaining, paneID)
-			}
-		}
-		sort.Slice(remaining, func(i, j int) bool { return remaining[i] < remaining[j] })
-		for _, paneID := range remaining {
-			if pane := s.Panes[paneID]; pane != nil {
-				snapshot.Panes = append(snapshot.Panes, s.formatPaneSnapshot(pane, 0))
-			}
-		}
-		activeWindow := s.Windows[activeWindowID]
-		if snapshot.HasActiveWindow && activeWindow != nil && windowHasPane(activeWindow, activePaneID) {
-			for index := range snapshot.Panes {
-				if snapshot.Panes[index].ID == activePaneID {
-					active := snapshot.Panes[index]
-					snapshot.ActivePane = &active
-					break
-				}
-			}
-		}
-		return nil
+		return windows[i].ID < windows[j].ID
 	})
+
+	seen := make(map[uint64]struct{}, len(s.Panes))
+	for _, window := range windows {
+		if window.ID == activeWindowID {
+			snapshot.ActiveWindowIndex = window.DisplayIndex
+			snapshot.HasActiveWindow = true
+		}
+		paneIDs := []uint64(nil)
+		if window.Layout != nil {
+			paneIDs = window.Layout.PaneIDs()
+		}
+		for _, paneID := range paneIDs {
+			pane := s.Panes[paneID]
+			if pane == nil {
+				continue
+			}
+			seen[paneID] = struct{}{}
+			snapshot.Panes = append(snapshot.Panes, s.formatPaneSnapshot(pane, window.DisplayIndex))
+		}
+	}
+
+	// A live pane should normally always be present in a window layout. Keep
+	// a deterministic fallback for transitional or test states.
+	remaining := make([]uint64, 0, len(s.Panes))
+	for paneID := range s.Panes {
+		if _, ok := seen[paneID]; !ok {
+			remaining = append(remaining, paneID)
+		}
+	}
+	sort.Slice(remaining, func(i, j int) bool { return remaining[i] < remaining[j] })
+	for _, paneID := range remaining {
+		if pane := s.Panes[paneID]; pane != nil {
+			snapshot.Panes = append(snapshot.Panes, s.formatPaneSnapshot(pane, 0))
+		}
+	}
+	activeWindow := s.Windows[activeWindowID]
+	if snapshot.HasActiveWindow && activeWindow != nil && windowHasPane(activeWindow, activePaneID) {
+		for index := range snapshot.Panes {
+			if snapshot.Panes[index].ID == activePaneID {
+				active := snapshot.Panes[index]
+				snapshot.ActivePane = &active
+				break
+			}
+		}
+	}
 	return snapshot
 }
 
-func (s *Session) formatPaneSnapshot(pane *Pane, windowIndex int) formatPaneSnapshot {
+func (s *SessionState) formatPaneSnapshot(pane *Pane, windowIndex int) formatPaneSnapshot {
 	cols, rows := pane.TerminalSize()
-	observation := s.processObservations[pane.ID]
+	var observation ProcessObservation
+	if s.daemon != nil {
+		observation = s.daemon.processObservations[pane.ID]
+	}
 	command := formatPaneCommand(pane, observation)
 
 	path := ""
@@ -189,29 +198,29 @@ func commandBasename(raw string) string {
 }
 
 func listPanesCommand() commandHandler {
-	return func(ctx *commandContext, args []string) (commandExecution, error) {
+	return func(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
 		fs := commandFlagSet("list-panes")
 		all := fs.Bool("a", false, "all sessions")
 		target := fs.String("t", "", "session target")
 		format := fs.String("F", "#{pane_id}: #{pane_in_mode}", "format")
 		if err := fs.Parse(args); err != nil {
-			return commandExecution{}, err
+			return commandOutcome{}, err
 		}
 		if len(fs.Args()) != 0 {
-			return commandExecution{}, errors.New("list-panes accepts no positional arguments")
+			return commandOutcome{}, errors.New("list-panes accepts no positional arguments")
 		}
 		if *all && *target != "" {
-			return commandExecution{}, errors.New("list-panes -a cannot be combined with -t")
+			return commandOutcome{}, errors.New("list-panes -a cannot be combined with -t")
 		}
 
 		if *all {
-			if ctx.daemon == nil {
-				return commandExecution{}, errors.New("list-panes -a requires the daemon command interface")
+			if d == nil {
+				return commandOutcome{}, errors.New("list-panes -a requires the daemon command interface")
 			}
-			var sessions []*Session
-			ctx.daemon.call(func() {
-				sessions = make([]*Session, 0, len(ctx.daemon.sessions))
-				for _, session := range ctx.daemon.sessions {
+			var sessions []*SessionState
+			d.call(func() {
+				sessions = make([]*SessionState, 0, len(d.sessions))
+				for _, session := range d.sessions {
 					if session != nil {
 						sessions = append(sessions, session)
 					}
@@ -223,27 +232,28 @@ func listPanesCommand() commandHandler {
 				snapshot := session.formatSnapshot()
 				writePaneFormatLines(&output, *format, snapshot)
 			}
-			return commandExecution{result: commandResult{stdout: []byte(output.String())}}, nil
+			data := []byte(output.String())
+			return commandOutcome{Stdout: data}, nil
 		}
 
-		var session *Session
+		var session *SessionState
 		var err error
 		if *target != "" {
-			session, err = resolveCommandSession(ctx, *target)
-		} else if ctx.session != nil {
-			session = ctx.session
-		} else if ctx.request.CallerSessionTarget != "" {
-			session, err = resolveCommandSession(ctx, ctx.request.CallerSessionTarget)
+			session, err = resolveCommandSessionValue(d, ctx, *target)
 		} else {
-			err = errors.New("list-panes requires -t <session-target> or -a")
+			session, err = resolveCommandCallerSession(d, ctx)
+			if errors.Is(err, errNoImplicitCommandSession) {
+				err = errors.New("list-panes requires -t <session-target> or -a")
+			}
 		}
 		if err != nil {
-			return commandExecution{}, err
+			return commandOutcome{}, err
 		}
 		snapshot := session.formatSnapshot()
 		var output strings.Builder
 		writePaneFormatLines(&output, *format, snapshot)
-		return commandExecution{result: commandResult{stdout: []byte(output.String())}}, nil
+		data := []byte(output.String())
+		return commandOutcome{Stdout: data}, nil
 	}
 }
 
@@ -252,19 +262,6 @@ func writePaneFormatLines(output *strings.Builder, format string, snapshot forma
 		output.WriteString(expandFormat(format, formatContext{session: &snapshot, pane: &snapshot.Panes[index]}))
 		output.WriteByte('\n')
 	}
-}
-
-func expandPaneFormat(format string, session *Session, pane *Pane) string {
-	if session == nil || pane == nil {
-		return format
-	}
-	snapshot := session.formatSnapshot()
-	for index := range snapshot.Panes {
-		if snapshot.Panes[index].ID == pane.ID {
-			return expandFormat(format, formatContext{session: &snapshot, pane: &snapshot.Panes[index]})
-		}
-	}
-	return format
 }
 
 func expandFormat(format string, context formatContext) string {

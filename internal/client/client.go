@@ -61,6 +61,7 @@ type Config struct {
 	RemotePath               string
 	SocketSelector           SocketSelector
 	CallerSessionTarget      string
+	CallerPaneID             uint64
 	CommandArgs              []string
 	TerminalCols             uint16
 	TerminalRows             uint16
@@ -192,7 +193,15 @@ func Run(ctx context.Context, cfg Config) error {
 	cols, rows, terminalErr := terminalSize(cfg.Stdin)
 	if terminalErr == nil {
 		cfg.TerminalCols = cols
-		cfg.TerminalRows = drawableRows(int(rows))
+		if cfg.CallerSessionTarget != "" {
+			// Commands launched inside a Meja pane inherit that pane's PTY,
+			// which is already the drawable area below the outer status bar.
+			// Subtracting another row creates a permanently undersized pane whose
+			// render grid cannot satisfy the outer client's projection.
+			cfg.TerminalRows = rows
+		} else {
+			cfg.TerminalRows = drawableRows(int(rows))
+		}
 	}
 
 	result, err := executeCommand(ctx, cfg)
@@ -438,14 +447,6 @@ func sendCurrentControlEncoded[T any](current *atomic.Pointer[controlDestination
 		return err
 	}
 	return sendCurrentControl(current, protocol.Frame{Type: msgType, Payload: payload})
-}
-
-func sendCurrentFrontendInput(current *atomic.Pointer[controlDestination], ui *runtimeState, data, prediction []byte) (bool, error) {
-	destination := current.Load()
-	if destination == nil {
-		return false, nil
-	}
-	return sendFrontendInput(destination, ui, ui.appliedLayoutRevision.Load(), false, data, prediction)
 }
 
 func sendFrontendInput(destination *controlDestination, ui *runtimeState, layoutRevision uint64, sourceIdle bool, data, prediction []byte) (bool, error) {
@@ -1039,10 +1040,6 @@ func isTerminalQUICClose(err error) bool {
 		(applicationErr.ErrorCode == 0 || applicationErr.ErrorCode == protocol.SessionReplacedErrorCode)
 }
 
-func forwardInput(ctx context.Context, stdin *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error, cancel context.CancelCauseFunc) {
-	forwardInputWithInitial(ctx, stdin, control, ui, errs, cancel, nil)
-}
-
 func forwardInputWithInitial(ctx context.Context, stdin *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error, cancel context.CancelCauseFunc, initial []byte) {
 	reads := make(chan terminalInputRead, 16)
 	if len(initial) > 0 {
@@ -1498,7 +1495,15 @@ func (s *scanoutState) acceptFrame(slot uint8, frame renderFrame) (bool, error) 
 		if !ok {
 			return false, fmt.Errorf("frame for unbound slot %d", slot)
 		}
+		if !paneFrameMatchesRect(frame, placement.Rect) {
+			return false, nil
+		}
 		return true, s.emitFrame(slot, placement.Rect, frame)
+	}
+	if layout, ok := s.pendingLayouts[frame.layoutRevision]; ok {
+		if placement, found := placementForSlot(layout, slot); found && !paneFrameMatchesRect(frame, placement.Rect) {
+			return false, nil
+		}
 	}
 	bySlot := s.pendingFrames[frame.layoutRevision]
 	if bySlot == nil {
@@ -1516,7 +1521,14 @@ func (s *scanoutState) tryActivate(revision uint64) (bool, error) {
 	}
 	frames := s.pendingFrames[revision]
 	for _, placement := range layout.Panes {
-		if len(frames[placement.Slot]) == 0 {
+		matching := false
+		for _, frame := range frames[placement.Slot] {
+			if paneFrameMatchesRect(frame, placement.Rect) {
+				matching = true
+				break
+			}
+		}
+		if !matching {
 			return false, nil
 		}
 	}
@@ -1537,6 +1549,9 @@ func (s *scanoutState) tryActivate(revision uint64) (bool, error) {
 	s.emitLayoutBorders(layout)
 	for _, placement := range layout.Panes {
 		for _, frame := range frames[placement.Slot] {
+			if !paneFrameMatchesRect(frame, placement.Rect) {
+				continue
+			}
 			if err := s.emitFrame(placement.Slot, placement.Rect, frame); err != nil {
 				return false, err
 			}
@@ -1681,8 +1696,15 @@ func placementForSlot(layout protocol.WindowLayout, slot uint8) (protocol.PanePl
 	return protocol.PanePlacement{}, false
 }
 
+func paneFrameMatchesRect(frame renderFrame, rect protocol.Rect) bool {
+	// Older tests and pre-grid render streams use zero as unspecified. A
+	// START_RENDER frame with explicit dimensions, however, belongs only to the
+	// projection whose placement has exactly that grid.
+	return frame.cols == 0 || (frame.cols == rect.Width && frame.rows == rect.Height)
+}
+
 func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFrame) error {
-	if slot != protocol.StatusRenderSlot && frame.cols != 0 && (frame.cols != rect.Width || frame.rows != rect.Height) {
+	if slot != protocol.StatusRenderSlot && !paneFrameMatchesRect(frame, rect) {
 		return fmt.Errorf("pane slot %d frame grid %dx%d does not match layout %dx%d", slot, frame.cols, frame.rows, rect.Width, rect.Height)
 	}
 	styles := s.styles[slot]
@@ -1712,6 +1734,14 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 	}
 	display := result.frame
 	s.ansi.WriteString("\x1b[?25l")
+	// The OS terminal can already have its new width before this render loop
+	// consumes the corresponding sizeEvent. All Meja painting is absolutely
+	// positioned, so wrapping is never useful: suppress it for the complete
+	// frame to keep stale wide pane or status spans from spilling into adjacent
+	// rows. Status span clipping additionally handles frames processed after
+	// the sizeEvent has installed the new geometry.
+	s.ansi.WriteString("\x1b[?7l")
+	defer s.ansi.WriteString("\x1b[?7h")
 	fullPaneEmitted := false
 	fullWidth := rect.X == 0 && rect.Width == s.cols
 	nativeScroll := !result.repaintPane && (fullWidth || s.rectangularScroll)
@@ -1760,6 +1790,13 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 
 func (s *scanoutState) emitSpans(slot uint8, rect protocol.Rect, spans []paintSpan, styles map[uint32]protocol.Style) error {
 	for _, span := range spans {
+		if slot == protocol.StatusRenderSlot {
+			var visible bool
+			span, visible = clipStatusSpan(span, rect.Width, rect.Height)
+			if !visible {
+				continue
+			}
+		}
 		style, ok := styles[span.styleID]
 		if !ok {
 			return fmt.Errorf("undefined style %d on slot %d", span.styleID, slot)
@@ -1775,6 +1812,40 @@ func (s *scanoutState) emitSpans(slot uint8, rect protocol.Rect, spans []paintSp
 		}
 	}
 	return nil
+}
+
+// Status frames are barrierless and can race terminal resize events. Clip a
+// frame produced for an older, wider terminal to the current one-row status
+// rectangle so excess cells cannot wrap and scroll pane content upward.
+func clipStatusSpan(span paintSpan, width, height int) (paintSpan, bool) {
+	if width <= 0 || height <= 0 || span.row < 0 || span.row >= height || span.column < 0 || span.column >= width {
+		return paintSpan{}, false
+	}
+	cellWidth := int(span.cellWidth)
+	if cellWidth <= 0 {
+		return paintSpan{}, false
+	}
+	available := width - span.column
+	switch span.kind {
+	case paintFill:
+		span.fillColumns = min(span.fillColumns, available)
+		span.fillColumns -= span.fillColumns % cellWidth
+		return span, span.fillColumns > 0
+	case paintCluster:
+		return span, cellWidth <= available
+	case paintText:
+		maxRunes := available / cellWidth
+		if maxRunes <= 0 {
+			return paintSpan{}, false
+		}
+		runes := []rune(string(span.text))
+		if len(runes) > maxRunes {
+			span.text = []byte(string(runes[:maxRunes]))
+		}
+		return span, len(span.text) > 0
+	default:
+		return paintSpan{}, false
+	}
 }
 
 func applySpanToCache(cache *paneScanoutCache, span paintSpan, evidence *frameEvidence) error {
@@ -2064,12 +2135,24 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 				return false, "", nil
 			}
 			needsPresent, err = state.acceptLayout(e.layout)
+			if r.diagnostics != nil {
+				r.diagnostics.reportProjection(fmt.Sprintf(
+					"layout received window=%d revision=%d panes=%d activated=%t current=%d pending_layouts=%d pending_frame_revisions=%d",
+					e.layout.WindowID, e.layout.LayoutRevision, len(e.layout.Panes), needsPresent,
+					state.layout.LayoutRevision, len(state.pendingLayouts), len(state.pendingFrames)))
+			}
 			reason = "window-layout"
 		case paneFrameEvent:
 			if r.dropConnectionEvents.Load() {
 				return false, "", nil
 			}
 			needsPresent, err = state.acceptFrame(e.slot, e.frame)
+			if r.diagnostics != nil {
+				r.diagnostics.reportProjection(fmt.Sprintf(
+					"frame received slot=%d revision=%d grid=%dx%d activated=%t current=%d pending_layouts=%d pending_frame_revisions=%d",
+					e.slot, e.frame.layoutRevision, e.frame.cols, e.frame.rows, needsPresent,
+					state.layout.LayoutRevision, len(state.pendingLayouts), len(state.pendingFrames)))
+			}
 			reason = fmt.Sprintf("present slot=%d", e.slot)
 		case renderBarrierEvent:
 			close(e.done)
