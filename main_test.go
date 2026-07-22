@@ -32,6 +32,16 @@ func parseTestInvocation(t *testing.T, args ...string) client.Config {
 	return cfg
 }
 
+func shortUnixSocketPath(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("", "meja-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	return filepath.Join(directory, "meja.sock")
+}
+
 func waitForTestServerSocket(t *testing.T, socket string, serverDone chan error) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -54,11 +64,7 @@ func waitForTestServerSocket(t *testing.T, socket string, serverDone chan error)
 }
 
 func TestInteractiveResizeBurstKeepsDetachResponsive(t *testing.T) {
-	directory := t.TempDir()
-	if err := os.Chmod(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	socket := filepath.Join(directory, "meja.sock")
+	socket := shortUnixSocketPath(t)
 	serverCtx, stopServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
 	go func() {
@@ -204,11 +210,7 @@ func TestInteractiveResizeBurstKeepsDetachResponsive(t *testing.T) {
 }
 
 func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
-	directory := t.TempDir()
-	if err := os.Chmod(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	socket := filepath.Join(directory, "meja.sock")
+	socket := shortUnixSocketPath(t)
 	serverCtx, stopServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
 	go func() {
