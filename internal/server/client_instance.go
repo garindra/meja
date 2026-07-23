@@ -849,19 +849,20 @@ func (d *Daemon) transitionClientToSession(instance *ClientInstance, targetSessi
 			switchErr = errors.New("stale source window lease")
 			return
 		}
+		targetWindow := target.Windows[targetWindowID]
+		if targetWindow == nil {
+			switchErr = fmt.Errorf("unknown window %d", targetWindowID)
+			return
+		}
 		targetLease := d.windowLeases[targetWindowID]
 		var displacedCredential *reconnectCredential
 		if targetLease != nil && targetLease.AttachmentID != instance.AttachmentID {
 			assigned := d.attachments[target.ID]
 			if assigned == nil || assigned == credential || d.clients[target.ID] == nil {
-				switchErr = fmt.Errorf("window %d is currently viewed by another client", targetWindowID)
+				switchErr = fmt.Errorf("window %d is currently viewed by another client", targetWindow.DisplayIndex)
 				return
 			}
 			displacedCredential = assigned
-		}
-		if window := target.Windows[targetWindowID]; window == nil {
-			switchErr = fmt.Errorf("unknown window %d", targetWindowID)
-			return
 		}
 		if _, switchErr = prepareClientWindowGeometryNow(instance, target, targetWindowID); switchErr != nil {
 			return

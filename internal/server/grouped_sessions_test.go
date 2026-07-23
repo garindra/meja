@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/garindra/meja/internal/protocol"
@@ -139,6 +140,50 @@ func TestGroupedSessionsCanViewDifferentWindowsButLeaseConflictsAreAtomic(t *tes
 	if baseClient.ActiveWindowID != oldActive || testClientOf(base).ViewLeaseWindowID != first.WindowID {
 		t.Fatalf("failed selection changed view active=%d lease=%d", baseClient.ActiveWindowID, testClientOf(base).ViewLeaseWindowID)
 	}
+}
+
+func TestGroupedWindowLeaseConflictReportsDisplayIndexForEveryCommandOrigin(t *testing.T) {
+	d := groupedTestDaemon()
+	base := groupedTestSession(d, 1, "base")
+	setTestClientSize(base, 80, 23)
+	first, _ := createTestWindow(base, &Pane{ID: 1, terminal: newTerminal(80, 23)})
+	second, _ := createTestWindow(base, &Pane{ID: 2, terminal: newTerminal(80, 23)})
+	mirror := groupedTestSession(d, 2, "mirror")
+	if err := d.groupSession(base, mirror); err != nil {
+		t.Fatal(err)
+	}
+
+	baseClient := &ClientInstance{Daemon: d, AttachmentID: 10, sessionID: base.ID}
+	mirrorClient := &ClientInstance{Daemon: d, AttachmentID: 11, sessionID: mirror.ID}
+	setTestClient(base, baseClient)
+	setTestClient(mirror, mirrorClient)
+	base.ActiveWindowID = second.ID
+	mirror.ActiveWindowID = first.ID
+	d.windowLeases[second.ID] = &WindowViewLease{
+		WindowID: second.ID, SessionID: base.ID, AttachmentID: baseClient.AttachmentID, Generation: 1,
+	}
+	d.windowLeases[first.ID] = &WindowViewLease{
+		WindowID: first.ID, SessionID: mirror.ID, AttachmentID: mirrorClient.AttachmentID, Generation: 1,
+	}
+
+	if second.ID == uint64(second.DisplayIndex) {
+		t.Fatalf("fixture requires distinct internal ID and display index, both were %d", second.ID)
+	}
+	want := `window 1 is currently viewed by session "base"`
+
+	t.Run("attached status prompt", func(t *testing.T) {
+		_, err := d.commandEngine().run(mirrorClient.commandContext(), []string{"select-window", "-t", ":1"})
+		if err == nil || err.Error() != want {
+			t.Fatalf("attached conflict = %v, want %q", err, want)
+		}
+	})
+
+	t.Run("external CLI", func(t *testing.T) {
+		result := d.executeCommand(protocol.CommandRequest{Args: []string{"select-window", "-t", "mirror:1"}})
+		if result.exitCode != 1 || strings.TrimSpace(string(result.stderr)) != want {
+			t.Fatalf("external conflict = %#v, want stderr %q", result, want)
+		}
+	})
 }
 
 func TestGroupedSessionViewsKeepFocusIndependent(t *testing.T) {

@@ -646,7 +646,7 @@ func (d *Daemon) activateCreatedWindowNow(state *SessionState, windowID uint64) 
 		return fmt.Errorf("unknown new window %d", windowID)
 	}
 	if current := d.windowLeases[windowID]; current != nil && current.AttachmentID != client.AttachmentID {
-		return fmt.Errorf("window %d is currently viewed by another client", windowID)
+		return fmt.Errorf("window %d is currently viewed by another client", window.DisplayIndex)
 	}
 	oldWindowID := d.windowForAttachmentLocked(client.AttachmentID)
 	if oldWindowID != 0 && oldWindowID != windowID {
@@ -696,7 +696,7 @@ func (d *Daemon) selectWindow(attachmentID, sessionID, windowID uint64) (Prepare
 			if owner != nil {
 				name = owner.Name
 			}
-			err = fmt.Errorf("window %d is currently viewed by session %q", windowID, name)
+			err = fmt.Errorf("window %d is currently viewed by session %q", target.DisplayIndex, name)
 			return
 		}
 		oldWindowID := state.ActiveWindowID

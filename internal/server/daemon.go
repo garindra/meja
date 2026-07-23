@@ -768,7 +768,7 @@ func (d *Daemon) attachSessionView(state *SessionState, cols, rows uint16, advan
 		}
 		current := d.windowLeases[targetWindowID]
 		if current != nil && current.AttachmentID != client.AttachmentID {
-			err = fmt.Errorf("window %d is currently viewed by another client", targetWindowID)
+			err = fmt.Errorf("window %d is currently viewed by another client", target.DisplayIndex)
 			return
 		}
 		oldWindowID := d.windowForAttachmentLocked(client.AttachmentID)
