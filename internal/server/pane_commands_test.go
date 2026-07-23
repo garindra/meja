@@ -81,8 +81,8 @@ func TestPaneCommandsWorkThroughTheDaemonCommandEngine(t *testing.T) {
 	t.Cleanup(func() { stopState(s) })
 	s.daemon = d
 	s.setSessionName("work")
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 8, 1
+	client := newTestClient(s)
+	client.setTestTerminalSize(8, 1)
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -168,8 +168,8 @@ func TestSendKeysCopyModeCommandsAndPaneInModeFormat(t *testing.T) {
 	t.Cleanup(func() { stopState(s) })
 	s.daemon = d
 	s.setSessionName("work")
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 8, 2
+	client := newTestClient(s)
+	client.setTestTerminalSize(8, 2)
 	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(8, 2)}
 	pane.terminal.Apply([]byte("history\r\nline"))
 	createTestWindow(s, pane)

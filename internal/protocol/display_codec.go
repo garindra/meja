@@ -42,7 +42,7 @@ const MaxDisplayTextBytes = DefaultMaxFrameSize
 // DisplayCommand is a typed union. Only fields belonging to Opcode are used.
 type DisplayCommand struct {
 	Opcode         DisplayOpcode
-	LayoutRevision uint64
+	LayoutRevision ClientLayoutRevision
 	GridCols       int
 	GridRows       int
 	StyleID        uint32
@@ -102,7 +102,7 @@ func (e *DisplayEncoder) AppendStartRender(msg StartRender) error {
 		return fmt.Errorf("invalid display grid %dx%d", msg.Cols, msg.Rows)
 	}
 	e.opcode(DisplayOpcodeStartRender)
-	e.buf = appendUvarint(e.buf, msg.LayoutRevision)
+	e.buf = appendUvarint(e.buf, uint64(msg.LayoutRevision))
 	e.buf = appendUvarint(e.buf, uint64(msg.Cols))
 	e.buf = appendUvarint(e.buf, uint64(msg.Rows))
 	return nil
@@ -260,7 +260,8 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 	switch cmd.Opcode {
 	case DisplayOpcodeNoop:
 	case DisplayOpcodeStartRender:
-		cmd.LayoutRevision, err = d.readUvarint()
+		value, readErr := d.readUvarint()
+		cmd.LayoutRevision, err = ClientLayoutRevision(value), readErr
 		if err == nil {
 			cmd.GridCols, err = d.readCoord(MaxGridCols)
 		}

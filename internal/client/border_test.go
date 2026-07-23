@@ -82,7 +82,7 @@ func TestFourPaneWireIntersectionPhysicallyMeets(t *testing.T) {
 func TestSameRevisionFocusChangeRecolorsPaneBorders(t *testing.T) {
 	s := newScanoutState(true)
 	s.cols, s.rows = 9, 5
-	s.layout = protocol.WindowLayout{
+	s.layout = protocol.ClientLayout{
 		WindowID: 1, LayoutRevision: 1, FocusedPaneID: 0,
 		Panes: []protocol.PanePlacement{
 			{PaneID: 0, Slot: 0, Rect: protocol.Rect{Width: 4, Height: 4}},

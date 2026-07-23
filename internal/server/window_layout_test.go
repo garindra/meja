@@ -109,15 +109,14 @@ func TestPresetLayoutsComputeExpectedShapes(t *testing.T) {
 func TestCycleWindowLayoutAdvancesAndUsesFocusedPaneAsMain(t *testing.T) {
 	s := NewSessionState(1)
 	t.Cleanup(func() { stopState(s) })
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 120, 40
+	client := newTestClient(s)
+	client.setTestTerminalSize(120, 40)
 	first := &Pane{ID: testAddPaneID(s), terminal: newTerminal(120, 40)}
 	window, _ := createTestWindow(s, first)
 	second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(120, 40)}
 	if _, _, err := splitTestFocusedPane(s, second, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
-	client.FocusedPaneID = second.ID
 
 	for want := 0; want < layoutPresetCount; want++ {
 		if _, _, changed, err := cycleTestWindowLayout(s); err != nil || !changed {

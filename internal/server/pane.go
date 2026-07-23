@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/creack/pty"
+	"github.com/garindra/meja/internal/protocol"
 )
 
 // Pane owns a child process, PTY, terminal emulator, and its four enduring
@@ -94,7 +95,7 @@ type paneCommand struct {
 
 type paneOutputAttach struct {
 	Lease          *OutputLease
-	LayoutRevision uint64
+	LayoutRevision protocol.ClientLayoutRevision
 	Refresh        func(*renderOutput) error
 }
 

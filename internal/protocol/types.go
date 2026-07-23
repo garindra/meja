@@ -1,8 +1,7 @@
 package protocol
 
 const (
-	ALPN            = "meja/1"
-	ProtocolVersion = 11
+	ALPN = "meja-quic/12"
 
 	// SessionReplacedErrorCode is a terminal QUIC application close: another
 	// client has taken ownership of the session, so the displaced client must
@@ -13,15 +12,19 @@ const (
 	RenderOutputErrorCode = 0x52454e44
 )
 
+// ClientLayoutRevision identifies one frontend coordinate space. It is
+// intentionally distinct from the daemon's canonical window-layout revision.
+type ClientLayoutRevision uint64
+
 const (
 	MsgFrontendInputBytes uint64 = iota + 1
 	MsgFrontendResize
-	MsgWindowLayout
+	MsgClientLayout
 	MsgSessionAttach
 	MsgSessionAttachOK
 	MsgSessionAttachFailed
-	MsgSessionResume
-	MsgSessionResumeOK
+	MsgClientResume
+	MsgClientResumeOK
 	MsgFrontendTerminalWrite
 	MsgFrontendRegisterTerminalExitCommand
 	MsgFrontendExecuteTerminalExitCommand
@@ -29,14 +32,12 @@ const (
 )
 
 type SessionAttach struct {
-	Version int
-	Token   string
-	Cols    uint16
-	Rows    uint16
+	Token string
+	Cols  uint16
+	Rows  uint16
 }
 
 type SessionAttachOK struct {
-	Version     int
 	ResumeToken string
 }
 
@@ -44,19 +45,16 @@ type SessionAttachFailed struct {
 	Reason string
 }
 
-type SessionResume struct {
-	Version     int
+type ClientResume struct {
 	ResumeToken string
 	Cols        uint16
 	Rows        uint16
 }
 
-type SessionResumeOK struct {
-	Version int
-}
+type ClientResumeOK struct{}
 
 type FrontendInputBytes struct {
-	LayoutRevision uint64
+	LayoutRevision ClientLayoutRevision
 	// SourceIdle says the client observed a complete local terminal ambiguity
 	// window after Data. It is set only for a deferred standalone Escape; frame
 	// boundaries themselves remain semantically irrelevant.
@@ -90,15 +88,15 @@ type PanePlacement struct {
 	Rect   Rect
 }
 
-type WindowLayout struct {
+type ClientLayout struct {
 	WindowID       uint64
 	FocusedPaneID  uint64
-	LayoutRevision uint64
+	LayoutRevision ClientLayoutRevision
 	Panes          []PanePlacement
 }
 
 type StartRender struct {
-	LayoutRevision uint64
+	LayoutRevision ClientLayoutRevision
 	Cols           int
 	Rows           int
 }
@@ -157,7 +155,7 @@ type Style struct {
 	BG        Color
 }
 
-// Every pane/render binding reserves style ID 0 for this exact default style.
+// Every pane render slot reserves style ID 0 for this exact default style.
 const CanonicalDefaultStyleID uint32 = 0
 
 func CanonicalDefaultStyle() Style {

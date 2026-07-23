@@ -89,8 +89,8 @@ func (d *Daemon) startPane(state *SessionState, pane *Pane) {
 }
 
 func (c *ClientInstance) createWindowSize() (uint16, uint16, error) {
-	if clientState := c.snapshotClient(); clientState != nil && clientState.TerminalCols > 0 && clientState.TerminalRows > 0 {
-		return clientState.TerminalCols, clientState.TerminalRows, nil
+	if cols, rows := uint16(c.terminalCols.Load()), uint16(c.terminalRows.Load()); cols > 0 && rows > 0 {
+		return cols, rows, nil
 	}
 	activePane := c.activePane()
 	if activePane == nil {
@@ -100,7 +100,7 @@ func (c *ClientInstance) createWindowSize() (uint16, uint16, error) {
 	return uint16(cols), uint16(rows), nil
 }
 
-func (c *ClientInstance) handleInputBytes(layoutRevision uint64, data []byte) (bool, error) {
+func (c *ClientInstance) handleInputBytes(layoutRevision protocol.ClientLayoutRevision, data []byte) (bool, error) {
 	if c == nil {
 		return false, nil
 	}

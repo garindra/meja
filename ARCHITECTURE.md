@@ -120,12 +120,12 @@ The most important architectural question is not which package contains an objec
 |---|---|---|
 | CLI invocation | One command | Parses transport selection and submits one command request |
 | Server profile | Until its files are removed | Selects an isolated daemon, session namespace, socket, and snapshot directory |
-| Daemon | Server lifetime | Owns session identity, names, attach grants, reconnect credentials, assignments, and the QUIC listener |
+| Daemon | Server lifetime | Owns session identity, names, attach grants, client identities, identity/session/instance indexes, and the QUIC listener |
 | SessionState | Until killed or its final pane exits | Passive per-session view, focus, links, names, and persistence metadata |
 | Window | Session lifetime | Owns a layout tree, pane membership, active pane, name, zoom state, and layout revision |
 | Pane | Child-process lifetime | Actor-owns a PTY, packed terminal store, parser modes, history, process recipe, pending render damage, and at most one output lease |
-| Reconnect credential | Logical-client lifetime | Identifies one client across multiple transports and retains its target-session assignment |
-| Client instance | One live QUIC transport | Owns control/status streams, pane output leases, frontend parser and prompt state, remembered layouts, and connection workers |
+| Client identity | Logical-client lifetime | Retains the resume token and allocates `ClientLayoutRevision` across disposable transports |
+| Client instance | One live QUIC transport | Owns control/status streams, pane output leases, frontend parser and prompt state, the installed client layout, and connection workers |
 | Output lease | One client transport | Owns one render-slot stream, its fixed-capacity render buffer, and the worker that performs blocking stream writes |
 | Client pane cache | Current layout lifetime | Stores the last decoded authoritative scanout cells for one visible render slot |
 
@@ -247,7 +247,7 @@ SSH-authenticated remote account
     → exact QUIC/TLS daemon instance
 ```
 
-The attach token authorizes one initial attachment. It is not reused as the long-lived reconnect credential and is not itself the TLS encryption key.
+The attach token authorizes one initial attachment. It is not reused as the long-lived resume token and is not itself the TLS encryption key.
 
 ## QUIC stream topology
 
@@ -285,27 +285,35 @@ Meja separates initial authority, logical identity, and live transport.
 
 ```mermaid
 flowchart LR
-    A["Single-use attach grant"] -->|"consumed"| R["Reconnect credential"]
-    R --> I1["ClientInstance: connection 1"]
-    R --> I2["ClientInstance: connection 2"]
-    R --> I3["ClientInstance: connection 3"]
+    A["Single-use attach grant"] -->|"consumed"| R["ClientIdentity"]
+    R --> I1["Daemon index → ClientInstance 1"]
+    R --> I2["Daemon index → ClientInstance 2"]
+    R --> I3["Daemon index → ClientInstance 3"]
 ```
 
 ## Attach grant
 
 An attach-capable command chooses a session through the command plane and asks the daemon for a grant. The grant is random, short-lived, scoped to that session, and consumed once. It connects a previously authenticated command to a new QUIC connection without turning the public UDP listener into a login service.
 
-## Reconnect credential
+## Client identity
 
-After the first QUIC attachment succeeds, the daemon creates a reconnect credential and returns its token to the client. This credential represents the logical client process for the rest of its lifetime. The server retains its target-session assignment even when the transport disappears.
+After the first QUIC attachment succeeds, the daemon creates a `ClientIdentity` and returns its resume token to the client. The identity contains only that token and the daemon-owned monotonic `ClientLayoutRevision` allocator. Daemon indexes separately relate the identity to its assigned session, current disposable `ClientInstance`, terminal rejection reason, and reverse session attachment. Transport lifecycle therefore does not mutate an identity into a container for live runtime state.
 
 The reconnect token is stable across retries. Reconnection does not mint a chain of successor identities that could race with one another.
 
 ## Client instance
 
-A `ClientInstance` is the daemon-side object for one live QUIC connection. It owns the control stream, status stream, pane output leases, frontend input parser, recent layout map, held-key and pointer capture state, and connection-local workers. It is intentionally disposable.
+A `ClientInstance` is the daemon-side object for one live QUIC connection. It owns the control stream, status stream, pane output leases, frontend input parser, its last successfully published `currentLayout`, held-key and pointer capture state, and connection-local workers. The pane/slot mappings used for output handoff are derived from `currentLayout.Panes`; the client does not retain a second binding snapshot. This transport-local state is intentionally disposable.
 
-When a client reconnects, the daemon creates a new instance for the existing reconnect credential, marks the previous instance stale, and closes or ignores the old transport. Session processes and terminal state do not move; only the borrowed transport resources and frontend parser state are recreated.
+There is no separate `ClientState` view model. Prefix, prompt, resize-repeat,
+and directional-focus parser fields live in a private `clientInputState` value
+inside the instance; terminal dimensions live in the transport atomics; and
+the installed window, focus, geometry, slots, and revision live only in
+`currentLayout`.
+
+When a client reconnects, the daemon resolves the token to the existing identity, uses its daemon-owned session assignment, creates a new instance, marks the previous instance stale in the live-instance index, and closes or ignores the old transport. Session processes and terminal state do not move; only the borrowed transport resources and frontend parser state are recreated. The new instance begins without a current view. The daemon prepares a mandatory full reconnect projection by allocating a `ClientLayoutRevision` newer than every projection prepared for that identity.
+
+Attach and detach are daemon-coordinated lifecycle operations. The daemon validates and updates identity, session, live-instance, active-client, and window-lease ownership before asking the `ClientInstance` to initialize or release transport-local frontend resources. Client-side initialization and cleanup never register, replace, or unregister a daemon-owned client relationship.
 
 ## One-to-one assignment
 
@@ -314,7 +322,7 @@ The daemon enforces two sides of the attachment relationship:
 * one logical client is assigned to at most one session; and
 * one session is controlled by at most one logical client.
 
-A live session switch moves the same logical client, QUIC connection, streams, leases, and reconnect credential to another session. A second client attaching to an occupied session displaces the first. These are terminal ownership changes, not retryable network failures, so the displaced client exits instead of reconnecting forever.
+A live session switch moves the same logical client, QUIC connection, streams, leases, and identity assignment to another session. A second client attaching to an occupied session displaces the first. These are terminal ownership changes, not retryable network failures, so the displaced client exits instead of reconnecting forever.
 
 ## Reconnection lifecycle
 
@@ -328,7 +336,7 @@ stateDiagram-v2
     Disconnected --> Reconnecting: retry with backoff
     Reconnecting --> Attached: resume accepted
     Reconnecting --> Disconnected: retryable failure
-    Reconnecting --> Exited: credential rejected or session replaced
+    Reconnecting --> Exited: resume token rejected or session replaced
     Attached --> Exited: detach, takeover, or session end
 ```
 
@@ -365,7 +373,7 @@ The daemon actor owns server-wide coordination:
 * the numeric session registry;
 * the session-name registry;
 * attach grants;
-* reconnect credentials;
+* client identities and their assignment/live-instance indexes;
 * logical-client-to-session assignments; and
 * the active attachment for each session.
 
@@ -393,9 +401,11 @@ data but no mailbox, coordinator, or live-client authority. `GroupState` also
 has no mutex: relationship mutations are serialized by the daemon actor.
 
 The live `ClientInstance` owns one QUIC connection, ordered control frames,
-frontend decoding, prefix and prompt editing, terminal dimensions, cached
-projections, render bindings, output handoff, and stream writes. It consults
-the daemon by short transactions and never becomes the registry authority.
+frontend decoding, prefix and prompt editing, terminal dimensions, one
+installed client layout, output handoff, and stream writes. Pane identities,
+slots, and rectangles are read from that layout rather than retained in
+parallel binding state. It consults the daemon by short transactions and never
+becomes the registry authority.
 
 Every session has exactly one group, including an ordinary singleton session.
 Every window belongs to exactly one group, and every grouped session has a
@@ -432,8 +442,9 @@ actor. The daemon method owns the operation-specific validation and graph
 mutation. There is no delayed callback, tagged union, or caller-selected
 handoff policy.
 
-Second, every successful daemon operation converges on
-`prepareViewTransitionNow`. It returns one immutable
+Second, every successful visible-replacement operation converges on
+`prepareViewTransitionNow`. Inside the same daemon transaction it allocates
+the client identity's next `ClientLayoutRevision` and returns one immutable
 `PreparedViewTransition` containing the `ClientProjectionPlan`, exact
 daemon-authorized pane grids still to apply, and handles for removed panes that
 may still own this client's output leases. The daemon updates canonical target
@@ -443,19 +454,28 @@ is live.
 Third, the caller routes that prepared value to the affected ClientInstance;
 `ClientInstance.applyViewTransition` validates freshness, reclaims all
 installed output leases, applies the prepared pane grids, resolves and verifies
-the exact pane bindings, commits transport-local client state, reattaches the
-leases, publishes status, and sends the exact prepared `WINDOW_LAYOUT`. It does
+the exact pane output destinations, commits transport-local client state, reattaches the
+leases, publishes status, and sends the exact prepared `CLIENT_LAYOUT`. It does
 not call operation-specific logic or walk mutable session/window state to
 invent another answer.
 
-A plan carries the attachment and
-session identity, window lease generation, logical projection revision, layout
-revision, dimensions, pane rectangles, render-slot bindings, focused pane,
-status model, and whether a full snapshot is required. The client rejects an
+A plan carries the attachment and session identity, window lease generation,
+logical projection revision, one complete `ClientLayout`, and whether a full
+snapshot is required. Terminal dimensions remain transport state and are used
+while preparing pane rectangles and resize work; they are not copied into the
+plan. Status remains an independent stream
+and is not duplicated inside the projection. `ClientLayout` is the single
+representation of window identity, client layout revision, focused pane, pane
+rectangles, and render slots; the plan does not carry parallel pane and binding
+slices. The client rejects an
 older attachment, lease generation, or projection revision before releasing
-any output binding. Reconnect retains the logical projection revision attached
-to the reconnect credential and resends a full plan without advancing that
-revision merely because the transport changed.
+any output binding. `WindowLayoutRevision` is a distinct daemon-only type and
+never enters a client projection. The client identity owns
+`ClientLayoutRevision`; a full transition reserves its next value before
+crossing the actor boundary, and `ClientInstance.applyViewTransition` publishes
+that value unchanged in `CLIENT_LAYOUT` and `START_RENDER`. This forces one
+coherent cache-replacing activation even when canonical window geometry did
+not change.
 
 Window creation and selection, split and layout changes, terminal resize,
 pane close/exit, attach, and session switching all converge on this pipeline.
@@ -466,8 +486,10 @@ the transition carries the daemon-authorized assignment. There is no second
 session-specific activation action and no error value used as control flow.
 A focus change in an unzoomed layout is deliberately not a visible replacement:
 it updates cursor ownership through the control stream without releasing pane
-outputs or resizing panes. A zoomed focus change does alter visible geometry
-and therefore uses a full transition.
+outputs or resizing panes. It reuses the current `ClientLayoutRevision`; the
+frontend accepts that equal revision only when window identity, pane IDs,
+slots, and rectangles are unchanged. A zoomed focus change does alter visible
+geometry and therefore uses a full transition with a newer revision.
 
 New-window activation, session switching, selection, attach/resume, and
 involuntary pane-exit fallback all produce the same transition type. The daemon
@@ -662,11 +684,11 @@ Plain printable input has a fast path that preserves batching when no escape seq
 
 ## Layout-aware pointer routing
 
-Pointer input is tagged with the layout revision the user was viewing. The `ClientInstance` retains a small map of recent layouts. Hit testing maps frontend coordinates to a pane and rectangle for that revision; an unknown revision has no pointer target.
+Pointer input is tagged with the layout revision the user was viewing. The `ClientInstance` hit-tests only when that revision equals `currentLayout.LayoutRevision`. Input for an older or unknown revision is dropped instead of being interpreted against either historical or current geometry. This deliberately prefers an occasional missed click during a layout race over retaining old projections or risking delivery to the wrong pane.
 
 A press can focus a pane. Drag and release remain captured by the pane where the gesture began even if the pointer crosses a border. When the application has enabled mouse tracking, Meja translates the event to pane-relative coordinates and forwards it using the application's selected mouse encoding. Otherwise, wheel events navigate history or become cursor-key input, and a primary-button drag belongs to Meja's selection behavior.
 
-This gives input a geometry contract analogous to the render relayout contract: a pointer event is interpreted against the layout the user actually saw, not merely whichever layout happens to be current when the event reaches the server.
+This gives input a strict geometry contract analogous to the render relayout contract: a pointer event is interpreted only when the server and frontend name the same current coordinate space.
 
 ---
 
@@ -886,12 +908,12 @@ Layouts and pane output travel on different streams. QUIC may deliver those stre
 
 ## Render slots
 
-The connection creates a bounded pool of pane output streams. Each stream has a connection-local slot number. A `WindowLayout` control message maps visible panes to:
+The connection creates a bounded pool of pane output streams. Each stream has a connection-local slot number. A `ClientLayout` control message maps visible panes to:
 
 * pane ID;
 * slot;
 * rectangle; and
-* one layout revision shared by the active window projection.
+* one `ClientLayoutRevision` shared by the active projection.
 
 Slots are reusable transport resources, not pane identities. Switching windows can bind the same slot to an entirely different pane.
 
@@ -930,7 +952,7 @@ sequenceDiagram
     S->>N: Attach lease with new layout revision
     N->>C: START_RENDER revision
     N->>C: START_RENDER + first bounded pane batch + PRESENT
-    S->>C: WINDOW_LAYOUT revision and rectangles
+    S->>C: CLIENT_LAYOUT revision and rectangles
     C->>C: Activate after layout and one presented frame per visible pane
     N->>C: Remaining authoritative batches, each ending in PRESENT
 ```
@@ -939,7 +961,7 @@ The old pane stops submitting new work before the new pane receives the lease. A
 
 ## Start render
 
-The first command after a pane acquires a render stream is `START_RENDER`, carrying the current layout revision and pane grid dimensions. It resets the display compiler's stream-local position, style selection, installed styles, and pending frame state. It says that all subsequent commands belong to the current coordinate space and cannot be interpreted as a continuation of the previous pane binding. The revision may be unchanged when a client reconnects to an unchanged layout. The client validates that the dimensions match the rectangle later activated for that slot.
+The first command after a pane acquires a render stream is `START_RENDER`, carrying the prepared `ClientLayoutRevision` and pane grid dimensions. It resets the display compiler's stream-local position, style selection, installed styles, and pending frame state. It says that all subsequent commands belong to the current coordinate space and cannot be interpreted as a continuation of the previous pane binding. A reconnect uses a revision newer than the surviving frontend scanout even when canonical window geometry is unchanged, ensuring that the accompanying full refresh replaces the old pane caches. The client validates that the dimensions match the rectangle later activated for that slot.
 
 The pane then installs canonical styles and begins a complete refresh. The first bounded batch carries `START_RENDER` and ends in `PRESENT`; later batches progressively fill any remaining dirty rows. `START_RENDER` is not itself a control-stream layout message; it is the render stream's declaration of which layout the following pixels belong to.
 
@@ -1228,7 +1250,7 @@ Meja delegates SSH host verification and user authentication to OpenSSH. SSH con
 
 The direct UDP listener accepts only Meja's ALPN and protocol handshake. The initial attach token is random, expires quickly, and is consumed once. TLS 1.3 protects the connection, and the client compares the certificate SPKI to the value received through the command plane.
 
-Reconnect tokens are bearer credentials. Possession allows a peer to attempt to resume that logical client, so they must remain secret in client and server memory. A successful newer instance replaces the older instance for the same credential.
+Reconnect tokens are bearer credentials. Possession allows a peer to attempt to resume that logical client, so they must remain secret in client and server memory. A successful newer instance replaces the older instance indexed for the same identity.
 
 ## Frontend terminal-control boundary
 
@@ -1277,7 +1299,7 @@ Terminal output and frontend input can both be high-volume or adversarial. Meja 
 * command and control frames have maximum payload sizes;
 * strings, byte fields, and argument lists are bounded during decoding;
 * frontend escape sequences and bracketed-paste capture are bounded;
-* only a small number of recent layouts are retained for pointer hit testing;
+* only the current client layout is retained for pointer hit testing;
 * visible panes and render slots are bounded;
 * grid dimensions are bounded;
 * terminal rows are retained in a fixed-capacity circular store;
@@ -1301,16 +1323,18 @@ Performance work is concentrated around semantic hot paths rather than general s
 
 # Protocol evolution
 
-Meja versions its independently evolving boundaries separately:
+Meja has two live compatibility surfaces. The command protocol versions the
+Unix/SSH request and result framing; its attach result contains a separately
+validated bootstrap payload in the current implementation. The exact QUIC
+ALPN, currently `meja-quic/12`, versions the complete interactive profile:
+attachment and resume messages, stream topology, control codecs, display
+opcodes, scanout/cache semantics, reconnect behavior, and coupled terminal
+behavior such as DSCLRM probing. Attach and resume messages therefore do not
+repeat a version field. The durable `.meja` file format retains its own version.
 
-* command request/result framing;
-* command bootstrap contents;
-* the interactive control protocol and its attachment version;
-* the display opcode grammar;
-* QUIC ALPN; and
-* the `.meja` file format.
-
-A change to the SSH-delivered bootstrap need not imply a change to display opcodes. A new frontend event or terminal-control message can evolve within the control boundary. A new `.meja` syntax need not invalidate a compatible live transport. Keeping these versions distinct lets each boundary reject incompatibility where it can explain it accurately.
+`meja version` reports the local product version, `meja version --verbose`
+also reports its command protocol and QUIC profile, and `meja server-version`
+reports the selected running daemon's full compatibility set.
 
 Control decoders validate payload bounds, required fields, message roles, sizes, and versions. Display decoders additionally validate stream roles, slot numbers, relayout dimensions, write bounds, style references, UTF-8, widths, and opcode-specific invariants. Unknown or malformed input fails the relevant operation or connection rather than being applied partially to session state.
 
@@ -1340,9 +1364,9 @@ The server package owns the daemon, command socket, client-instance registry, se
 
 The implementation is split by ownership and data flow rather than by public API. Useful starting points are:
 
-* `daemon.go` and `client_instance.go` for daemon ownership, credentials, QUIC attachment, control streams, session assignment, and switching;
+* `daemon.go` and `client_instance.go` for daemon ownership, client identities and resume tokens, QUIC attachment, control streams, session assignment, and switching;
 * `session.go` and `grouped_sessions.go` for passive session/group/window-view state and daemon-serialized mutations;
-* `client_input.go`, `client_output.go`, `client_projection.go`, `client_runtime.go`, `view_transition.go`, and `frontend_routing.go` for live ClientInstance behavior, transition preparation, exact projection application, and input routing;
+* `client_instance.go`, `client_input.go`, `client_output.go`, `client_runtime.go`, `view_transition.go`, and `frontend_routing.go` for live ClientInstance behavior, transition preparation, exact projection application, and input routing;
 * `frontend_input.go` and `frontend_routing.go` for semantic frontend parsing, mode-aware input encoding, pointer routing, and OSC 52 copy;
 * `pane.go` and `pane_runtime.go` for pane ownership, PTY workers, and the pane actor loop;
 * `pane_render_state.go`, `output_lease.go`, and `pane_display.go` for persistent damage, leased fixed-capacity buffers, output workers, and display compilation;
@@ -1355,7 +1379,7 @@ The implementation is split by ownership and data flow rather than by public API
 
 The protocol package defines command framing, the bidirectional control messages, layout and attachment codecs, display opcodes, bounded binary helpers, shared limits, authentication tokens, and stream-slot conventions. It contains no session policy; it validates and transports values used by the client and server.
 
-`types.go`, `control_codec.go`, `session_codec.go`, `layout_codec.go`, `display_codec.go`, `command.go`, `frame.go`, and `limits.go` are the main boundaries.
+`types.go`, `control_codec.go`, `layout_codec.go`, `display_codec.go`, `command.go`, `frame.go`, and `limits.go` are the main boundaries.
 
 ## `internal/theme` and `internal/version`
 
@@ -1388,7 +1412,7 @@ The suite includes:
 * attach-token expiry, single use, resume, takeover, and live session switching;
 * frontend setup, registered cleanup, disconnect cleanup, and render-loop terminal ownership;
 * output-lease release, `START_RENDER`, grid validation, and revision activation;
-* prepared-transition slice ownership, exact layout/binding publication, grid/layout agreement, and rejected-target source preservation;
+* prepared-transition slice ownership, exact client-layout publication, grid/layout agreement, and rejected-target source preservation;
 * blocked output workers without blocked pane actors;
 * bounded progressive render batches, retained dirty suffixes, and a terminating `PRESENT` in every batch;
 * prediction confirmation, partial confirmation, conflict, and repair;
@@ -1410,20 +1434,20 @@ The following statements summarize the contracts contributors should preserve:
 4. A ClientInstance actor owns prompts, frontend routing, output handoff, status, and transport-local state.
 5. A pane actor alone mutates its terminal state, packed row store, history view, pending damage, and output lease.
 6. A pane and its PTY outlive replacement of the attached client transport.
-7. One reconnect credential represents one logical client across many disposable client instances.
+7. One `ClientIdentity` represents one logical client across many disposable client instances; daemon indexes, not the identity value, own live assignment and instance relationships.
 8. Only the current client instance may control its assigned session.
 9. A session has at most one controlling logical client.
 10. The bidirectional control stream is the authoritative interactive lifecycle and input path.
 11. Disconnected ordinary input is dropped rather than replayed later.
 12. Server-provided frontend setup has paired cleanup, and terminal writes are serialized by the client UI loop.
-13. Every full visible replacement is installed from one `PreparedProjection`; application does not rebuild bindings or layout from live graph state.
-14. Every prepared pane grid matches its published rectangle, and `START_RENDER` and `WINDOW_LAYOUT` carry the same transport-local layout revision.
+13. Every full visible replacement is installed from one `PreparedProjection`; application does not rebuild pane placements or layout from live graph state.
+14. Every prepared pane grid matches its published rectangle, and `START_RENDER` and `CLIENT_LAYOUT` carry the same daemon-allocated `ClientLayoutRevision`.
 15. Pane terminal modes are learned from authoritative PTY output; frontend events are encoded for the pane's current modes on the server.
 16. Pointer hit testing uses the layout revision the frontend reported, not an unrelated current geometry.
 17. An output lease is owned by at most one pane actor, and its render buffer is owned by exactly one of that actor or the lease worker at a time.
 18. Blocking PTY reads, PTY writes, and pane-stream writes occur outside the pane actor and do not mutate its terminal state.
 19. A render slot is a transport resource, not a permanent pane identity.
-20. Every pane render after rebinding begins with `START_RENDER` containing the revision and grid dimensions, followed by a complete refresh that may span multiple presented frames. Reconnection may reuse the existing revision when the layout is unchanged.
+20. Every pane render after rebinding begins with `START_RENDER` containing the prepared revision and grid dimensions, followed by a complete refresh that may span multiple presented frames. Reconnection always allocates a newer `ClientLayoutRevision`, even when canonical window geometry is unchanged.
 21. Every submitted pane render buffer ends with `PRESENT`; no partial batch becomes visible in the UI.
 22. Damage not encoded into one batch remains dirty, and later PTY damage is merged before another borrowed buffer is rendered.
 23. The client activates a layout revision only with initial frames for all its visible panes.

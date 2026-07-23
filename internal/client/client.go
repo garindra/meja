@@ -114,7 +114,7 @@ type paintSpan struct {
 }
 
 type renderFrame struct {
-	layoutRevision uint64
+	layoutRevision protocol.ClientLayoutRevision
 	cols, rows     int
 	styleInstalls  []protocol.StyleDefinition
 	scrollDelta    int
@@ -129,7 +129,7 @@ type paneFrameEvent struct {
 	frame renderFrame
 }
 type localInputEvent struct{ data []byte }
-type layoutEvent struct{ layout protocol.WindowLayout }
+type layoutEvent struct{ layout protocol.ClientLayout }
 type sizeEvent struct{ cols, rows int }
 type reconnectEvent struct {
 	reconnecting bool
@@ -449,7 +449,7 @@ func sendCurrentControlEncoded[T any](current *atomic.Pointer[controlDestination
 	return sendCurrentControl(current, protocol.Frame{Type: msgType, Payload: payload})
 }
 
-func sendFrontendInput(destination *controlDestination, ui *runtimeState, layoutRevision uint64, sourceIdle bool, data, prediction []byte) (bool, error) {
+func sendFrontendInput(destination *controlDestination, ui *runtimeState, layoutRevision protocol.ClientLayoutRevision, sourceIdle bool, data, prediction []byte) (bool, error) {
 	if destination == nil {
 		return false, nil
 	}
@@ -559,9 +559,9 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 	errs := make(chan error, 8)
 	live.start(func() { writeFrames(connCtx, controlStream, live.controlFrames, errs) })
 	if resumeToken == "" {
-		err = enqueueEncoded(live.controlFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Version: protocol.ProtocolVersion, Token: bootstrap.AttachToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionAttach)
+		err = enqueueEncoded(live.controlFrames, protocol.MsgSessionAttach, protocol.SessionAttach{Token: bootstrap.AttachToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionAttach)
 	} else {
-		err = enqueueEncoded(live.controlFrames, protocol.MsgSessionResume, protocol.SessionResume{Version: protocol.ProtocolVersion, ResumeToken: resumeToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeSessionResume)
+		err = enqueueEncoded(live.controlFrames, protocol.MsgClientResume, protocol.ClientResume{ResumeToken: resumeToken, Cols: cols, Rows: drawableRows(int(rows))}, protocol.EncodeClientResume)
 	}
 	if err != nil {
 		return fail(err)
@@ -577,17 +577,14 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 		if decodeErr != nil {
 			return fail(decodeErr)
 		}
-		if msg.Version != protocol.ProtocolVersion || msg.ResumeToken == "" {
+		if msg.ResumeToken == "" {
 			return fail(errors.New("invalid session attachment response"))
 		}
 		live.resumeToken = msg.ResumeToken
-	case protocol.MsgSessionResumeOK:
-		msg, decodeErr := protocol.DecodeSessionResumeOK(attachResult.Payload)
+	case protocol.MsgClientResumeOK:
+		_, decodeErr := protocol.DecodeClientResumeOK(attachResult.Payload)
 		if decodeErr != nil {
 			return fail(decodeErr)
-		}
-		if msg.Version != protocol.ProtocolVersion {
-			return fail(errors.New("invalid session resume response"))
 		}
 		live.resumeToken = resumeToken
 	case protocol.MsgSessionAttachFailed:
@@ -669,6 +666,17 @@ func readFrontendTerminalConfiguration(decoder *protocol.Decoder) ([]byte, []byt
 }
 
 func quicDialError(addr string, err error) error {
+	// QUIC encodes TLS alerts as CRYPTO_ERROR(0x100 + alert). TLS alert 120 is
+	// no_application_protocol, which means the server accepted UDP/QUIC but not
+	// the complete interactive profile selected through ALPN.
+	const noApplicationProtocol = quic.TransportErrorCode(0x100 + 120)
+	var transportError *quic.TransportError
+	if errors.As(err, &transportError) && transportError.ErrorCode == noApplicationProtocol {
+		return fmt.Errorf(
+			"server at %s did not accept client QUIC profile %q; the remote meja binary and running server must use the same QUIC profile as this client. Compare %q locally with %q using the same remote transport options, check --remote-path, and restart the remote server: %w",
+			addr, protocol.ALPN, "meja version --verbose", "meja server-version", err,
+		)
+	}
 	var idleTimeout *quic.IdleTimeoutError
 	if errors.As(err, &idleTimeout) {
 		return fmt.Errorf("UDP %s is unreachable: %w", addr, err)
@@ -785,7 +793,7 @@ func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeS
 
 type displayFrameCompiler struct {
 	slot           uint8
-	layoutRevision uint64
+	layoutRevision protocol.ClientLayoutRevision
 	hasBarrier     bool
 	cols, rows     int
 	row, column    int
@@ -988,10 +996,10 @@ func controlLoop(decoder *protocol.Decoder, ui *runtimeState, controlFrames chan
 			lastContact.Store(time.Now().UnixNano())
 		}
 		switch frame.Type {
-		case protocol.MsgWindowLayout:
-			msg, err := protocol.DecodeWindowLayout(frame.Payload)
+		case protocol.MsgClientLayout:
+			msg, err := protocol.DecodeClientLayout(frame.Payload)
 			if err != nil {
-				done <- connectionResult{err: fmt.Errorf("decode WINDOW_LAYOUT: %w", err)}
+				done <- connectionResult{err: fmt.Errorf("decode CLIENT_LAYOUT: %w", err)}
 				return
 			}
 			ui.emit(layoutEvent{layout: msg})
@@ -1153,7 +1161,7 @@ func forwardInputReads(ctx context.Context, reads <-chan terminalInputRead, cont
 	var predictionDecoder predictionInputDecoder
 	var predictionDestination *controlDestination
 	var pendingDestination *controlDestination
-	var pendingRevision uint64
+	var pendingRevision protocol.ClientLayoutRevision
 	var escapeTimer *time.Timer
 	var escapeTimerC <-chan time.Time
 	stopEscapeTimer := func() {
@@ -1176,7 +1184,7 @@ func forwardInputReads(ctx context.Context, reads <-chan terminalInputRead, cont
 	}
 	defer stopEscapeTimer()
 
-	sendBytes := func(destination *controlDestination, revision uint64, sourceIdle bool, data []byte) (bool, error) {
+	sendBytes := func(destination *controlDestination, revision protocol.ClientLayoutRevision, sourceIdle bool, data []byte) (bool, error) {
 		prediction := predictionDecoder.Feed(data)
 		if sourceIdle {
 			prediction = append(prediction, predictionDecoder.FlushLoneEscape()...)
@@ -1214,7 +1222,7 @@ func forwardInputReads(ctx context.Context, reads <-chan terminalInputRead, cont
 			predictionDestination = destination
 		}
 		stopEscapeTimer()
-		revision := ui.appliedLayoutRevision.Load()
+		revision := protocol.ClientLayoutRevision(ui.appliedLayoutRevision.Load())
 		if pendingDestination != nil {
 			if pendingDestination == destination {
 				data = append([]byte{0x1b}, data...)
@@ -1384,9 +1392,9 @@ func (r *runtimeState) markDisconnected(lastContact time.Time) {
 
 type scanoutState struct {
 	cols, rows        int
-	layout            protocol.WindowLayout
-	pendingLayouts    map[uint64]protocol.WindowLayout
-	pendingFrames     map[uint64]map[uint8][]renderFrame
+	layout            protocol.ClientLayout
+	pendingLayouts    map[protocol.ClientLayoutRevision]protocol.ClientLayout
+	pendingFrames     map[protocol.ClientLayoutRevision]map[uint8][]renderFrame
 	styles            map[uint8]map[uint32]protocol.Style
 	cursors           map[uint8]protocol.CursorUpdate
 	ansi              bytes.Buffer
@@ -1451,7 +1459,7 @@ func (p *paneScanoutCache) scroll(delta int) {
 }
 
 func newScanoutState(rectangularScroll bool) *scanoutState {
-	return &scanoutState{rectangularScroll: rectangularScroll, caches: make(map[uint8]*paneScanoutCache), pendingLayouts: make(map[uint64]protocol.WindowLayout), pendingFrames: make(map[uint64]map[uint8][]renderFrame), styles: make(map[uint8]map[uint32]protocol.Style), cursors: make(map[uint8]protocol.CursorUpdate)}
+	return &scanoutState{rectangularScroll: rectangularScroll, caches: make(map[uint8]*paneScanoutCache), pendingLayouts: make(map[protocol.ClientLayoutRevision]protocol.ClientLayout), pendingFrames: make(map[protocol.ClientLayoutRevision]map[uint8][]renderFrame), styles: make(map[uint8]map[uint32]protocol.Style), cursors: make(map[uint8]protocol.CursorUpdate)}
 }
 
 func (s *scanoutState) takeANSI() []byte {
@@ -1460,11 +1468,14 @@ func (s *scanoutState) takeANSI() []byte {
 	return out
 }
 
-func (s *scanoutState) acceptLayout(layout protocol.WindowLayout) (bool, error) {
+func (s *scanoutState) acceptLayout(layout protocol.ClientLayout) (bool, error) {
 	if layout.LayoutRevision < s.layout.LayoutRevision {
 		return false, nil
 	}
 	if layout.LayoutRevision == s.layout.LayoutRevision && s.layout.LayoutRevision != 0 {
+		if !sameClientLayoutGeometry(s.layout, layout) {
+			return false, errors.New("client layout with same revision changed geometry")
+		}
 		focusChanged := layout.FocusedPaneID != s.layout.FocusedPaneID
 		if focusChanged {
 			if _, err := s.resetPrediction(); err != nil {
@@ -1481,6 +1492,18 @@ func (s *scanoutState) acceptLayout(layout protocol.WindowLayout) (bool, error) 
 	}
 	s.pendingLayouts[layout.LayoutRevision] = layout
 	return s.tryActivate(layout.LayoutRevision)
+}
+
+func sameClientLayoutGeometry(left, right protocol.ClientLayout) bool {
+	if left.WindowID != right.WindowID || len(left.Panes) != len(right.Panes) {
+		return false
+	}
+	for index := range left.Panes {
+		if left.Panes[index] != right.Panes[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *scanoutState) acceptFrame(slot uint8, frame renderFrame) (bool, error) {
@@ -1514,7 +1537,7 @@ func (s *scanoutState) acceptFrame(slot uint8, frame renderFrame) (bool, error) 
 	return s.tryActivate(frame.layoutRevision)
 }
 
-func (s *scanoutState) tryActivate(revision uint64) (bool, error) {
+func (s *scanoutState) tryActivate(revision protocol.ClientLayoutRevision) (bool, error) {
 	layout, ok := s.pendingLayouts[revision]
 	if !ok {
 		return false, nil
@@ -1659,7 +1682,7 @@ func (s *scanoutState) clearContentRows() {
 	}
 }
 
-func (s *scanoutState) emitLayoutBorders(layout protocol.WindowLayout) {
+func (s *scanoutState) emitLayoutBorders(layout protocol.ClientLayout) {
 	inactiveStyle := protocol.CanonicalDefaultStyle()
 	activeStyle := inactiveStyle
 	activeStyle.FG = theme.AccentColor()
@@ -1687,7 +1710,7 @@ func (s *scanoutState) emitLayoutBorders(layout protocol.WindowLayout) {
 	}
 }
 
-func placementForSlot(layout protocol.WindowLayout, slot uint8) (protocol.PanePlacement, bool) {
+func placementForSlot(layout protocol.ClientLayout, slot uint8) (protocol.PanePlacement, bool) {
 	for _, placement := range layout.Panes {
 		if placement.Slot == slot {
 			return placement, true
@@ -2052,7 +2075,7 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 			return err
 		}
 		if state.layout.LayoutRevision != 0 {
-			r.appliedLayoutRevision.Store(state.layout.LayoutRevision)
+			r.appliedLayoutRevision.Store(uint64(state.layout.LayoutRevision))
 		}
 		return nil
 	}
@@ -2141,7 +2164,7 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 					e.layout.WindowID, e.layout.LayoutRevision, len(e.layout.Panes), needsPresent,
 					state.layout.LayoutRevision, len(state.pendingLayouts), len(state.pendingFrames)))
 			}
-			reason = "window-layout"
+			reason = "client-layout"
 		case paneFrameEvent:
 			if r.dropConnectionEvents.Load() {
 				return false, "", nil

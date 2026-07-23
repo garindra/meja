@@ -8,6 +8,35 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
+func TestDaemonPreparesFinalClientLayoutRevision(t *testing.T) {
+	state, client, _, _ := preparedTransitionFixture(t, 12, 4)
+	client.identity = &ClientIdentity{lastAllocatedClientLayoutRevision: 17}
+	state.daemon.clientInstances[client.identity] = client
+	client.currentLayout.LayoutRevision = 17
+
+	var transition PreparedViewTransition
+	state.daemon.call(func() {
+		transition = state.daemon.prepareViewTransitionNow(viewTransitionLayout, client, state)
+	})
+	if got := transition.Projection.Layout.LayoutRevision; got != 18 {
+		t.Fatalf("prepared client layout revision = %d, want 18", got)
+	}
+	if got := client.identity.lastAllocatedClientLayoutRevision; got != 18 {
+		t.Fatalf("identity client layout revision = %d, want 18", got)
+	}
+
+	_, err := client.prepareProjection(transition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := commitTestProjection(client, transition); err != nil {
+		t.Fatal(err)
+	}
+	if got := client.currentLayout.LayoutRevision; got != 18 {
+		t.Fatalf("applied client layout revision = %d, want prepared revision 18", got)
+	}
+}
+
 func preparedTransitionFixture(t *testing.T, cols, rows int) (*SessionState, *ClientInstance, *Pane, ClientProjectionPlan) {
 	t.Helper()
 	state := NewSessionState(0)
@@ -17,7 +46,7 @@ func preparedTransitionFixture(t *testing.T, cols, rows int) (*SessionState, *Cl
 	client := testClientInstance(make(chan protocol.Frame, 4), map[int]*OutputLease{0: testOutputLease(0, &bytes.Buffer{})})
 	attachDisplayTestClient(t, state, client)
 	var plan ClientProjectionPlan
-	state.daemon.call(func() { plan = state.daemon.projectionPlanLockedWithRevision(client, state, true) })
+	state.daemon.call(func() { plan = state.daemon.prepareViewTransitionNow(viewTransitionLayout, client, state).Projection })
 	return state, client, pane, plan
 }
 
@@ -27,24 +56,24 @@ func TestPreparedProjectionOwnsDaemonPlanSlices(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan.Panes[0].Rect.Width = 1
-	plan.Bindings[0].Slot = 7
-	if got := prepared.Plan.Panes[0].Rect.Width; got != 12 {
+	plan.Layout.Panes[0].Rect.Width = 1
+	plan.Layout.Panes[0].Slot = 7
+	if got := prepared.Plan.Layout.Panes[0].Rect.Width; got != 12 {
 		t.Fatalf("prepared plan width changed through source slice: got %d, want 12", got)
 	}
-	if got := prepared.Bindings[0].Binding.Slot; got != 0 {
-		t.Fatalf("prepared binding slot changed through source slice: got %d, want 0", got)
+	if got := prepared.Panes[0].Placement.Slot; got != 0 {
+		t.Fatalf("prepared pane slot changed through source slice: got %d, want 0", got)
 	}
 }
 
 func TestPrepareProjectionRejectsPaneGridLayoutMismatch(t *testing.T) {
 	_, client, pane, plan := preparedTransitionFixture(t, 12, 4)
-	plan.Panes[0].Rect.Width = 11
+	plan.Layout.Panes[0].Rect.Width = 11
 	_, err := client.prepareProjection(PreparedViewTransition{Reason: viewTransitionResize, Projection: plan})
 	if err == nil || !strings.Contains(err.Error(), "grid 12x4 does not match layout 11x4") {
 		t.Fatalf("prepare error = %v, want pane grid/layout mismatch", err)
 	}
-	if got := client.projectionRevision.Load(); got >= plan.ProjectionRevision {
+	if got := client.appliedProjectionRevision.Load(); got >= plan.ProjectionRevision {
 		t.Fatalf("invalid projection revision %d was installed; client revision=%d", plan.ProjectionRevision, got)
 	}
 	_ = pane
@@ -73,7 +102,7 @@ func TestPreparedProjectionBindsResolvedPaneWithoutGraphReread(t *testing.T) {
 		t.Fatalf("prepared pane emitted %#v, want START_RENDER", commandOpcodes(commands))
 	}
 	frame := <-client.controlOut
-	layout, err := protocol.DecodeWindowLayout(frame.Payload)
+	layout, err := protocol.DecodeClientLayout(frame.Payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +158,7 @@ func TestDaemonPreparesResizeAndClientAppliesPhysicalGrid(t *testing.T) {
 	if cols, rows := pane.TerminalSize(); cols != 20 || rows != 6 {
 		t.Fatalf("daemon preparation changed physical pane grid to %dx%d", cols, rows)
 	}
-	if len(transition.PaneResizes) != 1 || transition.PaneResizes[0].Rect.Width != 80 || transition.PaneResizes[0].Rect.Height != 20 {
+	if len(transition.PaneResizes) != 1 || transition.PaneResizes[0].Cols != 80 || transition.PaneResizes[0].Rows != 20 {
 		t.Fatalf("prepared pane resizes = %#v, want one 80x20 resize", transition.PaneResizes)
 	}
 	if err := client.applyViewTransition(transition); err != nil {

@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/garindra/meja/internal/client"
+	"github.com/garindra/meja/internal/protocol"
 	"github.com/garindra/meja/internal/server"
 	"github.com/garindra/meja/internal/version"
 )
@@ -70,11 +71,15 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 		}
 		return server.Run(ctx, server.Config{ControlPath: socket, Stdout: stdout, Stderr: stderr})
 	case "version":
-		if len(cfg.CommandArgs) != 1 {
-			return usageError{"version accepts no arguments"}
+		if len(cfg.CommandArgs) == 1 {
+			fmt.Fprintf(stdout, "meja %s\n", version.Current())
+			return nil
 		}
-		fmt.Fprintf(stdout, "meja %s\n", version.Current())
-		return nil
+		if len(cfg.CommandArgs) == 2 && cfg.CommandArgs[1] == "--verbose" {
+			fmt.Fprintf(stdout, "meja:             %s\ncommand protocol: %d\nQUIC profile:     %s\n", version.Current(), protocol.CommandProtocolVersion, protocol.ALPN)
+			return nil
+		}
+		return usageError{"version accepts only --verbose"}
 	case "__ssh-forward-v1":
 		if !cfg.Local || len(cfg.CommandArgs) != 1 {
 			return usageError{"__ssh-forward-v1 accepts no arguments"}

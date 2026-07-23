@@ -96,8 +96,8 @@ func TestHistorySelectionPositionSnapsWideContinuationToAnchor(t *testing.T) {
 
 func TestPanesRetainIndependentHistoryViews(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 8, 4
+	client := newTestClient(s)
+	client.setTestTerminalSize(8, 4)
 	pane0 := &Pane{ID: testAddPaneID(s), terminal: newTerminal(8, 4)}
 	createTestWindow(s, pane0)
 	pane1 := &Pane{ID: testAddPaneID(s), terminal: newTerminal(8, 4)}

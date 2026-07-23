@@ -322,6 +322,22 @@ func TestQUICDialIdleTimeoutReportsUnreachableUDPAddress(t *testing.T) {
 	}
 }
 
+func TestQUICDialALPNRejectionReportsIncompatibleServer(t *testing.T) {
+	cause := &quic.TransportError{
+		Remote:       true,
+		ErrorCode:    0x178,
+		ErrorMessage: "tls: no application protocol",
+	}
+	err := quicDialError("example.com:60000", cause)
+	want := `server at example.com:60000 did not accept client QUIC profile "meja-quic/12"; the remote meja binary and running server must use the same QUIC profile as this client. Compare "meja version --verbose" locally with "meja server-version" using the same remote transport options, check --remote-path, and restart the remote server: CRYPTO_ERROR 0x178 (remote): tls: no application protocol`
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err, want)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("formatted error does not preserve the QUIC transport failure")
+	}
+}
+
 func TestQUICDialOtherErrorsKeepDialContext(t *testing.T) {
 	cause := errors.New("resolve failed")
 	err := quicDialError("example.com:60000", cause)
@@ -385,7 +401,7 @@ func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
 	errs := make(chan error, 2)
 	go ui.renderLoop(ctx, errs)
 	ui.emit(sizeEvent{cols: 8, rows: 4})
-	ui.emit(layoutEvent{layout: protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 8, Height: 3}}}}})
+	ui.emit(layoutEvent{layout: protocol.ClientLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 8, Height: 3}}}}})
 	reader, writer := io.Pipe()
 	defer reader.Close()
 	defer writer.Close()
@@ -682,7 +698,7 @@ func TestDroppedFrontendInputDoesNotQueuePredictionEvents(t *testing.T) {
 	var control atomic.Pointer[controlDestination]
 	control.Store(&controlDestination{frames: frames, done: done})
 	ui := &runtimeState{events: make(chan renderEvent, 2)}
-	if _, err := sendFrontendInput(control.Load(), ui, ui.appliedLayoutRevision.Load(), false, []byte("a"), []byte("a")); err != nil {
+	if _, err := sendFrontendInput(control.Load(), ui, protocol.ClientLayoutRevision(ui.appliedLayoutRevision.Load()), false, []byte("a"), []byte("a")); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -698,7 +714,7 @@ func TestQueuedFrontendInputQueuesDecodedPrediction(t *testing.T) {
 	var control atomic.Pointer[controlDestination]
 	control.Store(&controlDestination{frames: frames, done: done})
 	ui := &runtimeState{events: make(chan renderEvent, 1)}
-	if _, err := sendFrontendInput(control.Load(), ui, ui.appliedLayoutRevision.Load(), false, []byte("\x1b[97u"), []byte("a")); err != nil {
+	if _, err := sendFrontendInput(control.Load(), ui, protocol.ClientLayoutRevision(ui.appliedLayoutRevision.Load()), false, []byte("\x1b[97u"), []byte("a")); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -987,7 +1003,7 @@ func TestLayoutActivationPreservesStatusRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
-	layout := protocol.WindowLayout{WindowID: 1, LayoutRevision: 2, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 12, Height: 3}}}}
+	layout := protocol.ClientLayout{WindowID: 1, LayoutRevision: 2, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 12, Height: 3}}}}
 	_, _ = s.acceptLayout(layout)
 	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 2}); err != nil {
 		t.Fatal(err)
@@ -1044,7 +1060,7 @@ func TestStatusFrameCannotWrapWhileLocalResizeEventIsPending(t *testing.T) {
 func TestPaneFrameCannotWrapWhileLocalResizeEventIsPending(t *testing.T) {
 	state := newScanoutState(true)
 	state.cols, state.rows = 80, 4
-	state.layout = protocol.WindowLayout{
+	state.layout = protocol.ClientLayout{
 		WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1,
 		Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 80, Height: 3}}},
 	}
@@ -1178,8 +1194,8 @@ func TestReconnectStateIsLocalToRuntime(t *testing.T) {
 	}
 }
 
-func testSnapshotLayout(revision uint64) protocol.WindowLayout {
-	return protocol.WindowLayout{WindowID: 1, FocusedPaneID: 1, LayoutRevision: revision, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 80, Height: 23}}}}
+func testSnapshotLayout(revision protocol.ClientLayoutRevision) protocol.ClientLayout {
+	return protocol.ClientLayout{WindowID: 1, FocusedPaneID: 1, LayoutRevision: revision, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 80, Height: 23}}}}
 }
 
 func waitForBufferText(t *testing.T, buffer *lockedBuffer, want string) {
@@ -1503,7 +1519,7 @@ func TestClientCacheAndRepaintPreserveMixedInternationalClusters(t *testing.T) {
 func TestNativeScrollUsesRectangularMargins(t *testing.T) {
 	s := newScanoutState(true)
 	s.cols, s.rows = 12, 5
-	layout := protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{X: 6, Width: 6, Height: 4}}}}
+	layout := protocol.ClientLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{X: 6, Width: 6, Height: 4}}}}
 	if _, err := s.acceptLayout(layout); err != nil {
 		t.Fatal(err)
 	}
@@ -1522,7 +1538,7 @@ func TestNativeScrollUsesRectangularMargins(t *testing.T) {
 
 func TestScanoutDropsGeometryMismatchedPaneFrame(t *testing.T) {
 	const revision = 7
-	layout := protocol.WindowLayout{
+	layout := protocol.ClientLayout{
 		WindowID:       1,
 		LayoutRevision: revision,
 		FocusedPaneID:  1,
@@ -1585,7 +1601,7 @@ func TestScanoutDropsGeometryMismatchedPaneFrame(t *testing.T) {
 
 func TestFocusOnlyLayoutActivatesWithoutReplacementPaneFrames(t *testing.T) {
 	const revision = 8
-	layout := protocol.WindowLayout{
+	layout := protocol.ClientLayout{
 		WindowID:       1,
 		LayoutRevision: revision,
 		FocusedPaneID:  1,
@@ -1619,10 +1635,32 @@ func TestFocusOnlyLayoutActivatesWithoutReplacementPaneFrames(t *testing.T) {
 	}
 }
 
+func TestEqualRevisionClientLayoutRejectsGeometryChange(t *testing.T) {
+	layout := protocol.ClientLayout{
+		WindowID: 1, LayoutRevision: 8, FocusedPaneID: 1,
+		Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 10, Height: 4}}},
+	}
+	s := newScanoutState(false)
+	s.cols, s.rows = 10, 5
+	if _, err := s.acceptLayout(layout); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 8, cols: 10, rows: 4}); err != nil {
+		t.Fatal(err)
+	}
+
+	changed := layout
+	changed.Panes = append([]protocol.PanePlacement(nil), layout.Panes...)
+	changed.Panes[0].Rect.Width = 9
+	if _, err := s.acceptLayout(changed); err == nil || !strings.Contains(err.Error(), "same revision changed geometry") {
+		t.Fatalf("equal-revision geometry error = %v", err)
+	}
+}
+
 func TestFullWidthScrollUsesOnlyVerticalMargins(t *testing.T) {
 	s := newScanoutState(false)
 	s.cols, s.rows = 12, 5
-	layout := protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 12, Height: 4}}}}
+	layout := protocol.ClientLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 12, Height: 4}}}}
 	if _, err := s.acceptLayout(layout); err != nil {
 		t.Fatal(err)
 	}
@@ -1645,7 +1683,7 @@ func TestFullWidthScrollUsesOnlyVerticalMargins(t *testing.T) {
 func TestFallbackScrollRetainsVisibleRows(t *testing.T) {
 	s := newScanoutState(false)
 	s.cols, s.rows = 6, 4
-	layout := protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{X: 2, Width: 4, Height: 3}}}}
+	layout := protocol.ClientLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{X: 2, Width: 4, Height: 3}}}}
 	_, _ = s.acceptLayout(layout)
 	full := renderFrame{layoutRevision: 1, spans: []paintSpan{
 		{kind: paintText, row: 0, styleID: 0, cellWidth: 1, text: []byte("aaaa")},

@@ -26,7 +26,6 @@ type statusModel struct {
 type statusCommand struct {
 	attach io.Writer
 	detach bool
-	client *ClientInstance
 	model  *statusModel
 	done   chan error
 }
@@ -50,15 +49,14 @@ func (c *ClientInstance) sendStatusCommand(command statusCommand) error {
 }
 
 func (c *ClientInstance) attachStatusOutput(stream io.Writer) error {
-	return c.sendStatusCommand(statusCommand{attach: stream, client: c})
+	return c.sendStatusCommand(statusCommand{attach: stream})
 }
 
 func (c *ClientInstance) detachStatusOutput() error {
-	return c.sendStatusCommand(statusCommand{detach: true, client: c})
+	return c.sendStatusCommand(statusCommand{detach: true})
 }
 
 func (c *ClientInstance) runStatusOutput() {
-	var client *ClientInstance
 	var output *renderOutput
 	initialized := false
 	var latest statusModel
@@ -69,7 +67,6 @@ func (c *ClientInstance) runStatusOutput() {
 			var err error
 			switch {
 			case command.attach != nil:
-				client = command.client
 				output = newRenderOutput(command.attach)
 				initialized = false
 				if hasLatest {
@@ -77,11 +74,8 @@ func (c *ClientInstance) runStatusOutput() {
 					initialized = err == nil
 				}
 			case command.detach:
-				if client == command.client {
-					client = nil
-					output = nil
-					initialized = false
-				}
+				output = nil
+				initialized = false
 			case command.model != nil:
 				latest = *command.model
 				hasLatest = true
@@ -261,15 +255,14 @@ func statusLocation(hostname, root, home string) string {
 }
 
 func (c *ClientInstance) publishStatusBar() error {
-	client := c.snapshotClient()
-	if client == nil || client.TerminalCols == 0 {
+	width := int(c.terminalCols.Load())
+	if width == 0 {
 		return nil
 	}
 	status, ok := c.Daemon.clientStatusSnapshot(c.sessionID)
 	if !ok {
 		return nil
 	}
-	width := int(client.TerminalCols)
 	styleID := statusNormalStyleID
 	text := ""
 	if prompt := c.ActivePrompt(); prompt != nil {
@@ -303,35 +296,11 @@ func (c *ClientInstance) publishStatusBar() error {
 	}})
 }
 
-func (c *ClientInstance) publishWindowLayout() error {
-	if err := c.cancelFrontendPointerCapture(); err != nil {
-		return err
-	}
-	layout, err := c.windowLayout()
-	if err != nil {
-		return err
-	}
-	client := c.sessionState().attachedClient()
-	if client != nil {
-		client.rememberLayout(layout)
-		for previous := client.highestLayoutRevision.Load(); layout.LayoutRevision > previous; previous = client.highestLayoutRevision.Load() {
-			if client.highestLayoutRevision.CompareAndSwap(previous, layout.LayoutRevision) {
-				break
-			}
-		}
-	}
-	if client == nil || client.controlOut == nil {
-		return nil
-	}
-	return sendEncoded(client.controlOut, protocol.MsgWindowLayout, layout, protocol.EncodeWindowLayout)
-}
-
-func (c *ClientInstance) publishPreparedWindowLayout(layout protocol.WindowLayout) error {
-	c.rememberLayout(layout)
+func (c *ClientInstance) sendPreparedClientLayout(layout protocol.ClientLayout) error {
 	if c.controlOut == nil {
 		return nil
 	}
-	return sendEncoded(c.controlOut, protocol.MsgWindowLayout, layout, protocol.EncodeWindowLayout)
+	return sendEncoded(c.controlOut, protocol.MsgClientLayout, layout, protocol.EncodeClientLayout)
 }
 
 type outputHandoff struct {
@@ -341,24 +310,21 @@ type outputHandoff struct {
 }
 
 func (c *ClientInstance) beginOutputHandoffWithRemovedPanes(removedPanes []*Pane) *outputHandoff {
-	bindings := append([]RenderBinding(nil), c.installedBindings...)
-	if len(bindings) == 0 {
-		bindings = c.renderBindings()
-	}
+	placements := c.currentPanePlacements()
 	handoff := &outputHandoff{
-		released: make(chan *OutputLease, len(bindings)),
-		pending:  make(map[int]struct{}, len(bindings)),
+		released: make(chan *OutputLease, len(placements)),
+		pending:  make(map[int]struct{}, len(placements)),
 	}
-	for _, binding := range bindings {
+	for _, placement := range placements {
 		var pane *Pane
 		if c.Daemon != nil {
-			if value, ok := c.Daemon.paneIndex.Load(binding.PaneID); ok && value != nil {
+			if value, ok := c.Daemon.paneIndex.Load(placement.PaneID); ok && value != nil {
 				pane = value.(*Pane)
 			}
 		}
 		if pane == nil {
 			for _, removed := range removedPanes {
-				if removed != nil && removed.ID == binding.PaneID {
+				if removed != nil && removed.ID == placement.PaneID {
 					pane = removed
 					break
 				}
@@ -367,45 +333,43 @@ func (c *ClientInstance) beginOutputHandoffWithRemovedPanes(removedPanes []*Pane
 		if pane == nil {
 			continue
 		}
-		handoff.pending[binding.Slot] = struct{}{}
+		handoff.pending[int(placement.Slot)] = struct{}{}
 		pane.releaseOutputStream(handoff.released)
 	}
 	return handoff
 }
 
 func (c *ClientInstance) finishPreparedOutputHandoff(handoff *outputHandoff, prepared PreparedProjection) error {
-	bySlot := make(map[int]PreparedRenderBinding, len(prepared.Bindings))
-	bindings := make([]RenderBinding, 0, len(prepared.Bindings))
-	for _, binding := range prepared.Bindings {
-		bySlot[binding.Binding.Slot] = binding
-		bindings = append(bindings, binding.Binding)
+	bySlot := make(map[int]PreparedRenderPane, len(prepared.Panes))
+	for _, pane := range prepared.Panes {
+		bySlot[int(pane.Placement.Slot)] = pane
 	}
-	attach := func(binding PreparedRenderBinding) error {
-		lease := c.currentOutputLease(binding.Binding.Slot)
-		if lease == nil || binding.Pane == nil {
+	attach := func(preparedPane PreparedRenderPane) error {
+		placement := preparedPane.Placement
+		lease := c.currentOutputLease(int(placement.Slot))
+		if lease == nil || preparedPane.Pane == nil {
 			return nil
 		}
-		cols, rows := binding.Pane.TerminalSize()
-		if cols != binding.Rect.Width || rows != binding.Rect.Height {
-			return fmt.Errorf("pane %d grid changed from prepared layout %dx%d to %dx%d", binding.Pane.ID, binding.Rect.Width, binding.Rect.Height, cols, rows)
+		cols, rows := preparedPane.Pane.TerminalSize()
+		if cols != placement.Rect.Width || rows != placement.Rect.Height {
+			return fmt.Errorf("pane %d grid changed from prepared layout %dx%d to %dx%d", preparedPane.Pane.ID, placement.Rect.Width, placement.Rect.Height, cols, rows)
 		}
 		c.Daemon.logf("meja projection: bind attachment=%d session=%d window=%d pane=%d slot=%d revision=%d grid=%dx%d\n",
-			c.AttachmentID, prepared.Plan.SessionID, prepared.Plan.WindowID, binding.Pane.ID, binding.Binding.Slot,
-			prepared.Layout.LayoutRevision, cols, rows)
-		return binding.Pane.attachOutputStream(lease, prepared.Layout.LayoutRevision)
+			c.AttachmentID, prepared.Plan.SessionID, prepared.Plan.Layout.WindowID, preparedPane.Pane.ID, placement.Slot,
+			prepared.Plan.Layout.LayoutRevision, cols, rows)
+		return preparedPane.Pane.attachOutputStream(lease, prepared.Plan.Layout.LayoutRevision)
 	}
 	if handoff == nil || handoff.waited {
-		for _, binding := range prepared.Bindings {
-			if err := attach(binding); err != nil {
+		for _, pane := range prepared.Panes {
+			if err := attach(pane); err != nil {
 				return err
 			}
 		}
-		c.installedBindings = append(c.installedBindings[:0], bindings...)
 		return nil
 	}
-	for _, binding := range prepared.Bindings {
-		if _, waiting := handoff.pending[binding.Binding.Slot]; !waiting {
-			if err := attach(binding); err != nil {
+	for _, pane := range prepared.Panes {
+		if _, waiting := handoff.pending[int(pane.Placement.Slot)]; !waiting {
+			if err := attach(pane); err != nil {
 				return err
 			}
 		}
@@ -433,7 +397,6 @@ func (c *ClientInstance) finishPreparedOutputHandoff(handoff *outputHandoff, pre
 			}
 		}
 	}
-	c.installedBindings = append(c.installedBindings[:0], bindings...)
 	return nil
 }
 
@@ -448,11 +411,8 @@ func (c *ClientInstance) waitOutputHandoff(handoff *outputHandoff) error {
 	return nil
 }
 
-func (c *ClientInstance) detachLeases(state *SessionState, leases map[int]*OutputLease) error {
-	if state == nil {
-		return nil
-	}
-	for _, pane := range state.PanesSnapshot() {
+func (c *ClientInstance) detachLeases(panes []*Pane, leases map[int]*OutputLease) error {
+	for _, pane := range panes {
 		for _, lease := range leases {
 			if err := pane.detachOutputStream(lease.Stream); err != nil {
 				return err

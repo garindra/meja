@@ -12,7 +12,10 @@ import (
 
 func attachStatusTestClient(t *testing.T, s *SessionState, client *ClientInstance) {
 	t.Helper()
-	setTestClient(s, client)
+	previous := clientForState(s)
+	client.terminalCols.Store(previous.terminalCols.Load())
+	client.terminalRows.Store(previous.terminalRows.Load())
+	setLeasedTestClient(t, s, client, 1)
 	if err := client.attachStatusOutput(client.StatusOutput); err != nil {
 		t.Fatal(err)
 	}
@@ -20,8 +23,8 @@ func attachStatusTestClient(t *testing.T, s *SessionState, client *ClientInstanc
 
 func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	s := NewSessionState(1)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	window, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash"})
 	statusClient := newStatusTestClient()
 	state := s
@@ -123,8 +126,8 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 func TestRenameSessionPromptUpdatesStatusName(t *testing.T) {
 	s := NewSessionState(7)
 	s.setSessionName("work")
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash"})
 	statusClient := newStatusTestClient()
 	state := s
@@ -160,8 +163,8 @@ func TestRenameSessionPromptUpdatesStatusName(t *testing.T) {
 
 func TestZoomedWindowStatusIncludesZFlag(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash", terminal: newTerminal(80, 23)})
 	if _, _, err := splitTestFocusedPane(s, &Pane{ID: testAddPaneID(s), Title: "logs", terminal: newTerminal(80, 23)}, SplitVertical); err != nil {
 		t.Fatal(err)
@@ -176,8 +179,8 @@ func TestZoomedWindowStatusIncludesZFlag(t *testing.T) {
 
 func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 	s := NewSessionState(1)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash", terminal: newTerminal(80, 23)})
 	statusClient := newStatusTestClient()
 	attachStatusTestClient(t, s, testClientInstance(nil, nil, &statusClient.wire))
@@ -238,8 +241,8 @@ func TestSuccessfulSetRootPromptRestoresNormalStatus(t *testing.T) {
 	s.rootDir = root
 	s.daemon = testDaemonForState(s)
 	s.daemon.processObserver = emptyProcessObserver{}
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	pane := &Pane{
 		ID:       testAddPaneID(s),
 		Title:    "bash",
@@ -439,8 +442,8 @@ func TestStatusLinePartsSharesOverflowAndKeepsLocationTail(t *testing.T) {
 
 func TestStatusOutputReconnectGetsBarrierlessFullRefresh(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 40, 3
+	client := newTestClient(s)
+	client.setTestTerminalSize(40, 3)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash"})
 
 	first := newStatusTestClient()
@@ -467,7 +470,7 @@ func TestStatusOutputReconnectGetsBarrierlessFullRefresh(t *testing.T) {
 	}
 
 	firstConnection.detaching.Store(true)
-	clientForState(s).detachClientInstance()
+	firstConnection.releaseFrontendResources(nil)
 	s.Name = "live"
 	if err := clientForState(s).publishStatusBar(); err != nil {
 		t.Fatal(err)

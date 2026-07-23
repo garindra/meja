@@ -91,8 +91,8 @@ func TestPasteBufferCommandUsesTmuxSeparatorsAndDeletes(t *testing.T) {
 	t.Cleanup(func() { stopState(s) })
 	s.daemon = d
 	s.setSessionName("work")
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 8, 1
+	client := newTestClient(s)
+	client.setTestTerminalSize(8, 1)
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)

@@ -39,11 +39,15 @@ type SessionState struct {
 	group            *GroupState
 	grouped          atomic.Bool
 
-	NextLayoutRevision uint64
+	lastWindowLayoutRevision WindowLayoutRevision
 
 	daemon  *Daemon
 	rootDir string
 }
+
+// WindowLayoutRevision versions canonical daemon-owned window geometry. It is
+// never sent to a frontend or used as a ClientLayoutRevision.
+type WindowLayoutRevision uint64
 
 type Window struct {
 	ID               uint64
@@ -55,7 +59,7 @@ type Window struct {
 	Zoomed           bool
 	ZoomedPaneID     uint64
 	Layout           LayoutNode
-	LayoutRevision   uint64
+	LayoutRevision   WindowLayoutRevision
 	Cols             uint16
 	Rows             uint16
 	layoutCycleIndex int
@@ -102,11 +106,6 @@ type promptResult struct {
 
 type promptContinuation func(promptResult) (bool, error)
 
-type RenderBinding struct {
-	Slot   int
-	PaneID uint64
-}
-
 type PaneSwapDirection int8
 
 const (
@@ -143,9 +142,9 @@ func (s *SessionState) contextualPaneRequest(request paneRequest) paneRequest {
 	return request
 }
 
-func (s *SessionState) nextLayoutRevisionLocked() uint64 {
-	s.NextLayoutRevision++
-	return s.NextLayoutRevision
+func (s *SessionState) nextWindowLayoutRevisionNow() WindowLayoutRevision {
+	s.lastWindowLayoutRevision++
+	return s.lastWindowLayoutRevision
 }
 
 func (s *SessionState) markSessionChangedForPersistence() {
@@ -194,7 +193,7 @@ func (s *SessionState) createWindowNow(pane *Pane, cols, rows uint16) (*Window, 
 		AutomaticName:    true,
 		ActivePaneID:     pane.ID,
 		Layout:           &PaneLayout{PaneID: pane.ID},
-		LayoutRevision:   s.nextLayoutRevisionLocked(),
+		LayoutRevision:   s.nextWindowLayoutRevisionNow(),
 		Cols:             cols,
 		Rows:             rows,
 		layoutCycleIndex: layoutPresetCustom,
@@ -242,7 +241,7 @@ func (s *SessionState) activePane() *Pane {
 	if window == nil {
 		return nil
 	}
-	view := s.groupWindowViewLocked(window.ID)
+	view := s.groupWindowViewNow(window.ID)
 	paneID := view.FocusedPaneID
 	if paneID == 0 {
 		paneID = window.ActivePaneID
@@ -281,7 +280,7 @@ func (s *SessionState) RenameWindow(windowID uint64, name string) (*Window, erro
 		s.markWindowChangedForPersistence(windowID)
 		if s.isGrouped() && s.daemon != nil {
 			var members []*SessionState
-			s.daemon.call(func() { members = s.groupMembersLocked() })
+			s.daemon.call(func() { members = s.groupMembersNow() })
 			for _, member := range members {
 				if member == s {
 					continue
@@ -303,17 +302,17 @@ func (s *SessionState) focusPaneNow(paneID uint64) (*Window, error) {
 	if !windowHasPane(window, paneID) {
 		return nil, fmt.Errorf("pane %d not visible in window %d", paneID, window.ID)
 	}
-	view := s.groupWindowViewLocked(window.ID)
+	view := s.groupWindowViewNow(window.ID)
 	if (view.ZoomedPaneID != 0 || (!s.isGrouped() && window.Zoomed)) && view.ZoomedPaneID != paneID {
 		view.ZoomedPaneID = 0
 		if !s.isGrouped() {
 			window.clearZoom()
 		}
-		window.LayoutRevision = s.nextLayoutRevisionLocked()
+		window.LayoutRevision = s.nextWindowLayoutRevisionNow()
 	}
 	changed := view.FocusedPaneID != paneID
 	view.focusPane(paneID)
-	s.setGroupWindowViewLocked(window.ID, view)
+	s.setGroupWindowViewNow(window.ID, view)
 	if !s.isGrouped() {
 		window.ActivePaneID = paneID
 	}
@@ -331,7 +330,7 @@ func (s *SessionState) toggleZoomNow() (*Window, bool, error) {
 	if len(window.Layout.PaneIDs()) <= 1 {
 		return cloneWindow(window), false, nil
 	}
-	view := s.groupWindowViewLocked(window.ID)
+	view := s.groupWindowViewNow(window.ID)
 	focusedPaneID := view.FocusedPaneID
 	if focusedPaneID == 0 {
 		focusedPaneID = window.ActivePaneID
@@ -351,8 +350,8 @@ func (s *SessionState) toggleZoomNow() (*Window, bool, error) {
 			window.ZoomedPaneID = focusedPaneID
 		}
 	}
-	s.setGroupWindowViewLocked(window.ID, view)
-	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	s.setGroupWindowViewNow(window.ID, view)
+	window.LayoutRevision = s.nextWindowLayoutRevisionNow()
 	return cloneWindow(window), true, nil
 }
 
@@ -365,7 +364,7 @@ func (s *SessionState) cycleWindowLayoutNow() (*Window, bool, error) {
 	if len(paneIDs) <= 1 {
 		return cloneWindow(window), false, nil
 	}
-	view := s.groupWindowViewLocked(window.ID)
+	view := s.groupWindowViewNow(window.ID)
 	focusedPaneID := view.FocusedPaneID
 	if focusedPaneID == 0 {
 		focusedPaneID = window.ActivePaneID
@@ -377,8 +376,8 @@ func (s *SessionState) cycleWindowLayoutNow() (*Window, bool, error) {
 	}
 	window.Layout = buildPresetLayout(paneIDs, focusedPaneID, next)
 	window.layoutCycleIndex = next
-	s.clearGroupWindowZoomLocked(window)
-	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	s.clearGroupWindowZoomNow(window)
+	window.LayoutRevision = s.nextWindowLayoutRevisionNow()
 	s.markWindowChangedForPersistence(window.ID)
 	return cloneWindow(window), true, nil
 }
@@ -394,13 +393,13 @@ func (s *SessionState) resizeFocusedPaneNow(direction PaneResizeDirection, amoun
 	if amount <= 0 {
 		return nil, false, fmt.Errorf("pane resize amount must be positive")
 	}
-	view := s.groupWindowViewLocked(window.ID)
+	view := s.groupWindowViewNow(window.ID)
 	focusedPaneID := view.FocusedPaneID
 	if focusedPaneID == 0 {
 		focusedPaneID = window.ActivePaneID
 	}
 	unzoomed := view.ZoomedPaneID != 0 || (!s.isGrouped() && window.Zoomed)
-	s.clearGroupWindowZoomLocked(window)
+	s.clearGroupWindowZoomNow(window)
 	resized := ResizePaneBoundary(window.Layout, focusedPaneID, direction, amount, Rect{
 		Width:  int(window.Cols),
 		Height: int(window.Rows),
@@ -409,7 +408,7 @@ func (s *SessionState) resizeFocusedPaneNow(direction PaneResizeDirection, amoun
 		return cloneWindow(window), false, nil
 	}
 	window.layoutCycleIndex = layoutPresetCustom
-	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	window.LayoutRevision = s.nextWindowLayoutRevisionNow()
 	if resized {
 		s.markWindowChangedForPersistence(window.ID)
 	}
@@ -421,7 +420,7 @@ func (s *SessionState) splitFocusedPaneNow(pane *Pane, direction SplitDirection)
 	if window == nil {
 		return nil, errors.New("client has no active window")
 	}
-	view := s.groupWindowViewLocked(window.ID)
+	view := s.groupWindowViewNow(window.ID)
 	focusedPaneID := view.FocusedPaneID
 	if focusedPaneID == 0 {
 		focusedPaneID = window.ActivePaneID
@@ -435,7 +434,7 @@ func (s *SessionState) splitFocusedPaneNow(pane *Pane, direction SplitDirection)
 	if direction != SplitVertical && direction != SplitHorizontal {
 		return nil, fmt.Errorf("invalid split direction %d", direction)
 	}
-	s.clearGroupWindowZoomLocked(window)
+	s.clearGroupWindowZoomNow(window)
 	view.ZoomedPaneID = 0
 	window.layoutCycleIndex = layoutPresetCustom
 	updated, replaced := replacePaneWithSplit(window.Layout, focusedPaneID, pane.ID, direction)
@@ -446,7 +445,7 @@ func (s *SessionState) splitFocusedPaneNow(pane *Pane, direction SplitDirection)
 		return nil, err
 	}
 	view.focusPane(pane.ID)
-	s.setGroupWindowViewLocked(window.ID, view)
+	s.setGroupWindowViewNow(window.ID, view)
 	s.markWindowChangedForPersistence(window.ID)
 	return cloneWindow(window), nil
 }
@@ -459,8 +458,8 @@ func (s *SessionState) swapFocusedPaneNow(direction PaneSwapDirection) (*Window,
 	if direction != SwapPanePrevious && direction != SwapPaneNext {
 		return nil, false, fmt.Errorf("invalid pane swap direction %d", direction)
 	}
-	s.clearGroupWindowZoomLocked(window)
-	view := s.groupWindowViewLocked(window.ID)
+	s.clearGroupWindowZoomNow(window)
+	view := s.groupWindowViewNow(window.ID)
 	focusedPaneID := view.FocusedPaneID
 	if focusedPaneID == 0 {
 		focusedPaneID = window.ActivePaneID
@@ -485,7 +484,7 @@ func (s *SessionState) swapFocusedPaneNow(direction PaneSwapDirection) (*Window,
 		return nil, false, fmt.Errorf("swap panes %d and %d in window %d", focusedPaneID, targetPaneID, window.ID)
 	}
 	window.layoutCycleIndex = layoutPresetCustom
-	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	window.LayoutRevision = s.nextWindowLayoutRevisionNow()
 	s.markWindowChangedForPersistence(window.ID)
 	return cloneWindow(window), true, nil
 }
@@ -495,7 +494,7 @@ func (s *SessionState) CanSplitFocusedPane() error {
 	if window == nil {
 		return errors.New("client has no active window")
 	}
-	view := s.groupWindowViewLocked(window.ID)
+	view := s.groupWindowViewNow(window.ID)
 	focusedPaneID := view.FocusedPaneID
 	if focusedPaneID == 0 {
 		focusedPaneID = window.ActivePaneID
@@ -523,7 +522,7 @@ func (s *SessionState) WindowStatuses() []WindowStatus {
 	for _, window := range s.Windows {
 		zoomed := window.Zoomed
 		if s.isGrouped() {
-			zoomed = s.groupWindowViewLocked(window.ID).ZoomedPaneID != 0
+			zoomed = s.groupWindowViewNow(window.ID).ZoomedPaneID != 0
 		}
 		list = append(list, WindowStatus{
 			WindowID: window.ID,
@@ -560,7 +559,7 @@ func resizeSessionWindowModelNow(s *SessionState, windowID uint64, cols, rows ui
 	}
 	window.Cols = cols
 	window.Rows = rows
-	window.LayoutRevision = s.nextLayoutRevisionLocked()
+	window.LayoutRevision = s.nextWindowLayoutRevisionNow()
 	return nil
 }
 
@@ -590,16 +589,5 @@ func clonePromptState(prompt *PromptState) *PromptState {
 	out.Text = append([]rune(nil), prompt.Text...)
 	out.pendingUTF8 = append([]byte(nil), prompt.pendingUTF8...)
 	out.PendingEscape = append([]byte(nil), prompt.PendingEscape...)
-	return &out
-}
-
-func cloneClientState(c *ClientState) *ClientState {
-	if c == nil {
-		return nil
-	}
-	out := *c
-	out.RenderBindings = append([]RenderBinding(nil), c.RenderBindings...)
-	out.PrefixEscape = append([]byte(nil), c.PrefixEscape...)
-	out.Prompt = clonePromptState(c.Prompt)
 	return &out
 }

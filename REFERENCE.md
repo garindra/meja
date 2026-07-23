@@ -53,7 +53,7 @@ Everything at and after `--` is preserved as command input.
 
 Other profiles use `~/.meja/<profile>/meja.sock`. Profile names may contain letters, digits, `.`, `_`, and `-`. Exact socket paths must be absolute. For remote commands, profiles and socket paths are resolved on the remote machine.
 
-Each profile or exact socket has an isolated server, session-ID sequence, live sessions, reconnect credentials, and recovery files.
+Each profile or exact socket has an isolated server, session-ID sequence, live sessions, client identities with resume tokens, and recovery files.
 
 ## Remote options
 
@@ -326,7 +326,7 @@ Direction flags are `-U`, `-D`, `-L`, and `-R`. Resize defaults to one cell; an 
 
 `set-root` without a path uses the active pane's observed directory. A relative path is resolved there; `~` and `~/...` are supported. Existing panes keep their directories, while future windows, splits, recovery files, and saves use the new root.
 
-`switch-session` retains the current QUIC connection and reconnect credential while changing the attached live session.
+`switch-session` retains the current QUIC connection and client identity while changing the attached live session.
 
 Confirmation accepts `y`/`Y`; `n`, Enter, Escape, or `Ctrl+c` cancels.
 
@@ -635,7 +635,7 @@ The client pins the server public key fingerprint delivered through authenticate
 
 On transport loss, the client keeps the last confirmed screen, shows reconnecting status, drops input, and retries with exponential backoff up to two seconds. It resumes after receiving the current layout and full visible state.
 
-Reconnect uses an in-memory credential and does not repeat SSH or contact the Unix socket. Session end, server stop, or client replacement produces a terminal reason and clean exit rather than endless reconnect.
+Reconnect uses the in-memory resume token for the existing client identity and does not repeat SSH or contact the Unix socket. Session end, server stop, or client replacement produces a terminal reason and clean exit rather than endless reconnect.
 
 ---
 

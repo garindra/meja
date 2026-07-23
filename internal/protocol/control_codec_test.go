@@ -5,6 +5,48 @@ import (
 	"testing"
 )
 
+func TestClientHandshakeMessagesRoundTrip(t *testing.T) {
+	attach := SessionAttach{Token: "attach", Cols: 100, Rows: 40}
+	payload, err := EncodeSessionAttach(nil, attach)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedAttach, err := DecodeSessionAttach(payload)
+	if err != nil || !reflect.DeepEqual(decodedAttach, attach) {
+		t.Fatalf("attach = %#v, err = %v", decodedAttach, err)
+	}
+
+	attachOK := SessionAttachOK{ResumeToken: "resume"}
+	payload, err = EncodeSessionAttachOK(nil, attachOK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedAttachOK, err := DecodeSessionAttachOK(payload)
+	if err != nil || !reflect.DeepEqual(decodedAttachOK, attachOK) {
+		t.Fatalf("attach OK = %#v, err = %v", decodedAttachOK, err)
+	}
+
+	resume := ClientResume{ResumeToken: "resume", Cols: 100, Rows: 40}
+	payload, err = EncodeClientResume(nil, resume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedResume, err := DecodeClientResume(payload)
+	if err != nil || !reflect.DeepEqual(decodedResume, resume) {
+		t.Fatalf("resume = %#v, err = %v", decodedResume, err)
+	}
+
+	resumeOK := ClientResumeOK{}
+	payload, err = EncodeClientResumeOK(nil, resumeOK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedResumeOK, err := DecodeClientResumeOK(payload)
+	if err != nil || !reflect.DeepEqual(decodedResumeOK, resumeOK) {
+		t.Fatalf("resume OK = %#v, err = %v", decodedResumeOK, err)
+	}
+}
+
 func TestFrontendInputBytesSourceIdleRoundTrip(t *testing.T) {
 	want := FrontendInputBytes{LayoutRevision: 42, SourceIdle: true, Data: []byte{0x1b}}
 	payload, err := EncodeFrontendInputBytes(nil, want)

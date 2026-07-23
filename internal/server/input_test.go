@@ -58,7 +58,7 @@ func TestTranslateApplicationCursor(t *testing.T) {
 
 func TestServerConsumesPrefixCommandsAndForwardsLiteralBytes(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	if event := clientForState(s).ConsumeInputByte('a'); event.Command != serverCommandLiteral || event.Byte != 'a' {
 		t.Fatalf("normal input event = %#v", event)
 	}
@@ -98,14 +98,14 @@ func TestEveryPrefixBindingExpandsToCanonicalCommandArgs(t *testing.T) {
 	}
 	for _, binding := range bindings {
 		s := NewSessionState(1)
-		newStandaloneClient(s)
+		newTestClient(s)
 		clientForState(s).ConsumeInputByte(0x02)
 		if event := clientForState(s).ConsumeInputByte(binding.key); !isCommandInput(event, binding.argv...) {
 			t.Errorf("prefix %q = %#v, want %v", binding.key, event, binding.argv)
 		}
 	}
 	s := NewSessionState(1)
-	newStandaloneClient(s)
+	newTestClient(s)
 	clientForState(s).ConsumeInputByte(0x02)
 	if event := clientForState(s).ConsumeInputByte(':'); event.Command != serverCommandOpenCommandPrompt {
 		t.Errorf("prefix ':' = %#v, want local command prompt", event)
@@ -114,7 +114,7 @@ func TestEveryPrefixBindingExpandsToCanonicalCommandArgs(t *testing.T) {
 
 func TestServerRecognizesRenameSessionPrefix(t *testing.T) {
 	s := NewSessionState(1)
-	newStandaloneClient(s)
+	newTestClient(s)
 	clientForState(s).ConsumeInputByte(0x02)
 	if event := clientForState(s).ConsumeInputByte('$'); !isCommandInput(event, "rename-session") {
 		t.Fatalf("rename-session event = %#v", event)
@@ -123,7 +123,7 @@ func TestServerRecognizesRenameSessionPrefix(t *testing.T) {
 
 func TestServerRecognizesSwapPanePrefixes(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	for key, want := range map[byte][]string{
 		'{': {"swap-pane", "-U"},
 		'}': {"swap-pane", "-D"},
@@ -137,7 +137,7 @@ func TestServerRecognizesSwapPanePrefixes(t *testing.T) {
 
 func TestServerRecognizesToggleZoomPrefix(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	clientForState(s).ConsumeInputByte(0x02)
 	if event := clientForState(s).ConsumeInputByte('z'); !isCommandInput(event, "resize-pane", "-Z") {
 		t.Fatalf("toggle zoom event = %#v", event)
@@ -146,7 +146,7 @@ func TestServerRecognizesToggleZoomPrefix(t *testing.T) {
 
 func TestClosePanePromptsBeforeKilling(t *testing.T) {
 	s := NewSessionState(1)
-	newStandaloneClient(s)
+	newTestClient(s)
 	first := &Pane{ID: testAddPaneID(s), Title: "first"}
 	createTestWindow(s, first)
 	second := &Pane{ID: testAddPaneID(s), Title: "second"}
@@ -196,7 +196,7 @@ func TestClosePanePromptsBeforeKilling(t *testing.T) {
 
 func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	s := NewSessionState(1)
-	newStandaloneClient(s)
+	newTestClient(s)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash", terminal: newTerminal(80, 24)})
 	var input bytes.Buffer
 	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: []byte{0x02, 'd', 0x02, 'd'}})
@@ -227,15 +227,16 @@ func TestSwitchSessionPromptAppliesPreparedTransition(t *testing.T) {
 	target.daemon = d
 	d.ensureSessionGroupInActor(source)
 	d.ensureSessionGroupInActor(target)
-	clientState := newStandaloneClient(source)
-	clientState.TerminalCols, clientState.TerminalRows = 90, 28
+	fixtureClient := newTestClient(source)
+	fixtureClient.setTestTerminalSize(90, 28)
 	createTestWindow(source, &Pane{ID: testAddPaneID(source), terminal: newTerminal(90, 28)})
 	createTestWindow(target, &Pane{ID: testAddPaneID(target), terminal: newTerminal(90, 28)})
 	client := clientForState(source)
-	credential := &reconnectCredential{EncodedToken: "input-switch", Instance: client}
-	client.credential = credential
-	d.clientSessions[credential] = source.ID
-	d.attachments[source.ID] = credential
+	identity := &ClientIdentity{ResumeToken: "input-switch", lastAllocatedClientLayoutRevision: client.currentLayout.LayoutRevision}
+	client.identity = identity
+	d.clientInstances[identity] = client
+	d.clientSessions[identity] = source.ID
+	d.attachments[source.ID] = identity
 	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: client.AttachmentID, Generation: 1}
 
 	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: append([]byte{0x02, ':'}, []byte("switch-session -t logs\r")...)})
@@ -256,7 +257,7 @@ func TestSwitchSessionPromptAppliesPreparedTransition(t *testing.T) {
 
 func TestServerParsesPrefixArrowAndWindowIndex(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	for _, b := range []byte{0x02, 0x1b, '[', 'A'} {
 		event := clientForState(s).ConsumeInputByte(b)
 		if b == 'A' && !isCommandInput(event, "select-pane", "-U") {
@@ -286,7 +287,7 @@ func TestServerParsesModifiedPrefixArrowsForResize(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := NewSessionState(0)
-			newStandaloneClient(s)
+			newTestClient(s)
 			clientForState(s).ConsumeInputByte(0x02)
 			var event serverInputEvent
 			for _, b := range test.sequence {
@@ -305,7 +306,7 @@ func TestServerParsesModifiedPrefixArrowsForResize(t *testing.T) {
 
 func TestServerResetsOverlongPrefixCSI(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	clientForState(s).ConsumeInputByte(0x02)
 	for _, b := range append([]byte("\x1b["), []byte("11111111111111111111111111111111")...) {
 		clientForState(s).ConsumeInputByte(b)
@@ -317,12 +318,11 @@ func TestServerResetsOverlongPrefixCSI(t *testing.T) {
 }
 
 func TestPaneResizeBindingRepeatsWithoutPrefix(t *testing.T) {
-	s := NewSessionState(0)
-	client := newStandaloneClient(s)
+	client := &clientInputState{}
 	now := time.Unix(100, 0)
 	var event serverInputEvent
 	for _, b := range append([]byte{0x02}, []byte("\x1b[1;5C")...) {
-		event = consumeInputByteLockedAt(client, b, now)
+		event = consumeInputByteAt(client, b, now)
 	}
 	if !isCommandInput(event, "resize-pane", "-R", "1") {
 		t.Fatalf("initial resize event = %#v", event)
@@ -333,7 +333,7 @@ func TestPaneResizeBindingRepeatsWithoutPrefix(t *testing.T) {
 
 	repeatedAt := now.Add(100 * time.Millisecond)
 	for _, b := range []byte("\x1b[1;5C") {
-		event = consumeInputByteLockedAt(client, b, repeatedAt)
+		event = consumeInputByteAt(client, b, repeatedAt)
 	}
 	if !isCommandInput(event, "resize-pane", "-R", "1") {
 		t.Fatalf("repeated resize event = %#v", event)
@@ -355,11 +355,11 @@ func TestPaneResizeRepeatCancellationPreservesInput(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			client := &ClientState{InputState: serverInputNormal, ResizeRepeatUntil: time.Unix(200, 0)}
+			client := &clientInputState{InputState: serverInputNormal, ResizeRepeatUntil: time.Unix(200, 0)}
 			now := time.Unix(199, 750_000_000)
 			var event serverInputEvent
 			for _, b := range test.input {
-				event = consumeInputByteLockedAt(client, b, now)
+				event = consumeInputByteAt(client, b, now)
 			}
 			if event.Command != serverCommandLiteral {
 				t.Fatalf("cancellation event = %#v", event)
@@ -380,8 +380,8 @@ func TestPaneResizeRepeatCancellationPreservesInput(t *testing.T) {
 
 func TestPaneResizeRepeatExpires(t *testing.T) {
 	deadline := time.Unix(300, 0)
-	client := &ClientState{InputState: serverInputNormal, ResizeRepeatUntil: deadline}
-	event := consumeInputByteLockedAt(client, 0x1b, deadline)
+	client := &clientInputState{InputState: serverInputNormal, ResizeRepeatUntil: deadline}
+	event := consumeInputByteAt(client, 0x1b, deadline)
 	if event.Command != serverCommandLiteral || event.Byte != 0x1b {
 		t.Fatalf("expired repeat event = %#v", event)
 	}
@@ -392,8 +392,8 @@ func TestPaneResizeRepeatExpires(t *testing.T) {
 
 func TestHandleInputBytesAppliesRepeatedPaneResize(t *testing.T) {
 	s := NewSessionState(1)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 24
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 24)
 	left := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
 	createTestWindow(s, left)
 	right := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
@@ -404,7 +404,7 @@ func TestHandleInputBytesAppliesRepeatedPaneResize(t *testing.T) {
 	if detach, err := clientForState(s).handleInputBytes(0, input); err != nil || detach {
 		t.Fatalf("handleInputBytes() detach=%v err=%v", detach, err)
 	}
-	placements := s.Windows[client.ActiveWindowID].Layout.Compute(Rect{Width: 80, Height: 24})
+	placements := s.Windows[client.testLayout().WindowID].Layout.Compute(Rect{Width: 80, Height: 24})
 	if placements[0].Rect.Width != 41 || placements[1].Rect.Width != 38 {
 		t.Fatalf("placements after repeated resize = %#v", placements)
 	}
@@ -412,7 +412,7 @@ func TestHandleInputBytesAppliesRepeatedPaneResize(t *testing.T) {
 
 func TestServerPromptEditsAndCancelsAuthoritatively(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	pane := &Pane{ID: testAddPaneID(s), Title: "bash"}
 	window, _ := createTestWindow(s, pane)
 
@@ -463,7 +463,7 @@ func TestPromptDeleteSequenceSurvivesEveryPayloadBoundary(t *testing.T) {
 	sequence := []byte{0x1b, '[', '3', '~'}
 	for boundary := 1; boundary < len(sequence); boundary++ {
 		s := NewSessionState(0)
-		newStandaloneClient(s)
+		newTestClient(s)
 		createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash"})
 		if _, err := executeTestClientCommand(clientForState(s), []string{"rename-window"}); err != nil {
 			t.Fatal(err)
@@ -497,8 +497,8 @@ func TestPromptDeleteSequenceSurvivesEveryPayloadBoundary(t *testing.T) {
 
 func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 	s := NewSessionState(1)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -541,8 +541,8 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 
 func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -580,13 +580,15 @@ func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
 
 func TestStaleTransportInputIsIgnoredAfterReconnect(t *testing.T) {
 	s := NewSessionState(0)
-	clientState := newStandaloneClient(s)
-	clientState.TerminalCols, clientState.TerminalRows = 80, 24
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(80, 24)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)})
 	client := newClientInstance(nil, nil)
 	client.Daemon = s.daemon
 	client.sessionID = s.ID
 	currentClient := &ClientInstance{}
+	currentClient.terminalCols.Store(80)
+	currentClient.terminalRows.Store(24)
 	setTestClient(s, currentClient)
 
 	payload, err := protocol.EncodeFrontendResize(nil, protocol.FrontendResize{Cols: 40, Rows: 12})
@@ -600,15 +602,15 @@ func TestStaleTransportInputIsIgnoredAfterReconnect(t *testing.T) {
 	if err := handleTestControlFrames(s, client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
 	}
-	clientState = snapshotTestClient(s)
-	if clientState.TerminalCols != 80 || clientState.TerminalRows != 24 {
-		t.Fatalf("stale resize changed client size to %dx%d", clientState.TerminalCols, clientState.TerminalRows)
+	current := clientForState(s)
+	if cols, rows := current.terminalCols.Load(), current.terminalRows.Load(); cols != 80 || rows != 24 {
+		t.Fatalf("stale resize changed client size to %dx%d", cols, rows)
 	}
 }
 
 func TestPromptBufferIsRuneAware(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash"})
 	if _, err := clientForState(s).BeginPrompt(PromptModeText, "prompt ", "猫"); err != nil {
 		t.Fatal(err)
@@ -628,8 +630,8 @@ func TestPromptBufferIsRuneAware(t *testing.T) {
 
 func TestStandaloneWindowNavigationBookkeeping(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	first := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
 	window1, _ := createTestWindow(s, first)
 	second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
@@ -650,8 +652,8 @@ func TestStandaloneWindowNavigationBookkeeping(t *testing.T) {
 
 func TestDirectionalFocusGeometryHandlesPaneZero(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	top := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
 	createTestWindow(s, top)
 	bottom := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
@@ -666,8 +668,8 @@ func TestDirectionalFocusGeometryHandlesPaneZero(t *testing.T) {
 
 func TestDirectionalFocusRemembersPositionAcrossUnevenPanes(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 24
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 24)
 	left := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
 	createTestWindow(s, left)
 	topRight := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}

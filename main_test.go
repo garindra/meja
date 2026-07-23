@@ -495,6 +495,27 @@ func TestVersionCommandOutput(t *testing.T) {
 	}
 }
 
+func TestVerboseVersionCommandOutput(t *testing.T) {
+	previous := version.Value
+	version.Value = "v1.2.3"
+	t.Cleanup(func() { version.Value = previous })
+
+	stdin, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"version", "--verbose"}, stdin, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	want := "meja:             1.2.3\ncommand protocol: 1\nQUIC profile:     meja-quic/12\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
 func TestDebugEnvironmentConfiguresClientDiagnostics(t *testing.T) {
 	t.Setenv("MEJA_DEBUG", "")
 	t.Setenv("MEJA_DEBUG_RENDER", "true")

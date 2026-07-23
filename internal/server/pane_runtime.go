@@ -69,7 +69,7 @@ func (l *paneOutputRateLimiter) reserve(now time.Time, bytes int) time.Duration 
 	return time.Duration(-l.tokens / paneOutputBytesPerSecond * float64(time.Second))
 }
 
-func (p *Pane) attachOutputStream(lease *OutputLease, layoutRevision uint64) error {
+func (p *Pane) attachOutputStream(lease *OutputLease, layoutRevision protocol.ClientLayoutRevision) error {
 	attachment := &paneOutputAttach{Lease: lease, LayoutRevision: layoutRevision}
 	if p.commands == nil {
 		return p.renderAttachedView(newRenderOutput(lease.Stream), layoutRevision)
@@ -84,7 +84,7 @@ func (p *Pane) attachOutputStream(lease *OutputLease, layoutRevision uint64) err
 	}
 }
 
-func (p *Pane) renderAttachedView(output *renderOutput, layoutRevision uint64) error {
+func (p *Pane) renderAttachedView(output *renderOutput, layoutRevision protocol.ClientLayoutRevision) error {
 	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: layoutRevision, GridCols: p.terminal.Cols, GridRows: p.terminal.Rows}); err != nil {
 		return err
 	}
