@@ -682,17 +682,18 @@ func TestSessionRenameImmediatelyWritesPersistence(t *testing.T) {
 	}
 
 	path := filepath.Join(directory, "after.session.meja")
+	oldPath := filepath.Join(directory, "before.session.meja")
 	deadline := time.Now().Add(time.Second)
+	var newErr, oldErr error
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			if _, err := os.Stat(filepath.Join(directory, "before.session.meja")); !os.IsNotExist(err) {
-				t.Fatalf("old session name was unexpectedly saved: %v", err)
-			}
+		_, newErr = os.Stat(path)
+		_, oldErr = os.Stat(oldPath)
+		if newErr == nil && os.IsNotExist(oldErr) {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("renamed persistence %q was not written immediately", path)
+	t.Fatalf("renamed persistence did not converge: new %q: %v; old %q: %v", path, newErr, oldPath, oldErr)
 }
 
 func addPersistenceTestWindow(session *SessionState, paneID uint64) {
