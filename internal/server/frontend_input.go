@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/garindra/meja/internal/protocol"
 )
 
 type frontendEventKind uint8
@@ -102,7 +104,7 @@ type frontendPointerEvent struct {
 
 type frontendInputEvent struct {
 	Kind           frontendEventKind
-	LayoutRevision uint64
+	LayoutRevision protocol.ClientLayoutRevision
 	Key            frontendKeyEvent
 	Paste          []byte
 	PasteDiscarded bool
@@ -125,7 +127,7 @@ const (
 type frontendInputParser struct {
 	state         frontendParserState
 	pending       []byte
-	revision      uint64
+	revision      protocol.ClientLayoutRevision
 	paste         []byte
 	pasteOverflow bool
 }
@@ -135,7 +137,7 @@ const maxFrontendPasteBytes = 8 << 20
 
 var bracketedPasteEnd = []byte("\x1b[201~")
 
-func (p *frontendInputParser) Feed(layoutRevision uint64, data []byte) []frontendInputEvent {
+func (p *frontendInputParser) Feed(layoutRevision protocol.ClientLayoutRevision, data []byte) []frontendInputEvent {
 	events := make([]frontendInputEvent, 0, min(len(data), 64))
 	for _, b := range data {
 		// Outside bracketed paste, Escape always starts a new input
@@ -231,7 +233,7 @@ func (p *frontendInputParser) Feed(layoutRevision uint64, data []byte) []fronten
 	return events
 }
 
-func (p *frontendInputParser) startEscape(layoutRevision uint64) {
+func (p *frontendInputParser) startEscape(layoutRevision protocol.ClientLayoutRevision) {
 	p.state = frontendParserEscape
 	p.revision = layoutRevision
 	p.pending = append(p.pending[:0], 0x1b)
@@ -263,7 +265,7 @@ func (p *frontendInputParser) flushLoneEscape() (frontendInputEvent, bool) {
 	return event, true
 }
 
-func keyInputEvent(revision uint64, key frontendKeyEvent) frontendInputEvent {
+func keyInputEvent(revision protocol.ClientLayoutRevision, key frontendKeyEvent) frontendInputEvent {
 	return frontendInputEvent{Kind: frontendEventKey, LayoutRevision: revision, Key: key}
 }
 
@@ -322,7 +324,7 @@ func decodeLegacySequence(raw []byte) frontendKeyEvent {
 	return key
 }
 
-func decodeCSIInput(revision uint64, raw []byte) []frontendInputEvent {
+func decodeCSIInput(revision protocol.ClientLayoutRevision, raw []byte) []frontendInputEvent {
 	if len(raw) < 3 {
 		return nil
 	}

@@ -60,7 +60,11 @@ func (c *ClientInstance) mejaOwnedWheelTarget(event frontendInputEvent) (uint64,
 	if event.Kind != frontendEventPointer || !isFrontendWheelAction(event.Pointer.Action) {
 		return 0, false
 	}
-	paneID, _, found := hitTestFrontendLayout(c.layouts[event.LayoutRevision], event.Pointer.X, event.Pointer.Y)
+	layout, current := c.inputLayoutForRevision(event.LayoutRevision)
+	if !current {
+		return 0, false
+	}
+	paneID, _, found := hitTestFrontendLayout(layout, event.Pointer.X, event.Pointer.Y)
 	if !found {
 		return 0, false
 	}
@@ -467,13 +471,17 @@ func kittyFunctionalSequence(code frontendKeyCode) (byte, string, bool) {
 	}
 }
 
-func (c *ClientInstance) handleFrontendPointer(revision uint64, pointer frontendPointerEvent) error {
+func (c *ClientInstance) handleFrontendPointer(revision protocol.ClientLayoutRevision, pointer frontendPointerEvent) error {
 	if pointer.Action == frontendPointerPress && c.pointerCapture.active {
 		if err := c.cancelFrontendPointerCapture(); err != nil {
 			return err
 		}
 	}
-	paneID, rect, found := hitTestFrontendLayout(c.layouts[revision], pointer.X, pointer.Y)
+	layout, current := c.inputLayoutForRevision(revision)
+	paneID, rect, found := uint64(0), protocol.Rect{}, false
+	if current {
+		paneID, rect, found = hitTestFrontendLayout(layout, pointer.X, pointer.Y)
+	}
 	capture := c.pointerCapture
 	captured := capture.active
 	if pointer.Action == frontendPointerMove || pointer.Action == frontendPointerRelease {
@@ -481,7 +489,7 @@ func (c *ClientInstance) handleFrontendPointer(revision uint64, pointer frontend
 			paneID = capture.paneID
 			found = true
 			rect = capture.rect
-			if placement, ok := panePlacement(c.layouts[revision], paneID); ok {
+			if placement, ok := panePlacement(layout, paneID); current && ok {
 				rect = placement.Rect
 			}
 		}
@@ -497,9 +505,6 @@ func (c *ClientInstance) handleFrontendPointer(revision uint64, pointer frontend
 	if pointer.Action == frontendPointerPress {
 		if !c.isFocusedPane(paneID) {
 			if _, err := c.focusPane(paneID); err != nil {
-				return err
-			}
-			if err := c.publishWindowLayout(); err != nil {
 				return err
 			}
 		}
@@ -606,7 +611,7 @@ func osc52ClipboardWrite(data []byte) []byte {
 	return out
 }
 
-func hitTestFrontendLayout(layout protocol.WindowLayout, x, y int) (uint64, protocol.Rect, bool) {
+func hitTestFrontendLayout(layout protocol.ClientLayout, x, y int) (uint64, protocol.Rect, bool) {
 	for _, placement := range layout.Panes {
 		r := placement.Rect
 		if x >= r.X && y >= r.Y && x < r.X+r.Width && y < r.Y+r.Height {
@@ -616,7 +621,7 @@ func hitTestFrontendLayout(layout protocol.WindowLayout, x, y int) (uint64, prot
 	return 0, protocol.Rect{}, false
 }
 
-func panePlacement(layout protocol.WindowLayout, paneID uint64) (protocol.PanePlacement, bool) {
+func panePlacement(layout protocol.ClientLayout, paneID uint64) (protocol.PanePlacement, bool) {
 	for _, placement := range layout.Panes {
 		if placement.PaneID == paneID {
 			return placement, true

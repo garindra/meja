@@ -9,11 +9,16 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
-// projectTestClientState is for passive model tests which assert SessionState
-// and ClientState without starting transport or pane actors. Integration tests
-// use ClientInstance.applyViewTransition instead.
-func projectTestClientState(client *ClientInstance, transition PreparedViewTransition) error {
-	return client.commitProjectionPlan(transition.Projection)
+// commitTestProjection is for passive model tests which assert SessionState
+// and ClientInstance.currentLayout without starting transport or pane actors.
+// Integration tests use ClientInstance.applyViewTransition instead.
+func commitTestProjection(client *ClientInstance, transition PreparedViewTransition) error {
+	if err := client.commitProjectionPlan(transition.Projection); err != nil {
+		return err
+	}
+	client.currentLayout = transition.Projection.Layout
+	client.appliedProjectionRevision.Store(transition.Projection.ProjectionRevision)
+	return nil
 }
 
 func installTestCurrentProjection(client *ClientInstance) error {
@@ -27,9 +32,9 @@ func installTestCurrentProjection(client *ClientInstance) error {
 	var transition PreparedViewTransition
 	client.Daemon.call(func() {
 		_, _ = prepareClientWindowGeometryNow(client, state, state.ActiveWindowID)
-		transition = client.Daemon.prepareViewTransitionNow(viewTransitionAttach, client, state, true)
+		transition = client.Daemon.prepareViewTransitionNow(viewTransitionAttach, client, state)
 	})
-	return projectTestClientState(client, transition)
+	return commitTestProjection(client, transition)
 }
 
 func selectTestWindow(client *ClientInstance, windowID uint64) error {
@@ -37,22 +42,24 @@ func selectTestWindow(client *ClientInstance, windowID uint64) error {
 	if err != nil {
 		return err
 	}
-	return projectTestClientState(client, transition)
+	return commitTestProjection(client, transition)
 }
 
 func resizeTestActiveWindow(client *ClientInstance, cols, rows uint16) (ClientProjectionPlan, error) {
+	client.terminalCols.Store(uint32(cols))
+	client.terminalRows.Store(uint32(rows))
 	transition, err := client.Daemon.resizeClientView(client, cols, rows)
 	if err != nil {
 		return transition.Projection, err
 	}
 	for _, resize := range transition.PaneResizes {
 		if resize.Pane.commands == nil && resize.Pane.terminal != nil {
-			if err := resize.Pane.resize(uint16(resize.Rect.Width), uint16(resize.Rect.Height)); err != nil {
+			if err := resize.Pane.resize(resize.Cols, resize.Rows); err != nil {
 				return transition.Projection, err
 			}
 		}
 	}
-	return transition.Projection, projectTestClientState(client, transition)
+	return transition.Projection, commitTestProjection(client, transition)
 }
 
 func setLeasedTestClient(t *testing.T, state *SessionState, client *ClientInstance, generation uint64) {
@@ -96,6 +103,15 @@ func setLeasedTestClient(t *testing.T, state *SessionState, client *ClientInstan
 
 var testClientByState sync.Map
 
+func (c *ClientInstance) setTestTerminalSize(cols, rows uint16) {
+	c.terminalCols.Store(uint32(cols))
+	c.terminalRows.Store(uint32(rows))
+}
+
+func (c *ClientInstance) testLayout() protocol.ClientLayout {
+	return c.currentLayout
+}
+
 func clientForState(state *SessionState) *ClientInstance {
 	if state == nil {
 		return nil
@@ -107,65 +123,16 @@ func clientForState(state *SessionState) *ClientInstance {
 		testClientByState.Store(state, current)
 		return current
 	}
-	client := &ClientInstance{
-		sessionID:      state.ID,
-		Daemon:         state.daemon,
-		shell:          defaultShell(),
-		lifetimeDone:   make(chan struct{}),
-		statusCommands: make(chan statusCommand, 64),
-		events:         make(chan func() error, 64),
-		layouts:        make(map[uint64]protocol.WindowLayout),
-		heldKeys:       make(map[frontendHeldKey]uint64),
-	}
 	if state.daemon == nil {
 		state.daemon = testDaemonForState(state)
 	}
-	client.Daemon = state.daemon
-	client.clientState = &ClientState{}
-	// Production registration publishes the singleton group into the daemon's
-	// authoritative indexes before any panes or windows are inserted. Tests
-	// must preserve that shape or daemon-posted lifecycle events silently stop
-	// at an index lookup that direct SessionState adapters bypass.
-	state.daemon.ensureSessionGroupInActor(state)
-	if state.daemon.clients == nil {
-		state.daemon.clients = make(map[uint64]*ClientInstance)
-	}
-	if state.daemon.sessions == nil {
-		state.daemon.sessions = make(map[uint64]*SessionState)
-	}
-	state.daemon.ensureSessionGroupInActor(state)
-	state.daemon.sessions[state.ID] = state
-	state.daemon.sessionIndex.Store(state.ID, state)
-	if client.statusCommands == nil {
-		client.statusCommands = make(chan statusCommand, 64)
-	}
-	if client.lifetimeDone == nil {
-		client.lifetimeDone = make(chan struct{})
-	}
-	if client.events == nil {
-		client.events = make(chan func() error, 64)
-	}
-	state.daemon.clients[state.ID] = client
-	state.daemon.clientIndex.Store(state.ID, client)
-	// A newly registered production client is not projected until its first
-	// window exists. Keep the fixture on that same boundary instead of asking
-	// the plan builder to tolerate an impossible empty view.
-	if len(state.Windows) > 0 {
-		if err := installTestCurrentProjection(client); err != nil {
-			panic(err)
-		}
-	}
-	client.startStatusOutput()
-	testClientByState.Store(state, client)
+	client := newClientInstance(state.daemon, &ClientIdentity{})
+	setTestClient(state, client)
 	return client
 }
 
-func newStandaloneClient(state *SessionState) *ClientState {
-	client := clientForState(state)
-	if client == nil {
-		return nil
-	}
-	return client.ensureClientState()
+func newTestClient(state *SessionState) *ClientInstance {
+	return clientForState(state)
 }
 
 func executeTestClientCommand(client *ClientInstance, argv []string) (bool, error) {
@@ -199,83 +166,87 @@ func syncTestProjection(t *testing.T, state *SessionState) {
 	}
 }
 
-func focusTestSessionPane(s *SessionState, paneID uint64) (*Window, *ClientState, error) {
+func focusTestSessionPane(s *SessionState, paneID uint64) (*Window, protocol.ClientLayout, error) {
 	client := clientForState(s)
-	window, plan, err := s.daemon.focusClientPane(client, paneID)
+	window, err := client.focusPane(paneID)
 	if err != nil {
-		return nil, nil, err
+		return nil, protocol.ClientLayout{}, err
 	}
-	if err := client.commitProjectionPlan(plan); err != nil {
-		return nil, nil, err
-	}
-	return window, cloneClientState(client.clientState), nil
+	return window, client.currentLayout, nil
 }
 
-func selectTestSessionWindow(s *SessionState, windowID uint64) (*Window, *ClientState, error) {
+func selectTestSessionWindow(s *SessionState, windowID uint64) (*Window, protocol.ClientLayout, error) {
 	client := clientForState(s)
 	if err := selectTestWindow(client, windowID); err != nil {
-		return nil, nil, err
+		return nil, protocol.ClientLayout{}, err
 	}
-	return cloneWindow(s.Windows[windowID]), cloneClientState(client.clientState), nil
+	return cloneWindow(s.Windows[windowID]), client.currentLayout, nil
 }
 
-func testActivePane(s *SessionState) (*Pane, *ClientState) {
+func testActivePane(s *SessionState) (*Pane, protocol.ClientLayout) {
 	client := clientForState(s)
-	return client.activePane(), client.snapshotClient()
+	return client.activePane(), client.currentLayout
 }
 
-func testActiveWindow(s *SessionState) (*Window, *ClientState) {
+func testActiveWindow(s *SessionState) (*Window, protocol.ClientLayout) {
 	client := clientForState(s)
-	return client.activeWindow(), client.snapshotClient()
+	return client.activeWindow(), client.currentLayout
 }
 
-func resolveTestInputTarget(s *SessionState, paneID uint64) (*Pane, *ClientState, bool) {
+func resolveTestInputTarget(s *SessionState, paneID uint64) (*Pane, protocol.ClientLayout, bool) {
 	client := clientForState(s)
 	pane := client.activePane()
-	matched := pane != nil && client.clientState.FocusedPaneID == paneID
-	return pane, client.snapshotClient(), matched
+	matched := pane != nil && client.currentLayout.FocusedPaneID == paneID
+	return pane, client.currentLayout, matched
 }
 
-func testWindowLayout(s *SessionState) (protocol.WindowLayout, error) {
-	return clientForState(s).windowLayout()
-}
-
-func testRenderBindings(s *SessionState) ([]RenderBinding, *ClientState) {
+func testClientLayout(s *SessionState) (protocol.ClientLayout, error) {
 	client := clientForState(s)
-	return client.renderBindings(), client.snapshotClient()
+	layout := client.currentLayout
+	if layout.LayoutRevision == 0 {
+		return protocol.ClientLayout{}, errors.New("test client has no installed layout")
+	}
+	return layout, nil
 }
 
-func snapshotTestClient(s *SessionState) *ClientState {
-	return clientForState(s).snapshotClient()
+func testClientLayoutPanes(s *SessionState) ([]protocol.PanePlacement, protocol.ClientLayout) {
+	client := clientForState(s)
+	return client.currentPanePlacements(), client.currentLayout
 }
 
-func setTestClientSize(s *SessionState, cols, rows uint16) *ClientState {
+func snapshotTestClient(s *SessionState) *clientInputState {
+	state := &clientForState(s).inputState
+	snapshot := *state
+	snapshot.PrefixEscape = append([]byte(nil), state.PrefixEscape...)
+	snapshot.Prompt = clonePromptState(state.Prompt)
+	return &snapshot
+}
+
+func setTestClientSize(s *SessionState, cols, rows uint16) protocol.ClientLayout {
 	client := clientForState(s)
 	client.terminalCols.Store(uint32(cols))
 	client.terminalRows.Store(uint32(rows))
 	if _, err := resizeTestActiveWindow(client, cols, rows); err != nil && s.ActiveWindowID != 0 {
-		return nil
+		return protocol.ClientLayout{}
 	}
-	client.clientState.TerminalCols = cols
-	client.clientState.TerminalRows = rows
-	return client.snapshotClient()
+	return client.currentLayout
 }
 
-func createTestWindow(s *SessionState, pane *Pane) (*Window, *ClientState) {
+func createTestWindow(s *SessionState, pane *Pane) (*Window, protocol.ClientLayout) {
 	client := clientForState(s)
-	cols, rows := client.clientState.TerminalCols, client.clientState.TerminalRows
+	cols, rows := uint16(client.terminalCols.Load()), uint16(client.terminalRows.Load())
 	if cols == 0 || rows == 0 {
 		paneCols, paneRows := pane.TerminalSize()
 		cols, rows = uint16(paneCols), uint16(paneRows)
 	}
 	window, transition, err := s.daemon.createClientWindow(client, pane, cols, rows)
 	if err != nil {
-		return nil, nil
+		return nil, protocol.ClientLayout{}
 	}
-	if err := projectTestClientState(client, transition); err != nil {
-		return nil, nil
+	if err := commitTestProjection(client, transition); err != nil {
+		return nil, protocol.ClientLayout{}
 	}
-	return window, client.snapshotClient()
+	return window, client.currentLayout
 }
 
 func resizeTestSessionActiveWindow(s *SessionState, cols, rows uint16) error {
@@ -283,96 +254,96 @@ func resizeTestSessionActiveWindow(s *SessionState, cols, rows uint16) error {
 	return err
 }
 
-func toggleTestZoom(s *SessionState) (*Window, *ClientState, bool, error) {
+func toggleTestZoom(s *SessionState) (*Window, protocol.ClientLayout, bool, error) {
 	client := clientForState(s)
 	window, transition, changed, err := s.daemon.toggleClientZoom(client)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, protocol.ClientLayout{}, false, err
 	}
-	if err := projectTestClientState(client, transition); err != nil {
-		return nil, nil, false, err
+	if err := commitTestProjection(client, transition); err != nil {
+		return nil, protocol.ClientLayout{}, false, err
 	}
-	return window, cloneClientState(client.clientState), changed, nil
+	return window, client.currentLayout, changed, nil
 }
 
-func splitTestFocusedPane(s *SessionState, pane *Pane, direction SplitDirection) (*Window, *ClientState, error) {
+func splitTestFocusedPane(s *SessionState, pane *Pane, direction SplitDirection) (*Window, protocol.ClientLayout, error) {
 	client := clientForState(s)
 	window, transition, err := s.daemon.splitClientPane(client, pane, direction)
 	if err != nil {
-		return nil, nil, err
+		return nil, protocol.ClientLayout{}, err
 	}
-	if err := projectTestClientState(client, transition); err != nil {
-		return nil, nil, err
+	if err := commitTestProjection(client, transition); err != nil {
+		return nil, protocol.ClientLayout{}, err
 	}
-	return window, cloneClientState(client.clientState), nil
+	return window, client.currentLayout, nil
 }
 
-func cycleTestWindowLayout(s *SessionState) (*Window, *ClientState, bool, error) {
+func cycleTestWindowLayout(s *SessionState) (*Window, protocol.ClientLayout, bool, error) {
 	client := clientForState(s)
-	window, transition, changed, err := s.daemon.cycleClientLayout(client)
+	window, transition, changed, err := s.daemon.cycleWindowLayout(client)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, protocol.ClientLayout{}, false, err
 	}
-	if err := projectTestClientState(client, transition); err != nil {
-		return nil, nil, false, err
+	if err := commitTestProjection(client, transition); err != nil {
+		return nil, protocol.ClientLayout{}, false, err
 	}
-	return window, cloneClientState(client.clientState), changed, nil
+	return window, client.currentLayout, changed, nil
 }
 
-func resizeTestFocusedPane(s *SessionState, direction PaneResizeDirection, amount int) (*Window, *ClientState, bool, error) {
+func resizeTestFocusedPane(s *SessionState, direction PaneResizeDirection, amount int) (*Window, protocol.ClientLayout, bool, error) {
 	client := clientForState(s)
 	window, transition, changed, err := s.daemon.resizeClientPane(client, direction, amount)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, protocol.ClientLayout{}, false, err
 	}
-	if err := projectTestClientState(client, transition); err != nil {
-		return nil, nil, false, err
+	if err := commitTestProjection(client, transition); err != nil {
+		return nil, protocol.ClientLayout{}, false, err
 	}
-	return window, cloneClientState(client.clientState), changed, nil
+	return window, client.currentLayout, changed, nil
 }
 
-func swapTestFocusedPane(s *SessionState, direction PaneSwapDirection) (*Window, *ClientState, bool, error) {
+func swapTestFocusedPane(s *SessionState, direction PaneSwapDirection) (*Window, protocol.ClientLayout, bool, error) {
 	client := clientForState(s)
 	window, transition, changed, err := s.daemon.swapClientPane(client, direction)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, protocol.ClientLayout{}, false, err
 	}
-	if err := projectTestClientState(client, transition); err != nil {
-		return nil, nil, false, err
+	if err := commitTestProjection(client, transition); err != nil {
+		return nil, protocol.ClientLayout{}, false, err
 	}
-	return window, cloneClientState(client.clientState), changed, nil
+	return window, client.currentLayout, changed, nil
 }
 
-func closeTestFocusedPane(s *SessionState) (*Pane, *Window, *ClientState, bool, uint64, bool, error) {
+func closeTestFocusedPane(s *SessionState) (*Pane, *Window, protocol.ClientLayout, bool, uint64, bool, error) {
 	client := clientForState(s)
 	pane := client.activePane()
 	if pane == nil {
-		return nil, nil, nil, false, 0, false, errors.New("client has no active pane")
+		return nil, nil, protocol.ClientLayout{}, false, 0, false, errors.New("client has no active pane")
 	}
 	result, err := s.daemon.removeClientPane(client, pane.ID)
 	if err != nil {
-		return nil, nil, nil, false, 0, false, err
+		return nil, nil, protocol.ClientLayout{}, false, 0, false, err
 	}
 	if !result.FinalPane {
-		if err := projectTestClientState(client, result.Transition); err != nil {
-			return nil, nil, nil, false, 0, false, err
+		if err := commitTestProjection(client, result.Transition); err != nil {
+			return nil, nil, protocol.ClientLayout{}, false, 0, false, err
 		}
 	}
-	return result.Pane, result.Window, cloneClientState(client.clientState), result.WindowClosed, result.ClosedWindowID, result.FinalPane, nil
+	return result.Pane, result.Window, client.currentLayout, result.WindowClosed, result.ClosedWindowID, result.FinalPane, nil
 }
 
-func removeTestPane(s *SessionState, paneID uint64) (*Window, *ClientState, bool, bool, error) {
+func removeTestPane(s *SessionState, paneID uint64) (*Window, protocol.ClientLayout, bool, bool, error) {
 	client := clientForState(s)
 	result, err := s.daemon.removeClientPane(client, paneID)
 	if err != nil {
-		return nil, nil, false, false, err
+		return nil, protocol.ClientLayout{}, false, false, err
 	}
 	if result.Removed && !result.FinalPane {
-		if err := projectTestClientState(client, result.Transition); err != nil {
-			return nil, nil, false, false, err
+		if err := commitTestProjection(client, result.Transition); err != nil {
+			return nil, protocol.ClientLayout{}, false, false, err
 		}
 	}
-	return result.Window, cloneClientState(client.clientState), result.FinalPane, result.Removed, nil
+	return result.Window, client.currentLayout, result.FinalPane, result.Removed, nil
 }
 
 func setTestClient(state *SessionState, client *ClientInstance) {
@@ -392,20 +363,60 @@ func setTestClient(state *SessionState, client *ClientInstance) {
 	if state.daemon.sessions == nil {
 		state.daemon.sessions = make(map[uint64]*SessionState)
 	}
+	if state.daemon.clientSessions == nil {
+		state.daemon.clientSessions = make(map[*ClientIdentity]uint64)
+	}
+	if state.daemon.clientInstances == nil {
+		state.daemon.clientInstances = make(map[*ClientIdentity]*ClientInstance)
+	}
+	if state.daemon.attachments == nil {
+		state.daemon.attachments = make(map[uint64]*ClientIdentity)
+	}
 	state.daemon.sessions[state.ID] = state
 	state.daemon.sessionIndex.Store(state.ID, state)
+	state.daemon.ensureSessionGroupInActor(state)
+	previous := state.daemon.clients[state.ID]
 	if client == nil {
 		delete(state.daemon.clients, state.ID)
 		state.daemon.clientIndex.Delete(state.ID)
+		if previous != nil && previous.identity != nil {
+			if state.daemon.attachments[state.ID] == previous.identity {
+				delete(state.daemon.attachments, state.ID)
+			}
+			if state.daemon.clientSessions[previous.identity] == state.ID {
+				delete(state.daemon.clientSessions, previous.identity)
+			}
+			if state.daemon.clientInstances[previous.identity] == previous {
+				delete(state.daemon.clientInstances, previous.identity)
+			}
+		}
 		testClientByState.Delete(state)
 		return
 	}
-	client.sessionID = state.ID
-	if client.clientState == nil {
-		client.clientState = &ClientState{}
+	if previous != nil && previous != client && previous.identity != nil {
+		if state.daemon.attachments[state.ID] == previous.identity {
+			delete(state.daemon.attachments, state.ID)
+		}
+		if state.daemon.clientSessions[previous.identity] == state.ID {
+			delete(state.daemon.clientSessions, previous.identity)
+		}
+		if state.daemon.clientInstances[previous.identity] == previous {
+			delete(state.daemon.clientInstances, previous.identity)
+		}
 	}
-	client.terminalCols.Store(uint32(client.clientState.TerminalCols))
-	client.terminalRows.Store(uint32(client.clientState.TerminalRows))
+	if client.identity == nil {
+		client.identity = &ClientIdentity{}
+	}
+	if oldSessionID := state.daemon.clientSessions[client.identity]; oldSessionID != 0 && oldSessionID != state.ID {
+		if state.daemon.attachments[oldSessionID] == client.identity {
+			delete(state.daemon.attachments, oldSessionID)
+		}
+		if state.daemon.clients[oldSessionID] == client {
+			delete(state.daemon.clients, oldSessionID)
+			state.daemon.clientIndex.Delete(oldSessionID)
+		}
+	}
+	client.sessionID = state.ID
 	if client.Daemon == nil {
 		client.Daemon = state.daemon
 	}
@@ -420,14 +431,24 @@ func setTestClient(state *SessionState, client *ClientInstance) {
 	}
 	state.daemon.clients[state.ID] = client
 	state.daemon.clientIndex.Store(state.ID, client)
+	state.daemon.clientInstances[client.identity] = client
+	state.daemon.clientSessions[client.identity] = state.ID
+	state.daemon.attachments[state.ID] = client.identity
 	testClientByState.Store(state, client)
-	_ = installTestCurrentProjection(client)
+	if len(state.Windows) > 0 {
+		_ = installTestCurrentProjection(client)
+	}
 	client.startStatusOutput()
 }
 
 func testDaemonForState(state *SessionState) *Daemon {
 	return &Daemon{
 		clients:                  make(map[uint64]*ClientInstance),
+		clientIdentities:         make(map[string]*ClientIdentity),
+		clientSessions:           make(map[*ClientIdentity]uint64),
+		clientInstances:          make(map[*ClientIdentity]*ClientInstance),
+		clientTerminalReasons:    make(map[*ClientIdentity]string),
+		attachments:              make(map[uint64]*ClientIdentity),
 		sessions:                 make(map[uint64]*SessionState),
 		panes:                    make(map[uint64]*Pane),
 		names:                    make(map[string]*SessionState),

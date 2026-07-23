@@ -212,7 +212,7 @@ func decodePredictableKittyKey(sequence []byte) (byte, kittyPredictionDispositio
 type predictionTarget struct {
 	paneID         uint64
 	slot           uint8
-	layoutRevision uint64
+	layoutRevision protocol.ClientLayoutRevision
 }
 
 type predictionContext struct {
@@ -511,7 +511,7 @@ func (p *inputPredictor) withVisibleOverlay(result predictionResult, _ *paneScan
 	return result
 }
 
-func (p *inputPredictor) reset(layoutRevision uint64, view *paneScanoutCache) (renderFrame, bool) {
+func (p *inputPredictor) reset(layoutRevision protocol.ClientLayoutRevision, view *paneScanoutCache) (renderFrame, bool) {
 	visible := p.visibleOperations()
 	p.clear()
 	spans := repairSpans(visible, view)

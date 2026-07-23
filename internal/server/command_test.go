@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/garindra/meja/internal/protocol"
+	"github.com/garindra/meja/internal/version"
 )
 
 func shortUnixSocketDir(t *testing.T) string {
@@ -97,12 +98,12 @@ func TestDetachedNewSessionDoesNotActivateInvokingClient(t *testing.T) {
 	d.names[source.Name] = source
 	d.nextID = 2
 
-	credential := &reconnectCredential{EncodedToken: "detached-test"}
-	instance := newClientInstance(d, credential)
-	credential.Instance = instance
+	identity := &ClientIdentity{ResumeToken: "detached-test"}
+	instance := newClientInstance(d, identity)
+	d.clientInstances[identity] = instance
 	setTestClient(source, instance)
-	d.clientSessions[credential] = source.ID
-	d.attachments[source.ID] = credential
+	d.clientSessions[identity] = source.ID
+	d.attachments[source.ID] = identity
 
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:                []string{"new-session", "-d", "-P", "-F", "#{session_id}:#{pane_id}", "-s", "detached"},
@@ -272,7 +273,7 @@ func TestCommandEngineRegistryIsCanonicalAndExcludesClientUX(t *testing.T) {
 
 func TestAttachedAdapterRejectsCommandStdout(t *testing.T) {
 	s := NewSessionState(1)
-	newStandaloneClient(s)
+	newTestClient(s)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)})
 	client := clientForState(s)
 	if _, err := client.executeAttachedCommand([]string{"set-buffer", "payload"}); err != nil {
@@ -289,7 +290,7 @@ func TestContextualKillPaneUsesInjectedCallerPaneID(t *testing.T) {
 	s.daemon = d
 	d.sessions[s.ID] = s
 	d.ensureSessionGroupInActor(s)
-	newStandaloneClient(s)
+	newTestClient(s)
 	first := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
 	createTestWindow(s, first)
 	second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
@@ -441,7 +442,7 @@ func TestSharedPaneFormatExpandsRequiredValuesAndStableCreationTime(t *testing.T
 func TestPaneFormatUsesLaunchedCommandAndCwdFallbacks(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	session := NewSessionState(1)
-	newStandaloneClient(session)
+	newTestClient(session)
 	session.setSessionName("fallback")
 	pane := &Pane{ID: 7, Launch: PaneLaunch{Shell: "/bin/zsh", RequestedArgv: []string{"/bin/sleep", "5"}, Cwd: "/launch"}, terminal: newTerminal(10, 2)}
 	createTestWindow(session, pane)
@@ -1184,8 +1185,8 @@ func TestParseCommandLinePreservesQuotedAndEscapedArguments(t *testing.T) {
 
 func TestCommandPromptIsClientLocalAndSubmitsToCommandEngine(t *testing.T) {
 	s := NewSessionState(1)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	pane := &Pane{ID: testAddPaneID(s), Title: "bash", terminal: newTerminal(80, 23)}
 	window, _ := createTestWindow(s, pane)
 	clientForState(s).ConsumeInputByte(0x02)
@@ -1223,8 +1224,8 @@ func TestCommandPromptIsClientLocalAndSubmitsToCommandEngine(t *testing.T) {
 
 func TestCommandPromptReportsCommandErrorsWithoutClosingInput(t *testing.T) {
 	s := NewSessionState(1)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)})
 	if _, err := clientForState(s).BeginCommandPrompt(); err != nil {
 		t.Fatal(err)
@@ -1239,6 +1240,21 @@ func TestCommandPromptReportsCommandErrorsWithoutClosingInput(t *testing.T) {
 	message, _ := clientForState(s).statusMessage.Load().(string)
 	if state.Prompt != nil || message != `unknown command "not-a-command"` {
 		t.Fatalf("client after command error = %#v", state)
+	}
+}
+
+func TestServerVersionCommandReportsDaemonCompatibility(t *testing.T) {
+	previous := version.Value
+	version.Value = "v1.2.3"
+	t.Cleanup(func() { version.Value = previous })
+
+	outcome, err := runServerVersionCommand(nil, CommandContext{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "server:           meja 1.2.3\ncommand protocol: 1\nQUIC profile:     meja-quic/12\n"
+	if got := string(outcome.Stdout); got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
 	}
 }
 
@@ -1260,15 +1276,14 @@ func TestSwitchSessionCommandAppliesPreparedTransition(t *testing.T) {
 	d.ensureSessionGroupInActor(target)
 	createTestWindow(source, &Pane{ID: testAddPaneID(source), terminal: newTerminal(101, 37)})
 	createTestWindow(target, &Pane{ID: testAddPaneID(target), terminal: newTerminal(101, 37)})
-	clientState := newStandaloneClient(source)
-	clientState.TerminalCols, clientState.TerminalRows = 101, 37
-	clientForState(source).terminalCols.Store(101)
-	clientForState(source).terminalRows.Store(37)
+	fixtureClient := newTestClient(source)
+	fixtureClient.setTestTerminalSize(101, 37)
 	client := clientForState(source)
-	credential := &reconnectCredential{EncodedToken: "switch-command", Instance: client}
-	client.credential = credential
-	d.clientSessions[credential] = source.ID
-	d.attachments[source.ID] = credential
+	identity := &ClientIdentity{ResumeToken: "switch-command", lastAllocatedClientLayoutRevision: client.currentLayout.LayoutRevision}
+	client.identity = identity
+	d.clientInstances[identity] = client
+	d.clientSessions[identity] = source.ID
+	d.attachments[source.ID] = identity
 	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: client.AttachmentID, Generation: 1}
 	if _, err := client.executeAttachedCommand([]string{"switch-session", "-t", "target"}); err != nil {
 		t.Fatal(err)
@@ -1302,10 +1317,11 @@ func TestSwitchSessionHandlerPreparesButDoesNotApplyClientView(t *testing.T) {
 	client := clientForState(source)
 	client.terminalCols.Store(80)
 	client.terminalRows.Store(23)
-	credential := &reconnectCredential{EncodedToken: "prepare-only", Instance: client}
-	client.credential = credential
-	d.clientSessions[credential] = source.ID
-	d.attachments[source.ID] = credential
+	identity := &ClientIdentity{ResumeToken: "prepare-only", lastAllocatedClientLayoutRevision: client.currentLayout.LayoutRevision}
+	client.identity = identity
+	d.clientInstances[identity] = client
+	d.clientSessions[identity] = source.ID
+	d.attachments[source.ID] = identity
 	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{
 		WindowID: source.ActiveWindowID, SessionID: source.ID,
 		AttachmentID: client.AttachmentID, Generation: 1,
@@ -1363,8 +1379,8 @@ func TestAttachedRestoreCreatesSessionAndAppliesPreparedTransition(t *testing.T)
 	source.daemon = d
 	source.setSessionName("source")
 	source.rootDir = project
-	state := newStandaloneClient(source)
-	state.TerminalCols, state.TerminalRows = 101, 37
+	state := newTestClient(source)
+	state.setTestTerminalSize(101, 37)
 	createTestWindow(source, &Pane{
 		ID: testAddPaneID(source), Launch: PaneLaunch{Cwd: project}, terminal: newTerminal(101, 37),
 	})
@@ -1374,10 +1390,11 @@ func TestAttachedRestoreCreatesSessionAndAppliesPreparedTransition(t *testing.T)
 	d.sessions[source.ID] = source
 	d.names[source.Name] = source
 	client := clientForState(source)
-	credential := &reconnectCredential{EncodedToken: "restore-command", Instance: client}
-	client.credential = credential
-	d.clientSessions[credential] = source.ID
-	d.attachments[source.ID] = credential
+	identity := &ClientIdentity{ResumeToken: "restore-command", lastAllocatedClientLayoutRevision: client.currentLayout.LayoutRevision}
+	client.identity = identity
+	d.clientInstances[identity] = client
+	d.clientSessions[identity] = source.ID
+	d.attachments[source.ID] = identity
 	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: client.AttachmentID, Generation: 1}
 
 	_, err := client.executeAttachedCommand([]string{
@@ -1412,7 +1429,7 @@ func TestPaneCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
 	s.rootDir = t.TempDir()
 	s.daemon.processObserver = emptyProcessObserver{}
 	project := t.TempDir()
-	newStandaloneClient(s)
+	newTestClient(s)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), Launch: PaneLaunch{Cwd: project}})
 	d.sessions[s.ID] = s
 	d.names[s.Name] = s
@@ -1462,8 +1479,8 @@ func TestCLIAndAttachedInvocationShareOperationalCommandHandler(t *testing.T) {
 	s := NewSessionState(41)
 	t.Cleanup(func() { stopState(s) })
 	s.setSessionName("work")
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	left := &Pane{ID: testAddPaneID(s), Title: "left", terminal: newTerminal(80, 23)}
 	window, _ := createTestWindow(s, left)
 	right := &Pane{ID: testAddPaneID(s), Title: "right", terminal: newTerminal(80, 23)}

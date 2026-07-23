@@ -7,20 +7,21 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/garindra/meja/internal/protocol"
 )
 
 const paneResizeRepeatWindow = 500 * time.Millisecond
 
 func (c *ClientInstance) BeginPrompt(mode PromptMode, label, initial string) (*PromptState, error) {
 	state := c.sessionState()
-	client := c.clientState
-	if client == nil {
+	if c == nil {
 		return nil, errors.New("client is unavailable")
 	}
-	windowID := client.ActiveWindowID
+	client := &c.inputState
+	windowID := c.currentLayout.WindowID
 	if windowID == 0 {
 		windowID = state.ActiveWindowID
-		client.ActiveWindowID = windowID
 	}
 	if state.Windows[windowID] == nil {
 		return nil, errors.New("client has no active window")
@@ -43,7 +44,7 @@ func (c *ClientInstance) BeginCommandPrompt() (*PromptState, error) {
 }
 
 func (c *ClientInstance) showStatusMessage(message string) {
-	if c.sessionState() == nil || c.clientState == nil {
+	if c == nil || c.sessionState() == nil {
 		return
 	}
 	messageID := c.statusMessageID.Add(1)
@@ -82,10 +83,10 @@ func (c *ClientInstance) resolvePrompt(result promptResult) (bool, error) {
 }
 
 func (c *ClientInstance) ActivePrompt() *PromptState {
-	client := c.clientState
-	if client == nil {
+	if c == nil {
 		return nil
 	}
+	client := &c.inputState
 	return clonePromptState(client.Prompt)
 }
 
@@ -121,17 +122,17 @@ type serverInputEvent struct {
 }
 
 func (c *ClientInstance) ConsumeInputByte(b byte) serverInputEvent {
-	client := c.clientState
-	if client == nil {
+	if c == nil {
 		return serverInputEvent{}
 	}
+	client := &c.inputState
 	if client.Prompt != nil {
-		return consumePromptByteLocked(client, b)
+		return consumePromptByte(client, b)
 	}
-	return consumeInputByteLockedAt(client, b, time.Now())
+	return consumeInputByteAt(client, b, time.Now())
 }
 
-func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) serverInputEvent {
+func consumeInputByteAt(client *clientInputState, b byte, now time.Time) serverInputEvent {
 	switch client.InputState {
 	case serverInputPrefix:
 		if b == 0x1b {
@@ -261,30 +262,30 @@ func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) server
 	return serverInputEvent{}
 }
 
-func armPaneResizeRepeat(client *ClientState, now time.Time) {
+func armPaneResizeRepeat(client *clientInputState, now time.Time) {
 	client.InputState = serverInputNormal
 	client.PrefixEscape = nil
 	client.ResizeRepeatUntil = now.Add(paneResizeRepeatWindow)
 }
 
-func paneResizeRepeatActive(client *ClientState, now time.Time) bool {
+func paneResizeRepeatActive(client *clientInputState, now time.Time) bool {
 	return client != nil && !client.ResizeRepeatUntil.IsZero() && now.Before(client.ResizeRepeatUntil)
 }
 
-func cancelPaneResizeRepeat(client *ClientState) {
+func cancelPaneResizeRepeat(client *clientInputState) {
 	client.InputState = serverInputNormal
 	client.PrefixEscape = nil
 	client.ResizeRepeatUntil = time.Time{}
 }
 
-func cancelPaneResizeRepeatWithInput(client *ClientState, suffix ...byte) serverInputEvent {
+func cancelPaneResizeRepeatWithInput(client *clientInputState, suffix ...byte) serverInputEvent {
 	data := append([]byte(nil), client.PrefixEscape...)
 	data = append(data, suffix...)
 	cancelPaneResizeRepeat(client)
 	return serverInputEvent{Command: serverCommandLiteral, Data: data}
 }
 
-func resetPrefixInput(client *ClientState) {
+func resetPrefixInput(client *clientInputState) {
 	client.InputState = serverInputNormal
 	client.PrefixEscape = nil
 }
@@ -357,13 +358,13 @@ func directionFlag(final byte) string {
 	}
 }
 
-func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
+func consumePromptByte(client *clientInputState, b byte) serverInputEvent {
 	prompt := client.Prompt
 	if prompt.Mode == PromptModeConfirm {
-		return consumeConfirmationByteLocked(client, b)
+		return consumeConfirmationByte(client, b)
 	}
 	if len(prompt.PendingEscape) > 0 {
-		return consumePromptEscapeByteLocked(client, b)
+		return consumePromptEscapeByte(client, b)
 	}
 	if b == 0x1b {
 		prompt.PendingEscape = []byte{b}
@@ -411,7 +412,7 @@ func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
 	return event
 }
 
-func consumeConfirmationByteLocked(client *ClientState, b byte) serverInputEvent {
+func consumeConfirmationByte(client *clientInputState, b byte) serverInputEvent {
 	prompt := client.Prompt
 	event := serverInputEvent{Command: serverCommandPrompt, PromptMode: prompt.Mode}
 	switch b {
@@ -426,7 +427,7 @@ func consumeConfirmationByteLocked(client *ClientState, b byte) serverInputEvent
 	return event
 }
 
-func consumePromptEscapeByteLocked(client *ClientState, b byte) serverInputEvent {
+func consumePromptEscapeByte(client *clientInputState, b byte) serverInputEvent {
 	prompt := client.Prompt
 	switch len(prompt.PendingEscape) {
 	case 1:
@@ -434,38 +435,38 @@ func consumePromptEscapeByteLocked(client *ClientState, b byte) serverInputEvent
 			prompt.PendingEscape = append(prompt.PendingEscape, b)
 			return serverInputEvent{}
 		}
-		return cancelPromptLocked(client)
+		return cancelPrompt(client)
 	case 2:
 		if b == '3' {
 			prompt.PendingEscape = append(prompt.PendingEscape, b)
 			return serverInputEvent{}
 		}
-		return cancelPromptLocked(client)
+		return cancelPrompt(client)
 	case 3:
 		if b == '~' {
 			prompt.PendingEscape = nil
 			prompt.pendingUTF8 = nil
 			deletePromptRune(prompt)
 			prompt.Action = PromptActionChanged
-			return promptEventLocked(prompt, PromptActionChanged, "")
+			return promptEvent(prompt, PromptActionChanged, "")
 		}
-		return cancelPromptLocked(client)
+		return cancelPrompt(client)
 	default:
-		return cancelPromptLocked(client)
+		return cancelPrompt(client)
 	}
 }
 
-func cancelPromptLocked(client *ClientState) serverInputEvent {
+func cancelPrompt(client *clientInputState) serverInputEvent {
 	prompt := client.Prompt
 	prompt.Action = PromptActionCancel
 	prompt.PendingEscape = nil
 	prompt.pendingUTF8 = nil
-	event := promptEventLocked(prompt, PromptActionCancel, "")
+	event := promptEvent(prompt, PromptActionCancel, "")
 	client.Prompt = nil
 	return event
 }
 
-func promptEventLocked(prompt *PromptState, action PromptAction, text string) serverInputEvent {
+func promptEvent(prompt *PromptState, action PromptAction, text string) serverInputEvent {
 	return serverInputEvent{
 		Command:      serverCommandPrompt,
 		PromptAction: action,
@@ -478,15 +479,15 @@ func promptEventLocked(prompt *PromptState, action PromptAction, text string) se
 // is resolved as cancel only once its next byte proves it is not CSI Delete.
 // Any submit/cancel terminates ownership of the current input payload.
 func (c *ClientInstance) ConsumePromptInput(data []byte) (int, []serverInputEvent, bool) {
-	client := c.clientState
-	if client == nil || client.Prompt == nil {
+	if c == nil || c.inputState.Prompt == nil {
 		return 0, nil, false
 	}
+	client := &c.inputState
 	events := make([]serverInputEvent, 0, len(data))
 	index := 0
 	terminated := false
 	for index < len(data) && client.Prompt != nil {
-		event := consumePromptByteLocked(client, data[index])
+		event := consumePromptByte(client, data[index])
 		index++
 		if event.Command != serverCommandNone {
 			events = append(events, event)
@@ -500,8 +501,7 @@ func (c *ClientInstance) ConsumePromptInput(data []byte) (int, []serverInputEven
 }
 
 func (c *ClientInstance) InputIsNormal() bool {
-	client := c.clientState
-	return client != nil && client.Prompt == nil && client.InputState == serverInputNormal && !paneResizeRepeatActive(client, time.Now())
+	return c != nil && c.inputState.Prompt == nil && c.inputState.InputState == serverInputNormal && !paneResizeRepeatActive(&c.inputState, time.Now())
 }
 
 func translateApplicationCursor(data []byte, enabled bool) ([]byte, int, bool) {
@@ -571,25 +571,27 @@ func deletePromptRune(prompt *PromptState) {
 	prompt.Text = prompt.Text[:len(prompt.Text)-1]
 }
 
-func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, *ClientState, error) {
-	client := c.clientState
-	if client == nil {
-		return nil, nil, errors.New("client is unavailable")
+func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, protocol.ClientLayout, error) {
+	if c == nil {
+		return nil, protocol.ClientLayout{}, errors.New("client is unavailable")
 	}
-	window := c.sessionState().Windows[client.ActiveWindowID]
+	client := &c.inputState
+	windowID := c.currentLayout.WindowID
+	window := c.sessionState().Windows[windowID]
 	if window == nil {
-		return nil, nil, fmt.Errorf("unknown window %d", client.ActiveWindowID)
+		return nil, protocol.ClientLayout{}, fmt.Errorf("unknown window %d", windowID)
 	}
-	placements := window.Layout.Compute(Rect{Width: int(client.TerminalCols), Height: int(client.TerminalRows)})
+	cols, rows := clientViewportSize(c, window)
+	placements := window.Layout.Compute(Rect{Width: int(cols), Height: int(rows)})
 	var current *PanePlacement
 	for i := range placements {
-		if placements[i].PaneID == client.FocusedPaneID {
+		if placements[i].PaneID == c.currentLayout.FocusedPaneID {
 			current = &placements[i]
 			break
 		}
 	}
 	if current == nil {
-		return cloneWindow(window), cloneClientState(client), nil
+		return cloneWindow(window), c.currentLayout, nil
 	}
 	if !client.HasFocusPoint {
 		client.FocusX2 = rectCenterX2(current.Rect)
@@ -659,11 +661,11 @@ func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, *ClientSta
 		}
 		focusedWindow, err := c.focusPane(best.placement.PaneID)
 		if err != nil {
-			return nil, nil, err
+			return nil, protocol.ClientLayout{}, err
 		}
-		return focusedWindow, cloneClientState(c.ensureClientState()), nil
+		return focusedWindow, c.currentLayout, nil
 	}
-	return cloneWindow(window), cloneClientState(client), nil
+	return cloneWindow(window), c.currentLayout, nil
 }
 
 func rectCenterX2(rect Rect) int {

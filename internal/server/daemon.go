@@ -15,7 +15,6 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -40,33 +39,34 @@ type Config struct {
 // registry access is serialized by requests; control handlers query it and
 // then query Sessions separately, so neither actor waits on the other.
 type Daemon struct {
-	logMu                sync.Mutex
-	shutdownMu           sync.Mutex
-	requests             chan daemonRequest
-	requestLoopOnce      sync.Once
-	requestLoopReady     atomic.Bool
-	commandEngineOnce    sync.Once
-	commands             *CommandEngine
-	nextID               uint64
-	nextPaneID           uint64
-	nextWindowID         uint64
-	nextGroupID          uint64
-	nextAttachmentID     uint64
-	sessions             map[uint64]*SessionState
-	sessionIndex         sync.Map // uint64 -> *SessionState; lock-free client lookup
-	groups               map[uint64]*GroupState
-	groupIndex           sync.Map // uint64 -> *GroupState
-	panes                map[uint64]*Pane
-	paneIndex            sync.Map // uint64 -> *Pane; process exits resolve directly
-	windowIndex          sync.Map // uint64 -> *Window
-	projectionRevisions  map[uint64]uint64
-	windowLeases         map[uint64]*WindowViewLease
-	names                map[string]*SessionState
-	reconnectCredentials map[string]*reconnectCredential
-	// clientSessions is separate from reconnectCredentials: it is only the
-	// target-session hint consulted when rebuilding a client after reconnect.
-	clientSessions           map[*reconnectCredential]uint64
-	attachments              map[uint64]*reconnectCredential
+	logMu             sync.Mutex
+	shutdownMu        sync.Mutex
+	requests          chan daemonRequest
+	requestLoopOnce   sync.Once
+	requestLoopReady  atomic.Bool
+	commandEngineOnce sync.Once
+	commands          *CommandEngine
+	nextID            uint64
+	nextPaneID        uint64
+	nextWindowID      uint64
+	nextGroupID       uint64
+	nextAttachmentID  uint64
+	sessions          map[uint64]*SessionState
+	sessionIndex      sync.Map // uint64 -> *SessionState; lock-free client lookup
+	groups            map[uint64]*GroupState
+	groupIndex        sync.Map // uint64 -> *GroupState
+	panes             map[uint64]*Pane
+	paneIndex         sync.Map // uint64 -> *Pane; process exits resolve directly
+	windowIndex       sync.Map // uint64 -> *Window
+	windowLeases      map[uint64]*WindowViewLease
+	names             map[string]*SessionState
+	clientIdentities  map[string]*ClientIdentity
+	// These daemon-owned indexes relate a stable identity to its current
+	// assignment and disposable transport instance.
+	clientSessions           map[*ClientIdentity]uint64
+	clientInstances          map[*ClientIdentity]*ClientInstance
+	clientTerminalReasons    map[*ClientIdentity]string
+	attachments              map[uint64]*ClientIdentity
 	clients                  map[uint64]*ClientInstance
 	clientIndex              sync.Map // uint64 -> *ClientInstance; lock-free client lookup
 	shutdowns                map[uint64]*sessionShutdown
@@ -207,7 +207,7 @@ func (d *Daemon) postPaneProcessExit(paneID uint64) {
 				plan := transition.Projection
 				client.post(func() error {
 					d.logf("meja pane-exit: deliver pane=%d attachment=%d session=%d window=%d projection=%d layout=%d close=%t\n",
-						paneID, client.AttachmentID, plan.SessionID, plan.WindowID, plan.ProjectionRevision, plan.LayoutRevision, plan.Close)
+						paneID, client.AttachmentID, plan.SessionID, plan.Layout.WindowID, plan.ProjectionRevision, plan.Layout.LayoutRevision, plan.Close)
 					if err := client.applyViewTransition(transition); err != nil {
 						if staleErr := client.validateProjectionPlan(plan); staleErr != nil {
 							d.logf("meja pane-exit: discard stale pane=%d attachment=%d projection=%d: %v\n",
@@ -217,7 +217,7 @@ func (d *Daemon) postPaneProcessExit(paneID uint64) {
 						return fmt.Errorf("pane-exit pane=%d projection=%d: %w", paneID, plan.ProjectionRevision, err)
 					}
 					d.logf("meja pane-exit: published pane=%d attachment=%d window=%d projection=%d layout=%d\n",
-						paneID, client.AttachmentID, plan.WindowID, plan.ProjectionRevision, client.highestLayoutRevision.Load())
+						paneID, client.AttachmentID, plan.Layout.WindowID, plan.ProjectionRevision, client.currentLayout.LayoutRevision)
 					return nil
 				})
 			}
@@ -283,7 +283,7 @@ func (d *Daemon) applyPaneExit(paneID uint64) ([]PreparedViewTransition, []*Clie
 		if state.ActiveWindowID != 0 {
 			_, _ = prepareClientWindowGeometryNow(client, state, state.ActiveWindowID)
 		}
-		transition := d.prepareViewTransitionNow(viewTransitionPaneExit, client, state, true, pane)
+		transition := d.prepareViewTransitionNow(viewTransitionPaneExit, client, state, pane)
 		if state.ActiveWindowID == 0 {
 			transition.Projection.Close = true
 			transition.Projection.CloseReason = "no viewable fallback window"
@@ -327,9 +327,11 @@ func Run(ctx context.Context, cfg Config) error {
 		panes:                 make(map[uint64]*Pane),
 		windowLeases:          make(map[uint64]*WindowViewLease),
 		names:                 make(map[string]*SessionState),
-		reconnectCredentials:  make(map[string]*reconnectCredential),
-		clientSessions:        make(map[*reconnectCredential]uint64),
-		attachments:           make(map[uint64]*reconnectCredential),
+		clientIdentities:      make(map[string]*ClientIdentity),
+		clientSessions:        make(map[*ClientIdentity]uint64),
+		clientInstances:       make(map[*ClientIdentity]*ClientInstance),
+		clientTerminalReasons: make(map[*ClientIdentity]string),
+		attachments:           make(map[uint64]*ClientIdentity),
 		clients:               make(map[uint64]*ClientInstance),
 		shutdowns:             make(map[uint64]*sessionShutdown),
 		tlsConfig:             tlsConfig,
@@ -610,19 +612,22 @@ func (d *Daemon) resizeClientView(client *ClientInstance, cols, rows uint16) (Pr
 		}
 		err = resizeSessionWindowModelNow(state, state.ActiveWindowID, cols, rows)
 		if err == nil {
-			transition = d.prepareViewTransitionNow(viewTransitionResize, client, state, true)
+			transition = d.prepareViewTransitionNow(viewTransitionResize, client, state)
 		}
 	})
 	return transition, err
 }
 
-func (d *Daemon) prepareViewTransitionNow(reason ViewTransitionReason, client *ClientInstance, state *SessionState, advance bool, removedPanes ...*Pane) PreparedViewTransition {
-	plan := d.projectionPlanLockedWithRevision(client, state, advance)
+func (d *Daemon) prepareViewTransitionNow(reason ViewTransitionReason, client *ClientInstance, state *SessionState, removedPanes ...*Pane) PreparedViewTransition {
+	plan := d.projectionPlanNow(client, state)
 	transition := PreparedViewTransition{Reason: reason, Projection: plan, RemovedPanes: append([]*Pane(nil), removedPanes...)}
 	if plan.Close {
 		return transition
 	}
-	for _, projected := range plan.Panes {
+	plan.FullSnapshot = true
+	plan.Layout.LayoutRevision = d.allocateClientLayoutRevisionNow(client)
+	transition.Projection = plan
+	for _, projected := range plan.Layout.Panes {
 		value, ok := d.paneIndex.Load(projected.PaneID)
 		if !ok || value == nil {
 			continue
@@ -632,9 +637,36 @@ func (d *Daemon) prepareViewTransitionNow(reason ViewTransitionReason, client *C
 		if cols == projected.Rect.Width && rows == projected.Rect.Height {
 			continue
 		}
-		transition.PaneResizes = append(transition.PaneResizes, PreparedPaneResize{Pane: pane, Rect: projected.Rect})
+		transition.PaneResizes = append(transition.PaneResizes, PreparedPaneResize{
+			Pane: pane,
+			Cols: uint16(projected.Rect.Width),
+			Rows: uint16(projected.Rect.Height),
+		})
 	}
 	return transition
+}
+
+func (d *Daemon) prepareFocusTransitionNow(client *ClientInstance, state *SessionState) PreparedViewTransition {
+	plan := d.projectionPlanNow(client, state)
+	plan.Layout.LayoutRevision = d.clientLayoutRevisionNow(client)
+	return PreparedViewTransition{Reason: viewTransitionFocus, Projection: plan}
+}
+
+func (d *Daemon) clientLayoutRevisionNow(client *ClientInstance) protocol.ClientLayoutRevision {
+	if client == nil || client.identity == nil {
+		return 0
+	}
+	return client.identity.lastAllocatedClientLayoutRevision
+}
+
+func (d *Daemon) allocateClientLayoutRevisionNow(client *ClientInstance) protocol.ClientLayoutRevision {
+	if client == nil || client.identity == nil {
+		return 0
+	}
+	if client.identity.lastAllocatedClientLayoutRevision != protocol.ClientLayoutRevision(^uint64(0)) {
+		client.identity.lastAllocatedClientLayoutRevision++
+	}
+	return client.identity.lastAllocatedClientLayoutRevision
 }
 
 // prepareClientWindowGeometryNow is the geometry half of window entry. Callers
@@ -670,67 +702,47 @@ func prepareClientWindowGeometryNow(client *ClientInstance, state *SessionState,
 	return true, nil
 }
 
-func (d *Daemon) projectionPlanLockedWithRevision(client *ClientInstance, state *SessionState, advance bool) ClientProjectionPlan {
-	plan := ClientProjectionPlan{AttachmentID: client.AttachmentID, SessionID: state.ID, FullSnapshot: true}
-	plan.WindowID = state.ActiveWindowID
-	if plan.WindowID == 0 && len(state.Windows) > 0 {
+func (d *Daemon) projectionPlanNow(client *ClientInstance, state *SessionState) ClientProjectionPlan {
+	plan := ClientProjectionPlan{AttachmentID: client.AttachmentID, SessionID: state.ID}
+	plan.Layout.WindowID = state.ActiveWindowID
+	if plan.Layout.WindowID == 0 && len(state.Windows) > 0 {
 		ids := state.orderedWindowIDs()
-		plan.WindowID = ids[0]
+		plan.Layout.WindowID = ids[0]
 	}
-	if lease := d.windowLeases[plan.WindowID]; lease != nil && lease.AttachmentID == client.AttachmentID {
+	if lease := d.windowLeases[plan.Layout.WindowID]; lease != nil && lease.AttachmentID == client.AttachmentID {
 		plan.ViewLeaseGeneration = lease.Generation
 	}
-	plan.Cols, plan.Rows = uint16(client.terminalCols.Load()), uint16(client.terminalRows.Load())
-	if plan.Cols == 0 || plan.Rows == 0 {
-		if window := state.Windows[plan.WindowID]; window != nil {
-			plan.Cols, plan.Rows = window.Cols, window.Rows
+	cols, rows := uint16(client.terminalCols.Load()), uint16(client.terminalRows.Load())
+	if cols == 0 || rows == 0 {
+		if window := state.Windows[plan.Layout.WindowID]; window != nil {
+			cols, rows = window.Cols, window.Rows
 		}
 	}
-	window := state.Windows[plan.WindowID]
+	window := state.Windows[plan.Layout.WindowID]
 	if window != nil {
-		plan.LayoutRevision = window.LayoutRevision
-		placements := visibleWindowPlacementsForSession(state, window, Rect{Width: int(plan.Cols), Height: int(plan.Rows)})
-		plan.Panes = make([]RenderPane, 0, len(placements))
-		plan.Bindings = make([]RenderBinding, 0, len(placements))
+		placements := visibleWindowPlacementsForSession(state, window, Rect{Width: int(cols), Height: int(rows)})
+		plan.Layout.Panes = make([]protocol.PanePlacement, 0, len(placements))
 		for slot, placement := range placements {
-			plan.Panes = append(plan.Panes, RenderPane(placement))
-			plan.Bindings = append(plan.Bindings, RenderBinding{Slot: slot, PaneID: placement.PaneID})
+			plan.Layout.Panes = append(plan.Layout.Panes, protocol.PanePlacement{
+				PaneID: placement.PaneID,
+				Slot:   uint8(slot),
+				Rect: protocol.Rect{
+					X: placement.Rect.X, Y: placement.Rect.Y, Width: placement.Rect.Width, Height: placement.Rect.Height,
+				},
+			})
 		}
-		view := state.groupWindowViewLocked(plan.WindowID)
-		plan.FocusedPaneID = view.FocusedPaneID
-		if plan.FocusedPaneID == 0 {
-			plan.FocusedPaneID = window.ActivePaneID
+		view := state.groupWindowViewNow(plan.Layout.WindowID)
+		plan.Layout.FocusedPaneID = view.FocusedPaneID
+		if plan.Layout.FocusedPaneID == 0 {
+			plan.Layout.FocusedPaneID = window.ActivePaneID
 		}
-		plan.Status = StatusUpdate{Width: int(plan.Cols), StyleID: statusNormalStyleID}
-		var status strings.Builder
-		for index, item := range state.WindowStatuses() {
-			if index > 0 {
-				status.WriteByte(' ')
-			}
-			if item.Active {
-				status.WriteByte('[')
-			}
-			status.WriteString(item.Title)
-			if item.Active {
-				status.WriteByte(']')
-			}
-		}
-		plan.Status.Text = status.String()
-		plan.Status.Location = state.rootDir
 	}
-	if d.projectionRevisions == nil {
-		d.projectionRevisions = make(map[uint64]uint64)
-	}
-	if d.projectionRevisions[client.AttachmentID] == 0 {
-		d.projectionRevisions[client.AttachmentID] = 1
-	} else if advance {
-		d.projectionRevisions[client.AttachmentID]++
-	}
-	plan.ProjectionRevision = d.projectionRevisions[client.AttachmentID]
+	client.lastPreparedProjectionRevision++
+	plan.ProjectionRevision = client.lastPreparedProjectionRevision
 	return plan
 }
 
-func (d *Daemon) windowForAttachmentLocked(attachmentID uint64) uint64 {
+func (d *Daemon) windowForAttachmentNow(attachmentID uint64) uint64 {
 	for windowID, lease := range d.windowLeases {
 		if lease != nil && lease.AttachmentID == attachmentID {
 			return windowID
@@ -739,16 +751,19 @@ func (d *Daemon) windowForAttachmentLocked(attachmentID uint64) uint64 {
 	return 0
 }
 
-func (d *Daemon) attachSessionView(state *SessionState, cols, rows uint16, advanceLayoutRevision bool) (PreparedViewTransition, error) {
+// prepareAttachedClientView resolves the registered instance's daemon-owned
+// session assignment and prepares its initial transport projection.
+func (d *Daemon) prepareAttachedClientView(client *ClientInstance, cols, rows uint16) (PreparedViewTransition, error) {
 	var transition PreparedViewTransition
 	var err error
 	d.call(func() {
-		if state == nil {
+		if client == nil || client.identity == nil || d.clientInstances[client.identity] != client {
 			err = errSessionUnavailable
 			return
 		}
-		client := d.clients[state.ID]
-		if client == nil {
+		sessionID := d.clientSessions[client.identity]
+		state := d.sessions[sessionID]
+		if state == nil || d.attachments[sessionID] != client.identity || d.clients[sessionID] != client {
 			err = errSessionUnavailable
 			return
 		}
@@ -767,7 +782,7 @@ func (d *Daemon) attachSessionView(state *SessionState, cols, rows uint16, advan
 			err = errSessionUnavailable
 			return
 		}
-		sizeChanged, prepareErr := prepareClientWindowGeometryNow(client, state, targetWindowID)
+		_, prepareErr := prepareClientWindowGeometryNow(client, state, targetWindowID)
 		if prepareErr != nil {
 			err = prepareErr
 			return
@@ -777,7 +792,7 @@ func (d *Daemon) attachSessionView(state *SessionState, cols, rows uint16, advan
 			err = fmt.Errorf("window %d is currently viewed by another client", target.DisplayIndex)
 			return
 		}
-		oldWindowID := d.windowForAttachmentLocked(client.AttachmentID)
+		oldWindowID := d.windowForAttachmentNow(client.AttachmentID)
 		if oldWindowID != 0 && oldWindowID != targetWindowID {
 			old := d.windowLeases[oldWindowID]
 			if old == nil || old.AttachmentID != client.AttachmentID {
@@ -796,7 +811,7 @@ func (d *Daemon) attachSessionView(state *SessionState, cols, rows uint16, advan
 		if oldWindowID != 0 && oldWindowID != targetWindowID {
 			delete(d.windowLeases, oldWindowID)
 		}
-		transition = d.prepareViewTransitionNow(viewTransitionAttach, client, state, advanceLayoutRevision || sizeChanged)
+		transition = d.prepareViewTransitionNow(viewTransitionAttach, client, state)
 	})
 	return transition, err
 }
@@ -894,10 +909,10 @@ func (d *Daemon) removeSession(state *SessionState) {
 			index--
 		}
 	}
-	if credential := d.attachments[state.ID]; credential != nil {
+	if identity := d.attachments[state.ID]; identity != nil {
 		delete(d.attachments, state.ID)
-		delete(d.clientSessions, credential)
-		credential.TerminalReason = "session is no longer available"
+		delete(d.clientSessions, identity)
+		d.clientTerminalReasons[identity] = "session is no longer available"
 	}
 	delete(d.sessions, state.ID)
 	d.sessionIndex.Delete(state.ID)
@@ -917,7 +932,7 @@ func (d *Daemon) removeSession(state *SessionState) {
 		} else {
 			for memberID := range group.SessionIDs {
 				if member := d.sessions[memberID]; member != nil {
-					member.syncGroupLinksLocked()
+					member.syncGroupLinksNow()
 					member.grouped.Store(len(group.SessionIDs) > 1)
 					member.persistSessionForPersistence()
 				}

@@ -9,7 +9,7 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
-func feedBytewise(parser *frontendInputParser, revision uint64, data []byte) []frontendInputEvent {
+func feedBytewise(parser *frontendInputParser, revision protocol.ClientLayoutRevision, data []byte) []frontendInputEvent {
 	var events []frontendInputEvent
 	for _, b := range data {
 		events = append(events, parser.Feed(revision, []byte{b})...)
@@ -17,11 +17,9 @@ func feedBytewise(parser *frontendInputParser, revision uint64, data []byte) []f
 	return events
 }
 
-func TestSessionSwitchResetsTransportInputStateAndKeepsLatestLayout(t *testing.T) {
+func TestSessionSwitchResetsTransportInputStateAndDropsPreviousLayout(t *testing.T) {
 	client := newClientInstance(nil, nil)
-	client.rememberLayout(protocol.WindowLayout{LayoutRevision: 4})
-	client.rememberLayout(protocol.WindowLayout{LayoutRevision: 5})
-	client.highestLayoutRevision.Store(5)
+	client.currentLayout = protocol.ClientLayout{LayoutRevision: 5}
 	client.frontendInput.Feed(5, []byte{0x1b})
 	client.heldKeys[frontendHeldKey{Code: frontendKeyRune, Rune: 'x'}] = 1
 	client.pointerCapture = frontendPaneCapture{active: true}
@@ -32,8 +30,8 @@ func TestSessionSwitchResetsTransportInputStateAndKeepsLatestLayout(t *testing.T
 	if client.frontendInput.state != frontendParserGround || len(client.heldKeys) != 0 || client.pointerCapture.active || client.pasteCapture.active {
 		t.Fatalf("frontend input state was not reset: %#v", client)
 	}
-	if len(client.layouts) != 1 || client.layouts[5].LayoutRevision != 5 {
-		t.Fatalf("retained layouts = %#v", client.layouts)
+	if client.currentLayout.LayoutRevision != 0 {
+		t.Fatalf("retained input layout = %#v", client.currentLayout)
 	}
 }
 
@@ -169,17 +167,16 @@ func TestFrontendTransportDelayDoesNotLeakFragmentedSequences(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s := NewSessionState(1)
-			newStandaloneClient(s)
+			newTestClient(s)
 			pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 5)}
 			pane.initializeRuntime()
 			createTestWindow(s, pane)
 			frontend := newFrontendTestClient(s)
-			setTestClient(s, frontend)
-			layout, err := testWindowLayout(s)
+			layout, err := testClientLayout(s)
 			if err != nil {
 				t.Fatal(err)
 			}
-			frontend.rememberLayout(layout)
+			layout = frontend.currentLayout
 
 			escapePayload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{LayoutRevision: layout.LayoutRevision, Data: []byte{0x1b}})
 			if err != nil {
@@ -219,12 +216,11 @@ func TestFrontendTransportDelayDoesNotLeakFragmentedSequences(t *testing.T) {
 
 func TestFrontendSourceIdleResolvesStandaloneEscape(t *testing.T) {
 	s := NewSessionState(1)
-	newStandaloneClient(s)
+	newTestClient(s)
 	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 5)}
 	pane.initializeRuntime()
 	createTestWindow(s, pane)
 	frontend := newFrontendTestClient(s)
-	setTestClient(s, frontend)
 
 	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{SourceIdle: true, Data: []byte{0x1b}})
 	if err != nil {
@@ -320,7 +316,7 @@ func TestKittyFunctionalPressAndReleaseConvertForLegacyPane(t *testing.T) {
 
 func TestKittyCtrlBUsesServerPrefixAndPasteBypassesIt(t *testing.T) {
 	s := NewSessionState(1)
-	newStandaloneClient(s)
+	newTestClient(s)
 	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 5)}
 	pane.initializeRuntime()
 	createTestWindow(s, pane)
@@ -359,7 +355,7 @@ func TestKittyCtrlBUsesServerPrefixAndPasteBypassesIt(t *testing.T) {
 
 func TestKittyReleaseStaysWithPressPane(t *testing.T) {
 	s := NewSessionState(1)
-	newStandaloneClient(s)
+	newTestClient(s)
 	first := &Pane{ID: testAddPaneID(s), terminal: newTerminal(10, 4)}
 	second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(10, 4)}
 	first.initializeRuntime()
@@ -406,21 +402,20 @@ func TestKittyReleaseStaysWithPressPane(t *testing.T) {
 
 func TestMouseRoutingUsesStampedLayoutAndPaneMode(t *testing.T) {
 	s := NewSessionState(1)
-	clientState := newStandaloneClient(s)
-	clientState.TerminalCols, clientState.TerminalRows = 20, 6
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(20, 6)
 	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 6)}
 	pane.initializeRuntime()
 	pane.terminal.MouseTracking = MouseTrackingMotion
 	pane.terminal.MouseEncoding = MouseEncodingSGR
 	pane.publishTerminalMetadata()
 	createTestWindow(s, pane)
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
-	frontend.rememberLayout(layout)
-	setTestClient(s, frontend)
+	layout = frontend.currentLayout
 
 	event := frontendPointerEvent{Action: frontendPointerWheelDown, X: 4, Y: 2}
 	if err := frontend.handleFrontendPointer(layout.LayoutRevision, event); err != nil {
@@ -508,8 +503,8 @@ func TestMouseRoutingUsesStampedLayoutAndPaneMode(t *testing.T) {
 
 func TestMousePressFocusesClickedPaneAndPublishesProjection(t *testing.T) {
 	s := NewSessionState(1)
-	clientState := newStandaloneClient(s)
-	clientState.TerminalCols, clientState.TerminalRows = 20, 6
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(20, 6)
 	first := &Pane{ID: testAddPaneID(s), terminal: newTerminal(10, 6)}
 	second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(10, 6)}
 	first.initializeRuntime()
@@ -521,7 +516,7 @@ func TestMousePressFocusesClickedPaneAndPublishesProjection(t *testing.T) {
 	if _, _, err := focusTestSessionPane(s, first.ID); err != nil {
 		t.Fatal(err)
 	}
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,9 +527,9 @@ func TestMousePressFocusesClickedPaneAndPublishesProjection(t *testing.T) {
 
 	frontend := newClientInstance(nil, nil)
 	frontend.controlOut = make(chan protocol.Frame, 1)
-	frontend.rememberLayout(layout)
 	setLeasedTestClient(t, s, frontend, 9)
-	renderedRevision := frontend.highestLayoutRevision.Load()
+	layout = frontend.currentLayout
+	renderedRevision := layout.LayoutRevision
 	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{
 		Action: frontendPointerPress,
 		Button: 0,
@@ -545,7 +540,7 @@ func TestMousePressFocusesClickedPaneAndPublishesProjection(t *testing.T) {
 	}
 
 	frame := <-frontend.controlOut
-	published, err := protocol.DecodeWindowLayout(frame.Payload)
+	published, err := protocol.DecodeClientLayout(frame.Payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -555,7 +550,7 @@ func TestMousePressFocusesClickedPaneAndPublishesProjection(t *testing.T) {
 	if published.LayoutRevision != renderedRevision {
 		t.Fatalf("mouse focus-only layout revision = %d, want existing rendered revision %d", published.LayoutRevision, renderedRevision)
 	}
-	if got := frontend.ensureClientState().FocusedPaneID; got != second.ID {
+	if got := frontend.currentLayout.FocusedPaneID; got != second.ID {
 		t.Fatalf("client focused pane = %d, want %d", got, second.ID)
 	}
 	if active, _ := testActivePane(s); active != second {
@@ -567,20 +562,59 @@ func TestMousePressFocusesClickedPaneAndPublishesProjection(t *testing.T) {
 	assertOnlyPaneInput(t, second.ptyInput, "clicked")
 }
 
+func TestPointerInputForPreviousLayoutIsDropped(t *testing.T) {
+	s := NewSessionState(1)
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(20, 6)
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 6)}
+	pane.initializeRuntime()
+	pane.terminal.MouseTracking = MouseTrackingMotion
+	pane.terminal.MouseEncoding = MouseEncodingSGR
+	pane.publishTerminalMetadata()
+	createTestWindow(s, pane)
+
+	stale, err := testClientLayout(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := stale
+	current.LayoutRevision++
+
+	frontend := newFrontendTestClient(s)
+	frontend.currentLayout = current
+
+	if err := frontend.handleFrontendPointer(stale.LayoutRevision, frontendPointerEvent{
+		Action: frontendPointerPress,
+		Button: 0,
+		X:      stale.Panes[0].Rect.X,
+		Y:      stale.Panes[0].Rect.Y,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-pane.ptyInput:
+		t.Fatalf("stale pointer input reached pane: %q", got)
+	default:
+	}
+	if frontend.pointerCapture.active {
+		t.Fatal("stale pointer input started capture")
+	}
+}
+
 func TestMouseSelectionCopiesThroughOSC52AndReturnsToLivePane(t *testing.T) {
 	s := NewSessionState(1)
-	clientState := newStandaloneClient(s)
-	clientState.TerminalCols, clientState.TerminalRows = 12, 4
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(12, 4)
 	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4)}
 	pane.terminal.Apply([]byte("hello"))
 	createTestWindow(s, pane)
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
 	frontend.controlOut = make(chan protocol.Frame, 1)
-	frontend.rememberLayout(layout)
+	layout = frontend.currentLayout
 	placement := layout.Panes[0]
 
 	for _, pointer := range []frontendPointerEvent{
@@ -611,17 +645,17 @@ func TestMouseSelectionCopiesThroughOSC52AndReturnsToLivePane(t *testing.T) {
 
 func TestMouseClickWithoutDragDoesNotCopy(t *testing.T) {
 	s := NewSessionState(1)
-	clientState := newStandaloneClient(s)
-	clientState.TerminalCols, clientState.TerminalRows = 12, 4
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(12, 4)
 	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4)}
 	createTestWindow(s, pane)
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
 	frontend.controlOut = make(chan protocol.Frame, 1)
-	frontend.rememberLayout(layout)
+	layout = frontend.currentLayout
 	point := layout.Panes[0].Rect
 	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
 		t.Fatal(err)
@@ -650,16 +684,16 @@ func TestMouseClickWithoutDragDoesNotCopy(t *testing.T) {
 
 func TestMousePressWithoutReleaseDoesNotBlockKey(t *testing.T) {
 	s := NewSessionState(1)
-	clientState := newStandaloneClient(s)
-	clientState.TerminalCols, clientState.TerminalRows = 12, 4
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(12, 4)
 	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4), ptyInput: make(chan []byte, 1)}
 	createTestWindow(s, pane)
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
-	frontend.rememberLayout(layout)
+	layout = frontend.currentLayout
 	point := layout.Panes[0].Rect
 	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
 		t.Fatal(err)
@@ -691,16 +725,16 @@ func TestMouseMotionWithoutHeldButtonCancelsTruncatedGesture(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s := NewSessionState(1)
-			clientState := newStandaloneClient(s)
-			clientState.TerminalCols, clientState.TerminalRows = 12, 4
+			fixtureClient := newTestClient(s)
+			fixtureClient.setTestTerminalSize(12, 4)
 			pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4)}
 			createTestWindow(s, pane)
-			layout, err := testWindowLayout(s)
+			layout, err := testClientLayout(s)
 			if err != nil {
 				t.Fatal(err)
 			}
 			frontend := newFrontendTestClient(s)
-			frontend.rememberLayout(layout)
+			layout = frontend.currentLayout
 			point := layout.Panes[0].Rect
 			if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
 				t.Fatal(err)
@@ -722,17 +756,17 @@ func TestMouseMotionWithoutHeldButtonCancelsTruncatedGesture(t *testing.T) {
 
 func TestMouseSelectionWithoutReleaseCancelsAndForwardsKey(t *testing.T) {
 	s := NewSessionState(1)
-	clientState := newStandaloneClient(s)
-	clientState.TerminalCols, clientState.TerminalRows = 12, 4
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(12, 4)
 	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4), ptyInput: make(chan []byte, 1)}
 	pane.terminal.Apply([]byte("hello"))
 	createTestWindow(s, pane)
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
-	frontend.rememberLayout(layout)
+	layout = frontend.currentLayout
 	point := layout.Panes[0].Rect
 
 	for _, pointer := range []frontendPointerEvent{
@@ -774,11 +808,12 @@ func TestMouseSelectionWithoutReleaseCancelsOnFocusLossAndRelayout(t *testing.T)
 		}},
 		{name: "split relayout", cancel: func(s *SessionState, frontend *ClientInstance) error {
 			second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4)}
-			_, clientState, err := splitTestFocusedPane(s, second, SplitVertical)
+			_, _, err := splitTestFocusedPane(s, second, SplitVertical)
 			if err != nil {
 				return err
 			}
-			if err := resizeTestSessionActiveWindow(s, clientState.TerminalCols, clientState.TerminalRows); err != nil {
+			cols, rows := uint16(frontend.terminalCols.Load()), uint16(frontend.terminalRows.Load())
+			if err := resizeTestSessionActiveWindow(s, cols, rows); err != nil {
 				return err
 			}
 			return clientForState(s).applyCurrentTestViewWithHandoff(nil)
@@ -786,17 +821,16 @@ func TestMouseSelectionWithoutReleaseCancelsOnFocusLossAndRelayout(t *testing.T)
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s := NewSessionState(1)
-			clientState := newStandaloneClient(s)
-			clientState.TerminalCols, clientState.TerminalRows = 12, 4
+			fixtureClient := newTestClient(s)
+			fixtureClient.setTestTerminalSize(12, 4)
 			pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4)}
 			createTestWindow(s, pane)
-			layout, err := testWindowLayout(s)
+			layout, err := testClientLayout(s)
 			if err != nil {
 				t.Fatal(err)
 			}
 			frontend := newFrontendTestClient(s)
-			frontend.rememberLayout(layout)
-			setTestClient(s, frontend)
+			layout = frontend.currentLayout
 			point := layout.Panes[0].Rect
 			for _, pointer := range []frontendPointerEvent{
 				{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y},
@@ -824,17 +858,17 @@ func TestOSC52ClipboardWrite(t *testing.T) {
 
 func TestFallbackWheelBurstsCoalesceNetDeltaWithoutTouchingNativeMouse(t *testing.T) {
 	s := NewSessionState(1)
-	clientState := newStandaloneClient(s)
-	clientState.TerminalCols, clientState.TerminalRows = 20, 6
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(20, 6)
 	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 6)}
 	pane.initializeRuntime()
 	createTestWindow(s, pane)
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
-	frontend.rememberLayout(layout)
+	layout = frontend.currentLayout
 
 	up := []byte("\x1b[<64;5;3M")
 	down := []byte("\x1b[<65;5;3M")
@@ -898,8 +932,8 @@ func assertOnlyPaneInput(t *testing.T, inputs <-chan []byte, want string) {
 
 func TestMouseWheelScrollsMejaHistoryBeforePaneMouseMode(t *testing.T) {
 	s := NewSessionState(1)
-	clientState := newStandaloneClient(s)
-	clientState.TerminalCols, clientState.TerminalRows = 20, 6
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(20, 6)
 	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 6)}
 	pane.initializeRuntime()
 	pane.terminal.Apply([]byte("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\nnine\r\nten\r\neleven\r\ntwelve\r\nthirteen\r\nfourteen\r\nfifteen"))
@@ -907,12 +941,12 @@ func TestMouseWheelScrollsMejaHistoryBeforePaneMouseMode(t *testing.T) {
 	pane.terminal.MouseEncoding = MouseEncodingSGR
 	pane.publishTerminalMetadata()
 	createTestWindow(s, pane)
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
-	frontend.rememberLayout(layout)
+	layout = frontend.currentLayout
 	request := paneHistoryRequest{Action: paneHistoryEnter}
 	if result := pane.handleHistoryRequest(&request); result.Err != nil {
 		t.Fatal(result.Err)

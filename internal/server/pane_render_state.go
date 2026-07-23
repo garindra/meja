@@ -22,7 +22,7 @@ type paneRenderState struct {
 	lease           *OutputLease
 	availableBuffer <-chan *paneRenderBuffer
 	failure         <-chan error
-	layoutRevision  uint64
+	layoutRevision  protocol.ClientLayoutRevision
 	barrierPending  bool
 	installedStyles map[uint32]protocol.Style
 	dirty           []DirtySpan
@@ -40,7 +40,7 @@ func newPaneRenderState(pane *Pane) *paneRenderState {
 	return &paneRenderState{pane: pane}
 }
 
-func (s *paneRenderState) attach(lease *OutputLease, layoutRevision uint64, refresh func(*renderOutput) error) {
+func (s *paneRenderState) attach(lease *OutputLease, layoutRevision protocol.ClientLayoutRevision, refresh func(*renderOutput) error) {
 	s.lease = lease
 	s.availableBuffer = lease.availableBuffers()
 	s.failure = lease.failures()

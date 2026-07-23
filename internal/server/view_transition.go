@@ -21,11 +21,26 @@ const (
 	viewTransitionClosePane    ViewTransitionReason = "close-pane"
 	viewTransitionPaneExit     ViewTransitionReason = "pane-exit"
 	viewTransitionSession      ViewTransitionReason = "switch-session"
+	viewTransitionFocus        ViewTransitionReason = "focus"
 )
+
+// ClientProjectionPlan is the immutable daemon-to-client transition contract.
+// Layout is its single pane/slot/geometry representation.
+type ClientProjectionPlan struct {
+	AttachmentID        uint64
+	SessionID           uint64
+	ViewLeaseGeneration uint64
+	ProjectionRevision  uint64
+	Layout              protocol.ClientLayout
+	FullSnapshot        bool
+	Close               bool
+	CloseReason         string
+}
 
 type PreparedPaneResize struct {
 	Pane *Pane
-	Rect Rect
+	Cols uint16
+	Rows uint16
 }
 
 // PreparedViewTransition is the daemon phase result. Graph mutation, lease
@@ -39,23 +54,22 @@ type PreparedViewTransition struct {
 	RemovedPanes []*Pane
 }
 
-// PreparedRenderBinding is a resolved, immutable output destination. Keeping
-// the pane and rectangle here prevents the application phase from inventing a
-// second answer by walking the live graph after the daemon transaction.
-type PreparedRenderBinding struct {
-	Binding RenderBinding
-	Pane    *Pane
-	Rect    Rect
+// PreparedRenderPane is a resolved, immutable output destination. Keeping the
+// pane together with its published placement prevents the application phase
+// from inventing a second answer by walking the live graph after the daemon
+// transaction.
+type PreparedRenderPane struct {
+	Placement protocol.PanePlacement
+	Pane      *Pane
 }
 
-// PreparedProjection is the complete visible result of a daemon transaction.
-// LayoutRevision is materialized when it is installed because that revision is
-// transport-local; all other layout and binding data comes directly from Plan.
+// PreparedProjection is the client-resolved application input for one daemon
+// transition. ClientLayoutRevision is allocated before the actor boundary, and
+// installation must publish the prepared value unchanged.
 type PreparedProjection struct {
-	Reason   ViewTransitionReason
-	Plan     ClientProjectionPlan
-	Layout   protocol.WindowLayout
-	Bindings []PreparedRenderBinding
+	Reason ViewTransitionReason
+	Plan   ClientProjectionPlan
+	Panes  []PreparedRenderPane
 }
 
 func (c *ClientInstance) applyViewTransition(transition PreparedViewTransition) error {
@@ -84,8 +98,8 @@ func (c *ClientInstance) applyViewTransition(transition PreparedViewTransition) 
 			if resize.Pane == nil {
 				return fmt.Errorf("%s contains nil pane resize", transition.Reason)
 			}
-			if err := resize.Pane.resize(uint16(resize.Rect.Width), uint16(resize.Rect.Height)); err != nil {
-				return fmt.Errorf("%s resize pane %d to %dx%d: %w", transition.Reason, resize.Pane.ID, resize.Rect.Width, resize.Rect.Height, err)
+			if err := resize.Pane.resize(resize.Cols, resize.Rows); err != nil {
+				return fmt.Errorf("%s resize pane %d to %dx%d: %w", transition.Reason, resize.Pane.ID, resize.Cols, resize.Rows, err)
 			}
 		}
 	}
@@ -127,55 +141,43 @@ func (c *ClientInstance) prepareProjection(transition PreparedViewTransition) (P
 	if !plan.FullSnapshot {
 		return PreparedProjection{}, errors.New("visible transition requires a full projection")
 	}
-	if len(plan.Panes) != len(plan.Bindings) {
-		return PreparedProjection{}, fmt.Errorf("pane count %d does not match binding count %d", len(plan.Panes), len(plan.Bindings))
+	if plan.Layout.LayoutRevision == 0 {
+		return PreparedProjection{}, errors.New("visible transition has no client layout revision")
 	}
 	// The daemon hands slices across an actor boundary. Own their backing arrays
 	// here so neither a caller nor later graph work can mutate an in-flight
 	// projection after validation.
-	plan.Panes = append([]RenderPane(nil), plan.Panes...)
-	plan.Bindings = append([]RenderBinding(nil), plan.Bindings...)
+	plan.Layout.Panes = append([]protocol.PanePlacement(nil), plan.Layout.Panes...)
 
-	byPane := make(map[uint64]RenderBinding, len(plan.Bindings))
-	for _, binding := range plan.Bindings {
-		if binding.Slot < 0 || uint64(binding.Slot) >= protocol.MaxRenderSlots {
-			return PreparedProjection{}, fmt.Errorf("pane %d has invalid render slot %d", binding.PaneID, binding.Slot)
+	seenPanes := make(map[uint64]struct{}, len(plan.Layout.Panes))
+	seenSlots := make(map[uint8]struct{}, len(plan.Layout.Panes))
+	for _, placement := range plan.Layout.Panes {
+		if uint64(placement.Slot) >= protocol.MaxRenderSlots {
+			return PreparedProjection{}, fmt.Errorf("pane %d has invalid render slot %d", placement.PaneID, placement.Slot)
 		}
-		if _, duplicate := byPane[binding.PaneID]; duplicate {
-			return PreparedProjection{}, fmt.Errorf("pane %d has duplicate render binding", binding.PaneID)
+		if _, duplicate := seenPanes[placement.PaneID]; duplicate {
+			return PreparedProjection{}, fmt.Errorf("pane %d has duplicate client placement", placement.PaneID)
 		}
-		byPane[binding.PaneID] = binding
+		if _, duplicate := seenSlots[placement.Slot]; duplicate {
+			return PreparedProjection{}, fmt.Errorf("render slot %d has duplicate client placement", placement.Slot)
+		}
+		seenPanes[placement.PaneID] = struct{}{}
+		seenSlots[placement.Slot] = struct{}{}
 	}
 
 	prepared := PreparedProjection{Reason: reason, Plan: plan}
-	prepared.Layout = protocol.WindowLayout{
-		WindowID:       plan.WindowID,
-		FocusedPaneID:  plan.FocusedPaneID,
-		LayoutRevision: plan.LayoutRevision,
-		Panes:          make([]protocol.PanePlacement, 0, len(plan.Panes)),
-	}
-	prepared.Bindings = make([]PreparedRenderBinding, 0, len(plan.Panes))
-	for _, renderPane := range plan.Panes {
-		binding, ok := byPane[renderPane.PaneID]
-		if !ok {
-			return PreparedProjection{}, fmt.Errorf("pane %d has no render binding", renderPane.PaneID)
-		}
-		value, ok := c.Daemon.paneIndex.Load(renderPane.PaneID)
+	prepared.Panes = make([]PreparedRenderPane, 0, len(plan.Layout.Panes))
+	for _, placement := range plan.Layout.Panes {
+		value, ok := c.Daemon.paneIndex.Load(placement.PaneID)
 		if !ok || value == nil {
-			return PreparedProjection{}, fmt.Errorf("pane %d disappeared while preparing projection", renderPane.PaneID)
+			return PreparedProjection{}, fmt.Errorf("pane %d disappeared while preparing projection", placement.PaneID)
 		}
 		pane := value.(*Pane)
 		cols, rows := pane.TerminalSize()
-		if cols != renderPane.Rect.Width || rows != renderPane.Rect.Height {
-			return PreparedProjection{}, fmt.Errorf("pane %d grid %dx%d does not match layout %dx%d", pane.ID, cols, rows, renderPane.Rect.Width, renderPane.Rect.Height)
+		if cols != placement.Rect.Width || rows != placement.Rect.Height {
+			return PreparedProjection{}, fmt.Errorf("pane %d grid %dx%d does not match layout %dx%d", pane.ID, cols, rows, placement.Rect.Width, placement.Rect.Height)
 		}
-		prepared.Bindings = append(prepared.Bindings, PreparedRenderBinding{Binding: binding, Pane: pane, Rect: renderPane.Rect})
-		prepared.Layout.Panes = append(prepared.Layout.Panes, protocol.PanePlacement{
-			PaneID: renderPane.PaneID,
-			Slot:   uint8(binding.Slot),
-			Rect: protocol.Rect{X: renderPane.Rect.X, Y: renderPane.Rect.Y,
-				Width: renderPane.Rect.Width, Height: renderPane.Rect.Height},
-		})
+		prepared.Panes = append(prepared.Panes, PreparedRenderPane{Placement: placement, Pane: pane})
 	}
 	return prepared, nil
 }
@@ -184,7 +186,6 @@ func (c *ClientInstance) installPreparedProjection(prepared PreparedProjection, 
 	if err := c.commitProjectionPlan(prepared.Plan); err != nil {
 		return fmt.Errorf("%s install projection=%d: %w", prepared.Reason, prepared.Plan.ProjectionRevision, err)
 	}
-	prepared.Layout.LayoutRevision = c.highestLayoutRevision.Load()
 	if err := c.cancelFrontendPointerCapture(); err != nil {
 		return fmt.Errorf("%s cancel pointer capture: %w", prepared.Reason, err)
 	}
@@ -194,8 +195,29 @@ func (c *ClientInstance) installPreparedProjection(prepared PreparedProjection, 
 	if err := c.publishStatusBar(); err != nil {
 		return fmt.Errorf("%s publish status: %w", prepared.Reason, err)
 	}
-	if err := c.publishPreparedWindowLayout(prepared.Layout); err != nil {
+	if err := c.sendPreparedClientLayout(prepared.Plan.Layout); err != nil {
 		return fmt.Errorf("%s publish layout: %w", prepared.Reason, err)
 	}
+	c.currentLayout = prepared.Plan.Layout
+	c.appliedProjectionRevision.Store(prepared.Plan.ProjectionRevision)
+	return nil
+}
+
+func (c *ClientInstance) applyFocusTransition(transition PreparedViewTransition) error {
+	if transition.Projection.FullSnapshot {
+		return errors.New("focus transition unexpectedly requires a full snapshot")
+	}
+	if err := c.commitProjectionPlan(transition.Projection); err != nil {
+		return fmt.Errorf("%s install projection=%d: %w", transition.Reason, transition.Projection.ProjectionRevision, err)
+	}
+	if err := c.cancelFrontendPointerCapture(); err != nil {
+		return fmt.Errorf("%s cancel pointer capture: %w", transition.Reason, err)
+	}
+	layout := transition.Projection.Layout
+	if err := c.sendPreparedClientLayout(layout); err != nil {
+		return err
+	}
+	c.currentLayout = layout
+	c.appliedProjectionRevision.Store(transition.Projection.ProjectionRevision)
 	return nil
 }

@@ -232,13 +232,13 @@ func decodeDisplayCommands(tb testing.TB, reader io.Reader) []DisplayCommand {
 	}
 }
 
-func TestWindowLayoutRoundTripIncludesSlots(t *testing.T) {
-	msg := WindowLayout{WindowID: 2, FocusedPaneID: 8, LayoutRevision: 11, Panes: []PanePlacement{{PaneID: 7, Slot: 0, Rect: Rect{Width: 40, Height: 20}}, {PaneID: 8, Slot: 1, Rect: Rect{X: 41, Width: 39, Height: 20}}}}
-	payload, err := EncodeWindowLayout(nil, msg)
+func TestClientLayoutRoundTripIncludesSlots(t *testing.T) {
+	msg := ClientLayout{WindowID: 2, FocusedPaneID: 8, LayoutRevision: 11, Panes: []PanePlacement{{PaneID: 7, Slot: 0, Rect: Rect{Width: 40, Height: 20}}, {PaneID: 8, Slot: 1, Rect: Rect{X: 41, Width: 39, Height: 20}}}}
+	payload, err := EncodeClientLayout(nil, msg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := DecodeWindowLayout(payload)
+	out, err := DecodeClientLayout(payload)
 	if err != nil {
 		t.Fatal(err)
 	}

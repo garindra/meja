@@ -163,16 +163,15 @@ func TestResizePaneBoundaryClampsForNestedPaneMinimums(t *testing.T) {
 	}
 }
 
-func TestSessionSplitCreatesNewPaneAndBindings(t *testing.T) {
+func TestSessionSplitCreatesNewPaneAndPlacements(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols = 120
-	client.TerminalRows = 39
+	client := newTestClient(s)
+	client.setTestTerminalSize(120, 39)
 
 	pane0 := &Pane{ID: testAddPaneID(s), Title: "bash"}
-	window, clientState := createTestWindow(s, pane0)
-	if window.ID != 1 || windowPrimaryPaneID(window) != pane0.ID || clientState.FocusedPaneID != pane0.ID {
-		t.Fatalf("initial window = %#v client=%#v", window, clientState)
+	window, inputState := createTestWindow(s, pane0)
+	if window.ID != 1 || windowPrimaryPaneID(window) != pane0.ID || inputState.FocusedPaneID != pane0.ID {
+		t.Fatalf("initial window = %#v client=%#v", window, inputState)
 	}
 
 	pane1 := &Pane{ID: testAddPaneID(s), Title: "logs"}
@@ -184,19 +183,20 @@ func TestSessionSplitCreatesNewPaneAndBindings(t *testing.T) {
 		t.Fatalf("window layout = %#v, want split", window.Layout)
 	}
 	syncTestProjection(t, s)
-	clientState = snapshotTestClient(s)
-	if clientState.FocusedPaneID != pane1.ID || len(clientState.RenderBindings) != 2 {
-		t.Fatalf("client after split = %#v", clientState)
+	inputState = client.testLayout()
+	placements, _ := testClientLayoutPanes(s)
+	if inputState.FocusedPaneID != pane1.ID || len(placements) != 2 {
+		t.Fatalf("client after split = %#v", inputState)
 	}
-	if clientState.RenderBindings[1].PaneID != pane1.ID {
-		t.Fatalf("second render slot = %#v", clientState.RenderBindings)
+	if placements[1].PaneID != pane1.ID {
+		t.Fatalf("second render slot = %#v", placements)
 	}
 }
 
 func TestResizeFocusedPaneAdvancesRevisionAndPersistsRatio(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 24
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 24)
 	left := &Pane{ID: testAddPaneID(s)}
 	createTestWindow(s, left)
 	right := &Pane{ID: testAddPaneID(s)}
@@ -207,7 +207,7 @@ func TestResizeFocusedPaneAdvancesRevisionAndPersistsRatio(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncTestProjection(t, s)
-	before := s.Windows[client.ActiveWindowID].LayoutRevision
+	before := s.Windows[client.testLayout().WindowID].LayoutRevision
 	window, _, changed, err := resizeTestFocusedPane(s, ResizePaneRight, 5)
 	if err != nil || !changed {
 		t.Fatalf("ResizeFocusedPane() changed=%v err=%v", changed, err)
@@ -226,8 +226,8 @@ func TestResizeFocusedPaneAdvancesRevisionAndPersistsRatio(t *testing.T) {
 
 func TestResizePaneCommandRelayoutsPaneTerminals(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 24
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 24)
 	left := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
 	createTestWindow(s, left)
 	right := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
@@ -250,8 +250,8 @@ func TestResizePaneCommandRelayoutsPaneTerminals(t *testing.T) {
 
 func TestToggleZoomProjectsFocusedPaneWithoutChangingLayout(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 24
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 24)
 	left := &Pane{ID: testAddPaneID(s)}
 	createTestWindow(s, left)
 	right := &Pane{ID: testAddPaneID(s)}
@@ -261,7 +261,7 @@ func TestToggleZoomProjectsFocusedPaneWithoutChangingLayout(t *testing.T) {
 	if _, _, err := focusTestSessionPane(s, left.ID); err != nil {
 		t.Fatal(err)
 	}
-	root := s.Windows[client.ActiveWindowID].Layout.(*SplitLayout)
+	root := s.Windows[client.testLayout().WindowID].Layout.(*SplitLayout)
 	ratio := root.Ratio
 	window, _, changed, err := toggleTestZoom(s)
 	if err != nil || !changed {
@@ -271,11 +271,11 @@ func TestToggleZoomProjectsFocusedPaneWithoutChangingLayout(t *testing.T) {
 		t.Fatalf("zoom changed underlying layout: window=%#v ratio=%d want=%d", window, root.Ratio, ratio)
 	}
 	syncTestProjection(t, s)
-	state := snapshotTestClient(s)
-	if len(state.RenderBindings) != 1 || state.RenderBindings[0].PaneID != left.ID || state.RenderBindings[0].Slot != 0 {
-		t.Fatalf("zoomed bindings = %#v", state.RenderBindings)
+	placements, _ := testClientLayoutPanes(s)
+	if len(placements) != 1 || placements[0].PaneID != left.ID || placements[0].Slot != 0 {
+		t.Fatalf("zoomed placements = %#v", placements)
 	}
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,16 +288,16 @@ func TestToggleZoomProjectsFocusedPaneWithoutChangingLayout(t *testing.T) {
 		t.Fatalf("unzoom changed=%v window=%#v err=%v", changed, window, err)
 	}
 	syncTestProjection(t, s)
-	state = snapshotTestClient(s)
-	if len(state.RenderBindings) != 2 || root.Ratio != ratio {
-		t.Fatalf("unzoomed bindings=%#v ratio=%d want=%d", state.RenderBindings, root.Ratio, ratio)
+	placements, _ = testClientLayoutPanes(s)
+	if len(placements) != 2 || root.Ratio != ratio {
+		t.Fatalf("unzoomed placements=%#v ratio=%d want=%d", placements, root.Ratio, ratio)
 	}
 }
 
 func TestToggleZoomSinglePaneIsNoOp(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 24
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 24)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s)})
 	window, _, changed, err := toggleTestZoom(s)
 	if err != nil || changed || window.Zoomed {
@@ -307,8 +307,8 @@ func TestToggleZoomSinglePaneIsNoOp(t *testing.T) {
 
 func TestZoomCommandResizesOnlyVisiblePaneToFullWindow(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 24
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 24)
 	left := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
 	createTestWindow(s, left)
 	right := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
@@ -359,7 +359,8 @@ func TestLayoutOperationsUnzoomWindow(t *testing.T) {
 		}
 		syncTestProjection(t, s)
 		window, state, err := clientForState(s).FocusPaneDirection('C')
-		if err != nil || window.Zoomed || state.FocusedPaneID != right.ID || len(state.RenderBindings) != 2 {
+		placements, _ := testClientLayoutPanes(s)
+		if err != nil || window.Zoomed || state.FocusedPaneID != right.ID || len(placements) != 2 {
 			t.Fatalf("focus after zoom: window=%#v state=%#v err=%v", window, state, err)
 		}
 	})
@@ -375,7 +376,8 @@ func TestLayoutOperationsUnzoomWindow(t *testing.T) {
 		window, _, changed, err := resizeTestFocusedPane(s, ResizePaneRight, 1)
 		syncTestProjection(t, s)
 		state := snapshotTestClient(s)
-		if err != nil || !changed || window.Zoomed || len(state.RenderBindings) != 2 {
+		placements, _ := testClientLayoutPanes(s)
+		if err != nil || !changed || window.Zoomed || len(placements) != 2 {
 			t.Fatalf("resize after zoom: changed=%v window=%#v state=%#v err=%v", changed, window, state, err)
 		}
 	})
@@ -388,7 +390,8 @@ func TestLayoutOperationsUnzoomWindow(t *testing.T) {
 		window, _, changed, err := swapTestFocusedPane(s, SwapPanePrevious)
 		syncTestProjection(t, s)
 		state := snapshotTestClient(s)
-		if err != nil || !changed || window.Zoomed || len(state.RenderBindings) != 2 {
+		placements, _ := testClientLayoutPanes(s)
+		if err != nil || !changed || window.Zoomed || len(placements) != 2 {
 			t.Fatalf("swap after zoom: changed=%v window=%#v state=%#v err=%v", changed, window, state, err)
 		}
 	})
@@ -400,7 +403,8 @@ func TestLayoutOperationsUnzoomWindow(t *testing.T) {
 		window, _, err := splitTestFocusedPane(s, &Pane{ID: testAddPaneID(s)}, SplitHorizontal)
 		syncTestProjection(t, s)
 		state := snapshotTestClient(s)
-		if err != nil || window.Zoomed || len(state.RenderBindings) != 3 {
+		placements, _ := testClientLayoutPanes(s)
+		if err != nil || window.Zoomed || len(placements) != 3 {
 			t.Fatalf("split after zoom: window=%#v state=%#v err=%v", window, state, err)
 		}
 	})
@@ -421,7 +425,8 @@ func TestZoomStateSurvivesWindowSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !window.Zoomed || window.ZoomedPaneID != left.ID || len(state.RenderBindings) != 1 || state.RenderBindings[0].PaneID != left.ID {
+	placements, _ := testClientLayoutPanes(s)
+	if !window.Zoomed || window.ZoomedPaneID != left.ID || len(placements) != 1 || placements[0].PaneID != left.ID {
 		t.Fatalf("restored zoomed window=%#v state=%#v", window, state)
 	}
 }
@@ -443,7 +448,8 @@ func TestPaneExitMaintainsOrClearsZoomAsLayoutAllows(t *testing.T) {
 		t.Fatalf("hidden pane exit: window=%#v final=%v removed=%v err=%v", window, final, removed, err)
 	}
 	window, state, final, removed, err := removeTestPane(s, third.ID)
-	if err != nil || final || !removed || window.Zoomed || len(state.RenderBindings) != 1 || state.RenderBindings[0].PaneID != left.ID {
+	placements, _ := testClientLayoutPanes(s)
+	if err != nil || final || !removed || window.Zoomed || len(placements) != 1 || placements[0].PaneID != left.ID {
 		t.Fatalf("last hidden pane exit: window=%#v state=%#v final=%v removed=%v err=%v", window, state, final, removed, err)
 	}
 }
@@ -458,7 +464,8 @@ func TestClosingZoomedPaneClearsZoom(t *testing.T) {
 	}
 	syncTestProjection(t, s)
 	_, window, state, windowClosed, _, _, err := closeTestFocusedPane(s)
-	if err != nil || windowClosed || window.Zoomed || len(state.RenderBindings) != 1 {
+	placements, _ := testClientLayoutPanes(s)
+	if err != nil || windowClosed || window.Zoomed || len(placements) != 1 {
 		t.Fatalf("close zoomed pane: window=%#v state=%#v windowClosed=%v err=%v", window, state, windowClosed, err)
 	}
 }
@@ -466,11 +473,11 @@ func TestClosingZoomedPaneClearsZoom(t *testing.T) {
 func newZoomTestSession(t *testing.T) (*SessionState, *Pane, *Pane) {
 	t.Helper()
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 24
-	left := &Pane{ID: testAddPaneID(s)}
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 24)
+	left := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
 	createTestWindow(s, left)
-	right := &Pane{ID: testAddPaneID(s)}
+	right := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
 	if _, _, err := splitTestFocusedPane(s, right, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
@@ -478,15 +485,15 @@ func newZoomTestSession(t *testing.T) (*SessionState, *Pane, *Pane) {
 	return s, left, right
 }
 
-func TestResizeRebuildsVisualRenderBindings(t *testing.T) {
+func TestResizePreservesVisualClientPaneOrder(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 16, 4
+	client := newTestClient(s)
+	client.setTestTerminalSize(16, 4)
 	first := &Pane{ID: 2, terminal: newTerminal(16, 4)}
 	second := &Pane{ID: 1, terminal: newTerminal(16, 4)}
 	s.daemon.nextPaneID = 3
 	createTestWindow(s, first)
-	window := s.Windows[client.ActiveWindowID]
+	window := s.Windows[client.testLayout().WindowID]
 	s.Panes[second.ID] = second
 	window.Layout = &SplitLayout{
 		Direction: SplitHorizontal,
@@ -494,23 +501,24 @@ func TestResizeRebuildsVisualRenderBindings(t *testing.T) {
 		First:     &PaneLayout{PaneID: first.ID},
 		Second:    &PaneLayout{PaneID: second.ID},
 	}
-	client.RenderBindings = []RenderBinding{{Slot: 0, PaneID: first.ID}, {Slot: 1, PaneID: second.ID}}
-	if got := client.RenderBindings[0].PaneID; got != first.ID {
+	clientInstance := clientForState(s)
+	clientInstance.currentLayout.Panes = []protocol.PanePlacement{{PaneID: first.ID, Slot: 0}, {PaneID: second.ID, Slot: 1}}
+	if got := clientInstance.currentPanePlacements()[0].PaneID; got != first.ID {
 		t.Fatalf("initial slot 0 pane = %d, want %d", got, first.ID)
 	}
 
 	if err := resizeTestSessionActiveWindow(s, 16, 1); err != nil {
 		t.Fatal(err)
 	}
-	if got := client.RenderBindings[0].PaneID; got != first.ID {
+	if got := clientInstance.currentPanePlacements()[0].PaneID; got != first.ID {
 		t.Fatalf("resized slot 0 pane = %d, want %d", got, first.ID)
 	}
 }
 
 func TestSwapFocusedPaneUsesVisualOrderAndKeepsFocus(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 120, 39
+	client := newTestClient(s)
+	client.setTestTerminalSize(120, 39)
 	left := &Pane{ID: testAddPaneID(s)}
 	createTestWindow(s, left)
 	topRight := &Pane{ID: testAddPaneID(s)}
@@ -549,8 +557,8 @@ func TestSwapFocusedPaneUsesVisualOrderAndKeepsFocus(t *testing.T) {
 
 func TestSwapFocusedPaneWrapsAtVisualEdges(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 80, 24
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 24)
 	first := &Pane{ID: testAddPaneID(s)}
 	createTestWindow(s, first)
 	second := &Pane{ID: testAddPaneID(s)}
@@ -573,9 +581,8 @@ func TestSwapFocusedPaneWrapsAtVisualEdges(t *testing.T) {
 
 func TestRecursiveMixedSplitsAndCloseCollapseOnlyParent(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols = 120
-	client.TerminalRows = 39
+	client := newTestClient(s)
+	client.setTestTerminalSize(120, 39)
 
 	pane0 := &Pane{ID: testAddPaneID(s), Title: "root"}
 	createTestWindow(s, pane0)
@@ -589,32 +596,31 @@ func TestRecursiveMixedSplitsAndCloseCollapseOnlyParent(t *testing.T) {
 		t.Fatalf("nested horizontal SplitFocusedPane() error = %v", err)
 	}
 	syncTestProjection(t, s)
-	clientState := snapshotTestClient(s)
-	placements := window.Layout.Compute(Rect{Width: 120, Height: 39})
-	if len(placements) != 3 || len(clientState.RenderBindings) != 3 {
-		t.Fatalf("nested layout = %#v bindings=%#v", placements, clientState.RenderBindings)
+	clientPlacements, _ := testClientLayoutPanes(s)
+	layoutPlacements := window.Layout.Compute(Rect{Width: 120, Height: 39})
+	if len(layoutPlacements) != 3 || len(clientPlacements) != 3 {
+		t.Fatalf("nested layout = %#v client placements=%#v", layoutPlacements, clientPlacements)
 	}
-	if placements[0].PaneID != pane0.ID || placements[0].Rect.Width != 59 ||
-		placements[1].PaneID != pane1.ID || placements[1].Rect.Height != 19 ||
-		placements[2].PaneID != pane2.ID || placements[2].Rect.Y != 20 {
-		t.Fatalf("nested placements = %#v", placements)
+	if layoutPlacements[0].PaneID != pane0.ID || layoutPlacements[0].Rect.Width != 59 ||
+		layoutPlacements[1].PaneID != pane1.ID || layoutPlacements[1].Rect.Height != 19 ||
+		layoutPlacements[2].PaneID != pane2.ID || layoutPlacements[2].Rect.Y != 20 {
+		t.Fatalf("nested placements = %#v", layoutPlacements)
 	}
 
-	closed, window, clientState, windowClosed, _, _, err := closeTestFocusedPane(s)
+	closed, window, inputState, windowClosed, _, _, err := closeTestFocusedPane(s)
 	if err != nil || windowClosed || closed != pane2 {
 		t.Fatalf("CloseFocusedPane() closed=%#v windowClosed=%v err=%v", closed, windowClosed, err)
 	}
-	placements = window.Layout.Compute(Rect{Width: 120, Height: 39})
-	if len(placements) != 2 || placements[0].PaneID != pane0.ID || placements[1].PaneID != pane1.ID || clientState.FocusedPaneID != pane1.ID {
-		t.Fatalf("collapsed nested layout = %#v client=%#v", placements, clientState)
+	layoutPlacements = window.Layout.Compute(Rect{Width: 120, Height: 39})
+	if len(layoutPlacements) != 2 || layoutPlacements[0].PaneID != pane0.ID || layoutPlacements[1].PaneID != pane1.ID || inputState.FocusedPaneID != pane1.ID {
+		t.Fatalf("collapsed nested layout = %#v client=%#v", layoutPlacements, inputState)
 	}
 }
 
 func TestWindowRejectsNinthPane(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols = 240
-	client.TerminalRows = 80
+	client := newTestClient(s)
+	client.setTestTerminalSize(240, 80)
 	pane := &Pane{ID: testAddPaneID(s)}
 	createTestWindow(s, pane)
 	for count := 2; count <= int(protocol.MaxVisiblePanes); count++ {
@@ -632,11 +638,10 @@ func TestWindowRejectsNinthPane(t *testing.T) {
 	}
 }
 
-func TestWindowLayoutAndFocusReuseVisiblePanes(t *testing.T) {
+func TestClientLayoutAndFocusReuseVisiblePanes(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols = 120
-	client.TerminalRows = 39
+	client := newTestClient(s)
+	client.setTestTerminalSize(120, 39)
 
 	pane0 := &Pane{ID: testAddPaneID(s), Title: "bash"}
 	createTestWindow(s, pane0)
@@ -646,26 +651,25 @@ func TestWindowLayoutAndFocusReuseVisiblePanes(t *testing.T) {
 	}
 	syncTestProjection(t, s)
 
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
-		t.Fatalf("WindowLayout() error = %v", err)
+		t.Fatalf("ClientLayout() error = %v", err)
 	}
 	if len(layout.Panes) != 2 || layout.Panes[0].Rect.Width != 59 || layout.Panes[1].Rect.Width != 60 {
-		t.Fatalf("WindowLayout() = %#v", layout)
+		t.Fatalf("ClientLayout() = %#v", layout)
 	}
 
-	if _, clientState, err := focusTestSessionPane(s, pane0.ID); err != nil {
+	if _, inputState, err := focusTestSessionPane(s, pane0.ID); err != nil {
 		t.Fatalf("FocusPane() error = %v", err)
-	} else if clientState.FocusedPaneID != pane0.ID {
-		t.Fatalf("FocusPane() client = %#v", clientState)
+	} else if inputState.FocusedPaneID != pane0.ID {
+		t.Fatalf("FocusPane() client = %#v", inputState)
 	}
 }
 
 func TestResolveInputTargetUsesFocusedPaneWithinSplit(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols = 120
-	client.TerminalRows = 39
+	client := newTestClient(s)
+	client.setTestTerminalSize(120, 39)
 
 	pane0 := &Pane{ID: testAddPaneID(s), Title: "bash"}
 	createTestWindow(s, pane0)
@@ -677,17 +681,16 @@ func TestResolveInputTargetUsesFocusedPaneWithinSplit(t *testing.T) {
 		t.Fatalf("FocusPane() error = %v", err)
 	}
 
-	pane, clientState, exact := resolveTestInputTarget(s, pane1.ID)
-	if pane == nil || clientState == nil || pane.ID != pane0.ID || exact {
-		t.Fatalf("ResolveInputTarget() = pane %#v client %#v exact=%v", pane, clientState, exact)
+	pane, inputState, exact := resolveTestInputTarget(s, pane1.ID)
+	if pane == nil || inputState.LayoutRevision == 0 || pane.ID != pane0.ID || exact {
+		t.Fatalf("ResolveInputTarget() = pane %#v client %#v exact=%v", pane, inputState, exact)
 	}
 }
 
 func TestCloseFocusedPaneCollapsesSplit(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols = 120
-	client.TerminalRows = 39
+	client := newTestClient(s)
+	client.setTestTerminalSize(120, 39)
 
 	pane0 := &Pane{ID: testAddPaneID(s), Title: "bash"}
 	createTestWindow(s, pane0)
@@ -697,12 +700,12 @@ func TestCloseFocusedPaneCollapsesSplit(t *testing.T) {
 	}
 	syncTestProjection(t, s)
 
-	closedPane, window, clientState, windowClosed, _, autoCreate, err := closeTestFocusedPane(s)
+	closedPane, window, inputState, windowClosed, _, autoCreate, err := closeTestFocusedPane(s)
 	if err != nil {
 		t.Fatalf("CloseFocusedPane() error = %v", err)
 	}
-	if windowClosed || autoCreate || closedPane == nil || clientState.FocusedPaneID != pane0.ID {
-		t.Fatalf("CloseFocusedPane() = pane %#v window %#v client %#v windowClosed=%v autoCreate=%v", closedPane, window, clientState, windowClosed, autoCreate)
+	if windowClosed || autoCreate || closedPane == nil || inputState.FocusedPaneID != pane0.ID {
+		t.Fatalf("CloseFocusedPane() = pane %#v window %#v client %#v windowClosed=%v autoCreate=%v", closedPane, window, inputState, windowClosed, autoCreate)
 	}
 	if _, ok := window.Layout.(*PaneLayout); !ok {
 		t.Fatalf("collapsed layout = %#v, want single pane", window.Layout)
@@ -711,8 +714,8 @@ func TestCloseFocusedPaneCollapsesSplit(t *testing.T) {
 
 func TestCloseFocusedPaneRestoresMostRecentlyFocusedSurvivor(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols, client.TerminalRows = 120, 39
+	client := newTestClient(s)
+	client.setTestTerminalSize(120, 39)
 
 	first := &Pane{ID: testAddPaneID(s), Title: "first"}
 	second := &Pane{ID: testAddPaneID(s), Title: "second"}
@@ -756,7 +759,7 @@ func TestCloseFocusedPaneRestoresMostRecentlyFocusedSurvivor(t *testing.T) {
 
 func TestCloseFocusedPaneSelectsLatestSurvivingWindow(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	first, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "first"})
 	second, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "second"})
 	third, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "third"})
@@ -771,17 +774,17 @@ func TestCloseFocusedPaneSelectsLatestSurvivingWindow(t *testing.T) {
 	if err != nil || !closed {
 		t.Fatalf("CloseFocusedPane() replacement=%#v client=%#v closed=%v err=%v", replacement, client, closed, err)
 	}
-	if replacement == nil || replacement.ID != second.ID || client.ActiveWindowID != second.ID {
+	if replacement == nil || replacement.ID != second.ID || client.WindowID != second.ID {
 		t.Fatalf("replacement window=%#v client=%#v; want window %d active", replacement, client, second.ID)
 	}
-	if client.ActiveWindowID == first.ID {
+	if client.WindowID == first.ID {
 		t.Fatalf("close selected window fell back to first window %d", first.ID)
 	}
 }
 
 func TestRemovePaneCollapsesSplitAndMovesFocus(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	pane0 := &Pane{ID: testAddPaneID(s), Title: "bash"}
 	createTestWindow(s, pane0)
 	pane1 := &Pane{ID: testAddPaneID(s), Title: "logs"}
@@ -803,12 +806,12 @@ func TestRemovePaneCollapsesSplitAndMovesFocus(t *testing.T) {
 
 func TestRemoveFinalPaneRequestsReplacement(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	pane := &Pane{ID: testAddPaneID(s), Title: "bash"}
 	createTestWindow(s, pane)
 
 	window, client, finalPane, removed, err := removeTestPane(s, pane.ID)
-	if err != nil || !removed || !finalPane || window != nil || client == nil {
+	if err != nil || !removed || !finalPane || window != nil || client.LayoutRevision == 0 {
 		t.Fatalf("RemovePane() window=%#v client=%#v removed=%v final=%v err=%v", window, client, removed, finalPane, err)
 	}
 	if s.HasWindows() {
@@ -818,7 +821,7 @@ func TestRemoveFinalPaneRequestsReplacement(t *testing.T) {
 
 func TestLayoutRevisionsAreUniqueAcrossWindows(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	first := &Pane{ID: testAddPaneID(s), Title: "one"}
 	w1, _ := createTestWindow(s, first)
 	second := &Pane{ID: testAddPaneID(s), Title: "two"}
@@ -828,15 +831,15 @@ func TestLayoutRevisionsAreUniqueAcrossWindows(t *testing.T) {
 	}
 }
 
-func TestReattachPreservesActiveWindowLayoutRevision(t *testing.T) {
+func TestReattachPreservesActiveClientLayoutRevision(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	pane := &Pane{ID: testAddPaneID(s), Title: "one"}
 	window, _ := createTestWindow(s, pane)
 	previousRevision := window.LayoutRevision
 
-	client := clientForState(s).ensureClientState()
-	reattached := cloneWindow(s.Windows[client.ActiveWindowID])
+	client := clientForState(s).currentLayout
+	reattached := cloneWindow(s.Windows[client.WindowID])
 	activePane := s.Panes[client.FocusedPaneID]
 	if activePane != pane {
 		t.Fatalf("active pane = %#v, want %#v", activePane, pane)
@@ -848,12 +851,12 @@ func TestReattachPreservesActiveWindowLayoutRevision(t *testing.T) {
 
 func TestSelectingWindowAdvancesClientProjectionWithoutChangingCanonicalLayout(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	first, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "one"})
 	second, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "two"})
 	firstRevision, secondRevision := first.LayoutRevision, second.LayoutRevision
 	client := clientForState(s)
-	projectionRevision := client.highestLayoutRevision.Load()
+	clientLayoutRevision := client.currentLayout.LayoutRevision
 
 	selected, _, err := selectTestSessionWindow(s, first.ID)
 	if err != nil {
@@ -862,14 +865,14 @@ func TestSelectingWindowAdvancesClientProjectionWithoutChangingCanonicalLayout(t
 	if selected.LayoutRevision != firstRevision || second.LayoutRevision != secondRevision {
 		t.Fatalf("selection changed canonical revisions: first=%d want=%d second=%d want=%d", selected.LayoutRevision, firstRevision, second.LayoutRevision, secondRevision)
 	}
-	if client.highestLayoutRevision.Load() <= projectionRevision {
-		t.Fatalf("selected projection revision = %d, want newer than %d", client.highestLayoutRevision.Load(), projectionRevision)
+	if client.currentLayout.LayoutRevision <= clientLayoutRevision {
+		t.Fatalf("selected client layout revision = %d, want newer than %d", client.currentLayout.LayoutRevision, clientLayoutRevision)
 	}
 }
 
 func TestSelectingWindowRestoresItsLastActivePane(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	left := &Pane{ID: testAddPaneID(s), Title: "left"}
 	firstWindow, _ := createTestWindow(s, left)
 	right := &Pane{ID: testAddPaneID(s), Title: "right"}
@@ -900,11 +903,10 @@ func TestSelectingWindowRestoresItsLastActivePane(t *testing.T) {
 	}
 }
 
-func TestWindowLayoutCarriesRenderSlots(t *testing.T) {
+func TestClientLayoutCarriesRenderSlots(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols = 80
-	client.TerminalRows = 23
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
 	left := &Pane{ID: testAddPaneID(s)}
 	createTestWindow(s, left)
 	right := &Pane{ID: testAddPaneID(s)}
@@ -912,7 +914,7 @@ func TestWindowLayoutCarriesRenderSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncTestProjection(t, s)
-	layout, err := testWindowLayout(s)
+	layout, err := testClientLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -923,9 +925,8 @@ func TestWindowLayoutCarriesRenderSlots(t *testing.T) {
 
 func TestCreateWindowSizePrefersClientDimensionsOverSplitPane(t *testing.T) {
 	s := NewSessionState(0)
-	client := newStandaloneClient(s)
-	client.TerminalCols = 120
-	client.TerminalRows = 39
+	client := newTestClient(s)
+	client.setTestTerminalSize(120, 39)
 
 	pane0 := &Pane{ID: testAddPaneID(s), Title: "bash", terminal: newTerminal(120, 39)}
 	createTestWindow(s, pane0)
@@ -945,7 +946,7 @@ func TestCreateWindowSizePrefersClientDimensionsOverSplitPane(t *testing.T) {
 
 func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	s := NewSessionState(0)
-	newStandaloneClient(s)
+	newTestClient(s)
 	first, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "one"})
 	second, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "two"})
 	third, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "three"})
@@ -959,7 +960,7 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := projectTestClientState(client, result.Transition); err != nil {
+	if err := commitTestProjection(client, result.Transition); err != nil {
 		t.Fatal(err)
 	}
 	statuses := s.WindowStatuses()
@@ -988,8 +989,8 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	if _, _, err := selectTestSessionWindow(s, third.ID); err != nil {
 		t.Fatal(err)
 	}
-	if state := snapshotTestClient(s); state.ActiveWindowID != third.ID {
-		t.Fatalf("numeric-selection target = %d, want %d", state.ActiveWindowID, third.ID)
+	if layout := clientForState(s).currentLayout; layout.WindowID != third.ID {
+		t.Fatalf("numeric-selection target = %d, want %d", layout.WindowID, third.ID)
 	}
 }
 
@@ -1087,40 +1088,20 @@ func TestSessionShutdownEscalatesAndReapsPaneProcess(t *testing.T) {
 	}
 }
 
-func TestSessionClosesExistingConnectionBeforeAttachingReplacement(t *testing.T) {
+func TestInitializeAttachedViewDoesNotReplaceDaemonClient(t *testing.T) {
 	s := NewSessionState(1)
-	clientState := newStandaloneClient(s)
-	clientState.TerminalCols, clientState.TerminalRows = 80, 24
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(80, 24)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)})
-	replacement := &ClientInstance{}
-	closed := false
-	var closeErr error
-	existing := &ClientInstance{QUIC: &recordingQUICConnection{closeWithError: func(code quic.ApplicationErrorCode, message string) error {
-		if testClientOf(s) == replacement {
-			closeErr = fmt.Errorf("replacement was attached before existing connection was closed")
-		}
-		if code != protocol.SessionReplacedErrorCode || message != "session attached elsewhere" {
-			closeErr = fmt.Errorf("CloseWithError(%d, %q), want replacement close", code, message)
-		}
-		closed = true
-		return nil
-	}}}
+	existing := &ClientInstance{}
 	setTestClient(s, existing)
-	replacement.sessionID = s.ID
-	replacement.Daemon = s.daemon
+	replacement := &ClientInstance{sessionID: s.ID, Daemon: s.daemon}
 
-	if err := replacement.attachClientInstance(80, 24, false); err != nil {
-		t.Fatal(err)
+	if err := replacement.initializeAttachedView(80, 24); err == nil {
+		t.Fatal("unregistered replacement initialized a view")
 	}
-
-	if !closed {
-		t.Fatal("existing QUIC connection was not closed")
-	}
-	if closeErr != nil {
-		t.Fatal(closeErr)
-	}
-	if testClientOf(s) != replacement {
-		t.Fatal("replacement connection was not attached")
+	if testClientOf(s) != existing {
+		t.Fatal("client-side view initialization changed daemon ownership")
 	}
 }
 
@@ -1131,7 +1112,7 @@ func TestStaleTransportCleanupDoesNotDetachReconnectedClientInstance(t *testing.
 	current := &ClientInstance{}
 	setTestClient(s, current)
 
-	current.detachClientInstance()
+	stale.releaseFrontendResources(nil)
 
 	if testClientOf(s) != current {
 		t.Fatal("stale transport cleanup detached the replacement transport")

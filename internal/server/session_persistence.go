@@ -137,7 +137,7 @@ type windowCaptureInput struct {
 	window         *Window
 	windowID       uint64
 	displayIndex   int
-	layoutRevision uint64
+	layoutRevision WindowLayoutRevision
 	name           string
 	automaticName  bool
 	activePaneID   uint64
@@ -934,7 +934,7 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 		if preset, ok := namedLayoutPreset(persistedWindow.NamedLayout); ok {
 			layoutCycleIndex = preset
 		}
-		s.NextLayoutRevision++
+		s.lastWindowLayoutRevision++
 		window := &Window{
 			ID:               windowID,
 			GroupID:          s.GroupID,
@@ -943,7 +943,7 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 			AutomaticName:    persistedWindow.AutomaticName,
 			ActivePaneID:     persistedWindow.ActivePane,
 			Layout:           restoreLayout(persistedWindow.Layout),
-			LayoutRevision:   s.NextLayoutRevision,
+			LayoutRevision:   s.lastWindowLayoutRevision,
 			layoutCycleIndex: layoutCycleIndex,
 		}
 		s.Windows[windowID] = window

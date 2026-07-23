@@ -252,7 +252,6 @@ func TestSessionPersistenceDirectoryIsBesideProfileSocket(t *testing.T) {
 func TestSessionRenameConfirmsBeforeOverwritingPersistence(t *testing.T) {
 	session := NewSessionState(12)
 	t.Cleanup(func() { stopState(session) })
-	newStandaloneClient(session)
 	session.setSessionName("current")
 	directory := filepath.Join(t.TempDir(), "sessions")
 	if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -266,6 +265,7 @@ func TestSessionRenameConfirmsBeforeOverwritingPersistence(t *testing.T) {
 		names:                 map[string]*SessionState{"current": session},
 		sessionPersistenceDir: directory,
 	}
+	session.daemon = d
 	connection := &ClientInstance{Daemon: d}
 	setTestClient(session, connection)
 	createTestWindow(session, &Pane{ID: testAddPaneID(session), terminal: newTerminal(80, 23)})

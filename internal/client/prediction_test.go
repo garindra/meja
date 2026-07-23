@@ -352,7 +352,7 @@ func TestScanoutPredictionEmitsBackspaceWithoutChangingAuthoritativeCache(t *tes
 func TestUnfocusedPaneFrameDoesNotConfirmPrediction(t *testing.T) {
 	s := newScanoutState(true)
 	s.cols, s.rows = 10, 2
-	s.layout = protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{
+	s.layout = protocol.ClientLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{
 		{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 4, Height: 1}},
 		{PaneID: 2, Slot: 1, Rect: protocol.Rect{X: 5, Width: 4, Height: 1}},
 	}}
@@ -379,7 +379,7 @@ func TestUnfocusedPaneFrameDoesNotConfirmPrediction(t *testing.T) {
 func TestFocusChangeRepairsPredictionAndUsesNewPaneCursor(t *testing.T) {
 	s := newScanoutState(true)
 	s.cols, s.rows = 10, 2
-	s.layout = protocol.WindowLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{
+	s.layout = protocol.ClientLayout{WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1, Panes: []protocol.PanePlacement{
 		{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 4, Height: 1}},
 		{PaneID: 2, Slot: 1, Rect: protocol.Rect{X: 5, Width: 4, Height: 1}},
 	}}
