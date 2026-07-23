@@ -474,7 +474,7 @@ func TestPaneCLINewReconcilesNestedPTYSizeToLiveViewport(t *testing.T) {
 
 func TestPaneCLIRestoreResolvesInvokerCwdAndSwitchesOuterClient(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	project := t.TempDir()
 	if err := os.WriteFile(filepath.Join(project, "dev6.meja"), []byte(`root "."
 window {
@@ -802,7 +802,7 @@ func TestResizeBurstPreservesDetachInput(t *testing.T) {
 
 func TestPaneCLIRestoreRetargetsLiveInputLoop(t *testing.T) {
 	d := newCommandTestDaemonWithActor(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	sourceRoot := t.TempDir()
 	created := d.executeCommand(protocol.CommandRequest{
 		Args: []string{"new", "-s", "source", "--", "/bin/sleep", "30"}, WorkingDirectory: sourceRoot,

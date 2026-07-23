@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"net"
 	"os"
@@ -736,7 +735,7 @@ func TestAttachedOutputCommandsRejectBeforeProducingOutputOrSideEffects(t *testi
 
 func TestSaveAndNewFileCommandsRoundTripSession(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	root := t.TempDir()
 	created := d.executeCommand(protocol.CommandRequest{
 		Args: []string{"new", "-s", "work", "--", "/bin/sleep", "30"}, WorkingDirectory: root,
@@ -798,7 +797,7 @@ func TestSaveAndNewFileCommandsRoundTripSession(t *testing.T) {
 
 func TestSaveUnnamedSessionUsesOutputFilenameAsRestoreName(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	created := d.executeCommand(protocol.CommandRequest{
 		Args: []string{"new-session", "--", "/bin/sleep", "30"}, WorkingDirectory: t.TempDir(),
 		TerminalCols: 80, TerminalRows: 23,
@@ -885,7 +884,7 @@ func TestPaneCLIRenameWindowUsesInjectedSessionWithWindowOnlyTarget(t *testing.T
 
 func TestSaveRelativeOutputUsesTargetSessionRoot(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	base := t.TempDir()
 	created := d.executeCommand(protocol.CommandRequest{
 		Args: []string{"new", "-s", "work", "--", "/bin/sleep", "30"}, WorkingDirectory: base,
@@ -937,7 +936,7 @@ func TestSaveRelativeOutputUsesTargetSessionRoot(t *testing.T) {
 
 func TestRestoreRejectsMalformedPersistenceWithoutCreatingSession(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	if err := os.MkdirAll(d.sessionPersistenceDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -957,7 +956,7 @@ func TestRestoreRejectsMalformedPersistenceWithoutCreatingSession(t *testing.T) 
 
 func TestRestoreDoesNotReadLegacyPersistenceFilename(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	if err := os.MkdirAll(d.sessionPersistenceDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -972,7 +971,7 @@ func TestRestoreDoesNotReadLegacyPersistenceFilename(t *testing.T) {
 
 func TestNewFileRejectsMalformedUserMejaWithoutCreatingSession(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	path := filepath.Join(t.TempDir(), "broken.meja")
 	if err := os.WriteFile(path, []byte("meja 1\nsession \"broken\" active-window=\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -1344,7 +1343,7 @@ func TestSwitchSessionHandlerPreparesButDoesNotApplyClientView(t *testing.T) {
 
 func TestAttachedRestoreCreatesSessionAndAppliesPreparedTransition(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	project := t.TempDir()
 	plan := SessionPlan{
 		Version: mejaFormatVersion, Name: "persisted", Root: project, ActiveWindow: 1,
@@ -1537,7 +1536,7 @@ func TestSetRootUsesObservedPaneCwdAndDoesNotMoveExistingPane(t *testing.T) {
 
 func TestSetRootControlsFutureWindowsPanesAndSaveLocation(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	oldRoot := t.TempDir()
 	newRoot := t.TempDir()
 	created := d.executeCommand(protocol.CommandRequest{
@@ -1570,16 +1569,19 @@ func TestSetRootControlsFutureWindowsPanesAndSaveLocation(t *testing.T) {
 	if session.rootDir != newRoot || oldCount != 1 || newCount != 2 {
 		t.Fatalf("future pane roots: session=%q old=%d new=%d", session.rootDir, oldCount, newCount)
 	}
-	recoveryPath, err := flushTestSessionPersistence(context.Background(), session, d.sessionPersistenceDir)
-	if err != nil {
-		t.Fatal(err)
+	recoveryPath := filepath.Join(d.sessionPersistenceDir, "work.session.meja")
+	deadline := time.Now().Add(time.Second)
+	var recovery []byte
+	var recoveryErr error
+	for time.Now().Before(deadline) {
+		recovery, recoveryErr = os.ReadFile(recoveryPath)
+		if recoveryErr == nil && strings.Contains(string(recovery), `root "`+newRoot+`"`) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	recovery, err := os.ReadFile(recoveryPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(recovery), `root "`+newRoot+`"`) {
-		t.Fatalf("recovery file retained old root:\n%s", recovery)
+	if recoveryErr != nil || !strings.Contains(string(recovery), `root "`+newRoot+`"`) {
+		t.Fatalf("recovery file did not converge to root %q: %v\n%s", newRoot, recoveryErr, recovery)
 	}
 	saved := d.executeCommand(protocol.CommandRequest{Args: []string{"save", "-t", "work", "-o", "dev.meja"}})
 	if saved.exitCode != 0 {

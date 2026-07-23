@@ -370,7 +370,7 @@ func TestRestoreCommandModesPrepareSkipAndRun(t *testing.T) {
 
 func TestDaemonRestoresPersistenceWindowsLayoutsAndPanes(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	base := t.TempDir()
 	plan := SessionPlan{
 		Version: mejaFormatVersion, Name: "work", Root: base, ActiveWindow: 1,
