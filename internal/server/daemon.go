@@ -478,15 +478,7 @@ func (d *Daemon) shutdownSessionWithTimeouts(state *SessionState, timeouts paneT
 		lifecycle.stopping = true
 		d.shutdownMu.Unlock()
 
-		var panes []*Pane
-		lastGroupMember := !state.isGrouped()
-		if lastGroupMember {
-			panes = make([]*Pane, 0, len(state.Panes))
-			for _, pane := range state.Panes {
-				panes = append(panes, pane)
-			}
-		}
-		d.shutdownSessionNow(state)
+		panes := d.shutdownSessionNow(state)
 		if remaining := terminatePanesAndWait(panes, timeouts); len(remaining) > 0 {
 			cleanupErr := fmt.Errorf("%d pane process(es) did not exit before the shutdown deadline", len(remaining))
 			d.logf("meja server: shut down session %d: %v\n", state.ID, cleanupErr)
@@ -538,11 +530,25 @@ func (d *Daemon) runPersistence(ctx context.Context, sessionPersistenceDir strin
 	}
 }
 
-func (d *Daemon) shutdownSessionNow(state *SessionState) {
+func (d *Daemon) shutdownSessionNow(state *SessionState) []*Pane {
 	if d == nil || state == nil {
-		return
+		return nil
 	}
-	d.call(func() { d.shutdownSessionInActor(state) })
+	var panes []*Pane
+	d.call(func() {
+		if d.sessions[state.ID] != state {
+			return
+		}
+		lastGroupMember := state.group == nil || len(state.group.SessionIDs) <= 1
+		if lastGroupMember {
+			panes = make([]*Pane, 0, len(state.Panes))
+			for _, pane := range state.Panes {
+				panes = append(panes, pane)
+			}
+		}
+		d.shutdownSessionInActor(state)
+	})
+	return panes
 }
 
 // shutdownSessionInActor performs registry mutation in the daemon actor.
