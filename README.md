@@ -12,14 +12,14 @@ meja is a tmux-style multiplexer with native remote capability and restorable & 
 On Linux x86-64:
 
 ```sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.7/meja_0.0.7_linux_amd64.tar.gz \
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.8/meja_0.0.8_linux_amd64.tar.gz \
   | sudo tar -xz -C /usr/local/bin meja
 ```
 
 On macOS with Apple Silicon:
 
 ```sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.7/meja_0.0.7_darwin_arm64.tar.gz \
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.8/meja_0.0.8_darwin_arm64.tar.gz \
   | sudo tar -xz -C /usr/local/bin meja
 ```
 
