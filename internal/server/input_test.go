@@ -17,7 +17,7 @@ func isCommandInput(event serverInputEvent, args ...string) bool {
 	return event.Command == serverCommandExecute && slices.Equal(event.CommandArgs, args)
 }
 
-func handleTestControlFrames(s *Session, client *ClientInstance, decoder *protocol.Decoder) error {
+func handleTestControlFrames(s *SessionState, client *ClientInstance, decoder *protocol.Decoder) error {
 	for {
 		frame, err := decoder.ReadFrame()
 		if errors.Is(err, io.EOF) {
@@ -26,7 +26,7 @@ func handleTestControlFrames(s *Session, client *ClientInstance, decoder *protoc
 		if err != nil {
 			return err
 		}
-		stopped, err := s.handleControlFrame(client, frame)
+		stopped, err := client.handleControlFrame(frame)
 		if err != nil || stopped {
 			return err
 		}
@@ -57,19 +57,19 @@ func TestTranslateApplicationCursor(t *testing.T) {
 }
 
 func TestServerConsumesPrefixCommandsAndForwardsLiteralBytes(t *testing.T) {
-	s := NewSession(0)
-	s.NewClient(0)
-	if event := s.ConsumeInputByte(0, 'a'); event.Command != serverCommandLiteral || event.Byte != 'a' {
+	s := NewSessionState(0)
+	newStandaloneClient(s)
+	if event := clientForState(s).ConsumeInputByte('a'); event.Command != serverCommandLiteral || event.Byte != 'a' {
 		t.Fatalf("normal input event = %#v", event)
 	}
-	if event := s.ConsumeInputByte(0, 0x02); event.Command != serverCommandNone {
+	if event := clientForState(s).ConsumeInputByte(0x02); event.Command != serverCommandNone {
 		t.Fatalf("prefix start event = %#v", event)
 	}
-	if event := s.ConsumeInputByte(0, '['); !isCommandInput(event, "copy-mode") {
+	if event := clientForState(s).ConsumeInputByte('['); !isCommandInput(event, "copy-mode") {
 		t.Fatalf("history prefix event = %#v", event)
 	}
-	s.ConsumeInputByte(0, 0x02)
-	if event := s.ConsumeInputByte(0, 0x02); event.Command != serverCommandLiteral || event.Byte != 0x02 {
+	clientForState(s).ConsumeInputByte(0x02)
+	if event := clientForState(s).ConsumeInputByte(0x02); event.Command != serverCommandLiteral || event.Byte != 0x02 {
 		t.Fatalf("literal prefix event = %#v", event)
 	}
 }
@@ -87,7 +87,7 @@ func TestEveryPrefixBindingExpandsToCanonicalCommandArgs(t *testing.T) {
 		{'n', []string{"next-window"}},
 		{'p', []string{"previous-window"}},
 		{'l', []string{"last-window"}},
-		{'x', []string{"confirm-before", "kill-pane"}},
+		{'x', []string{"kill-pane"}},
 		{'z', []string{"resize-pane", "-Z"}},
 		{'[', []string{"copy-mode"}},
 		{']', []string{"paste-buffer"}},
@@ -95,105 +95,109 @@ func TestEveryPrefixBindingExpandsToCanonicalCommandArgs(t *testing.T) {
 		{'}', []string{"swap-pane", "-D"}},
 		{',', []string{"rename-window"}},
 		{'$', []string{"rename-session"}},
-		{':', []string{"command-prompt"}},
 	}
 	for _, binding := range bindings {
-		s := NewSession(1)
-		s.NewClient(clientID0)
-		s.ConsumeInputByte(clientID0, 0x02)
-		if event := s.ConsumeInputByte(clientID0, binding.key); !isCommandInput(event, binding.argv...) {
+		s := NewSessionState(1)
+		newStandaloneClient(s)
+		clientForState(s).ConsumeInputByte(0x02)
+		if event := clientForState(s).ConsumeInputByte(binding.key); !isCommandInput(event, binding.argv...) {
 			t.Errorf("prefix %q = %#v, want %v", binding.key, event, binding.argv)
 		}
+	}
+	s := NewSessionState(1)
+	newStandaloneClient(s)
+	clientForState(s).ConsumeInputByte(0x02)
+	if event := clientForState(s).ConsumeInputByte(':'); event.Command != serverCommandOpenCommandPrompt {
+		t.Errorf("prefix ':' = %#v, want local command prompt", event)
 	}
 }
 
 func TestServerRecognizesRenameSessionPrefix(t *testing.T) {
-	s := NewSession(1)
-	s.NewClient(0)
-	s.ConsumeInputByte(0, 0x02)
-	if event := s.ConsumeInputByte(0, '$'); !isCommandInput(event, "rename-session") {
+	s := NewSessionState(1)
+	newStandaloneClient(s)
+	clientForState(s).ConsumeInputByte(0x02)
+	if event := clientForState(s).ConsumeInputByte('$'); !isCommandInput(event, "rename-session") {
 		t.Fatalf("rename-session event = %#v", event)
 	}
 }
 
 func TestServerRecognizesSwapPanePrefixes(t *testing.T) {
-	s := NewSession(0)
-	s.NewClient(0)
+	s := NewSessionState(0)
+	newStandaloneClient(s)
 	for key, want := range map[byte][]string{
 		'{': {"swap-pane", "-U"},
 		'}': {"swap-pane", "-D"},
 	} {
-		s.ConsumeInputByte(0, 0x02)
-		if event := s.ConsumeInputByte(0, key); !isCommandInput(event, want...) {
+		clientForState(s).ConsumeInputByte(0x02)
+		if event := clientForState(s).ConsumeInputByte(key); !isCommandInput(event, want...) {
 			t.Fatalf("prefix %q event = %#v, want command %v", key, event, want)
 		}
 	}
 }
 
 func TestServerRecognizesToggleZoomPrefix(t *testing.T) {
-	s := NewSession(0)
-	s.NewClient(0)
-	s.ConsumeInputByte(0, 0x02)
-	if event := s.ConsumeInputByte(0, 'z'); !isCommandInput(event, "resize-pane", "-Z") {
+	s := NewSessionState(0)
+	newStandaloneClient(s)
+	clientForState(s).ConsumeInputByte(0x02)
+	if event := clientForState(s).ConsumeInputByte('z'); !isCommandInput(event, "resize-pane", "-Z") {
 		t.Fatalf("toggle zoom event = %#v", event)
 	}
 }
 
 func TestClosePanePromptsBeforeKilling(t *testing.T) {
-	s := NewSession(0)
-	s.NewClient(0)
-	first := &Pane{ID: s.AddPaneID(), Title: "first"}
-	s.CreateWindow(first, 0)
-	second := &Pane{ID: s.AddPaneID(), Title: "second"}
-	if _, _, err := s.SplitFocusedPane(0, second, SplitVertical); err != nil {
+	s := NewSessionState(1)
+	newStandaloneClient(s)
+	first := &Pane{ID: testAddPaneID(s), Title: "first"}
+	createTestWindow(s, first)
+	second := &Pane{ID: testAddPaneID(s), Title: "second"}
+	if _, _, err := splitTestFocusedPane(s, second, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
-	handler := &ClientInstance{}
-
-	s.ConsumeInputByte(0, 0x02)
-	event := s.ConsumeInputByte(0, 'x')
-	if !isCommandInput(event, "confirm-before", "kill-pane") {
+	syncTestProjection(t, s)
+	clientForState(s).ConsumeInputByte(0x02)
+	event := clientForState(s).ConsumeInputByte('x')
+	if !isCommandInput(event, "kill-pane") {
 		t.Fatalf("close-pane event = %#v", event)
 	}
-	if _, err := s.handleServerInputEvent(handler, event); err != nil {
+	if _, err := clientForState(s).handleServerInputEvent(event); err != nil {
 		t.Fatal(err)
 	}
-	prompt := s.ActivePrompt(0)
-	if prompt == nil || prompt.Kind != PromptKindConfirm || prompt.Label != "kill-pane? (y/N) " {
+	prompt := clientForState(s).ActivePrompt()
+	if prompt == nil || prompt.Mode != PromptModeConfirm || prompt.Label != "kill-pane? (y/N) " {
 		t.Fatalf("close-pane confirmation prompt = %#v", prompt)
 	}
 	if s.Pane(second.ID) == nil {
 		t.Fatal("pane was killed before confirmation")
 	}
 
-	if _, err := s.handleServerInputEvent(handler, s.ConsumeInputByte(0, '\r')); err != nil {
+	if _, err := clientForState(s).handleServerInputEvent(clientForState(s).ConsumeInputByte('\r')); err != nil {
 		t.Fatal(err)
 	}
-	if s.ActivePrompt(0) != nil || s.Pane(second.ID) == nil {
-		t.Fatalf("default-No confirmation changed pane state: prompt=%#v pane=%#v", s.ActivePrompt(0), s.Pane(second.ID))
+	if clientForState(s).ActivePrompt() != nil || s.Pane(second.ID) == nil {
+		t.Fatalf("default-No confirmation changed pane state: prompt=%#v pane=%#v", clientForState(s).ActivePrompt(), s.Pane(second.ID))
 	}
 
-	s.ConsumeInputByte(0, 0x02)
-	event = s.ConsumeInputByte(0, 'x')
-	if _, err := s.handleServerInputEvent(handler, event); err != nil {
+	clientForState(s).ConsumeInputByte(0x02)
+	event = clientForState(s).ConsumeInputByte('x')
+	if _, err := clientForState(s).handleServerInputEvent(event); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.handleServerInputEvent(handler, s.ConsumeInputByte(0, 'y')); err != nil {
+	if _, err := clientForState(s).handleServerInputEvent(clientForState(s).ConsumeInputByte('y')); err != nil {
 		t.Fatal(err)
 	}
-	if s.ActivePrompt(0) != nil || s.Pane(second.ID) != nil {
-		t.Fatalf("confirmed pane close did not complete: prompt=%#v pane=%#v", s.ActivePrompt(0), s.Pane(second.ID))
+	if clientForState(s).ActivePrompt() != nil || s.Pane(second.ID) != nil {
+		t.Fatalf("confirmed pane close did not complete: prompt=%#v pane=%#v", clientForState(s).ActivePrompt(), s.Pane(second.ID))
 	}
-	got, _ := s.ActivePane(0)
+	got, _ := testActivePane(s)
 	if got != first {
 		t.Fatalf("active pane after close = %#v, want %#v", got, first)
 	}
 }
 
 func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
-	s := NewSession(1)
-	s.NewClient(0)
-	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash", terminal: newTerminal(80, 24)}, 0)
+	s := NewSessionState(1)
+	newStandaloneClient(s)
+	createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash", terminal: newTerminal(80, 24)})
 	var input bytes.Buffer
 	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: []byte{0x02, 'd', 0x02, 'd'}})
 	if err != nil {
@@ -203,27 +207,36 @@ func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := &ClientInstance{}
-	s.clientInstance = handler
+	setTestClient(s, handler)
 	if err := handleTestControlFrames(s, handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestSwitchSessionPromptReturnsInputHandoff(t *testing.T) {
+func TestSwitchSessionPromptAppliesPreparedTransition(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	source := NewSession(1)
-	target := NewSession(2)
-	t.Cleanup(source.stopOperations)
-	t.Cleanup(target.stopOperations)
+	source := NewSessionState(1)
+	target := NewSessionState(2)
+	t.Cleanup(func() { stopState(source) })
+	t.Cleanup(func() { stopState(target) })
 	target.setSessionName("logs")
 	d.sessions[source.ID] = source
 	d.sessions[target.ID] = target
 	d.names[target.Name] = target
-	clientState := source.NewClient(clientID0)
+	source.daemon = d
+	target.daemon = d
+	d.ensureSessionGroupInActor(source)
+	d.ensureSessionGroupInActor(target)
+	clientState := newStandaloneClient(source)
 	clientState.TerminalCols, clientState.TerminalRows = 90, 28
-	source.CreateWindow(&Pane{ID: source.AddPaneID(), terminal: newTerminal(90, 28)}, clientID0)
-	client := &ClientInstance{Daemon: d}
-	source.clientInstance = client
+	createTestWindow(source, &Pane{ID: testAddPaneID(source), terminal: newTerminal(90, 28)})
+	createTestWindow(target, &Pane{ID: testAddPaneID(target), terminal: newTerminal(90, 28)})
+	client := clientForState(source)
+	credential := &reconnectCredential{EncodedToken: "input-switch", Instance: client}
+	client.credential = credential
+	d.clientSessions[credential] = source.ID
+	d.attachments[source.ID] = credential
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: client.AttachmentID, Generation: 1}
 
 	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: append([]byte{0x02, ':'}, []byte("switch-session -t logs\r")...)})
 	if err != nil {
@@ -233,23 +246,25 @@ func TestSwitchSessionPromptReturnsInputHandoff(t *testing.T) {
 	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	var request *sessionSwitchRequest
-	if err := handleTestControlFrames(source, client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize)); !errors.As(err, &request) || request.rawTarget != "logs" {
-		t.Fatalf("input handoff = %#v, error = %v", request, err)
+	if err := handleTestControlFrames(source, client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize)); err != nil {
+		t.Fatal(err)
+	}
+	if client.sessionState() != target {
+		t.Fatalf("command prompt left client in session %#v, want %#v", client.sessionState(), target)
 	}
 }
 
 func TestServerParsesPrefixArrowAndWindowIndex(t *testing.T) {
-	s := NewSession(0)
-	s.NewClient(0)
+	s := NewSessionState(0)
+	newStandaloneClient(s)
 	for _, b := range []byte{0x02, 0x1b, '[', 'A'} {
-		event := s.ConsumeInputByte(0, b)
+		event := clientForState(s).ConsumeInputByte(b)
 		if b == 'A' && !isCommandInput(event, "select-pane", "-U") {
 			t.Fatalf("prefix arrow event = %#v", event)
 		}
 	}
-	s.ConsumeInputByte(0, 0x02)
-	if event := s.ConsumeInputByte(0, '3'); !isCommandInput(event, "select-window", "-t", ":3") {
+	clientForState(s).ConsumeInputByte(0x02)
+	if event := clientForState(s).ConsumeInputByte('3'); !isCommandInput(event, "select-window", "-t", ":3") {
 		t.Fatalf("numeric window event = %#v", event)
 	}
 }
@@ -270,17 +285,17 @@ func TestServerParsesModifiedPrefixArrowsForResize(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := NewSession(0)
-			s.NewClient(0)
-			s.ConsumeInputByte(0, 0x02)
+			s := NewSessionState(0)
+			newStandaloneClient(s)
+			clientForState(s).ConsumeInputByte(0x02)
 			var event serverInputEvent
 			for _, b := range test.sequence {
-				event = s.ConsumeInputByte(0, b)
+				event = clientForState(s).ConsumeInputByte(b)
 			}
 			if !isCommandInput(event, "resize-pane", resizeDirectionFlag(test.direction), strconv.Itoa(test.amount)) {
 				t.Fatalf("resize event = %#v", event)
 			}
-			client := s.SnapshotClient(0)
+			client := snapshotTestClient(s)
 			if client.InputState != serverInputNormal || len(client.PrefixEscape) != 0 {
 				t.Fatalf("parser did not reset after resize: %#v", client)
 			}
@@ -289,21 +304,21 @@ func TestServerParsesModifiedPrefixArrowsForResize(t *testing.T) {
 }
 
 func TestServerResetsOverlongPrefixCSI(t *testing.T) {
-	s := NewSession(0)
-	s.NewClient(0)
-	s.ConsumeInputByte(0, 0x02)
+	s := NewSessionState(0)
+	newStandaloneClient(s)
+	clientForState(s).ConsumeInputByte(0x02)
 	for _, b := range append([]byte("\x1b["), []byte("11111111111111111111111111111111")...) {
-		s.ConsumeInputByte(0, b)
+		clientForState(s).ConsumeInputByte(b)
 	}
-	client := s.SnapshotClient(0)
+	client := snapshotTestClient(s)
 	if client.InputState != serverInputNormal || len(client.PrefixEscape) != 0 {
 		t.Fatalf("overlong CSI left parser active: %#v", client)
 	}
 }
 
 func TestPaneResizeBindingRepeatsWithoutPrefix(t *testing.T) {
-	s := NewSession(0)
-	client := s.NewClient(0)
+	s := NewSessionState(0)
+	client := newStandaloneClient(s)
 	now := time.Unix(100, 0)
 	var event serverInputEvent
 	for _, b := range append([]byte{0x02}, []byte("\x1b[1;5C")...) {
@@ -376,17 +391,17 @@ func TestPaneResizeRepeatExpires(t *testing.T) {
 }
 
 func TestHandleInputBytesAppliesRepeatedPaneResize(t *testing.T) {
-	s := NewSession(0)
-	client := s.NewClient(0)
+	s := NewSessionState(1)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 80, 24
-	left := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
-	s.CreateWindow(left, 0)
-	right := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
-	if _, _, err := s.SplitFocusedPane(0, right, SplitVertical); err != nil {
+	left := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
+	createTestWindow(s, left)
+	right := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
+	if _, _, err := splitTestFocusedPane(s, right, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
 	input := append([]byte{0x02}, []byte("\x1b[1;5C\x1b[1;5C")...)
-	if detach, err := s.handleInputBytes(&ClientInstance{heldKeys: make(map[frontendHeldKey]uint64)}, 0, input); err != nil || detach {
+	if detach, err := clientForState(s).handleInputBytes(0, input); err != nil || detach {
 		t.Fatalf("handleInputBytes() detach=%v err=%v", detach, err)
 	}
 	placements := s.Windows[client.ActiveWindowID].Layout.Compute(Rect{Width: 80, Height: 24})
@@ -396,47 +411,47 @@ func TestHandleInputBytesAppliesRepeatedPaneResize(t *testing.T) {
 }
 
 func TestServerPromptEditsAndCancelsAuthoritatively(t *testing.T) {
-	s := NewSession(0)
-	s.NewClient(0)
-	pane := &Pane{ID: s.AddPaneID(), Title: "bash"}
-	window, _ := s.CreateWindow(pane, 0)
+	s := NewSessionState(0)
+	newStandaloneClient(s)
+	pane := &Pane{ID: testAddPaneID(s), Title: "bash"}
+	window, _ := createTestWindow(s, pane)
 
-	s.ConsumeInputByte(0, 0x02)
-	if event := s.ConsumeInputByte(0, ','); !isCommandInput(event, "rename-window") {
+	clientForState(s).ConsumeInputByte(0x02)
+	if event := clientForState(s).ConsumeInputByte(','); !isCommandInput(event, "rename-window") {
 		t.Fatalf("rename prompt event = %#v", event)
 	}
-	if _, err := s.BeginRenameWindowPrompt(0); err != nil {
+	if _, err := executeTestClientCommand(clientForState(s), []string{"rename-window"}); err != nil {
 		t.Fatal(err)
 	}
-	if event := s.ConsumeInputByte(0, 'x'); event.Command != serverCommandPrompt || event.PromptAction != PromptActionChanged {
+	if event := clientForState(s).ConsumeInputByte('x'); event.Command != serverCommandPrompt || event.PromptAction != PromptActionChanged {
 		t.Fatalf("prompt text event = %#v", event)
 	}
-	if got := string(s.ActivePrompt(0).Text); got != "bashx" {
+	if got := string(clientForState(s).ActivePrompt().Text); got != "bashx" {
 		t.Fatalf("prompt text after typing = %q", got)
 	}
-	if event := s.ConsumeInputByte(0, 0x7f); event.Command != serverCommandPrompt || event.PromptAction != PromptActionChanged {
+	if event := clientForState(s).ConsumeInputByte(0x7f); event.Command != serverCommandPrompt || event.PromptAction != PromptActionChanged {
 		t.Fatalf("backspace event = %#v", event)
 	}
-	if got := string(s.ActivePrompt(0).Text); got != "bash" {
+	if got := string(clientForState(s).ActivePrompt().Text); got != "bash" {
 		t.Fatalf("prompt text after backspace = %q", got)
 	}
 	for _, b := range []byte("xy") {
-		s.ConsumeInputByte(0, b)
+		clientForState(s).ConsumeInputByte(b)
 	}
-	consumed, events, terminated := s.ConsumePromptInput(0, []byte("\x1b[3~"))
+	consumed, events, terminated := clientForState(s).ConsumePromptInput([]byte("\x1b[3~"))
 	if consumed != 4 || len(events) != 1 || events[0].PromptAction != PromptActionChanged || terminated {
 		t.Fatalf("delete sequence consumed=%d events=%#v terminated=%v", consumed, events, terminated)
 	}
-	if got := string(s.ActivePrompt(0).Text); got != "bashx" {
+	if got := string(clientForState(s).ActivePrompt().Text); got != "bashx" {
 		t.Fatalf("prompt text after delete = %q", got)
 	}
-	if event := s.ConsumeInputByte(0, 0x1b); event.Command != serverCommandNone {
+	if event := clientForState(s).ConsumeInputByte(0x1b); event.Command != serverCommandNone {
 		t.Fatalf("escape prefix event = %#v", event)
 	}
-	if event := s.ConsumeInputByte(0, 'x'); event.Command != serverCommandPrompt || event.PromptAction != PromptActionCancel {
+	if event := clientForState(s).ConsumeInputByte('x'); event.Command != serverCommandPrompt || event.PromptAction != PromptActionCancel {
 		t.Fatalf("bare escape cancel event = %#v", event)
 	}
-	if s.ActivePrompt(0) != nil {
+	if clientForState(s).ActivePrompt() != nil {
 		t.Fatal("prompt remained active after escape")
 	}
 	if s.Windows[window.ID].Name != "bash" {
@@ -447,21 +462,21 @@ func TestServerPromptEditsAndCancelsAuthoritatively(t *testing.T) {
 func TestPromptDeleteSequenceSurvivesEveryPayloadBoundary(t *testing.T) {
 	sequence := []byte{0x1b, '[', '3', '~'}
 	for boundary := 1; boundary < len(sequence); boundary++ {
-		s := NewSession(0)
-		s.NewClient(0)
-		s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, 0)
-		if _, err := s.BeginRenameWindowPrompt(0); err != nil {
+		s := NewSessionState(0)
+		newStandaloneClient(s)
+		createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash"})
+		if _, err := executeTestClientCommand(clientForState(s), []string{"rename-window"}); err != nil {
 			t.Fatal(err)
 		}
 		for _, b := range []byte("x") {
-			s.ConsumeInputByte(0, b)
+			clientForState(s).ConsumeInputByte(b)
 		}
 
-		consumed, events, terminated := s.ConsumePromptInput(0, sequence[:boundary])
+		consumed, events, terminated := clientForState(s).ConsumePromptInput(sequence[:boundary])
 		if consumed != boundary || len(events) != 0 || terminated {
 			t.Fatalf("boundary %d first payload consumed=%d events=%#v terminated=%v", boundary, consumed, events, terminated)
 		}
-		prompt := s.ActivePrompt(0)
+		prompt := clientForState(s).ActivePrompt()
 		if prompt == nil || !bytes.Equal(prompt.PendingEscape, sequence[:boundary]) {
 			var pending []byte
 			if prompt != nil {
@@ -470,28 +485,30 @@ func TestPromptDeleteSequenceSurvivesEveryPayloadBoundary(t *testing.T) {
 			t.Fatalf("boundary %d pending escape=%#v prompt=%#v", boundary, pending, prompt)
 		}
 
-		consumed, events, terminated = s.ConsumePromptInput(0, sequence[boundary:])
+		consumed, events, terminated = clientForState(s).ConsumePromptInput(sequence[boundary:])
 		if consumed != len(sequence)-boundary || len(events) != 1 || events[0].PromptAction != PromptActionChanged || terminated {
 			t.Fatalf("boundary %d second payload consumed=%d events=%#v terminated=%v", boundary, consumed, events, terminated)
 		}
-		if got := string(s.ActivePrompt(0).Text); got != "bash" {
+		if got := string(clientForState(s).ActivePrompt().Text); got != "bash" {
 			t.Fatalf("boundary %d prompt text=%q, want bash", boundary, got)
 		}
 	}
 }
 
 func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
-	s := NewSession(0)
-	client := s.NewClient(0)
+	s := NewSessionState(1)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 80, 23
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	pane := &Pane{ID: s.AddPaneID(), PTY: writer, terminal: newTerminal(80, 23), Title: "bash"}
-	window, _ := s.CreateWindow(pane, 0)
-	if _, err := s.BeginRenameWindowPrompt(0); err != nil {
+	pane := &Pane{ID: testAddPaneID(s), PTY: writer, terminal: newTerminal(80, 23), Title: "bash"}
+	window, _ := createTestWindow(s, pane)
+	handler := &ClientInstance{controlOut: make(chan protocol.Frame, 8)}
+	setTestClient(s, handler)
+	if _, err := executeTestClientCommand(clientForState(s), []string{"rename-window"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -504,8 +521,6 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := s
-	handler := &ClientInstance{controlOut: make(chan protocol.Frame, 8)}
-	state.clientInstance = handler
 	if err := handleTestControlFrames(state, handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
 	}
@@ -519,22 +534,22 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("prompt input leaked to PTY: %q", got)
 	}
-	if window.Name != "bashx" || s.ActivePrompt(0) != nil {
-		t.Fatalf("prompt termination state window=%q prompt=%#v", window.Name, s.ActivePrompt(0))
+	if window.Name != "bashx" || clientForState(s).ActivePrompt() != nil {
+		t.Fatalf("prompt termination state window=%q prompt=%#v", window.Name, clientForState(s).ActivePrompt())
 	}
 }
 
 func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
-	s := NewSession(0)
-	client := s.NewClient(0)
+	s := NewSessionState(0)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 80, 23
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	pane := &Pane{ID: s.AddPaneID(), PTY: writer, terminal: newTerminal(80, 23), Title: "bash"}
-	s.CreateWindow(pane, 0)
+	pane := &Pane{ID: testAddPaneID(s), PTY: writer, terminal: newTerminal(80, 23), Title: "bash"}
+	createTestWindow(s, pane)
 
 	want := []byte("你好，世界")
 	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: want})
@@ -547,7 +562,7 @@ func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
 	}
 	state := s
 	handler := &ClientInstance{controlOut: make(chan protocol.Frame, 1)}
-	state.clientInstance = handler
+	setTestClient(state, handler)
 	if err := handleTestControlFrames(state, handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
 	}
@@ -564,13 +579,15 @@ func TestUTF8InputFrameIsForwardedIntact(t *testing.T) {
 }
 
 func TestStaleTransportInputIsIgnoredAfterReconnect(t *testing.T) {
-	s := NewSession(0)
-	clientState := s.NewClient(clientID0)
+	s := NewSessionState(0)
+	clientState := newStandaloneClient(s)
 	clientState.TerminalCols, clientState.TerminalRows = 80, 24
-	s.CreateWindow(&Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}, clientID0)
-	client := &ClientInstance{}
+	createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)})
+	client := newClientInstance(nil, nil)
+	client.Daemon = s.daemon
+	client.sessionID = s.ID
 	currentClient := &ClientInstance{}
-	s.clientInstance = currentClient
+	setTestClient(s, currentClient)
 
 	payload, err := protocol.EncodeFrontendResize(nil, protocol.FrontendResize{Cols: 40, Rows: 12})
 	if err != nil {
@@ -583,88 +600,89 @@ func TestStaleTransportInputIsIgnoredAfterReconnect(t *testing.T) {
 	if err := handleTestControlFrames(s, client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
 	}
-	clientState = s.SnapshotClient(clientID0)
+	clientState = snapshotTestClient(s)
 	if clientState.TerminalCols != 80 || clientState.TerminalRows != 24 {
 		t.Fatalf("stale resize changed client size to %dx%d", clientState.TerminalCols, clientState.TerminalRows)
 	}
 }
 
 func TestPromptBufferIsRuneAware(t *testing.T) {
-	s := NewSession(0)
-	s.NewClient(0)
-	s.CreateWindow(&Pane{ID: s.AddPaneID(), Title: "bash"}, 0)
-	if _, err := s.BeginPrompt(0, PromptKindRenameWindow, "prompt ", "猫"); err != nil {
+	s := NewSessionState(0)
+	newStandaloneClient(s)
+	createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash"})
+	if _, err := clientForState(s).BeginPrompt(PromptModeText, "prompt ", "猫"); err != nil {
 		t.Fatal(err)
 	}
 	for _, b := range []byte("é") {
-		s.ConsumeInputByte(0, b)
+		clientForState(s).ConsumeInputByte(b)
 	}
-	prompt := s.ActivePrompt(0)
+	prompt := clientForState(s).ActivePrompt()
 	if got := string(prompt.Text); got != "猫é" || prompt.Cursor != 2 {
 		t.Fatalf("rune prompt = %#v, want text 猫é cursor 2", prompt)
 	}
-	s.ConsumeInputByte(0, 0x7f)
-	if got := string(s.ActivePrompt(0).Text); got != "猫" {
+	clientForState(s).ConsumeInputByte(0x7f)
+	if got := string(clientForState(s).ActivePrompt().Text); got != "猫" {
 		t.Fatalf("rune prompt after backspace = %q", got)
 	}
 }
 
-func TestServerOwnsLastAndRelativeWindowSelection(t *testing.T) {
-	s := NewSession(0)
-	client := s.NewClient(0)
+func TestStandaloneWindowNavigationBookkeeping(t *testing.T) {
+	s := NewSessionState(0)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 80, 23
-	first := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 23)}
-	window1, _ := s.CreateWindow(first, 0)
-	second := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 23)}
-	window2, _ := s.CreateWindow(second, 0)
-	if got, ok := s.LastWindowID(0); !ok || got != window1.ID {
+	first := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
+	window1, _ := createTestWindow(s, first)
+	second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
+	window2, _ := createTestWindow(s, second)
+	if got, ok := s.daemon.windowSelectionTarget(s.ID, 0, true); !ok || got != window1.ID {
 		t.Fatalf("LastWindowID() = %d, %v; want %d, true", got, ok, window1.ID)
 	}
-	if got, ok := s.RelativeWindowID(0, 1); !ok || got != window1.ID {
+	if got, ok := s.daemon.windowSelectionTarget(s.ID, 1, false); !ok || got != window1.ID {
 		t.Fatalf("RelativeWindowID(+1) = %d, %v; want %d, true", got, ok, window1.ID)
 	}
-	if _, _, err := s.SelectWindow(0, window1.ID); err != nil {
+	if _, _, err := selectTestSessionWindow(s, window1.ID); err != nil {
 		t.Fatalf("SelectWindow() error = %v", err)
 	}
-	if got, ok := s.LastWindowID(0); !ok || got != window2.ID {
+	if got, ok := s.daemon.windowSelectionTarget(s.ID, 0, true); !ok || got != window2.ID {
 		t.Fatalf("LastWindowID() after selection = %d, %v; want %d, true", got, ok, window2.ID)
 	}
 }
 
-func TestServerGeometricFocusHandlesPaneZero(t *testing.T) {
-	s := NewSession(0)
-	client := s.NewClient(0)
+func TestDirectionalFocusGeometryHandlesPaneZero(t *testing.T) {
+	s := NewSessionState(0)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 80, 23
-	top := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 23)}
-	s.CreateWindow(top, 0)
-	bottom := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 23)}
-	if _, _, err := s.SplitFocusedPane(0, bottom, SplitHorizontal); err != nil {
+	top := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
+	createTestWindow(s, top)
+	bottom := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
+	if _, _, err := splitTestFocusedPane(s, bottom, SplitHorizontal); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
-	_, state, err := s.FocusPaneDirection(0, 'A')
+	_, state, err := clientForState(s).FocusPaneDirection('A')
 	if err != nil || state.FocusedPaneID != top.ID {
 		t.Fatalf("FocusPaneDirection(up) = state %#v err=%v; want pane %d", state, err, top.ID)
 	}
 }
 
 func TestDirectionalFocusRemembersPositionAcrossUnevenPanes(t *testing.T) {
-	s := NewSession(0)
-	client := s.NewClient(0)
+	s := NewSessionState(0)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 80, 24
-	left := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
-	s.CreateWindow(left, 0)
-	topRight := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
-	if _, _, err := s.SplitFocusedPane(0, topRight, SplitVertical); err != nil {
+	left := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
+	createTestWindow(s, left)
+	topRight := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
+	if _, _, err := splitTestFocusedPane(s, topRight, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
-	bottomRight := &Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 24)}
-	if _, _, err := s.SplitFocusedPane(0, bottomRight, SplitHorizontal); err != nil {
+	bottomRight := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)}
+	if _, _, err := splitTestFocusedPane(s, bottomRight, SplitHorizontal); err != nil {
 		t.Fatal(err)
 	}
+	syncTestProjection(t, s)
 
 	move := func(direction byte, want uint64) {
 		t.Helper()
-		_, state, err := s.FocusPaneDirection(0, direction)
+		_, state, err := clientForState(s).FocusPaneDirection(direction)
 		if err != nil {
 			t.Fatal(err)
 		}

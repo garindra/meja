@@ -1,8 +1,13 @@
 # Meja Architecture
 
-Meja is a terminal multiplexer for local and remote sessions. This document explains how its client, server, transport, terminal model, renderer, and persistence machinery fit together.
+Meja is a terminal multiplexer designed for both local and remote sessions. This document describes the system’s major components, the responsibilities they own, and the boundaries and data flows between the client, server, transport layer, terminal model, renderer, and persistence subsystem.
 
-For an introduction and quick start, see [README.md](README.md). For a comprehensive reference covering commands, options, keybindings, profiles, sockets, autosave, and diagnostics, see REFERENCE.md.
+> **About this document**
+>
+> This document is maintained primarily with the assistance of large language models. It serves two purposes: to record the authors’ architectural decisions and to provide continuously grounded context for the coding agents that contribute to Meja’s development. Architectural claims should reflect both the implementation and the maintainers’ intent; where they diverge, the code is authoritative.
+
+For an introduction and quick start, see [README.md](README.md). For a comprehensive reference covering commands, options, keybindings, profiles, sockets, autosave, and diagnostics, see [REFERENCE.md](REFERENCE.md).
+
 
 ## Table of Contents
 
@@ -90,11 +95,11 @@ flowchart LR
     C <-->|"QUIC control stream"| D
     D -->|"status + pane display streams"| C
 
-    D --> S1["Session"]
-    D --> S2["Session"]
-    S1 --> W["Windows and layout trees"]
-    W --> P1["Pane actor"]
-    W --> P2["Pane actor"]
+    D --> S1["passive SessionState"]
+    D --> S2["passive SessionState"]
+    D --> C1["ClientInstance actor"]
+    D --> P1["Pane actor"]
+    D --> P2["Pane actor"]
     P1 --> PTY1["PTY and child process"]
     P2 --> PTY2["PTY and child process"]
 ```
@@ -116,11 +121,11 @@ The most important architectural question is not which package contains an objec
 | CLI invocation | One command | Parses transport selection and submits one command request |
 | Server profile | Until its files are removed | Selects an isolated daemon, session namespace, socket, and snapshot directory |
 | Daemon | Server lifetime | Owns session identity, names, attach grants, reconnect credentials, assignments, and the QUIC listener |
-| Session | Until killed or its final pane exits | Owns windows, panes, focus, layouts, prompts, attached client, frontend routing, and snapshot coordination |
+| SessionState | Until killed or its final pane exits | Passive per-session view, focus, links, names, and persistence metadata |
 | Window | Session lifetime | Owns a layout tree, pane membership, active pane, name, zoom state, and layout revision |
 | Pane | Child-process lifetime | Actor-owns a PTY, packed terminal store, parser modes, history, process recipe, pending render damage, and at most one output lease |
 | Reconnect credential | Logical-client lifetime | Identifies one client across multiple transports and retains its target-session assignment |
-| Client instance | One live QUIC transport | Owns the control stream, status stream, pane output leases, frontend parser state, remembered layouts, and connection workers |
+| Client instance | One live QUIC transport | Owns control/status streams, pane output leases, frontend parser and prompt state, remembered layouts, and connection workers |
 | Output lease | One client transport | Owns one render-slot stream, its fixed-capacity render buffer, and the worker that performs blocking stream writes |
 | Client pane cache | Current layout lifetime | Stores the last decoded authoritative scanout cells for one visible render slot |
 
@@ -151,7 +156,34 @@ Only commands that can sensibly create state start a missing server automaticall
 
 ## One command engine
 
-CLI commands, prefix bindings, commands entered in Meja's command prompt, and server-backed help converge on canonical command definitions and the same operational handlers. For example, a key binding does not contain an independent implementation of window selection; it expands to the same command understood by the server command engine.
+The daemon constructs one immutable `CommandEngine`. Its ordered command registry is the source for lookup, aliases, and server-backed help. CLI commands, prefix bindings, and commands submitted from Meja's command prompt converge on those definitions. The `Ctrl+b, :` editor itself is ClientInstance UI, not a command; after editing it tokenizes the line and submits argv to the engine.
+
+All invocation paths terminate lookup and handler execution in
+`CommandEngine.run`. The command-socket adapter supplies a context derived from
+the wire request; attached UI supplies a fresh context snapshot from its
+ClientInstance. The engine returns an outcome, while the ClientInstance actor
+remains responsible for applying any transport-local action in that outcome.
+
+Every handler receives the daemon, an immutable `CommandContext`, and argv. The context contains only normalized caller values: origin (`AttachedUI`, `PaneCLI`, or `StandaloneCLI`), client-instance ID, session ID, pane ID, working directory, and terminal dimensions. It contains no live session, client, or pane pointer. The handler owns its flag and target semantics, then invokes daemon operations with stable IDs and other bare values.
+
+`resolveCommandCallerSession` is the only inference boundary for the caller's
+current session. It resolves an attached caller's session ID or a pane CLI's
+injected stable session/group target; for a grouped pane, the pane's window
+lease selects the exact viewing member. Command handlers resolve explicit
+targets directly and use this one function only when their target is omitted.
+Standalone callers therefore have no implicit session.
+
+Handlers return stdout, stderr, and at most one typed action. A visible mutation returns exactly one `applyViewTransitionAction`, which contains the complete daemon-prepared transition and therefore needs no separately supplied client ID. Attached execution applies it on the calling ClientInstance actor; command-socket execution routes the same action to the attachment named by the transition. The handler never installs the projection itself.
+
+This single action covers `new-session`, `attach-session`, `restore-session`, `switch-session`, window creation/selection, split, layout cycling, pane swapping, zoom/resize, and pane removal whenever the command affects a live view. A standalone session creation instead returns an attachment bootstrap because there is no existing ClientInstance to update. A mutation of a detached session returns no presentation action. Unzoomed focus is intentionally a control/layout notification rather than a visible replacement.
+
+The CLI adapter frames stdout/stderr and attachment bootstrap data over the command socket. The attached adapter rejects multiline/output-oriented commands instead of inventing a pane-output surface. Confirmation is also an outcome: for example, attached `kill-pane` returns a prompt request whose submit callback captures immutable IDs, revalidates them, commits the daemon operation, and returns the same view-transition action. Prompt behavior is encoded by `PromptMode`; command meaning is not represented by an expanding prompt-kind enum. There is no generic `confirm-before` command.
+
+Commands whose natural result is text, including help, session listing, and
+session-save confirmation, return `commandOutcome.Stdout` directly. They have
+no presentation action. Their handlers reject attached-UI origin before
+performing work; in particular, `save-session` cannot write a file and only
+then discover that the caller has no stdout surface.
 
 This reduces three common sources of drift:
 
@@ -161,7 +193,7 @@ This reduces three common sources of drift:
 
 Because help comes from the selected server, local and remote clients describe the command set implemented by the daemon they are actually addressing.
 
-Daemon-wide operations run against daemon-owned state. Operations within a live session are submitted to that session's actor. The command engine is shared, but ownership remains explicit.
+Daemon-wide operations run against daemon-owned state. Live client behavior runs on the ClientInstance actor, and pane behavior runs on Pane actors. The command engine is shared, but ownership remains explicit.
 
 ---
 
@@ -318,7 +350,11 @@ On resume, the server installs a fresh frontend-terminal setup, rebinds the new 
 
 # The actor-owned server
 
-Meja's server is organized around actors and ownership transfer. Daemon, session, pane, and status state each have one serialized executor. Other goroutines communicate with them through bounded channels and immutable or copied messages.
+Meja's server separates passive graph state from live actors. The daemon is the
+single executor for registry, group, window, lease, command, and lifecycle
+transactions. ClientInstance actors own connection-scoped behavior, and Pane
+actors own PTYs and terminal state. Other goroutines communicate through
+bounded channels and immutable or copied messages.
 
 We use “lock-free architecture” here in the ownership sense, not as a formal non-blocking progress guarantee. Core mutable domain state is not shared behind a large graph of mutexes. There are still narrow mutexes and atomics for infrastructure concerns such as logging, listener lifecycle, shutdown flags, and read-mostly pane metadata. Those do not replace actor ownership of sessions, layouts, terminal grids, or render leases.
 
@@ -333,28 +369,118 @@ The daemon actor owns server-wide coordination:
 * logical-client-to-session assignments; and
 * the active attachment for each session.
 
-Requests contain a closure and, when needed, a completion channel. Code that needs a result submits work and waits for that one actor operation. Code that only needs to continue a protocol submits a one-way post.
+Requests contain a closure and, when needed, a completion channel. Code that
+needs a result submits one short daemon transaction. Code that only needs to
+continue a protocol submits a one-way post. The daemon never waits for client
+output, pane termination, process observation, prompts, or filesystem I/O.
 
 The QUIC accept loop and command-socket handlers can run concurrently because they do not mutate the registries directly. They ask the daemon actor to perform the mutation.
 
-## Session actor
+## Session and group ownership
 
-Every session has its own operation queue. The session actor owns:
+The daemon actor owns the authoritative execution graph:
 
-* windows, panes, and client state;
-* the active client instance;
-* focus and window selection;
-* layout trees and revisions;
-* prompt and prefix-command state;
-* frontend event routing against pane terminal modes;
-* output-lease handoffs;
-* resize operations;
-* pane-exit handling; and
-* snapshot coordination.
+* `GroupState` membership;
+* canonical `WindowState` objects and synchronized `WindowLink` records;
+* canonical pane membership and daemon-global IDs;
+* `WindowViewLease` acquisition, release, and generation checks; and
+* grouped add/remove, fallback, process-target, and persistence-snapshot changes.
 
-Sessions therefore progress independently. A busy operation in one session does not require a global session-state lock and does not make another session's ordinary state mutation wait for that lock.
+It also owns pane lifecycle. Pane IDs are allocated by the daemon; pane creation, PTY/process startup, graph insertion, runtime goroutines, process observation, termination, and rollback are daemon operations. A ClientInstance receives pane identities and layout through a projection plan, never by constructing or starting a Pane.
 
-An operation coming from a client is coordinated with the expected `ClientInstance`. If reconnection or takeover has already replaced it, the stale operation becomes a no-op. A late goroutine from an old transport cannot regain control merely because it reached the session queue later.
+`SessionState` is passive. It contains the per-session view and durable model
+data but no mailbox, coordinator, or live-client authority. `GroupState` also
+has no mutex: relationship mutations are serialized by the daemon actor.
+
+The live `ClientInstance` owns one QUIC connection, ordered control frames,
+frontend decoding, prefix and prompt editing, terminal dimensions, cached
+projections, render bindings, output handoff, and stream writes. It consults
+the daemon by short transactions and never becomes the registry authority.
+
+Every session has exactly one group, including an ordinary singleton session.
+Every window belongs to exactly one group, and every grouped session has a
+separate link to the same canonical window object. A grouped new session copies
+view metadata and links; it never copies a pane, PTY, process, or execution
+graph.
+
+Each attached client owns exactly one `WindowViewLease`. A live window has at
+most one lease, so a pane has at most one viewer while retaining its existing
+single output-lease design. Lease acquisition checks the target before changing
+active/previous-window state and uses acquire-before-release semantics. A
+rejected target leaves the old lease, active/previous view, focus, bindings, and
+visible output untouched.
+
+Window selection, attach/resume, grouped window destruction, and fallback are
+single daemon transactions. Client projection plans include attachment ID,
+session ID, window ID, lease generation, projection/layout revision, and
+dimensions. The client validates these identities before changing output
+bindings or routing input.
+
+No Session coordinator remains. A command mutates passive model
+state in a daemon transaction, then sends an immutable projection or event to
+the relevant ClientInstance. Pane exit events use daemon-global pane IDs and
+are reconciled by the daemon before any client refresh is posted.
+
+### Projection plans
+
+Visible replacement is one three-step transition rather than a generic intent
+interpreter. First, the operation entry point calls the specific daemon method
+with its real parameters: for example `windowID`, `paneID`, split direction,
+target session, or terminal columns and rows. For a command, that entry point
+is its registered handler; for transport events it is the ClientInstance
+actor. The daemon method owns the operation-specific validation and graph
+mutation. There is no delayed callback, tagged union, or caller-selected
+handoff policy.
+
+Second, every successful daemon operation converges on
+`prepareViewTransitionNow`. It returns one immutable
+`PreparedViewTransition` containing the `ClientProjectionPlan`, exact
+daemon-authorized pane grids still to apply, and handles for removed panes that
+may still own this client's output leases. The daemon updates canonical target
+geometry but does not resize an attached pane actor while its old output grid
+is live.
+
+Third, the caller routes that prepared value to the affected ClientInstance;
+`ClientInstance.applyViewTransition` validates freshness, reclaims all
+installed output leases, applies the prepared pane grids, resolves and verifies
+the exact pane bindings, commits transport-local client state, reattaches the
+leases, publishes status, and sends the exact prepared `WINDOW_LAYOUT`. It does
+not call operation-specific logic or walk mutable session/window state to
+invent another answer.
+
+A plan carries the attachment and
+session identity, window lease generation, logical projection revision, layout
+revision, dimensions, pane rectangles, render-slot bindings, focused pane,
+status model, and whether a full snapshot is required. The client rejects an
+older attachment, lease generation, or projection revision before releasing
+any output binding. Reconnect retains the logical projection revision attached
+to the reconnect credential and resends a full plan without advancing that
+revision merely because the transport changed.
+
+Window creation and selection, split and layout changes, terminal resize,
+pane close/exit, attach, and session switching all converge on this pipeline.
+A session move commits daemon assignment and lease transfer during preparation,
+but changes the ClientInstance's installed session only during application.
+The application phase accepts an empty client-local starting view as long as
+the transition carries the daemon-authorized assignment. There is no second
+session-specific activation action and no error value used as control flow.
+A focus change in an unzoomed layout is deliberately not a visible replacement:
+it updates cursor ownership through the control stream without releasing pane
+outputs or resizing panes. A zoomed focus change does alter visible geometry
+and therefore uses a full transition.
+
+New-window activation, session switching, selection, attach/resume, and
+involuntary pane-exit fallback all produce the same transition type. The daemon
+never waits for output handoff, stream writes, or snapshot rendering. Pane exit
+is resolved by `PaneID -> WindowID -> GroupID`, reconciled once, and posts a
+normal `PreparedViewTransition` to each affected ClientInstance; it has no
+special projection installer. If no viewable fallback exists, the transition
+requests a clean client close rather than leaving stale bindings.
+
+The model has no `GroupState` mutex and no session-wide model mutex. The
+daemon request loop is the serialization mechanism; atomics are used only for
+immutable publication/revision or infrastructure flags, not to turn shared
+graph mutation into a second ownership system.
 
 ## Pane actor
 
@@ -383,31 +509,56 @@ flowchart LR
     PA -->|"commands + cursor + PRESENT"| OW
 ```
 
-The output lease is physically returned by the pane actor before the session gives it to another pane. If its worker is still writing the final old-pane batch, the newly attached pane cannot borrow the buffer until that ordered write completes. This makes stream rebinding observable and ordered rather than relying on a shared pointer swap.
+The output lease is physically returned by the pane actor before the ClientInstance binds it to another pane. If its worker is still writing the final old-pane batch, the newly selected pane cannot borrow the buffer until that ordered write completes. This makes stream rebinding observable and ordered rather than relying on a shared pointer swap.
 
 `capture-pane` is also submitted as a pane command. The actor formats the requested visible rows or history directly from the authoritative store while no PTY chunk, resize, or render compilation can mutate it. PTY reads can accumulate in the bounded input channel during that turn, but queued bytes are not part of the capture until the actor applies them. This produces a consistent actor-boundary capture without a terminal-grid mutex; a very large capture can temporarily delay that pane's actor.
 
-## Status actor
+## Client and status ownership
 
-Status output has its own small actor. The session publishes a status model—width, text, and style—while the status renderer owns the stream-local render state. Attaching a replacement stream causes the latest model to be rendered in full.
+Status output is part of the ClientInstance actor. The daemon supplies the
+current passive status model; the client owns status encoding, stream writes,
+prompts, and full refresh after replacement. Attaching or switching a client
+changes daemon assignment first, then the ClientInstance performs its output
+handoff without making the daemon wait for stream I/O.
 
 ## Avoiding actor deadlocks
 
-Actor ownership is only useful if actors do not form wait cycles. Cross-owner operations are structured so the daemon and a session do not synchronously wait on each other while each holds its own serialized turn.
-
-Session renaming is illustrative. The session requests validation from the daemon. The daemon reserves or rejects the name, then posts the result back to the session. The session actor does not remain blocked while the daemon tries to query or update session-owned state.
-
-Slow OS work is likewise moved outside actors where possible. Snapshot process observation captures stable anchors, releases the session actor, inspects the operating system, and later revalidates the anchors before accepting the result.
+Actor ownership is only useful if actors do not form wait cycles. Cross-owner
+operations therefore follow `ClientInstance -> Daemon.call`, `ClientInstance
+-> Pane`, `Pane/process -> Daemon.post`, and `Daemon -> ClientInstance.post`.
+Session rename and command prompts use typed client events; the daemon reserves
+the name or performs the mutation and posts the result without waiting for
+client output. Slow process observation and persistence writes happen outside
+the daemon transaction and return only immutable/advisory results.
 
 ---
 
 # Sessions, windows, panes, and PTYs
 
-## Session state
+## Session and group state
 
-A session is the authority for one persistent terminal workspace. It assigns monotonically increasing window, pane, and layout-revision identifiers. Client-visible selection state—active window, focused pane, terminal size, prompt, and status message—belongs to the session rather than the physical terminal.
+A group is the authority for one shared execution graph. It owns canonical
+windows, panes, layouts, dimensions, and daemon-global IDs. A session is the
+external view of that graph: active and previous window, focused pane, prompt,
+and status state belong to the session rather than the physical terminal.
 
 The final pane exiting ends the session. A network connection ending does not.
+
+## Grouped persistence
+
+Named recovery records use schema 2 metadata in the existing session file
+location. The record identifies the shared graph with a stable group ID and
+stores the session's active/previous windows plus independent focus and zoom
+views. Version-1 records have no group identity and restore as singleton
+groups. Runtime leases, ClientInstances, output bindings, transports, and
+terminal contents never enter a snapshot.
+
+The daemon supplies immutable persistence snapshots to the persistence worker;
+encoding, filesystem writes, and obsolete-file removal happen outside the
+daemon actor. If a session view with an already-live group ID is restored, the
+daemon attaches that view to the existing canonical graph and starts no new
+pane or process. A reconnect or restore therefore cannot duplicate the shared
+execution graph.
 
 ## Window layout trees
 
@@ -432,7 +583,13 @@ PTY output is read into pooled buffers and sent to the pane actor. Terminal-gene
 
 Meja tracks the command associated with a pane by observing operating-system process state. It does not require shell integration, inject prompt hooks, parse shell history, or infer commands from terminal text. The result is advisory metadata used for automatic window names and restart recipes; the pane's PTY and child process remain the runtime authority.
 
-When a pane starts, the session registers an `Anchor` with the daemon-wide `ProcessMonitor`. The anchor contains the `(session ID, pane ID)` key, the pane root's process identity, the PTY, and whether the root was launched as an interactive shell. Process identity is `(PID, birth token)`, not PID alone, so a later process that reuses the same numeric PID cannot be mistaken for the pane root.
+When a pane starts, the daemon-wide `ProcessMonitor` registers one `Anchor` for
+the daemon-global `PaneID`. The anchor contains the pane root's process
+identity, the PTY, and whether the root was launched as an interactive shell.
+The monitor's delivery session may change when a grouped session exits, but the
+pane watch and its identity do not. Process identity is `(PID, birth token)`
+rather than PID alone, so a later process that reuses the same numeric PID
+cannot be mistaken for the pane root.
 
 The monitor is a single actor with a bounded command mailbox and one watch per live pane. Pane I/O producers send it activity edges rather than observations:
 
@@ -457,7 +614,7 @@ Classification depends on how the pane was launched. For an explicitly requested
 
 Each accepted observation is reduced to a fingerprint containing the foreground group, classification, root directory, candidate identity and command, candidate directory, and derived window name. A newly detected command schedules a trailing stability confirmation rather than becoming durable immediately. Activity also schedules a trailing probe, and a periodic full reconciliation repairs missed activity edges or changes that produced no terminal output. The current implementation batches the initial watch after 10 milliseconds, settles activity for 250 milliseconds, limits activity probes to one per 500 milliseconds, confirms transitions after another 500 milliseconds, reconciles every 30 seconds, and bounds each deep observation to one second. These are tuning constants rather than persistence-format or protocol guarantees.
 
-Results are grouped by session and offered to the session actor. The channel is advisory and bounded; the monitor does not mutate session state directly. Before applying a result, the session actor revalidates the session ID, pane ID, root identity, and PTY against the current pane. Stale observations for removed or replaced panes are ignored.
+Results are grouped by daemon-global pane identity and posted to the daemon using the session ID captured in the watch. The monitor does not retain a SessionState pointer or mutate canonical state directly. Before applying a result, the daemon revalidates the pane ID, root identity, PTY, and surviving group target. Stale observations for removed or replaced panes are ignored.
 
 For persistence, the session projects a valid observation into a candidate working directory and restart command. The same projection normally has to be observed twice before it replaces the saved recipe; returning to the pane-owned shell is accepted in one sample. Explicitly launched commands continue to use their immutable launch recipe. Short-lived commands such as `ls`, `clear`, and `meja` do not replace the previous useful command. Ambiguous, unstable, or unavailable observations likewise do not overwrite a known-good recipe.
 
@@ -493,7 +650,7 @@ A trailing Escape is held for 25 milliseconds at the client's local TTY boundary
 
 ## Server-side routing and re-encoding
 
-The session actor decides whether an event belongs to Meja or to a pane application. Prefix commands, prompts, history interaction, and session switching stay on the command path. Ordinary pane input is re-encoded from the semantic event according to the pane's authoritative terminal metadata:
+The ClientInstance actor decides whether an event belongs to Meja or to a pane application. Prefix commands, prompts, history interaction, and session switching stay on the command path. Ordinary pane input is re-encoded from the semantic event according to the pane's authoritative terminal metadata:
 
 * normal versus application cursor keys;
 * bracketed paste;
@@ -740,7 +897,7 @@ Slots are reusable transport resources, not pane identities. Switching windows c
 
 ## Output leases
 
-An `OutputLease` pairs a slot with its physical QUIC stream. It also owns the stream's one fixed-capacity render buffer and a worker goroutine that is allowed to block on that stream. Exactly one pane actor or the session's unused pool owns a lease at a time. A pane can render only through the lease it currently owns, and it can compile only while that lease's worker has offered its buffer.
+An `OutputLease` pairs a slot with its physical QUIC stream. It also owns the stream's one fixed-capacity render buffer and a worker goroutine that is allowed to block on that stream. Exactly one pane actor or the ClientInstance's unused pool owns a lease at a time. A pane can render only through the lease it currently owns, and it can compile only while that lease's worker has offered its buffer.
 
 Buffer ownership alternates through bounded channels:
 
@@ -758,14 +915,18 @@ Relayout uses an explicit handoff:
 
 ```mermaid
 sequenceDiagram
-    participant S as Session actor
+    participant D as Daemon actor
+    participant S as ClientInstance actor
     participant O as Old pane actor
     participant N as New pane actor
     participant C as Client
 
+    S->>D: Specific operation with bare parameters
+    D-->>S: PreparedViewTransition
     S->>O: Release output lease
     O-->>S: Return physical slot lease
-    S->>S: Rebuild pane-to-slot bindings
+    S->>N: Apply daemon-authorized pane grid
+    S->>S: Verify and install the exact prepared projection
     S->>N: Attach lease with new layout revision
     N->>C: START_RENDER revision
     N->>C: START_RENDER + first bounded pane batch + PRESENT
@@ -996,14 +1157,14 @@ Snapshotting first builds a rich internal observation of a live session. It incl
 
 That internal `SessionCapture` is projected into a deliberately smaller, identity-free `SessionPlan`. Private recovery records wrap that plan with machine-local metadata such as the original session ID, profile, root, and save time. Runtime-only identifiers and ambiguous observation detail are not allowed to leak into the stable user format merely because they were convenient to collect.
 
-## Observe outside the session actor
+## Observe outside the daemon transaction
 
-Process inspection can be slow and operating-system dependent. Holding the session actor while walking process trees would pause interactive operations. Meja instead uses optimistic capture:
+Process inspection can be slow and operating-system dependent. Holding the daemon transaction while walking process trees would pause interactive operations. Meja instead uses optimistic capture:
 
-1. Enter the session actor and copy pane anchors, window identities, names, active state, layouts, and layout revisions.
-2. Leave the actor.
+1. Enter one daemon transaction and copy pane anchors, window identities, names, active state, layouts, and layout revisions.
+2. Leave the transaction.
 3. Observe process trees and working directories.
-4. Re-enter the actor.
+4. Post the result back to the daemon.
 5. Verify that the relevant pane identities, process roots, window identities, names, active state, session root, and revisions still match.
 6. Reject and retry later if the session changed during observation.
 
@@ -1095,7 +1256,7 @@ User-owned `.meja` files can contain commands. Prepare mode reduces accidental e
 | SSH bootstrap fails | Preserve and report SSH diagnostics | No interactive attachment occurs | Fix SSH or the remote executable |
 | UDP path is unreachable | Report the QUIC address as unreachable | Session remains alive | Fix firewall, VPN, NAT, or routing |
 | QUIC transport drops | Run frontend cleanup, keep the last confirmed view, stop routing input, and reconnect | Session, PTYs, terminal parsing, and snapshots continue | Resume with the reconnect token |
-| Old transport finishes late | Ignore its stale actor operations | Current client instance retains authority | Automatic |
+| Old transport finishes late | Ignore its stale client events | Current client instance retains authority | Automatic |
 | Another client takes the session | Show the takeover reason and exit | Session moves to the new logical client | Reattach intentionally |
 | Frontend input references an unknown layout | Do not route the pointer event to a pane | Session state remains unchanged | Wait for or use the active layout |
 | Pane output stream ends unexpectedly | Treat the connection as failed only through the control lifecycle | Session remains authoritative until transport cleanup | Reconnect and receive full views |
@@ -1175,19 +1336,20 @@ Useful starting points are:
 
 ## `internal/server`
 
-The server package owns the daemon, command socket, client-instance registry, session actors, pane actors, frontend parser and router, terminal emulator, packed row and cluster stores, layouts, history and selection, streamed rendering, process observation, snapshots, project-file creation, and restoration.
+The server package owns the daemon, command socket, client-instance registry, session views, grouped execution graph, pane actors, frontend parser and router, terminal emulator, packed row and cluster stores, layouts, history and selection, streamed rendering, process observation, snapshots, project-file creation, and restoration.
 
 The implementation is split by ownership and data flow rather than by public API. Useful starting points are:
 
-* `daemon.go` and `client_instance.go` for daemon ownership, credentials, QUIC attachment, control streams, and session switching;
-* `session.go`, `session_runtime.go`, `session_input.go`, and `session_output.go` for session coordination;
+* `daemon.go` and `client_instance.go` for daemon ownership, credentials, QUIC attachment, control streams, session assignment, and switching;
+* `session.go` and `grouped_sessions.go` for passive session/group/window-view state and daemon-serialized mutations;
+* `client_input.go`, `client_output.go`, `client_projection.go`, `client_runtime.go`, `view_transition.go`, and `frontend_routing.go` for live ClientInstance behavior, transition preparation, exact projection application, and input routing;
 * `frontend_input.go` and `frontend_routing.go` for semantic frontend parsing, mode-aware input encoding, pointer routing, and OSC 52 copy;
 * `pane.go` and `pane_runtime.go` for pane ownership, PTY workers, and the pane actor loop;
 * `pane_render_state.go`, `output_lease.go`, and `pane_display.go` for persistent damage, leased fixed-capacity buffers, output workers, and display compilation;
 * `pane_commands.go` and `pane_history.go` for actor-serialized capture, history, and selection;
 * `terminal.go` and `parser.go` for terminal semantics, packed cells, bounded rows, Unicode clusters, and terminal modes;
 * `window_layout.go` for layout trees and geometry; and
-* `process_monitor.go`, `process_observer.go`, and `session_persistence.go` for process recipes and persistence.
+* `process_monitor.go`, `process_observer.go`, and `session_persistence.go` for daemon-posted process observations and asynchronous persistence snapshots.
 
 ## `internal/protocol`
 
@@ -1221,11 +1383,12 @@ The suite includes:
 * fragmented legacy, Kitty, paste, focus, and SGR-mouse frontend input;
 * layout-aware pointer focus, capture, motion and wheel coalescing, native application mouse priority, selection, and OSC 52 copy;
 * layout computation, collapse, focus, zoom, swap, resize, and preset cases;
-* daemon and session actor serialization;
+* daemon graph and session-view serialization;
 * stale-controller rejection after reconnect or takeover;
 * attach-token expiry, single use, resume, takeover, and live session switching;
 * frontend setup, registered cleanup, disconnect cleanup, and render-loop terminal ownership;
 * output-lease release, `START_RENDER`, grid validation, and revision activation;
+* prepared-transition slice ownership, exact layout/binding publication, grid/layout agreement, and rejected-target source preservation;
 * blocked output workers without blocked pane actors;
 * bounded progressive render batches, retained dirty suffixes, and a terminating `PRESENT` in every batch;
 * prediction confirmation, partial confirmation, conflict, and repair;
@@ -1241,36 +1404,40 @@ The most valuable tests usually encode a statement that must remain true under a
 
 The following statements summarize the contracts contributors should preserve:
 
-1. The daemon actor alone mutates server-wide session and attachment registries.
-2. A session actor alone mutates that session's windows, layouts, client ownership, pane membership, prompts, and frontend routing decisions.
-3. A pane actor alone mutates its terminal state, packed row store, history view, pending damage, and output lease.
-4. A pane and its PTY outlive replacement of the attached client transport.
-5. One reconnect credential represents one logical client across many disposable client instances.
-6. Only the current client instance may control its assigned session.
-7. A session has at most one controlling logical client.
-8. The bidirectional control stream is the authoritative interactive lifecycle and input path.
-9. Disconnected ordinary input is dropped rather than replayed later.
-10. Server-provided frontend setup has paired cleanup, and terminal writes are serialized by the client UI loop.
-11. Pane terminal modes are learned from authoritative PTY output; frontend events are encoded for the pane's current modes on the server.
-12. Pointer hit testing uses the layout revision the frontend reported, not an unrelated current geometry.
-13. An output lease is owned by at most one pane actor, and its render buffer is owned by exactly one of that actor or the lease worker at a time.
-14. Blocking PTY reads, PTY writes, and pane-stream writes occur outside the pane actor and do not mutate its terminal state.
-15. A render slot is a transport resource, not a permanent pane identity.
-16. Every pane render after rebinding begins with `START_RENDER` containing the revision and grid dimensions, followed by a complete refresh that may span multiple presented frames. Reconnection may reuse the existing revision when the layout is unchanged.
-17. Every submitted pane render buffer ends with `PRESENT`; no partial batch becomes visible in the UI.
-18. Damage not encoded into one batch remains dirty, and later PTY damage is merged before another borrowed buffer is rendered.
-19. The client activates a layout revision only with initial frames for all its visible panes.
-20. A pane frame is never painted with geometry or grid dimensions from another layout revision.
-21. The server terminal grid and mode state are authoritative.
-22. `capture-pane` reads that grid as a serialized pane-actor operation rather than racing terminal mutation.
-23. Packed cells, cluster handles, continuation cells, and row eviction preserve valid reference and width relationships.
-24. Grapheme clusters remain atomic and bounded across parsing, storage, caching, rendering, history, selection, and resize.
-25. Client prediction decorates render output but never mutates authoritative cached state.
-26. Only authoritative server evidence confirms a prediction.
-27. History selection is view state; copying through OSC 52 does not inject bytes into the pane application.
-28. Snapshot observation performed outside an actor is revalidated before persistence.
-29. Recovery snapshots and `.meja` project files are restart recipes, not process images.
-30. `restore` consumes daemon-managed named-session snapshots; `new -f` consumes explicit project files.
-31. Initial remote attachment authority is transferred through SSH; the direct QUIC connection must match that bootstrap.
+1. The daemon actor alone mutates server-wide session, group, window-link, and attachment registries.
+2. The daemon actor alone mutates canonical windows, panes, leases, and grouped relationships.
+3. SessionState is passive; the daemon mutates its view and graph data in short transactions.
+4. A ClientInstance actor owns prompts, frontend routing, output handoff, status, and transport-local state.
+5. A pane actor alone mutates its terminal state, packed row store, history view, pending damage, and output lease.
+6. A pane and its PTY outlive replacement of the attached client transport.
+7. One reconnect credential represents one logical client across many disposable client instances.
+8. Only the current client instance may control its assigned session.
+9. A session has at most one controlling logical client.
+10. The bidirectional control stream is the authoritative interactive lifecycle and input path.
+11. Disconnected ordinary input is dropped rather than replayed later.
+12. Server-provided frontend setup has paired cleanup, and terminal writes are serialized by the client UI loop.
+13. Every full visible replacement is installed from one `PreparedProjection`; application does not rebuild bindings or layout from live graph state.
+14. Every prepared pane grid matches its published rectangle, and `START_RENDER` and `WINDOW_LAYOUT` carry the same transport-local layout revision.
+15. Pane terminal modes are learned from authoritative PTY output; frontend events are encoded for the pane's current modes on the server.
+16. Pointer hit testing uses the layout revision the frontend reported, not an unrelated current geometry.
+17. An output lease is owned by at most one pane actor, and its render buffer is owned by exactly one of that actor or the lease worker at a time.
+18. Blocking PTY reads, PTY writes, and pane-stream writes occur outside the pane actor and do not mutate its terminal state.
+19. A render slot is a transport resource, not a permanent pane identity.
+20. Every pane render after rebinding begins with `START_RENDER` containing the revision and grid dimensions, followed by a complete refresh that may span multiple presented frames. Reconnection may reuse the existing revision when the layout is unchanged.
+21. Every submitted pane render buffer ends with `PRESENT`; no partial batch becomes visible in the UI.
+22. Damage not encoded into one batch remains dirty, and later PTY damage is merged before another borrowed buffer is rendered.
+23. The client activates a layout revision only with initial frames for all its visible panes.
+24. A pane frame is never painted with geometry or grid dimensions from another layout revision.
+25. The server terminal grid and mode state are authoritative.
+26. `capture-pane` reads that grid as a serialized pane-actor operation rather than racing terminal mutation.
+27. Packed cells, cluster handles, continuation cells, and row eviction preserve valid reference and width relationships.
+28. Grapheme clusters remain atomic and bounded across parsing, storage, caching, rendering, history, selection, and resize.
+29. Client prediction decorates render output but never mutates authoritative cached state.
+30. Only authoritative server evidence confirms a prediction.
+31. History selection is view state; copying through OSC 52 does not inject bytes into the pane application.
+32. Snapshot observation performed outside an actor is revalidated before persistence.
+33. Recovery snapshots and `.meja` project files are restart recipes, not process images.
+34. `restore` consumes daemon-managed named-session snapshots; `new -f` consumes explicit project files.
+35. Initial remote attachment authority is transferred through SSH; the direct QUIC connection must match that bootstrap.
 
 These invariants are more stable than individual files, constants, or goroutine counts. When an implementation change preserves them—or deliberately revises them along with this document—the architecture remains understandable even as its internals evolve.

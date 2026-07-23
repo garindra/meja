@@ -95,6 +95,7 @@ func executeCommand(ctx context.Context, cfg Config) (commandResult, error) {
 		Args:                cfg.CommandArgs,
 		WorkingDirectory:    cfg.Cwd,
 		CallerSessionTarget: cfg.CallerSessionTarget,
+		CallerPaneID:        cfg.CallerPaneID,
 		TerminalCols:        cfg.TerminalCols,
 		TerminalRows:        cfg.TerminalRows,
 	}

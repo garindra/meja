@@ -81,19 +81,6 @@ func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.W
 		}
 		return client.ForwardCommand(ctx, cfg.SocketSelector, stdin, stdout)
 	}
-	if command == "server" && len(cfg.CommandArgs) >= 2 && cfg.CommandArgs[1] == "run" {
-		if !cfg.Local {
-			return usageError{"server run is local; invoke start-server through SSH on the remote host"}
-		}
-		if len(cfg.CommandArgs) != 2 {
-			return usageError{"server run accepts no arguments"}
-		}
-		socket, err := cfg.SocketSelector.Resolve()
-		if err != nil {
-			return err
-		}
-		return server.Run(ctx, server.Config{ControlPath: socket, Stdout: stdout, Stderr: stderr})
-	}
 	return client.Run(ctx, cfg)
 }
 
@@ -110,6 +97,7 @@ type invocationOptions struct {
 func parseInvocation(args []string, stdin *os.File, stdout, stderr io.Writer) (client.Config, error) {
 	options := invocationOptions{remotePath: "meja", port: 4433}
 	callerSessionTarget := ""
+	var callerPaneID uint64
 	commandArgs := make([]string, 0, len(args))
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
@@ -146,6 +134,13 @@ func parseInvocation(args []string, stdin *os.File, stdout, stderr io.Writer) (c
 		if contextSocket != "" && contextTarget != "" {
 			options.socket = contextSocket
 			callerSessionTarget = contextTarget
+			if rawPaneID := os.Getenv("MEJA_PANE_ID"); rawPaneID != "" {
+				parsedPaneID, parseErr := strconv.ParseUint(rawPaneID, 10, 64)
+				if parseErr != nil || parsedPaneID == 0 {
+					return client.Config{}, fmt.Errorf("invalid MEJA_PANE_ID %q", rawPaneID)
+				}
+				callerPaneID = parsedPaneID
+			}
 		}
 	}
 	selector, err := (client.SocketSelector{Profile: options.profile, Path: options.socket}).Normalize()
@@ -163,6 +158,7 @@ func parseInvocation(args []string, stdin *os.File, stdout, stderr io.Writer) (c
 		RemotePath:          options.remotePath,
 		SocketSelector:      selector,
 		CallerSessionTarget: callerSessionTarget,
+		CallerPaneID:        callerPaneID,
 		CommandArgs:         commandArgs,
 		Stdin:               stdin,
 		Stdout:              stdout,

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -9,6 +10,84 @@ import (
 )
 
 const paneResizeRepeatWindow = 500 * time.Millisecond
+
+func (c *ClientInstance) BeginPrompt(mode PromptMode, label, initial string) (*PromptState, error) {
+	state := c.sessionState()
+	client := c.clientState
+	if client == nil {
+		return nil, errors.New("client is unavailable")
+	}
+	windowID := client.ActiveWindowID
+	if windowID == 0 {
+		windowID = state.ActiveWindowID
+		client.ActiveWindowID = windowID
+	}
+	if state.Windows[windowID] == nil {
+		return nil, errors.New("client has no active window")
+	}
+	text := []rune(initial)
+	client.InputState = serverInputNormal
+	client.PrefixEscape = nil
+	client.ResizeRepeatUntil = time.Time{}
+	client.Prompt = &PromptState{Mode: mode, Label: label, Text: text, Cursor: len(text)}
+	return clonePromptState(client.Prompt), nil
+}
+
+func (c *ClientInstance) BeginCommandPrompt() (*PromptState, error) {
+	prompt, err := c.BeginPrompt(PromptModeText, ":", "")
+	if err != nil {
+		return nil, err
+	}
+	c.promptContinuation = c.runCommandPromptAnswer
+	return prompt, nil
+}
+
+func (c *ClientInstance) showStatusMessage(message string) {
+	if c.sessionState() == nil || c.clientState == nil {
+		return
+	}
+	messageID := c.statusMessageID.Add(1)
+	c.statusMessage.Store(message)
+	duration := c.statusMessageDuration
+	if duration <= 0 {
+		duration = time.Second
+	}
+	time.AfterFunc(duration, func() {
+		c.post(func() error {
+			if c.sessionState() == nil || c.statusMessageID.Load() != messageID {
+				return nil
+			}
+			c.statusMessage.Store("")
+			return c.publishStatusBar()
+		})
+	})
+}
+
+func (c *ClientInstance) beginPrompt(mode PromptMode, label, initial string, continuation promptContinuation) (*PromptState, error) {
+	prompt, err := c.BeginPrompt(mode, label, initial)
+	if err != nil {
+		return nil, err
+	}
+	c.promptContinuation = continuation
+	return prompt, nil
+}
+
+func (c *ClientInstance) resolvePrompt(result promptResult) (bool, error) {
+	continuation := c.promptContinuation
+	c.promptContinuation = nil
+	if continuation == nil {
+		return false, c.publishStatusBar()
+	}
+	return continuation(result)
+}
+
+func (c *ClientInstance) ActivePrompt() *PromptState {
+	client := c.clientState
+	if client == nil {
+		return nil
+	}
+	return clonePromptState(client.Prompt)
+}
 
 type serverInputState uint8
 
@@ -28,6 +107,7 @@ const (
 	serverCommandLiteral
 	serverCommandExecute
 	serverCommandPrompt
+	serverCommandOpenCommandPrompt
 )
 
 type serverInputEvent struct {
@@ -36,22 +116,18 @@ type serverInputEvent struct {
 	Data         []byte
 	CommandArgs  []string
 	PromptAction PromptAction
-	PromptKind   PromptKind
+	PromptMode   PromptMode
 	PromptText   string
 }
 
-func (s *Session) ConsumeInputByte(clientID uint64, b byte) serverInputEvent {
-	client := s.Clients[clientID]
+func (c *ClientInstance) ConsumeInputByte(b byte) serverInputEvent {
+	client := c.clientState
 	if client == nil {
 		return serverInputEvent{}
 	}
 	if client.Prompt != nil {
 		return consumePromptByteLocked(client, b)
 	}
-	return consumeInputByteLockedAt(client, b, time.Now())
-}
-
-func consumeInputByteLocked(client *ClientState, b byte) serverInputEvent {
 	return consumeInputByteLockedAt(client, b, time.Now())
 }
 
@@ -84,7 +160,7 @@ func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) server
 		case 'l':
 			return commandInputEvent("last-window")
 		case 'x':
-			return commandInputEvent("confirm-before", "kill-pane")
+			return commandInputEvent("kill-pane")
 		case 'z':
 			return commandInputEvent("resize-pane", "-Z")
 		case '[':
@@ -100,7 +176,7 @@ func consumeInputByteLockedAt(client *ClientState, b byte, now time.Time) server
 		case '$':
 			return commandInputEvent("rename-session")
 		case ':':
-			return commandInputEvent("command-prompt")
+			return serverInputEvent{Command: serverCommandOpenCommandPrompt}
 		default:
 			if b >= '0' && b <= '9' {
 				return commandInputEvent("select-window", "-t", ":"+string(b))
@@ -283,7 +359,7 @@ func directionFlag(final byte) string {
 
 func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
 	prompt := client.Prompt
-	if prompt.Kind == PromptKindConfirm {
+	if prompt.Mode == PromptModeConfirm {
 		return consumeConfirmationByteLocked(client, b)
 	}
 	if len(prompt.PendingEscape) > 0 {
@@ -295,7 +371,7 @@ func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
 	}
 	event := serverInputEvent{
 		Command:    serverCommandPrompt,
-		PromptKind: prompt.Kind,
+		PromptMode: prompt.Mode,
 	}
 	switch b {
 	case '\r', '\n':
@@ -304,9 +380,7 @@ func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
 		prompt.pendingUTF8 = nil
 		event.PromptAction = PromptActionSubmit
 		event.PromptText = string(prompt.Text)
-		if prompt.Kind != PromptKindRenameSession {
-			client.Prompt = nil
-		}
+		client.Prompt = nil
 	case 0x03, 0x1b:
 		prompt.Action = PromptActionCancel
 		prompt.PendingEscape = nil
@@ -339,7 +413,7 @@ func consumePromptByteLocked(client *ClientState, b byte) serverInputEvent {
 
 func consumeConfirmationByteLocked(client *ClientState, b byte) serverInputEvent {
 	prompt := client.Prompt
-	event := serverInputEvent{Command: serverCommandPrompt, PromptKind: prompt.Kind}
+	event := serverInputEvent{Command: serverCommandPrompt, PromptMode: prompt.Mode}
 	switch b {
 	case 'y', 'Y':
 		event.PromptAction = PromptActionSubmit
@@ -395,7 +469,7 @@ func promptEventLocked(prompt *PromptState, action PromptAction, text string) se
 	return serverInputEvent{
 		Command:      serverCommandPrompt,
 		PromptAction: action,
-		PromptKind:   prompt.Kind,
+		PromptMode:   prompt.Mode,
 		PromptText:   text,
 	}
 }
@@ -403,8 +477,8 @@ func promptEventLocked(prompt *PromptState, action PromptAction, text string) se
 // ConsumePromptInput keeps incomplete escape sequences in PromptState. Escape
 // is resolved as cancel only once its next byte proves it is not CSI Delete.
 // Any submit/cancel terminates ownership of the current input payload.
-func (s *Session) ConsumePromptInput(clientID uint64, data []byte) (int, []serverInputEvent, bool) {
-	client := s.Clients[clientID]
+func (c *ClientInstance) ConsumePromptInput(data []byte) (int, []serverInputEvent, bool) {
+	client := c.clientState
 	if client == nil || client.Prompt == nil {
 		return 0, nil, false
 	}
@@ -425,8 +499,8 @@ func (s *Session) ConsumePromptInput(clientID uint64, data []byte) (int, []serve
 	return index, events, terminated
 }
 
-func (s *Session) InputIsNormal(clientID uint64) bool {
-	client := s.Clients[clientID]
+func (c *ClientInstance) InputIsNormal() bool {
+	client := c.clientState
 	return client != nil && client.Prompt == nil && client.InputState == serverInputNormal && !paneResizeRepeatActive(client, time.Now())
 }
 
@@ -437,33 +511,11 @@ func translateApplicationCursor(data []byte, enabled bool) ([]byte, int, bool) {
 	return []byte{0x1b, 'O', data[2]}, 3, true
 }
 
-func (s *Session) RelativeWindowID(clientID uint64, delta int) (uint64, bool) {
-	client := s.Clients[clientID]
-	if client == nil || len(s.Windows) == 0 {
-		return 0, false
-	}
-	ids := s.windowIDsLocked()
-	for i, id := range ids {
-		if id == client.ActiveWindowID {
-			return ids[(i+delta+len(ids))%len(ids)], true
-		}
-	}
-	return ids[0], true
-}
-
-func (s *Session) LastWindowID(clientID uint64) (uint64, bool) {
-	client := s.Clients[clientID]
-	if client == nil || !client.HasLastWindow || s.Windows[client.LastWindowID] == nil {
-		return 0, false
-	}
-	return client.LastWindowID, true
-}
-
-func (s *Session) WindowIDByIndex(index int) (uint64, bool) {
+func (c *ClientInstance) WindowIDByIndex(index int) (uint64, bool) {
 	if index < 0 {
 		return 0, false
 	}
-	for _, window := range s.Windows {
+	for _, window := range c.sessionState().Windows {
 		if window.DisplayIndex == index {
 			return window.ID, true
 		}
@@ -519,19 +571,14 @@ func deletePromptRune(prompt *PromptState) {
 	prompt.Text = prompt.Text[:len(prompt.Text)-1]
 }
 
-func (s *Session) FocusPaneDirection(clientID uint64, direction byte) (*Window, *ClientState, error) {
-	client := s.Clients[clientID]
+func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, *ClientState, error) {
+	client := c.clientState
 	if client == nil {
-		return nil, nil, fmt.Errorf("unknown client %d", clientID)
+		return nil, nil, errors.New("client is unavailable")
 	}
-	window := s.Windows[client.ActiveWindowID]
+	window := c.sessionState().Windows[client.ActiveWindowID]
 	if window == nil {
 		return nil, nil, fmt.Errorf("unknown window %d", client.ActiveWindowID)
-	}
-	if window.Zoomed {
-		window.clearZoom()
-		window.LayoutRevision = s.nextLayoutRevisionLocked()
-		s.rebuildBindingsLocked(client, window)
 	}
 	placements := window.Layout.Compute(Rect{Width: int(client.TerminalCols), Height: int(client.TerminalRows)})
 	var current *PanePlacement
@@ -603,9 +650,6 @@ func (s *Session) FocusPaneDirection(clientID uint64, direction byte) (*Window, 
 		}
 	}
 	if best != nil {
-		changed := window.ActivePaneID != best.placement.PaneID
-		client.FocusedPaneID = best.placement.PaneID
-		window.ActivePaneID = best.placement.PaneID
 		if direction == 'A' || direction == 'B' {
 			client.FocusX2 = clampToRectAxis(client.FocusX2, best.placement.Rect.X, best.placement.Rect.Width)
 			client.FocusY2 = rectCenterY2(best.placement.Rect)
@@ -613,9 +657,11 @@ func (s *Session) FocusPaneDirection(clientID uint64, direction byte) (*Window, 
 			client.FocusX2 = rectCenterX2(best.placement.Rect)
 			client.FocusY2 = clampToRectAxis(client.FocusY2, best.placement.Rect.Y, best.placement.Rect.Height)
 		}
-		if changed {
-			s.markWindowChangedForPersistence(window.ID)
+		focusedWindow, err := c.focusPane(best.placement.PaneID)
+		if err != nil {
+			return nil, nil, err
 		}
+		return focusedWindow, cloneClientState(c.ensureClientState()), nil
 	}
 	return cloneWindow(window), cloneClientState(client), nil
 }

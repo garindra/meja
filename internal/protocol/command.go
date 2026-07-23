@@ -42,6 +42,7 @@ type CommandRequest struct {
 	Args                []string `json:"args"`
 	WorkingDirectory    string   `json:"workingDirectory,omitempty"`
 	CallerSessionTarget string   `json:"callerSessionTarget,omitempty"`
+	CallerPaneID        uint64   `json:"callerPaneId,omitempty"`
 	TerminalCols        uint16   `json:"terminalCols,omitempty"`
 	TerminalRows        uint16   `json:"terminalRows,omitempty"`
 }

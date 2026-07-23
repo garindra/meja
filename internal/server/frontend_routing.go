@@ -12,10 +12,10 @@ import (
 
 const frontendWheelReportsPerStep = 3
 
-func (s *Session) coalesceFrontendWheelBursts(c *ClientInstance, events []frontendInputEvent) []frontendInputEvent {
+func (c *ClientInstance) coalesceFrontendWheelBursts(events []frontendInputEvent) []frontendInputEvent {
 	result := make([]frontendInputEvent, 0, len(events))
 	for index := 0; index < len(events); {
-		paneID, owned := s.mejaOwnedWheelTarget(c, events[index])
+		paneID, owned := c.mejaOwnedWheelTarget(events[index])
 		if !owned {
 			result = append(result, events[index])
 			index++
@@ -25,7 +25,7 @@ func (s *Session) coalesceFrontendWheelBursts(c *ClientInstance, events []fronte
 		delta := 0
 		end := index
 		for end < len(events) {
-			candidatePaneID, candidateOwned := s.mejaOwnedWheelTarget(c, events[end])
+			candidatePaneID, candidateOwned := c.mejaOwnedWheelTarget(events[end])
 			if !candidateOwned || candidatePaneID != paneID || events[end].LayoutRevision != revision {
 				break
 			}
@@ -56,7 +56,7 @@ func (s *Session) coalesceFrontendWheelBursts(c *ClientInstance, events []fronte
 	return result
 }
 
-func (s *Session) mejaOwnedWheelTarget(c *ClientInstance, event frontendInputEvent) (uint64, bool) {
+func (c *ClientInstance) mejaOwnedWheelTarget(event frontendInputEvent) (uint64, bool) {
 	if event.Kind != frontendEventPointer || !isFrontendWheelAction(event.Pointer.Action) {
 		return 0, false
 	}
@@ -64,7 +64,7 @@ func (s *Session) mejaOwnedWheelTarget(c *ClientInstance, event frontendInputEve
 	if !found {
 		return 0, false
 	}
-	pane := s.Pane(paneID)
+	pane := c.sessionState().Pane(paneID)
 	return paneID, pane != nil && (pane.isHistoryMode() || pane.InputMode().mouseTracking == MouseTrackingNone)
 }
 
@@ -73,12 +73,12 @@ func isFrontendWheelAction(action frontendPointerAction) bool {
 		action == frontendPointerWheelLeft || action == frontendPointerWheelRight
 }
 
-func (s *Session) handleFrontendInputEvent(c *ClientInstance, event frontendInputEvent) (bool, error) {
+func (c *ClientInstance) handleFrontendInputEvent(event frontendInputEvent) (bool, error) {
 	switch event.Kind {
 	case frontendEventKey:
-		return s.handleFrontendKey(c, event.Key)
+		return c.handleFrontendKey(event.Key)
 	case frontendEventPasteStart:
-		if pane, _ := s.ActivePane(clientID0); pane != nil {
+		if pane := c.activePane(); pane != nil {
 			c.pasteCapture = frontendPaneCapture{paneID: pane.ID, active: true}
 		}
 	case frontendEventPaste:
@@ -90,7 +90,7 @@ func (s *Session) handleFrontendInputEvent(c *ClientInstance, event frontendInpu
 		if event.PasteDiscarded {
 			return false, nil
 		}
-		pane := s.Pane(capture.paneID)
+		pane := c.sessionState().Pane(capture.paneID)
 		if pane == nil {
 			return false, nil
 		}
@@ -103,11 +103,11 @@ func (s *Session) handleFrontendInputEvent(c *ClientInstance, event frontendInpu
 	case frontendEventFocus:
 		if !event.Focused {
 			clear(c.heldKeys)
-			if err := s.cancelFrontendPointerCapture(c); err != nil {
+			if err := c.cancelFrontendPointerCapture(); err != nil {
 				return false, err
 			}
 		}
-		pane, _ := s.ActivePane(clientID0)
+		pane := c.activePane()
 		if pane != nil && pane.InputMode().focusReporting {
 			if event.Focused {
 				return false, pane.sendInput([]byte("\x1b[I"))
@@ -115,14 +115,14 @@ func (s *Session) handleFrontendInputEvent(c *ClientInstance, event frontendInpu
 			return false, pane.sendInput([]byte("\x1b[O"))
 		}
 	case frontendEventPointer:
-		return false, s.handleFrontendPointer(c, event.LayoutRevision, event.Pointer)
+		return false, c.handleFrontendPointer(event.LayoutRevision, event.Pointer)
 	}
 	return false, nil
 }
 
-func (s *Session) handleFrontendKey(c *ClientInstance, key frontendKeyEvent) (bool, error) {
+func (c *ClientInstance) handleFrontendKey(key frontendKeyEvent) (bool, error) {
 	if key.Action != frontendKeyRelease && c.pointerCapture.mejaSelection && c.pointerCapture.autoSelection {
-		if err := s.cancelFrontendPointerCapture(c); err != nil {
+		if err := c.cancelFrontendPointerCapture(); err != nil {
 			return false, err
 		}
 	}
@@ -130,12 +130,12 @@ func (s *Session) handleFrontendKey(c *ClientInstance, key frontendKeyEvent) (bo
 		c.heldKeys = make(map[frontendHeldKey]uint64)
 	}
 	held := frontendHeldKey{Code: key.Code, Rune: key.Rune, Modifiers: key.Modifiers}
-	pane, _ := s.ActivePane(clientID0)
+	pane := c.activePane()
 	if key.Action == frontendKeyPress && key.HasEventType && pane != nil {
 		c.heldKeys[held] = pane.ID
 	} else if key.Action == frontendKeyRepeat || key.Action == frontendKeyRelease {
 		if paneID, ok := c.heldKeys[held]; ok {
-			pane = s.Pane(paneID)
+			pane = c.sessionState().Pane(paneID)
 		}
 		if key.Action == frontendKeyRelease {
 			delete(c.heldKeys, held)
@@ -143,13 +143,13 @@ func (s *Session) handleFrontendKey(c *ClientInstance, key frontendKeyEvent) (bo
 	}
 
 	commandBytes := encodeLegacyKey(key, paneTerminalMetadata{})
-	commandPath := s.ActivePrompt(clientID0) != nil || !s.InputIsNormal(clientID0) ||
+	commandPath := c.ActivePrompt() != nil || !c.InputIsNormal() ||
 		(pane != nil && pane.isHistoryMode()) || isMejaPrefixKey(key)
 	if commandPath {
 		if key.Action == frontendKeyRelease || len(commandBytes) == 0 {
 			return false, nil
 		}
-		return s.handleLegacyInputBytes(c, commandBytes)
+		return c.handleLegacyInputBytes(commandBytes)
 	}
 	if pane == nil {
 		return false, nil
@@ -164,7 +164,7 @@ func (s *Session) handleFrontendKey(c *ClientInstance, key frontendKeyEvent) (bo
 	return false, nil
 }
 
-func (s *Session) cancelFrontendPointerCapture(c *ClientInstance) error {
+func (c *ClientInstance) cancelFrontendPointerCapture() error {
 	if c == nil {
 		return nil
 	}
@@ -173,7 +173,7 @@ func (s *Session) cancelFrontendPointerCapture(c *ClientInstance) error {
 	if !capture.active || !capture.mejaSelection || !capture.selecting {
 		return nil
 	}
-	pane := s.Pane(capture.paneID)
+	pane := c.sessionState().Pane(capture.paneID)
 	if pane == nil {
 		return nil
 	}
@@ -467,9 +467,9 @@ func kittyFunctionalSequence(code frontendKeyCode) (byte, string, bool) {
 	}
 }
 
-func (s *Session) handleFrontendPointer(c *ClientInstance, revision uint64, pointer frontendPointerEvent) error {
+func (c *ClientInstance) handleFrontendPointer(revision uint64, pointer frontendPointerEvent) error {
 	if pointer.Action == frontendPointerPress && c.pointerCapture.active {
-		if err := s.cancelFrontendPointerCapture(c); err != nil {
+		if err := c.cancelFrontendPointerCapture(); err != nil {
 			return err
 		}
 	}
@@ -489,17 +489,17 @@ func (s *Session) handleFrontendPointer(c *ClientInstance, revision uint64, poin
 	if !found {
 		return nil
 	}
-	pane := s.Pane(paneID)
+	pane := c.sessionState().Pane(paneID)
 	if pane == nil {
 		c.pointerCapture = frontendPaneCapture{}
 		return nil
 	}
 	if pointer.Action == frontendPointerPress {
-		if !s.IsFocusedPane(clientID0, paneID) {
-			if _, _, err := s.FocusPane(clientID0, paneID); err != nil {
+		if !c.isFocusedPane(paneID) {
+			if _, err := c.focusPane(paneID); err != nil {
 				return err
 			}
-			if err := s.publishWindowLayout(); err != nil {
+			if err := c.publishWindowLayout(); err != nil {
 				return err
 			}
 		}
@@ -525,7 +525,7 @@ func (s *Session) handleFrontendPointer(c *ClientInstance, revision uint64, poin
 	}
 	if captured && capture.mejaSelection {
 		if pointer.Action == frontendPointerMove && pointer.Button != capture.button {
-			return s.cancelFrontendPointerCapture(c)
+			return c.cancelFrontendPointerCapture()
 		}
 		row := min(max(pointer.Y-rect.Y, 0), max(rect.Height-1, 0))
 		column := min(max(pointer.X-rect.X, 0), max(rect.Width-1, 0))
@@ -548,7 +548,7 @@ func (s *Session) handleFrontendPointer(c *ClientInstance, revision uint64, poin
 			if err != nil || len(data) == 0 {
 				return err
 			}
-			if c != nil && c.Daemon != nil {
+			if c.Daemon != nil {
 				if _, bufferErr := c.Daemon.pasteBuffers.addAutomatic(data); bufferErr != nil {
 					return bufferErr
 				}

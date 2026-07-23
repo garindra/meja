@@ -24,6 +24,7 @@ var errSessionChangedDuringCapture = errors.New("session changed while it was be
 
 const (
 	mejaFormatVersion         = 1
+	persistenceSchemaVersion  = 2
 	sessionPersistenceTimeout = 10 * time.Second
 )
 
@@ -64,7 +65,10 @@ type WindowCapture struct {
 
 // SessionPlan is the reconstructable, identity-free portion of a session.
 type SessionPlan struct {
-	Version      int
+	Version int
+	// Name is restore context, not part of the user-owned .meja document.
+	// Readers derive it from the filename and callers may override it with -s.
+	// Private SessionPersistence validates and stores its own required name.
 	Name         string
 	Root         string
 	ActiveWindow int
@@ -74,13 +78,27 @@ type SessionPlan struct {
 // SessionPersistence is Meja's private recovery record for one named live
 // session. Plan paths and Root are absolute machine-local paths in memory.
 type SessionPersistence struct {
-	Version   int
-	SessionID uint64
-	Name      string
-	SavedAt   time.Time
-	Profile   string
-	Root      string
-	Plan      SessionPlan
+	Version          int
+	Schema           int
+	SessionID        uint64
+	GroupID          uint64
+	Name             string
+	SavedAt          time.Time
+	Profile          string
+	Root             string
+	ActiveWindowID   uint64
+	PreviousWindowID uint64
+	WindowViews      []SessionViewPersistence
+	Plan             SessionPlan
+}
+
+// SessionViewPersistence is durable session-local view state. It never
+// contains leases, clients, transports, or pane runtime state.
+type SessionViewPersistence struct {
+	WindowID      uint64
+	DisplayIndex  int
+	FocusedPaneID uint64
+	ZoomedPaneID  uint64
 }
 
 type PlanWindow struct {
@@ -126,7 +144,7 @@ type windowCaptureInput struct {
 	layout         PlanLayout
 }
 
-func (s *Session) captureSession(ctx context.Context, observer ProcessObserver) (SessionCapture, error) {
+func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer ProcessObserver) (SessionCapture, error) {
 	if observer == nil {
 		observer = NewProcessObserver()
 	}
@@ -140,53 +158,43 @@ func (s *Session) captureSession(ctx context.Context, observer ProcessObserver) 
 	var sessionName string
 	var sessionRoot string
 	var activeWindowID uint64
-	if err := s.coordinate(func() error {
-		paneCount = len(s.Panes)
-		sessionName = s.Name
-		sessionRoot = s.rootDir
-		if client := s.Clients[clientID0]; client != nil {
-			activeWindowID = client.ActiveWindowID
+	paneCount = len(s.Panes)
+	sessionName = s.Name
+	sessionRoot = s.rootDir
+	activeWindowID = s.ActiveWindowID
+	inputs = make([]paneCaptureInput, 0, len(s.Panes))
+	for _, pane := range s.Panes {
+		if pane == nil || pane.Root.PID <= 0 {
+			continue
 		}
-		inputs = make([]paneCaptureInput, 0, len(s.Panes))
-		for _, pane := range s.Panes {
-			if pane == nil || pane.Root.PID <= 0 {
-				continue
-			}
-			launch := clonePaneLaunch(pane.Launch)
-			inputs = append(inputs, paneCaptureInput{
-				pane:   pane,
-				launch: launch,
-				anchor: Anchor{
-					Key: PaneKey{
-						SessionID: s.ID,
-						PaneID:    pane.ID,
-					},
-					Root:        pane.Root,
-					PTY:         pane.PTY,
-					RootIsShell: len(launch.RequestedArgv) == 0,
-				},
-			})
+		launch := clonePaneLaunch(pane.Launch)
+		inputs = append(inputs, paneCaptureInput{
+			pane:   pane,
+			launch: launch,
+			anchor: Anchor{
+				Key:         PaneKey{PaneID: pane.ID},
+				Root:        pane.Root,
+				PTY:         pane.PTY,
+				RootIsShell: len(launch.RequestedArgv) == 0,
+			},
+		})
+	}
+	windowInputs = make([]windowCaptureInput, 0, len(s.Windows))
+	for _, window := range s.Windows {
+		layout, err := planLayout(window.Layout)
+		if err != nil {
+			return SessionCapture{}, err
 		}
-		windowInputs = make([]windowCaptureInput, 0, len(s.Windows))
-		for _, window := range s.Windows {
-			layout, err := planLayout(window.Layout)
-			if err != nil {
-				return err
-			}
-			windowInputs = append(windowInputs, windowCaptureInput{
-				window:         window,
-				windowID:       window.ID,
-				displayIndex:   window.DisplayIndex,
-				layoutRevision: window.LayoutRevision,
-				name:           window.Name,
-				automaticName:  window.AutomaticName,
-				activePaneID:   windowActivePaneID(window),
-				layout:         layout,
-			})
-		}
-		return nil
-	}); err != nil {
-		return SessionCapture{}, err
+		windowInputs = append(windowInputs, windowCaptureInput{
+			window:         window,
+			windowID:       window.ID,
+			displayIndex:   window.DisplayIndex,
+			layoutRevision: window.LayoutRevision,
+			name:           window.Name,
+			automaticName:  window.AutomaticName,
+			activePaneID:   windowActivePaneID(window),
+			layout:         layout,
+		})
 	}
 	sort.Slice(inputs, func(i, j int) bool { return inputs[i].anchor.Key.PaneID < inputs[j].anchor.Key.PaneID })
 	sort.Slice(windowInputs, func(i, j int) bool { return windowInputs[i].displayIndex < windowInputs[j].displayIndex })
@@ -201,33 +209,25 @@ func (s *Session) captureSession(ctx context.Context, observer ProcessObserver) 
 	}
 
 	valid := false
-	if err := s.coordinate(func() error {
-		valid = len(s.Panes) == paneCount && len(s.Windows) == len(windowInputs) && s.Name == sessionName && s.rootDir == sessionRoot
-		currentActiveWindowID := uint64(0)
-		if client := s.Clients[clientID0]; client != nil {
-			currentActiveWindowID = client.ActiveWindowID
-		}
-		if currentActiveWindowID != activeWindowID {
+	valid = len(s.Panes) == paneCount && len(s.Windows) == len(windowInputs) && s.Name == sessionName && s.rootDir == sessionRoot
+	currentActiveWindowID := s.ActiveWindowID
+	if currentActiveWindowID != activeWindowID {
+		valid = false
+	}
+	for _, input := range inputs {
+		current := s.Panes[input.anchor.Key.PaneID]
+		if current != input.pane || current.Root != input.anchor.Root {
 			valid = false
+			break
 		}
-		for _, input := range inputs {
-			current := s.Panes[input.anchor.Key.PaneID]
-			if current != input.pane || current.Root != input.anchor.Root {
-				valid = false
-				break
-			}
+	}
+	for _, input := range windowInputs {
+		current := s.Windows[input.windowID]
+		if current != input.window || current.LayoutRevision != input.layoutRevision || current.Name != input.name ||
+			current.AutomaticName != input.automaticName || windowActivePaneID(current) != input.activePaneID {
+			valid = false
+			break
 		}
-		for _, input := range windowInputs {
-			current := s.Windows[input.windowID]
-			if current != input.window || current.LayoutRevision != input.layoutRevision || current.Name != input.name ||
-				current.AutomaticName != input.automaticName || windowActivePaneID(current) != input.activePaneID {
-				valid = false
-				break
-			}
-		}
-		return nil
-	}); err != nil {
-		return SessionCapture{}, err
 	}
 	if !valid {
 		return SessionCapture{}, errSessionChangedDuringCapture
@@ -407,9 +407,6 @@ func validateSessionPlan(plan SessionPlan) error {
 	if plan.Version != mejaFormatVersion {
 		return fmt.Errorf("unsupported .meja version %d", plan.Version)
 	}
-	if err := validateSessionName(plan.Name); err != nil {
-		return fmt.Errorf(".meja session name: %w", err)
-	}
 	if !filepath.IsAbs(plan.Root) {
 		return errors.New(".meja plan root must resolve to an absolute path")
 	}
@@ -468,6 +465,12 @@ func validateSessionPersistence(persistence SessionPersistence) error {
 	if persistence.Version != mejaFormatVersion {
 		return fmt.Errorf("unsupported .meja version %d", persistence.Version)
 	}
+	if persistence.Schema == 0 {
+		persistence.Schema = 1
+	}
+	if persistence.Schema != 1 && persistence.Schema != persistenceSchemaVersion {
+		return fmt.Errorf("unsupported session persistence schema %d", persistence.Schema)
+	}
 	if err := validateSessionName(persistence.Name); err != nil {
 		return fmt.Errorf("session persistence name: %w", err)
 	}
@@ -486,15 +489,57 @@ func validateSessionPersistence(persistence SessionPersistence) error {
 	return validateSessionPlan(persistence.Plan)
 }
 
-// Persistence state is owned by the session actor. Session-level mutations
-// rebuild the plan while retaining the observer-owned process leaves, then
-// enqueue one recovery-file write.
-func (s *Session) persistSessionForPersistence() {
+// Persistence state is projected from daemon-owned graph state. The lowest-ID
+// session in a group is the recovery-file owner so shared panes and processes
+// are projected once; other session views do not create duplicate execution
+// graph records.
+type persistenceSnapshot struct {
+	persistence   *SessionPersistence
+	obsoleteNames []string
+}
+
+func (s *SessionState) persistenceRecord() *SessionPersistence {
+	if s == nil || s.daemon == nil {
+		return nil
+	}
+	return s.daemon.sessionPersistions[s.ID]
+}
+
+func (s *SessionState) setPersistenceRecord(persistence *SessionPersistence) {
+	if s == nil || s.daemon == nil {
+		return
+	}
+	if s.daemon.sessionPersistions == nil {
+		s.daemon.sessionPersistions = make(map[uint64]*SessionPersistence)
+	}
+	if persistence == nil {
+		delete(s.daemon.sessionPersistions, s.ID)
+		return
+	}
+	s.daemon.sessionPersistions[s.ID] = persistence
+}
+
+func (s *SessionState) obsoletePersistenceSet() map[string]struct{} {
+	if s == nil || s.daemon == nil {
+		return nil
+	}
+	if s.daemon.obsoletePersistenceNames == nil {
+		s.daemon.obsoletePersistenceNames = make(map[uint64]map[string]struct{})
+	}
+	set := s.daemon.obsoletePersistenceNames[s.ID]
+	if set == nil {
+		set = make(map[string]struct{})
+		s.daemon.obsoletePersistenceNames[s.ID] = set
+	}
+	return set
+}
+
+func (s *SessionState) persistSessionForPersistence() {
 	previousProcesses := map[uint64]processSaveProjection{}
 	previousName := ""
-	if s.sessionPersistence != nil {
-		previousProcesses = plannedProcessLeaves(s.sessionPersistence.Plan.Windows)
-		previousName = s.sessionPersistence.Name
+	if persisted := s.persistenceRecord(); persisted != nil {
+		previousProcesses = plannedProcessLeaves(persisted.Plan.Windows)
+		previousName = persisted.Name
 	}
 	plan, err := s.projectSessionPlan(previousProcesses)
 	if err != nil {
@@ -505,22 +550,16 @@ func (s *Session) persistSessionForPersistence() {
 		return
 	}
 	if previousName != "" && previousName != s.Name {
-		s.obsoletePersistenceNames[previousName] = struct{}{}
+		s.obsoletePersistenceSet()[previousName] = struct{}{}
 	}
-	delete(s.obsoletePersistenceNames, s.Name)
-	s.sessionPersistence = &SessionPersistence{
-		Version:   mejaFormatVersion,
-		SessionID: s.ID,
-		Name:      s.Name,
-		SavedAt:   time.Now(),
-		Root:      s.rootDir,
-		Plan:      *plan,
-	}
+	delete(s.obsoletePersistenceSet(), s.Name)
+	record := s.newPersistenceRecord(*plan)
+	s.setPersistenceRecord(&record)
 	s.queuePersistenceWrite()
 }
 
 // Window-local mutations replace only that window's persisted leaf.
-func (s *Session) persistWindowForPersistence(windowID uint64) {
+func (s *SessionState) persistWindowForPersistence(windowID uint64) {
 	persisted := s.ensureSessionPersistence()
 	window := s.Windows[windowID]
 	if persisted == nil || window == nil {
@@ -539,13 +578,29 @@ func (s *Session) persistWindowForPersistence(windowID uint64) {
 		}
 	}
 	// A new or removed window is a session-level structural mutation.
-	s.persistSessionForPersistence()
+	previousProcesses := map[uint64]processSaveProjection{}
+	previousName := ""
+	if current := s.persistenceRecord(); current != nil {
+		previousProcesses = plannedProcessLeaves(current.Plan.Windows)
+		previousName = current.Name
+	}
+	plan, err := s.projectSessionPlan(previousProcesses)
+	if err != nil || plan == nil {
+		return
+	}
+	if previousName != "" && previousName != s.Name {
+		s.obsoletePersistenceSet()[previousName] = struct{}{}
+	}
+	delete(s.obsoletePersistenceSet(), s.Name)
+	record := s.newPersistenceRecord(*plan)
+	s.setPersistenceRecord(&record)
+	s.queuePersistenceWrite()
 }
 
 // initializeRestoredPersistence seeds the actor-owned model from the file
 // that created the live session, preserving commands that are prepared at the
 // shell prompt and are therefore not part of Pane.Launch.
-func (s *Session) initializeRestoredPersistence(restoredPlan SessionPlan) {
+func (s *SessionState) initializeRestoredPersistence(restoredPlan SessionPlan) {
 	plan := cloneSessionPlan(restoredPlan)
 	plan.Version = mejaFormatVersion
 	plan.Name = s.Name
@@ -557,18 +612,12 @@ func (s *Session) initializeRestoredPersistence(restoredPlan SessionPlan) {
 		// the current session root as each window's implicit parent.
 		plan.Windows[windowIndex].Cwd = s.rootDir
 	}
-	s.sessionPersistence = &SessionPersistence{
-		Version:   mejaFormatVersion,
-		SessionID: s.ID,
-		Name:      s.Name,
-		SavedAt:   time.Now(),
-		Root:      s.rootDir,
-		Plan:      plan,
-	}
+	record := s.newPersistenceRecord(plan)
+	s.setPersistenceRecord(&record)
 	s.queuePersistenceWrite()
 }
 
-func (s *Session) persistObservedPaneForPersistence(paneID uint64, projection processSaveProjection) {
+func (s *SessionState) persistObservedPaneForPersistence(paneID uint64, projection processSaveProjection) {
 	persisted := s.ensureSessionPersistence()
 	if persisted == nil {
 		return
@@ -587,9 +636,9 @@ func (s *Session) persistObservedPaneForPersistence(paneID uint64, projection pr
 	}
 }
 
-func (s *Session) ensureSessionPersistence() *SessionPersistence {
-	if s.sessionPersistence != nil {
-		return s.sessionPersistence
+func (s *SessionState) ensureSessionPersistence() *SessionPersistence {
+	if s.persistenceRecord() != nil {
+		return s.persistenceRecord()
 	}
 	plan, err := s.projectSessionPlan(nil)
 	if err != nil {
@@ -599,18 +648,41 @@ func (s *Session) ensureSessionPersistence() *SessionPersistence {
 	if plan == nil {
 		return nil
 	}
-	s.sessionPersistence = &SessionPersistence{
+	s.setPersistenceRecord(&SessionPersistence{
 		Version:   mejaFormatVersion,
 		SessionID: s.ID,
 		Name:      s.Name,
 		SavedAt:   time.Now(),
 		Root:      s.rootDir,
 		Plan:      *plan,
-	}
-	return s.sessionPersistence
+	})
+	return s.persistenceRecord()
 }
 
-func (s *Session) projectSessionPlan(processes map[uint64]processSaveProjection) (*SessionPlan, error) {
+func (s *SessionState) newPersistenceRecord(plan SessionPlan) SessionPersistence {
+	record := SessionPersistence{
+		Version:          mejaFormatVersion,
+		Schema:           persistenceSchemaVersion,
+		SessionID:        s.ID,
+		GroupID:          s.GroupID,
+		Name:             s.Name,
+		SavedAt:          time.Now(),
+		Root:             s.rootDir,
+		ActiveWindowID:   s.ActiveWindowID,
+		PreviousWindowID: s.PreviousWindowID,
+		Plan:             plan,
+	}
+	for _, link := range s.Links {
+		view := s.WindowViews[link.WindowID]
+		record.WindowViews = append(record.WindowViews, SessionViewPersistence{
+			WindowID: link.WindowID, DisplayIndex: link.DisplayIndex,
+			FocusedPaneID: view.FocusedPaneID, ZoomedPaneID: view.ZoomedPaneID,
+		})
+	}
+	return record
+}
+
+func (s *SessionState) projectSessionPlan(processes map[uint64]processSaveProjection) (*SessionPlan, error) {
 	if s.Name == "" || len(s.Windows) == 0 {
 		return nil, nil
 	}
@@ -632,7 +704,7 @@ func (s *Session) projectSessionPlan(processes map[uint64]processSaveProjection)
 	return plan, nil
 }
 
-func (s *Session) projectPlanWindow(window *Window, processes map[uint64]processSaveProjection) (PlanWindow, error) {
+func (s *SessionState) projectPlanWindow(window *Window, processes map[uint64]processSaveProjection) (PlanWindow, error) {
 	layout, err := planLayout(window.Layout)
 	if err != nil {
 		return PlanWindow{}, err
@@ -663,7 +735,7 @@ func (s *Session) projectPlanWindow(window *Window, processes map[uint64]process
 	return persisted, nil
 }
 
-func (s *Session) planWindows() []*Window {
+func (s *SessionState) planWindows() []*Window {
 	windows := make([]*Window, 0, len(s.Windows))
 	for _, window := range s.Windows {
 		if window != nil {
@@ -679,11 +751,8 @@ func (s *Session) planWindows() []*Window {
 	return windows
 }
 
-func (s *Session) plannedActiveWindow() int {
-	activeID := uint64(0)
-	if client := s.Clients[clientID0]; client != nil {
-		activeID = client.ActiveWindowID
-	}
+func (s *SessionState) plannedActiveWindow() int {
+	activeID := s.ActiveWindowID
 	windows := s.planWindows()
 	for index, window := range windows {
 		if window.ID == activeID {
@@ -706,19 +775,37 @@ func plannedProcessLeaves(windows []PlanWindow) map[uint64]processSaveProjection
 	return processes
 }
 
-func (s *Session) queuePersistenceWrite() {
-	if s.sessionPersistence == nil {
+func (s *SessionState) queuePersistenceWrite() {
+	if s.persistenceRecord() == nil {
 		return
 	}
-	s.sessionPersistence.SavedAt = time.Now()
-	s.sessionPersistence.SessionID = s.ID
+	persisted := s.persistenceRecord()
+	persisted.SavedAt = time.Now()
+	persisted.SessionID = s.ID
+	clone := cloneSessionPersistence(*persisted)
+	update := persistenceSnapshot{persistence: &clone}
+	for name := range s.obsoletePersistenceSet() {
+		if update.persistence.Name != name {
+			update.obsoleteNames = append(update.obsoleteNames, name)
+		}
+	}
+	if s.daemon != nil && s.daemon.persistenceUpdates != nil {
+		select {
+		case <-s.daemon.persistenceUpdates:
+		default:
+		}
+		select {
+		case s.daemon.persistenceUpdates <- update:
+		default:
+		}
+	}
 	select {
-	case s.persistenceNow <- struct{}{}:
+	case s.daemon.persistenceNow <- struct{}{}:
 	default:
 	}
 }
 
-func (s *Session) logPersistenceProjectionError(err error) {
+func (s *SessionState) logPersistenceProjectionError(err error) {
 	if err != nil && s.daemon != nil {
 		s.daemon.logf("meja server: project session persistence %d: %v\n", s.ID, err)
 	}
@@ -776,7 +863,7 @@ func restoreLayout(layout PlanLayout) LayoutNode {
 	}
 }
 
-func (s *Session) restoreSessionPlan(plan SessionPlan, mode restoreCommandMode) error {
+func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted *SessionPersistence, mode restoreCommandMode) error {
 	if err := validateSessionPlan(plan); err != nil {
 		return err
 	}
@@ -810,7 +897,7 @@ func (s *Session) restoreSessionPlan(plan SessionPlan, mode restoreCommandMode) 
 			if shell == "" {
 				shell = defaultShell()
 			}
-			pane, err := StartPane(persistedPane.ID, s.contextualPaneRequest(paneRequest{
+			pane, err := startPaneProcess(persistedPane.ID, s.contextualPaneRequest(paneRequest{
 				Cwd:   persistedPane.Cwd,
 				Cols:  defaultRestoreCols,
 				Rows:  defaultRestoreRows,
@@ -824,47 +911,139 @@ func (s *Session) restoreSessionPlan(plan SessionPlan, mode restoreCommandMode) 
 		}
 	}
 
-	err := s.coordinate(func() error {
-		s.Name = plan.Name
-		s.NextWindowID = uint64(len(plan.Windows) + 1)
-		for _, restored := range panes {
-			s.Panes[restored.pane.ID] = restored.pane
-		}
-		for index, persistedWindow := range plan.Windows {
-			windowID := uint64(index + 1)
-			layoutCycleIndex := layoutPresetCustom
-			if preset, ok := namedLayoutPreset(persistedWindow.NamedLayout); ok {
-				layoutCycleIndex = preset
-			}
-			s.NextLayoutRevision++
-			s.Windows[windowID] = &Window{
-				ID:               windowID,
-				DisplayIndex:     index,
-				Name:             persistedWindow.Name,
-				AutomaticName:    persistedWindow.AutomaticName,
-				ActivePaneID:     persistedWindow.ActivePane,
-				Layout:           restoreLayout(persistedWindow.Layout),
-				LayoutRevision:   s.NextLayoutRevision,
-				layoutCycleIndex: layoutCycleIndex,
-			}
-		}
-		client := s.ensureClientLocked(clientID0)
-		client.ActiveWindowID = uint64(plan.ActiveWindow)
-		activeWindow := s.Windows[client.ActiveWindowID]
-		client.setFocusedPane(activeWindow.ActivePaneID)
-		s.rebuildBindingsLocked(client, activeWindow)
-		s.rootDir = plan.Root
-		s.initializeRestoredPersistence(plan)
-		return nil
-	})
-	if err != nil {
+	if s == nil {
 		cleanup()
-		return err
+		return errSessionUnavailable
 	}
+	s.Name = plan.Name
+	for _, restored := range panes {
+		s.Panes[restored.pane.ID] = restored.pane
+		if s.daemon != nil {
+			if s.daemon.panes == nil {
+				s.daemon.panes = make(map[uint64]*Pane)
+			}
+			s.daemon.panes[restored.pane.ID] = restored.pane
+			s.daemon.paneIndex.Store(restored.pane.ID, restored.pane)
+		}
+	}
+	windowIDs := make(map[uint64]uint64, len(plan.Windows))
+	for index, persistedWindow := range plan.Windows {
+		windowID := uint64(index + 1)
+		windowIDs[persistedWindow.ID] = windowID
+		layoutCycleIndex := layoutPresetCustom
+		if preset, ok := namedLayoutPreset(persistedWindow.NamedLayout); ok {
+			layoutCycleIndex = preset
+		}
+		s.NextLayoutRevision++
+		window := &Window{
+			ID:               windowID,
+			GroupID:          s.GroupID,
+			DisplayIndex:     index,
+			Name:             persistedWindow.Name,
+			AutomaticName:    persistedWindow.AutomaticName,
+			ActivePaneID:     persistedWindow.ActivePane,
+			Layout:           restoreLayout(persistedWindow.Layout),
+			LayoutRevision:   s.NextLayoutRevision,
+			layoutCycleIndex: layoutCycleIndex,
+		}
+		s.Windows[windowID] = window
+		if s.daemon != nil {
+			s.daemon.windowIndex.Store(windowID, window)
+		}
+		for _, paneID := range window.Layout.PaneIDs() {
+			if pane := s.Panes[paneID]; pane != nil {
+				pane.WindowID = windowID
+			}
+		}
+		s.Links = append(s.Links, WindowLink{WindowID: windowID, DisplayIndex: index})
+		s.WindowViews[windowID] = SessionWindowView{FocusedPaneID: persistedWindow.ActivePane}
+		if s.group != nil {
+			s.group.Windows[windowID] = window
+		}
+		if s.daemon != nil && s.daemon.nextWindowID <= windowID {
+			s.daemon.nextWindowID = windowID + 1
+		}
+	}
+	if s.group != nil {
+		for paneID, pane := range s.Panes {
+			s.group.Panes[paneID] = pane
+		}
+	}
+	s.ActiveWindowID = uint64(plan.ActiveWindow)
+	if persisted != nil {
+		if active := windowIDs[persisted.ActiveWindowID]; active != 0 {
+			s.ActiveWindowID = active
+		}
+		if previous := windowIDs[persisted.PreviousWindowID]; previous != 0 {
+			s.PreviousWindowID = previous
+		}
+		for _, savedView := range persisted.WindowViews {
+			windowID := windowIDs[savedView.WindowID]
+			if windowID == 0 {
+				continue
+			}
+			s.WindowViews[windowID] = SessionWindowView{FocusedPaneID: savedView.FocusedPaneID, ZoomedPaneID: savedView.ZoomedPaneID}
+		}
+	}
+	s.rootDir = plan.Root
+	s.initializeRestoredPersistence(plan)
 	for _, restored := range panes {
 		input := restoredCommandInput(restored.command, mode)
 		restored.pane.startupInput = input
-		s.startPane(restored.pane)
+		d.startPane(s, restored.pane)
+	}
+	return nil
+}
+
+// restoreSessionView attaches a persisted mirror view to an already restored
+// execution graph. It deliberately starts no panes and no goroutines.
+func (d *Daemon) restoreSessionView(s *SessionState, persisted SessionPersistence) error {
+	if d == nil || s == nil || persisted.GroupID == 0 {
+		return errSessionUnavailable
+	}
+	group := d.persistenceGroups[persisted.GroupID]
+	if group == nil {
+		return errSessionUnavailable
+	}
+	group.addSession(s)
+	s.Name = persisted.Name
+	s.rootDir = persisted.Root
+	byDisplay := make(map[int]*Window, len(group.Windows))
+	for _, window := range group.Windows {
+		byDisplay[window.DisplayIndex] = window
+	}
+	for _, savedView := range persisted.WindowViews {
+		window := byDisplay[savedView.DisplayIndex]
+		if window == nil {
+			continue
+		}
+		s.WindowViews[window.ID] = SessionWindowView{FocusedPaneID: savedView.FocusedPaneID, ZoomedPaneID: savedView.ZoomedPaneID}
+	}
+	if persisted.ActiveWindowID != 0 {
+		for _, window := range group.Windows {
+			if window.ID == persisted.ActiveWindowID {
+				s.ActiveWindowID = window.ID
+				break
+			}
+		}
+	}
+	if s.ActiveWindowID == 0 {
+		ids := s.orderedWindowIDs()
+		if len(ids) > 0 {
+			s.ActiveWindowID = ids[0]
+		}
+	}
+	if persisted.PreviousWindowID != 0 {
+		s.PreviousWindowID = persisted.PreviousWindowID
+	}
+	if d.sessions[s.ID] != s {
+		return errSessionUnavailable
+	}
+	s.grouped.Store(len(group.SessionIDs) > 1)
+	for memberID := range group.SessionIDs {
+		if member := d.sessions[memberID]; member != nil {
+			member.grouped.Store(len(group.SessionIDs) > 1)
+		}
 	}
 	return nil
 }
@@ -872,7 +1051,7 @@ func (s *Session) restoreSessionPlan(plan SessionPlan, mode restoreCommandMode) 
 // allocateRestoredPaneIDs converts layout-local project references into fresh
 // daemon-wide live IDs. Restoration is initiated on the daemon actor, so the
 // direct allocator call avoids re-entering that actor.
-func (s *Session) allocateRestoredPaneIDs(plan *SessionPlan) error {
+func (s *SessionState) allocateRestoredPaneIDs(plan *SessionPlan) error {
 	for windowIndex := range plan.Windows {
 		window := &plan.Windows[windowIndex]
 		mapping := make(map[uint64]uint64, len(window.Panes))
@@ -880,11 +1059,10 @@ func (s *Session) allocateRestoredPaneIDs(plan *SessionPlan) error {
 			oldID := window.Panes[paneIndex].ID
 			var newID uint64
 			var err error
-			if s.daemon != nil {
-				newID, err = s.daemon.allocatePaneIDNow()
-			} else {
-				newID, err = s.allocatePaneID()
+			if s.daemon == nil {
+				return errors.New("restore pane IDs require daemon ownership")
 			}
+			newID, err = s.daemon.allocatePaneIDNow()
 			if err != nil {
 				return err
 			}
@@ -908,57 +1086,11 @@ func restoredCommandInput(command string, mode restoreCommandMode) []byte {
 	return input
 }
 
-func (s *Session) startPersistence(sessionPersistenceDir string) {
-	if sessionPersistenceDir == "" {
-		return
-	}
-	s.persistenceOnce.Do(func() {
-		s.persistenceStarted.Store(true)
-		go func() {
-			defer close(s.persistenceDone)
-			s.runPersistence(context.Background(), sessionPersistenceDir)
-		}()
-	})
-}
-
-func (s *Session) runPersistence(ctx context.Context, sessionPersistenceDir string) {
-	save := func() {
-		saveCtx, cancel := context.WithTimeout(ctx, sessionPersistenceTimeout)
-		_, err := s.flushPersistence(saveCtx, sessionPersistenceDir)
-		cancel()
-		if err != nil && s.daemon != nil {
-			s.daemon.logf("meja server: persist session %d: %v\n", s.ID, err)
-		}
-	}
-	for {
-		select {
-		case <-s.persistenceNow:
-			save()
-		case <-s.operationsDone:
-			return
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func (s *Session) flushPersistence(ctx context.Context, sessionPersistenceDir string) (string, error) {
-	var persisted *SessionPersistence
-	var obsoleteNames []string
-	if err := s.coordinate(func() error {
-		cached := s.ensureSessionPersistence()
-		if cached != nil {
-			clone := cloneSessionPersistence(*cached)
-			persisted = &clone
-		}
-		for name := range s.obsoletePersistenceNames {
-			if persisted == nil || name != persisted.Name {
-				obsoleteNames = append(obsoleteNames, name)
-			}
-		}
-		return nil
-	}); err != nil || persisted == nil {
-		return "", err
+func flushPersistenceSnapshot(ctx context.Context, sessionPersistenceDir string, update persistenceSnapshot) (string, error) {
+	persisted := update.persistence
+	obsoleteNames := update.obsoleteNames
+	if persisted == nil {
+		return "", nil
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -971,16 +1103,6 @@ func (s *Session) flushPersistence(ctx context.Context, sessionPersistenceDir st
 		if err := os.Remove(filepath.Join(sessionPersistenceDir, name+".session.meja")); err != nil && !os.IsNotExist(err) {
 			return "", fmt.Errorf("remove obsolete session persistence for %q: %w", name, err)
 		}
-	}
-	if len(obsoleteNames) > 0 {
-		_ = s.coordinate(func() error {
-			for _, name := range obsoleteNames {
-				if s.sessionPersistence == nil || s.sessionPersistence.Name != name {
-					delete(s.obsoletePersistenceNames, name)
-				}
-			}
-			return nil
-		})
 	}
 	return path, nil
 }
@@ -1104,9 +1226,29 @@ func encodeSessionPersistence(persistence SessionPersistence) ([]byte, error) {
 	session := node("session")
 	session.AddProperty("name", persistence.Name, "").Flag = document.FlagQuoted
 	session.AddProperty("id", persistence.SessionID, "")
+	session.AddProperty("schema", persistenceSchemaVersion, "")
+	if persistence.GroupID != 0 {
+		session.AddProperty("group-id", persistence.GroupID, "")
+	}
 	session.AddProperty("saved-at", persistence.SavedAt.Format(time.RFC3339), "").Flag = document.FlagQuoted
+	if persistence.ActiveWindowID != 0 {
+		session.AddProperty("active-window-id", persistence.ActiveWindowID, "")
+	}
+	if persistence.PreviousWindowID != 0 {
+		session.AddProperty("previous-window-id", persistence.PreviousWindowID, "")
+	}
 	if persistence.Profile != "" {
 		session.AddProperty("profile", persistence.Profile, "").Flag = document.FlagQuoted
+	}
+	for _, view := range persistence.WindowViews {
+		n := node("view")
+		n.AddProperty("window-id", view.WindowID, "")
+		n.AddProperty("display-index", view.DisplayIndex, "")
+		n.AddProperty("focused-pane-id", view.FocusedPaneID, "")
+		if view.ZoomedPaneID != 0 {
+			n.AddProperty("zoomed-pane-id", view.ZoomedPaneID, "")
+		}
+		session.AddNode(n)
 	}
 	for _, planNode := range planDocumentNodes(plan, true) {
 		session.AddNode(planNode)
@@ -1396,6 +1538,7 @@ func cloneSessionPlan(plan SessionPlan) SessionPlan {
 func cloneSessionPersistence(persistence SessionPersistence) SessionPersistence {
 	clone := persistence
 	clone.Plan = cloneSessionPlan(persistence.Plan)
+	clone.WindowViews = append([]SessionViewPersistence(nil), persistence.WindowViews...)
 	return clone
 }
 
@@ -1525,6 +1668,66 @@ func parseSessionPersistenceNode(n *document.Node) (SessionPersistence, error) {
 			return persistence, errors.New("session profile must be a string")
 		}
 	}
+	if schemaValue, exists := n.Properties.Get("schema"); exists {
+		var schema uint64
+		schema, err = valueUint(schemaValue)
+		if err != nil {
+			return persistence, errors.New("session schema must be a non-negative integer")
+		}
+		persistence.Schema = int(schema)
+	}
+	if groupValue, exists := n.Properties.Get("group-id"); exists {
+		persistence.GroupID, err = valueUint(groupValue)
+		if err != nil {
+			return persistence, errors.New("session group-id must be a non-negative integer")
+		}
+	}
+	if activeValue, exists := n.Properties.Get("active-window-id"); exists {
+		persistence.ActiveWindowID, err = valueUint(activeValue)
+		if err != nil {
+			return persistence, errors.New("session active-window-id must be a non-negative integer")
+		}
+	}
+	if previousValue, exists := n.Properties.Get("previous-window-id"); exists {
+		persistence.PreviousWindowID, err = valueUint(previousValue)
+		if err != nil {
+			return persistence, errors.New("session previous-window-id must be a non-negative integer")
+		}
+	}
+	for _, child := range n.Children {
+		if child.Name.ValueString() != "view" {
+			continue
+		}
+		var view SessionViewPersistence
+		windowID, ok := child.Properties.Get("window-id")
+		if !ok {
+			return persistence, errors.New("session view requires window-id")
+		}
+		view.WindowID, err = valueUint(windowID)
+		if err != nil {
+			return persistence, errors.New("session view window-id must be a non-negative integer")
+		}
+		if focused, ok := child.Properties.Get("focused-pane-id"); ok {
+			view.FocusedPaneID, err = valueUint(focused)
+			if err != nil {
+				return persistence, errors.New("session view focused-pane-id must be a non-negative integer")
+			}
+		}
+		if zoomed, ok := child.Properties.Get("zoomed-pane-id"); ok {
+			view.ZoomedPaneID, err = valueUint(zoomed)
+			if err != nil {
+				return persistence, errors.New("session view zoomed-pane-id must be a non-negative integer")
+			}
+		}
+		if display, ok := child.Properties.Get("display-index"); ok {
+			if value, valueErr := valueUint(display); valueErr == nil {
+				view.DisplayIndex = int(value)
+			} else {
+				return persistence, errors.New("session view display-index must be a non-negative integer")
+			}
+		}
+		persistence.WindowViews = append(persistence.WindowViews, view)
+	}
 	persistence.Plan, err = parsePlanNodes(n.Children, "", persistence.Name, false)
 	if err != nil {
 		return persistence, err
@@ -1532,6 +1735,9 @@ func parseSessionPersistenceNode(n *document.Node) (SessionPersistence, error) {
 	persistence.Root = persistence.Plan.Root
 	if err := validateSessionPersistence(persistence); err != nil {
 		return persistence, err
+	}
+	if persistence.ActiveWindowID == 0 {
+		persistence.ActiveWindowID = uint64(persistence.Plan.ActiveWindow)
 	}
 	return persistence, nil
 }

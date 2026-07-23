@@ -95,19 +95,19 @@ func TestHistorySelectionPositionSnapsWideContinuationToAnchor(t *testing.T) {
 }
 
 func TestPanesRetainIndependentHistoryViews(t *testing.T) {
-	s := NewSession(0)
-	client := s.NewClient(0)
+	s := NewSessionState(0)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 8, 4
-	pane0 := &Pane{ID: s.AddPaneID(), terminal: newTerminal(8, 4)}
-	s.CreateWindow(pane0, 0)
-	pane1 := &Pane{ID: s.AddPaneID(), terminal: newTerminal(8, 4)}
-	if _, _, err := s.SplitFocusedPane(0, pane1, SplitVertical); err != nil {
+	pane0 := &Pane{ID: testAddPaneID(s), terminal: newTerminal(8, 4)}
+	createTestWindow(s, pane0)
+	pane1 := &Pane{ID: testAddPaneID(s), terminal: newTerminal(8, 4)}
+	if _, _, err := splitTestFocusedPane(s, pane1, SplitVertical); err != nil {
 		t.Fatalf("SplitFocusedPane() error = %v", err)
 	}
 	if err := pane1.installHistoryView(captureTerminalHistorySnapshot(pane1.terminal)); err != nil {
 		t.Fatalf("install pane1 history = %v", err)
 	}
-	if _, _, err := s.FocusPane(0, pane0.ID); err != nil {
+	if _, _, err := focusTestSessionPane(s, pane0.ID); err != nil {
 		t.Fatalf("FocusPane() error = %v", err)
 	}
 	if err := pane0.installHistoryView(captureTerminalHistorySnapshot(pane0.terminal)); err != nil {
@@ -128,7 +128,7 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 		pane.stop()
 	}()
 	sendPTYOutput := func(data string) {
-		buffer := ptyReadBuffers.Get().([]byte)
+		buffer := takePTYReadBuffer()
 		n := copy(buffer, data)
 		ptyOutput <- buffer[:n]
 	}

@@ -48,8 +48,8 @@ func (o *recordingProcessObserver) Observe(_ context.Context, anchors []Anchor) 
 }
 
 func TestCaptureSessionBuildsProcessAnchorsOutsideDurableTypes(t *testing.T) {
-	session := NewSession(7)
-	t.Cleanup(session.stopOperations)
+	session := NewSessionState(7)
+	t.Cleanup(func() { stopState(session) })
 	shellPane := &Pane{
 		ID:   4,
 		Root: Identity{PID: 104, BirthToken: 1004},
@@ -67,7 +67,7 @@ func TestCaptureSessionBuildsProcessAnchorsOutsideDurableTypes(t *testing.T) {
 			Cwd:           "/notes",
 		},
 	}
-	if err := session.coordinate(func() error {
+	if err := runStateOperation(session, func() error {
 		session.Panes[shellPane.ID] = shellPane
 		session.Panes[commandPane.ID] = commandPane
 		return nil
@@ -76,7 +76,7 @@ func TestCaptureSessionBuildsProcessAnchorsOutsideDurableTypes(t *testing.T) {
 	}
 
 	observer := &recordingProcessObserver{}
-	capture, err := session.captureSession(context.Background(), observer)
+	capture, err := session.daemon.captureSession(session, context.Background(), observer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,21 +102,21 @@ func TestCaptureSessionBuildsProcessAnchorsOutsideDurableTypes(t *testing.T) {
 }
 
 func TestCaptureSessionMarksMissingObserverResultUnavailable(t *testing.T) {
-	session := NewSession(8)
-	t.Cleanup(session.stopOperations)
+	session := NewSessionState(8)
+	t.Cleanup(func() { stopState(session) })
 	pane := &Pane{
 		ID:     1,
 		Root:   Identity{PID: 101, BirthToken: 1001},
 		Launch: PaneLaunch{Shell: "/bin/sh", Cwd: "/initial"},
 	}
-	if err := session.coordinate(func() error {
+	if err := runStateOperation(session, func() error {
 		session.Panes[pane.ID] = pane
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	capture, err := session.captureSession(context.Background(), emptyProcessObserver{})
+	capture, err := session.daemon.captureSession(session, context.Background(), emptyProcessObserver{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,13 +133,13 @@ func (emptyProcessObserver) Observe(context.Context, []Anchor) map[PaneKey]Proce
 }
 
 func TestSessionPersistenceWritesPrivateRecoveryFile(t *testing.T) {
-	session := NewSession(9)
-	t.Cleanup(session.stopOperations)
+	session := NewSessionState(9)
+	t.Cleanup(func() { stopState(session) })
 	session.setSessionName("work")
 	addPersistenceTestWindow(session, 0)
 	directory := filepath.Join(t.TempDir(), "sessions")
 
-	path, err := session.flushPersistence(context.Background(), directory)
+	path, err := flushTestSessionPersistence(context.Background(), session, directory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestSessionPersistenceWritesPrivateRecoveryFile(t *testing.T) {
 	if err := os.Chtimes(path, oldModTime, oldModTime); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := session.flushPersistence(context.Background(), directory); err != nil {
+	if _, err := flushTestSessionPersistence(context.Background(), session, directory); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)
@@ -192,11 +192,44 @@ func TestSessionPersistenceWritesPrivateRecoveryFile(t *testing.T) {
 	}
 }
 
+func TestGroupedPersistenceRoundTripsIndependentSessionViewMetadata(t *testing.T) {
+	root := t.TempDir()
+	persistence := SessionPersistence{
+		Version:          mejaFormatVersion,
+		Schema:           persistenceSchemaVersion,
+		SessionID:        9,
+		GroupID:          42,
+		Name:             "mirror",
+		SavedAt:          time.Now(),
+		Root:             root,
+		ActiveWindowID:   8,
+		PreviousWindowID: 7,
+		WindowViews:      []SessionViewPersistence{{WindowID: 8, DisplayIndex: 1, FocusedPaneID: 99, ZoomedPaneID: 100}},
+		Plan: SessionPlan{
+			Version: mejaFormatVersion, Name: "mirror", Root: root, ActiveWindow: 1,
+			Windows: []PlanWindow{{ID: 8, Cwd: root, ActivePane: 99, Layout: PlanLayout{Pane: paneIDRef(99)}, Panes: []PlanPane{{ID: 99, Cwd: root}}}},
+		},
+	}
+	path, err := writeSessionPersistence(root, persistence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := readSessionPersistence(path, "mirror")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Schema != persistenceSchemaVersion || parsed.GroupID != persistence.GroupID ||
+		parsed.ActiveWindowID != persistence.ActiveWindowID || parsed.PreviousWindowID != persistence.PreviousWindowID ||
+		len(parsed.WindowViews) != 1 || parsed.WindowViews[0] != persistence.WindowViews[0] {
+		t.Fatalf("grouped persistence metadata = %#v", parsed)
+	}
+}
+
 func TestSessionPersistenceSkipsUnnamedSession(t *testing.T) {
-	session := NewSession(10)
-	t.Cleanup(session.stopOperations)
+	session := NewSessionState(10)
+	t.Cleanup(func() { stopState(session) })
 	directory := filepath.Join(t.TempDir(), "sessions")
-	path, err := session.flushPersistence(context.Background(), directory)
+	path, err := flushTestSessionPersistence(context.Background(), session, directory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,9 +250,9 @@ func TestSessionPersistenceDirectoryIsBesideProfileSocket(t *testing.T) {
 }
 
 func TestSessionRenameConfirmsBeforeOverwritingPersistence(t *testing.T) {
-	session := NewSession(12)
-	t.Cleanup(session.stopOperations)
-	session.NewClient(clientID0)
+	session := NewSessionState(12)
+	t.Cleanup(func() { stopState(session) })
+	newStandaloneClient(session)
 	session.setSessionName("current")
 	directory := filepath.Join(t.TempDir(), "sessions")
 	if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -229,27 +262,41 @@ func TestSessionRenameConfirmsBeforeOverwritingPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &Daemon{
-		sessions:              map[uint64]*Session{session.ID: session},
-		names:                 map[string]*Session{"current": session},
+		sessions:              map[uint64]*SessionState{session.ID: session},
+		names:                 map[string]*SessionState{"current": session},
 		sessionPersistenceDir: directory,
 	}
 	connection := &ClientInstance{Daemon: d}
+	setTestClient(session, connection)
+	createTestWindow(session, &Pane{ID: testAddPaneID(session), terminal: newTerminal(80, 23)})
 
-	d.requestSessionRename(session, "current", "work")
-	prompt := session.ActivePrompt(clientID0)
-	if prompt == nil || prompt.Kind != PromptKindConfirm ||
+	outcome, err := renameSessionAnswer(d, session.ID, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.applyAttachedCommandOutcome(outcome); err != nil {
+		t.Fatal(err)
+	}
+	prompt := clientForState(session).ActivePrompt()
+	if prompt == nil || prompt.Mode != PromptModeConfirm ||
 		prompt.Label != `persisted session "work" exists; overwrite? (y/N) ` {
 		t.Fatalf("confirmation prompt = %#v", prompt)
 	}
-	if _, err := session.handleServerInputEvent(connection, session.ConsumeInputByte(clientID0, '\r')); err != nil {
+	if _, err := connection.handleServerInputEvent(connection.ConsumeInputByte('\r')); err != nil {
 		t.Fatal(err)
 	}
-	if session.Name != "current" || session.ActivePrompt(clientID0) != nil {
-		t.Fatalf("default-No confirmation changed session: name=%q prompt=%#v", session.Name, session.ActivePrompt(clientID0))
+	if session.Name != "current" || clientForState(session).ActivePrompt() != nil {
+		t.Fatalf("default-No confirmation changed session: name=%q prompt=%#v", session.Name, clientForState(session).ActivePrompt())
 	}
 
-	d.requestSessionRename(session, "current", "work")
-	if _, err := session.handleServerInputEvent(connection, session.ConsumeInputByte(clientID0, 'y')); err != nil {
+	outcome, err = renameSessionAnswer(d, session.ID, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.applyAttachedCommandOutcome(outcome); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.handleServerInputEvent(connection.ConsumeInputByte('y')); err != nil {
 		t.Fatal(err)
 	}
 	if session.Name != "work" || d.names["work"] != session || d.names["current"] != nil {
@@ -323,7 +370,7 @@ func TestRestoreCommandModesPrepareSkipAndRun(t *testing.T) {
 
 func TestDaemonRestoresPersistenceWindowsLayoutsAndPanes(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	base := t.TempDir()
 	plan := SessionPlan{
 		Version: mejaFormatVersion, Name: "work", Root: base, ActiveWindow: 1,
@@ -346,7 +393,7 @@ func TestDaemonRestoresPersistenceWindowsLayoutsAndPanes(t *testing.T) {
 	}
 	session := bootstrap.session
 	var panes []*Pane
-	if err := session.coordinate(func() error {
+	if err := runStateOperation(session, func() error {
 		if session.Name != "work" || session.rootDir != base || len(session.Windows) != 1 || len(session.Panes) != 2 {
 			return fmt.Errorf("restored session = %#v", session)
 		}
@@ -357,7 +404,6 @@ func TestDaemonRestoresPersistenceWindowsLayoutsAndPanes(t *testing.T) {
 		for _, pane := range session.Panes {
 			panes = append(panes, pane)
 		}
-		session.daemon = nil
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -365,29 +411,25 @@ func TestDaemonRestoresPersistenceWindowsLayoutsAndPanes(t *testing.T) {
 	for _, pane := range panes {
 		_ = terminatePane(pane)
 	}
-	select {
-	case <-session.operationsDone:
-	case <-time.After(time.Second):
-		t.Fatal("restored session did not stop after its panes were terminated")
-	}
+	stopState(session)
 }
 
 func TestPersistenceLoopWritesOnlyAfterSessionChange(t *testing.T) {
-	session := NewSession(11)
+	session := NewSessionState(11)
 	session.setSessionName("changed")
 	addPersistenceTestWindow(session, 1)
-	<-session.persistenceNow
+	<-session.daemon.persistenceNow
 	directory := filepath.Join(t.TempDir(), "sessions")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		session.runPersistence(ctx, directory)
+		session.daemon.runPersistence(ctx, directory)
 		close(done)
 	}()
 	t.Cleanup(func() {
 		cancel()
 		<-done
-		session.stopOperations()
+		stopState(session)
 	})
 
 	path := filepath.Join(directory, "changed.session.meja")
@@ -395,7 +437,7 @@ func TestPersistenceLoopWritesOnlyAfterSessionChange(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("persistence ran without a session change: %v", err)
 	}
-	if err := session.coordinate(func() error {
+	if err := runStateOperation(session, func() error {
 		session.markSessionChangedForPersistence()
 		return nil
 	}); err != nil {
@@ -412,99 +454,99 @@ func TestPersistenceLoopWritesOnlyAfterSessionChange(t *testing.T) {
 }
 
 func TestAcceptedSessionRenameRequestsImmediatePersistence(t *testing.T) {
-	session := NewSession(13)
-	t.Cleanup(session.stopOperations)
+	session := NewSessionState(13)
+	t.Cleanup(func() { stopState(session) })
 	session.setSessionName("before")
 	addPersistenceTestWindow(session, 0)
-	<-session.persistenceNow
-	if err := session.coordinate(func() error { return session.finishSessionRename("after", true) }); err != nil {
+	<-session.daemon.persistenceNow
+	if err := session.daemon.renameSession(session, "after"); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 	default:
 		t.Fatal("accepted session rename did not request an immediate persistence")
 	}
-	if err := session.coordinate(func() error { return session.finishSessionRename("after", true) }); err != nil {
+	if err := session.daemon.renameSession(session, "after"); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 		t.Fatal("unchanged session name requested a persistence")
 	default:
 	}
 }
 
 func TestSessionActorPublishesOnlyPersistedStructureChanges(t *testing.T) {
-	session := NewSession(15)
-	t.Cleanup(session.stopOperations)
+	session := NewSessionState(15)
+	t.Cleanup(func() { stopState(session) })
 	pane := &Pane{ID: 0, Title: "shell", Launch: PaneLaunch{Cwd: "/work", Shell: "/bin/sh"}}
-	if err := session.coordinate(func() error {
+	if err := runStateOperation(session, func() error {
 		session.setSessionName("work")
-		session.CreateWindow(pane, clientID0)
+		createTestWindow(session, pane)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 	default:
 		t.Fatal("window creation did not publish a persistence change")
 	}
-	if err := session.coordinate(func() error {
+	if err := runStateOperation(session, func() error {
 		_ = session.Pane(0)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 		t.Fatal("read-only actor operation published a persistence change")
 	default:
 	}
-	if err := session.coordinate(func() error {
-		_, _, err := session.SplitFocusedPane(clientID0, &Pane{ID: 1, Launch: PaneLaunch{Cwd: "/work", Shell: "/bin/sh"}}, SplitVertical)
+	if err := runStateOperation(session, func() error {
+		_, err := session.splitFocusedPaneNow(&Pane{ID: 1, Launch: PaneLaunch{Cwd: "/work", Shell: "/bin/sh"}}, SplitVertical)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	<-session.persistenceNow
-	if err := session.coordinate(func() error {
-		_, _, _, err := session.ToggleZoom(clientID0)
+	<-session.daemon.persistenceNow
+	if err := runStateOperation(session, func() error {
+		_, _, err := session.toggleZoomNow()
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 		t.Fatal("non-persisted zoom-only change published a persistence change")
 	default:
 	}
 }
 
 func TestMonitoredObservationsPersistStableCommandsAndIgnoreTransientCommands(t *testing.T) {
-	session := NewSession(16)
-	t.Cleanup(session.stopOperations)
+	session := NewSessionState(16)
+	t.Cleanup(func() { stopState(session) })
 	pane := &Pane{
 		ID: 0, Title: "shell", Root: Identity{PID: 100, BirthToken: 1000},
 		Launch: PaneLaunch{Cwd: "/work", Shell: "/bin/sh"},
 	}
-	if err := session.coordinate(func() error {
+	if err := runStateOperation(session, func() error {
 		session.setSessionName("work")
-		session.CreateWindow(pane, clientID0)
+		createTestWindow(session, pane)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	<-session.persistenceNow
+	<-session.daemon.persistenceNow
 
 	observer := &changingProcessObserver{name: "nvim", argv: []string{"nvim", "."}, cwd: "/work"}
-	anchor := Anchor{Key: PaneKey{SessionID: session.ID, PaneID: pane.ID}, Root: pane.Root, PTY: pane.PTY, RootIsShell: true}
+	anchor := Anchor{Key: PaneKey{PaneID: pane.ID}, Root: pane.Root, PTY: pane.PTY, RootIsShell: true}
 	applyObservation := func() {
 		t.Helper()
 		observation := observer.Observe(context.Background(), []Anchor{anchor})[anchor.Key]
-		if err := session.coordinate(func() error {
-			return session.applyMonitoredProcessObservations(monitoredProcessBatch{{anchor: anchor, observation: observation}})
+		if err := runStateOperation(session, func() error {
+			return session.daemon.applyMonitoredProcessObservations(session, monitoredProcessBatch{{anchor: anchor, observation: observation}})
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -513,15 +555,15 @@ func TestMonitoredObservationsPersistStableCommandsAndIgnoreTransientCommands(t 
 		applyObservation()
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 	default:
 		t.Fatal("stable nvim command did not publish a persistence change")
 	}
 	assertCachedCommand := func(want string) {
 		t.Helper()
 		var got string
-		if err := session.coordinate(func() error {
-			got = plannedProcessLeaves(session.sessionPersistence.Plan.Windows)[0].Command
+		if err := runStateOperation(session, func() error {
+			got = plannedProcessLeaves(session.persistenceRecord().Plan.Windows)[0].Command
 			return nil
 		}); err != nil {
 			t.Fatal(err)
@@ -533,11 +575,11 @@ func TestMonitoredObservationsPersistStableCommandsAndIgnoreTransientCommands(t 
 	assertCachedCommand("nvim .")
 	var automaticName string
 	var persistedName string
-	if err := session.coordinate(func() error {
+	if err := runStateOperation(session, func() error {
 		for _, window := range session.Windows {
 			automaticName = window.Name
 		}
-		persistedName = session.sessionPersistence.Plan.Windows[0].Name
+		persistedName = session.persistenceRecord().Plan.Windows[0].Name
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -552,7 +594,7 @@ func TestMonitoredObservationsPersistStableCommandsAndIgnoreTransientCommands(t 
 		applyObservation()
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 		t.Fatal("unchanged stable command published another persistence change")
 	default:
 	}
@@ -562,13 +604,13 @@ func TestMonitoredObservationsPersistStableCommandsAndIgnoreTransientCommands(t 
 		applyObservation()
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 		t.Fatal("transient ls command published a persistence change")
 	default:
 	}
 	assertCachedCommand("nvim .")
 	automaticName = ""
-	if err := session.coordinate(func() error {
+	if err := runStateOperation(session, func() error {
 		for _, window := range session.Windows {
 			automaticName = window.Name
 		}
@@ -585,7 +627,7 @@ func TestMonitoredObservationsPersistStableCommandsAndIgnoreTransientCommands(t 
 		applyObservation()
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 		t.Fatal("transient meja command published a persistence change")
 	default:
 	}
@@ -596,7 +638,7 @@ func TestMonitoredObservationsPersistStableCommandsAndIgnoreTransientCommands(t 
 		applyObservation()
 	}
 	select {
-	case <-session.persistenceNow:
+	case <-session.daemon.persistenceNow:
 	default:
 		t.Fatal("stable vite command did not publish a persistence change")
 	}
@@ -619,43 +661,45 @@ func TestShellReturnRetainsLastMeaningfulCommandAndUpdatesCwd(t *testing.T) {
 }
 
 func TestSessionRenameImmediatelyWritesPersistence(t *testing.T) {
-	session := NewSession(14)
+	session := NewSessionState(14)
 	session.setSessionName("before")
 	addPersistenceTestWindow(session, 0)
 	directory := filepath.Join(t.TempDir(), "sessions")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		session.runPersistence(ctx, directory)
+		session.daemon.runPersistence(ctx, directory)
 		close(done)
 	}()
 	t.Cleanup(func() {
 		cancel()
 		<-done
-		session.stopOperations()
+		stopState(session)
 	})
 
-	if err := session.coordinate(func() error {
-		return session.finishSessionRename("after", true)
-	}); err != nil {
+	if err := session.daemon.renameSession(session, "after"); err != nil {
 		t.Fatal(err)
 	}
 
 	path := filepath.Join(directory, "after.session.meja")
+	oldPath := filepath.Join(directory, "before.session.meja")
 	deadline := time.Now().Add(time.Second)
+	var newErr, oldErr error
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			if _, err := os.Stat(filepath.Join(directory, "before.session.meja")); !os.IsNotExist(err) {
-				t.Fatalf("old session name was unexpectedly saved: %v", err)
-			}
+		_, newErr = os.Stat(path)
+		_, oldErr = os.Stat(oldPath)
+		if newErr == nil && os.IsNotExist(oldErr) {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("renamed persistence %q was not written immediately", path)
+	t.Fatalf("renamed persistence did not converge: new %q: %v; old %q: %v", path, newErr, oldPath, oldErr)
 }
 
-func addPersistenceTestWindow(session *Session, paneID uint64) {
+func addPersistenceTestWindow(session *SessionState, paneID uint64) {
+	if session.daemon == nil {
+		session.daemon = testDaemonForState(session)
+	}
 	session.rootDir = "/work"
 	pane := &Pane{
 		ID:     paneID,
@@ -663,7 +707,7 @@ func addPersistenceTestWindow(session *Session, paneID uint64) {
 		Root:   Identity{PID: 100 + int(paneID), BirthToken: 1000 + paneID},
 		Launch: PaneLaunch{Shell: "/bin/sh", Cwd: "/work"},
 	}
-	session.CreateWindow(pane, clientID0)
+	createTestWindow(session, pane)
 }
 
 func TestMejaFileReferenceFormatResolvesInheritedDirectories(t *testing.T) {
@@ -771,11 +815,11 @@ func TestUserMejaDropsStaleWindowCwdOutsideChangedRoot(t *testing.T) {
 func TestPrivateMejaDoesNotRetainCreationTimeWindowCwd(t *testing.T) {
 	home := t.TempDir()
 	root := filepath.Join(home, "test-project")
-	s := NewSession(1)
+	s := NewSessionState(1)
 	s.Name = "dev"
 	s.rootDir = root
-	pane := &Pane{ID: s.AddPaneID(), Launch: PaneLaunch{Cwd: home, Shell: "/bin/bash"}}
-	s.CreateWindow(pane, clientID0)
+	pane := &Pane{ID: testAddPaneID(s), Launch: PaneLaunch{Cwd: home, Shell: "/bin/bash"}}
+	createTestWindow(s, pane)
 	plan, err := s.projectSessionPlan(map[uint64]processSaveProjection{
 		pane.ID: {Cwd: root},
 	})

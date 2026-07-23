@@ -107,20 +107,20 @@ func TestPresetLayoutsComputeExpectedShapes(t *testing.T) {
 }
 
 func TestCycleWindowLayoutAdvancesAndUsesFocusedPaneAsMain(t *testing.T) {
-	s := NewSession(1)
-	t.Cleanup(s.stopOperations)
-	client := s.NewClient(clientID0)
+	s := NewSessionState(1)
+	t.Cleanup(func() { stopState(s) })
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 120, 40
-	first := &Pane{ID: s.AddPaneID(), terminal: newTerminal(120, 40)}
-	window, _ := s.CreateWindow(first, clientID0)
-	second := &Pane{ID: s.AddPaneID(), terminal: newTerminal(120, 40)}
-	if _, _, err := s.SplitFocusedPane(clientID0, second, SplitVertical); err != nil {
+	first := &Pane{ID: testAddPaneID(s), terminal: newTerminal(120, 40)}
+	window, _ := createTestWindow(s, first)
+	second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(120, 40)}
+	if _, _, err := splitTestFocusedPane(s, second, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
 	client.FocusedPaneID = second.ID
 
 	for want := 0; want < layoutPresetCount; want++ {
-		if _, _, changed, err := s.CycleWindowLayout(clientID0); err != nil || !changed {
+		if _, _, changed, err := cycleTestWindowLayout(s); err != nil || !changed {
 			t.Fatalf("cycle %d changed=%v err=%v", want, changed, err)
 		}
 		if got := s.Windows[window.ID].layoutCycleIndex; got != want {

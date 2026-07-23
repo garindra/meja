@@ -466,8 +466,7 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 				continue
 			}
 			if len(t.Parser.utf8Buf) > 0 || data[0] >= 0x80 {
-				var consumed int
-				consumed = t.consumeUTF8(data, update)
+				consumed := t.consumeUTF8(data, update)
 				data = data[consumed:]
 				continue
 			}
@@ -855,10 +854,7 @@ func (t *TerminalState) extendTail(r rune, update *Update) bool {
 		// cells. The already retained prefix remains a valid grapheme and a
 		// deterministic representation of the bounded terminal cell.
 		candidate := anchorText + string(r)
-		if isSingleGrapheme(candidate) {
-			return true
-		}
-		return false
+		return isSingleGrapheme(candidate)
 	}
 	candidate := anchorText + string(r)
 	if !isSingleGrapheme(candidate) {

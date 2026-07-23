@@ -306,7 +306,8 @@ func TestScanoutPredictionDecoratesAuthoritativeFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := string(s.takeANSI())
-	if !strings.Contains(out, "a") || !strings.Contains(out, "b") || !strings.HasSuffix(out, "\x1b[1;3H\x1b[?25h") {
+	visibleOut := strings.TrimSuffix(out, "\x1b[?7h")
+	if !strings.Contains(out, "a") || !strings.Contains(out, "b") || !strings.HasSuffix(visibleOut, "\x1b[1;3H\x1b[?25h") {
 		t.Fatalf("prediction output = %q", out)
 	}
 	if got := s.caches[0].row(0)[1].Cluster; got != "" {
@@ -339,7 +340,8 @@ func TestScanoutPredictionEmitsBackspaceWithoutChangingAuthoritativeCache(t *tes
 		t.Fatalf("backspace changed=%v err=%v", changed, err)
 	}
 	out := string(s.takeANSI())
-	if !strings.Contains(out, " ") || !strings.HasSuffix(out, "\x1b[1;1H\x1b[?25h") {
+	visibleOut := strings.TrimSuffix(out, "\x1b[?7h")
+	if !strings.Contains(out, " ") || !strings.HasSuffix(visibleOut, "\x1b[1;1H\x1b[?25h") {
 		t.Fatalf("backspace output = %q", out)
 	}
 	if got := s.caches[0].row(0)[0].Cluster; got != "a" {
@@ -407,7 +409,8 @@ func TestFocusChangeRepairsPredictionAndUsesNewPaneCursor(t *testing.T) {
 	if s.predictor.active() {
 		t.Fatalf("predictor survived focus change: %#v", s.predictor)
 	}
-	if !strings.Contains(out, "\x1b[1;2H") || !strings.HasSuffix(out, "\x1b[1;8H\x1b[?25h") {
+	visibleOut := strings.TrimSuffix(out, "\x1b[?7h")
+	if !strings.Contains(out, "\x1b[1;2H") || !strings.HasSuffix(visibleOut, "\x1b[1;8H\x1b[?25h") {
 		t.Fatalf("focus repair output = %q", out)
 	}
 }

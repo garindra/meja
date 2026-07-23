@@ -110,9 +110,12 @@ Help is server-backed and may start the selected server. `version` is a local cl
 ```text
 meja [transport-options] new-session
      [-d] [-P] [-F format]
-     [-s name]
-     [-r directory | --root directory]
-     [-- initial-command args...]
+    [-s name]
+    [-r directory | --root directory]
+    [-- initial-command args...]
+
+meja [transport-options] new-session
+     -d -t base-session -s mirror-session
 
 meja [transport-options] new-session
      -f file.meja
@@ -156,6 +159,30 @@ ordinary creation; they are rejected with `-f` project-file creation because
 the restored file may contain multiple panes and does not have one implicit
 initial pane for deterministic output.
 
+`new-session -d -t base-session -s mirror-session` creates a detached grouped
+session. The base target follows normal session target rules. The mirror must
+have a unique name and cannot specify an initial command, root, or project
+file. It receives links to the existing windows and panes; no PTY, process, or
+pane is created. If the base is already grouped, the mirror joins that group.
+Window lists and canonical layouts are shared, while session names, active and
+previous windows, focus, zoom, prompts, and status state remain independent.
+
+A window can be viewed by at most one attached client at a time. Selecting a
+window currently viewed by another grouped session fails without changing the
+requesting session's active window or focus. Detached sessions retain their
+remembered view but hold no live view lease until attached.
+
+If a viewed window disappears, Meja first tries the session's previous
+window, then the lowest display-index window that is not leased by another
+client. Explicit window kills are rejected when an attached grouped session
+would have no such fallback. A pane exit uses the same order; if no fallback
+exists, the affected client is closed cleanly rather than left bound to a
+destroyed pane.
+
+Process monitoring follows the daemon-global pane ID rather than the session
+that created the pane. Removing one grouped session therefore leaves
+monitoring and the shared process target attached to the surviving graph.
+
 ## `attach-session` / `attach` / `a`
 
 ```text
@@ -192,21 +219,37 @@ Restore does not read arbitrary project files; use `new -f`. It starts the selec
 
 ```text
 meja [transport-options] save-session
-     -t session-id-or-name
+     [-t session-id-or-name]
      -o file.meja
      [-f]
 ```
 
 ```sh
 meja save -t work -o dev.meja
+meja save -o dev.meja                 # inside a Meja pane
 meja -h prod save -t work -o ~/projects/acme/dev.meja
 ```
 
-A relative output path is resolved from the captured session root. Remote output is written remotely; Meja does not transfer it to the client.
+Inside a Meja pane, omitting `-t` selects the session identified by the
+injected `MEJA_SESSION_TARGET`. Outside Meja, `-t` remains required.
+
+The live session does not need a name. User-owned `.meja` files do not embed
+one; when the file is restored without `-s`, its filename supplies the default
+session name (`dev7.meja` restores as `dev7`).
+
+A relative output path is resolved from the captured session root. Successful
+save output prints both that root and the absolute destination path. Remote
+output is written remotely; Meja does not transfer it to the client.
+
+If the command's current directory differs from the session root, save warns
+and prints both paths. If the current directory is the intended project root,
+run `meja set-root .` there and save again. Reconstructed pane paths will then
+be relative to that root, making reconstruction more portable when the project
+directory is mirrored on another machine.
 
 Existing files are refused unless `-f` is supplied. Parent directories are created. Files are atomically replaced with mode `0644`.
 
-Save normalizes inherited paths, preset layouts, custom geometry, commands, and non-default shells. Paths under the session root become relative where practical. Absolute pane paths outside the root are retained with a portability warning. Inspect commands for secrets before sharing.
+Save normalizes inherited paths, preset layouts, custom geometry, commands, and non-default shells. Paths under the session root become relative where practical. Absolute pane paths outside the root are retained with a portability warning. Review captured pane commands and scrub any sensitive values before sharing or committing the file.
 
 Save requires a running server and live session.
 
@@ -241,7 +284,12 @@ meja [transport-options] kill-server
 
 # Attached-session commands
 
-Prefix bindings and the `Ctrl+b, :` prompt use the same command engine. Most commands can also be run from an outside shell by supplying `-t`.
+Prefix bindings and commands submitted by the `Ctrl+b, :` prompt use the same command engine. The prompt editor itself is attached-client UI, not a callable command. Most commands can also be run from an outside shell by supplying `-t`.
+
+Commands launched from a Meja pane inherit its session target, so session-scoped
+commands may omit `-t`. An explicit `-t` still overrides that default. Commands
+whose target means a destination or creation input (`attach`, `restore`,
+`switch-session`, and mirror creation with `new-session -t`) remain explicit.
 
 | Command | Usage | Effect |
 | --- | --- | --- |
@@ -252,9 +300,9 @@ Prefix bindings and the `Ctrl+b, :` prompt use the same command engine. Most com
 | `next-window` | `next-window [-t session]` | Select the next window. |
 | `previous-window` | `previous-window [-t session]` | Select the previous window. |
 | `last-window` | `last-window [-t session]` | Return to the last window. |
-| `select-window` | `select-window -t session:window` | Select a zero-based window index. |
-| `kill-session` | `kill-session -t session` | Terminate a session and its panes. |
-| `kill-pane` | `kill-pane [-t session]` | Close the active pane. |
+| `select-window` | `select-window -t [session:]window` | Select a zero-based window index; the session may be omitted inside a Meja pane. |
+| `kill-session` | `kill-session [-t session]` | Terminate a session and its panes. |
+| `kill-pane` | `kill-pane [-t session]` | Close the active pane; attached execution asks for confirmation, while CLI execution is immediate. |
 | `copy-mode` | `copy-mode [-t session]` | Enter history/copy mode. |
 | `send-keys` | `send-keys [-t session] [-X copy-mode-command | -l] key...` | Send keys or run a copy-mode command in the active pane. |
 | `capture-pane` | `capture-pane [-t session] [-p] [-b buffer-name] [-S start-line] [-E end-line] [-e] [-C] [-J] [-N]` | Capture the active pane into stdout or a paste buffer. |
@@ -273,8 +321,6 @@ Prefix bindings and the `Ctrl+b, :` prompt use the same command engine. Most com
 | `rename-session` | `rename-session [-t session] [name]` | Name/rename, or prompt when attached and omitted. |
 | `set-root` | `set-root [-t session] [directory]` | Change the session root. |
 | `switch-session` | `switch-session -t session` | Move the current client to another live session. |
-| `confirm-before` | `confirm-before command [args...]` | Confirm before another attached command. |
-| `command-prompt` | `command-prompt` | Open the status-bar command prompt. |
 
 Direction flags are `-U`, `-D`, `-L`, and `-R`. Resize defaults to one cell; an optional amount must be positive. `swap-pane` accepts only `-U` and `-D` for previous/next pane order.
 
@@ -350,7 +396,7 @@ Pane IDs are separate daemon-wide numeric identities. Current session-oriented
 `-t` targets continue to select sessions; future pane-specific commands can use
 the unique `#{pane_id}` value without a session-local disambiguation step.
 
-Meja injects `MEJA_SOCKET` and `MEJA_SESSION_TARGET` into panes. A plain local command with no explicit `-L`, `-S`, or `-h` automatically targets the current server and session:
+Meja injects `MEJA_SOCKET`, `MEJA_SESSION_TARGET`, and `MEJA_PANE_ID` into panes. A plain local command with no explicit `-L`, `-S`, or `-h` automatically targets the current server, session, and originating pane where the command needs pane context:
 
 ```sh
 meja set-root .
@@ -368,6 +414,10 @@ meja new -f dev.meja
 
 An explicit profile, socket, or host disables this injected context.
 
+The injected session target is session-oriented at the CLI boundary. Internally
+the daemon may use a stable group target so a pane created before grouping can
+continue to resolve commands after its original session is removed.
+
 ---
 
 # Named-session recovery
@@ -381,6 +431,17 @@ Only named sessions are persisted. Profile recovery files are stored at:
 For `-S /path/to/meja.sock`, they are stored under `/path/to/sessions/`. Directories use `0700`; files use `0600`.
 
 Persistence is change-driven rather than timer-based. Meja writes after recoverable structure changes and after stable process observations change a pane's recorded command or directory.
+
+Grouped recovery records use schema 2 metadata while keeping the existing
+`<name>.session.meja` location. Each named session records its stable group ID,
+active and previous windows, and independent focus/zoom views; version-1 files
+restore as singleton groups. Live leases, client instances, output bindings,
+transports, and terminal contents are never persisted.
+
+When another view from a group is restored while that group is already live,
+the daemon reuses the existing canonical windows, panes, and processes. It
+does not launch duplicate panes. Persistence writes are asynchronous, so a
+save request does not wait for filesystem I/O in the daemon transaction.
 
 Recovery records include the root, windows, panes, layout, active window/panes, directories, shells, explicit commands, and stable detected foreground commands. They do not contain process memory, terminal contents, scrollback, descriptors, connections, or application state.
 

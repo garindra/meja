@@ -19,13 +19,14 @@ import (
 // Pane owns a child process, PTY, terminal emulator, and its four enduring
 // goroutines: PTY reader, PTY writer, process waiter, and terminal actor.
 type Pane struct {
-	ID      uint64
-	PTY     *os.File
-	Process *exec.Cmd
-	User    *user.User
-	Title   string
-	Launch  PaneLaunch
-	Root    Identity
+	ID       uint64
+	WindowID uint64
+	PTY      *os.File
+	Process  *exec.Cmd
+	User     *user.User
+	Title    string
+	Launch   PaneLaunch
+	Root     Identity
 
 	terminal               *TerminalState
 	metadata               atomic.Pointer[paneTerminalMetadata]
@@ -221,7 +222,7 @@ func (p *Pane) publishTerminalMetadata() {
 	p.metadata.Store(&next)
 }
 
-func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
+func startPaneProcess(paneID uint64, request paneRequest) (*Pane, error) {
 	unixUser, err := user.Current()
 	if err != nil {
 		return nil, fmt.Errorf("resolve daemon user: %w", err)
@@ -273,14 +274,6 @@ func StartPane(paneID uint64, request paneRequest) (*Pane, error) {
 		Root:        root,
 		processDone: make(chan struct{}),
 	}, nil
-}
-
-func resolveStartingDirectory(raw string) (string, error) {
-	unixUser, err := user.Current()
-	if err != nil {
-		return "", fmt.Errorf("resolve daemon user: %w", err)
-	}
-	return resolveStartingDirectoryForUser(raw, unixUser)
 }
 
 func resolveRootDirectory(raw, relativeTo string) (string, error) {

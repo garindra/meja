@@ -168,14 +168,14 @@ func TestFrontendTransportDelayDoesNotLeakFragmentedSequences(t *testing.T) {
 		{name: "SGR mouse motion", sequence: "\x1b[<35;69;42M"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s := NewSession(1)
-			s.NewClient(clientID0)
-			pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(20, 5)}
+			s := NewSessionState(1)
+			newStandaloneClient(s)
+			pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 5)}
 			pane.initializeRuntime()
-			s.CreateWindow(pane, clientID0)
-			frontend := newClientInstance(nil, nil)
-			s.clientInstance = frontend
-			layout, err := s.WindowLayout(clientID0)
+			createTestWindow(s, pane)
+			frontend := newFrontendTestClient(s)
+			setTestClient(s, frontend)
+			layout, err := testWindowLayout(s)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -185,7 +185,7 @@ func TestFrontendTransportDelayDoesNotLeakFragmentedSequences(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if stopped, err := s.handleControlFrame(frontend, protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: escapePayload}); err != nil || stopped {
+			if stopped, err := frontend.handleControlFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: escapePayload}); err != nil || stopped {
 				t.Fatalf("Escape fragment stopped=%v err=%v", stopped, err)
 			}
 			if !frontend.frontendInput.hasLoneEscape() {
@@ -205,7 +205,7 @@ func TestFrontendTransportDelayDoesNotLeakFragmentedSequences(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if stopped, err := s.handleControlFrame(frontend, protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: suffixPayload}); err != nil || stopped {
+			if stopped, err := frontend.handleControlFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: suffixPayload}); err != nil || stopped {
 				t.Fatalf("sequence suffix stopped=%v err=%v", stopped, err)
 			}
 			select {
@@ -218,19 +218,19 @@ func TestFrontendTransportDelayDoesNotLeakFragmentedSequences(t *testing.T) {
 }
 
 func TestFrontendSourceIdleResolvesStandaloneEscape(t *testing.T) {
-	s := NewSession(1)
-	s.NewClient(clientID0)
-	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(20, 5)}
+	s := NewSessionState(1)
+	newStandaloneClient(s)
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 5)}
 	pane.initializeRuntime()
-	s.CreateWindow(pane, clientID0)
-	frontend := newClientInstance(nil, nil)
-	s.clientInstance = frontend
+	createTestWindow(s, pane)
+	frontend := newFrontendTestClient(s)
+	setTestClient(s, frontend)
 
 	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{SourceIdle: true, Data: []byte{0x1b}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stopped, err := s.handleControlFrame(frontend, protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil || stopped {
+	if stopped, err := frontend.handleControlFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil || stopped {
 		t.Fatalf("source-idle Escape stopped=%v err=%v", stopped, err)
 	}
 	select {
@@ -319,20 +319,20 @@ func TestKittyFunctionalPressAndReleaseConvertForLegacyPane(t *testing.T) {
 }
 
 func TestKittyCtrlBUsesServerPrefixAndPasteBypassesIt(t *testing.T) {
-	s := NewSession(1)
-	s.NewClient(clientID0)
-	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(20, 5)}
+	s := NewSessionState(1)
+	newStandaloneClient(s)
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 5)}
 	pane.initializeRuntime()
-	s.CreateWindow(pane, clientID0)
-	frontend := newClientInstance(nil, nil)
+	createTestWindow(s, pane)
+	frontend := newFrontendTestClient(s)
 
-	if detach, err := s.handleInputBytes(frontend, 1, []byte("\x1b[98;5u")); err != nil || detach {
+	if detach, err := frontend.handleInputBytes(1, []byte("\x1b[98;5u")); err != nil || detach {
 		t.Fatalf("first prefix detach=%v err=%v", detach, err)
 	}
-	if s.InputIsNormal(clientID0) {
+	if clientForState(s).InputIsNormal() {
 		t.Fatal("Kitty Ctrl+B did not enter prefix state")
 	}
-	if detach, err := s.handleInputBytes(frontend, 1, []byte("\x1b[98;5u")); err != nil || detach {
+	if detach, err := frontend.handleInputBytes(1, []byte("\x1b[98;5u")); err != nil || detach {
 		t.Fatalf("literal prefix detach=%v err=%v", detach, err)
 	}
 	select {
@@ -344,7 +344,7 @@ func TestKittyCtrlBUsesServerPrefixAndPasteBypassesIt(t *testing.T) {
 		t.Fatal("literal prefix was not delivered")
 	}
 
-	if detach, err := s.handleInputBytes(frontend, 1, []byte("\x1b[200~a\x02b\x1b[201~")); err != nil || detach {
+	if detach, err := frontend.handleInputBytes(1, []byte("\x1b[200~a\x02b\x1b[201~")); err != nil || detach {
 		t.Fatalf("paste detach=%v err=%v", detach, err)
 	}
 	select {
@@ -358,35 +358,35 @@ func TestKittyCtrlBUsesServerPrefixAndPasteBypassesIt(t *testing.T) {
 }
 
 func TestKittyReleaseStaysWithPressPane(t *testing.T) {
-	s := NewSession(1)
-	s.NewClient(clientID0)
-	first := &Pane{ID: s.AddPaneID(), terminal: newTerminal(10, 4)}
-	second := &Pane{ID: s.AddPaneID(), terminal: newTerminal(10, 4)}
+	s := NewSessionState(1)
+	newStandaloneClient(s)
+	first := &Pane{ID: testAddPaneID(s), terminal: newTerminal(10, 4)}
+	second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(10, 4)}
 	first.initializeRuntime()
 	second.initializeRuntime()
 	first.terminal.KittyFlags = 3
 	second.terminal.KittyFlags = 3
 	first.publishTerminalMetadata()
 	second.publishTerminalMetadata()
-	s.CreateWindow(first, clientID0)
-	if _, _, err := s.SplitFocusedPane(clientID0, second, SplitVertical); err != nil {
+	createTestWindow(s, first)
+	if _, _, err := splitTestFocusedPane(s, second, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.FocusPane(clientID0, first.ID); err != nil {
+	if _, _, err := focusTestSessionPane(s, first.ID); err != nil {
 		t.Fatal(err)
 	}
-	frontend := newClientInstance(nil, nil)
+	frontend := newFrontendTestClient(s)
 	press := frontendKeyEvent{Code: frontendKeyRune, Rune: 'x', Action: frontendKeyPress, HasEventType: true}
-	if _, err := s.handleFrontendKey(frontend, press); err != nil {
+	if _, err := frontend.handleFrontendKey(press); err != nil {
 		t.Fatal(err)
 	}
 	<-first.ptyInput
-	if _, _, err := s.FocusPane(clientID0, second.ID); err != nil {
+	if _, _, err := focusTestSessionPane(s, second.ID); err != nil {
 		t.Fatal(err)
 	}
 	release := press
 	release.Action = frontendKeyRelease
-	if _, err := s.handleFrontendKey(frontend, release); err != nil {
+	if _, err := frontend.handleFrontendKey(release); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -405,25 +405,25 @@ func TestKittyReleaseStaysWithPressPane(t *testing.T) {
 }
 
 func TestMouseRoutingUsesStampedLayoutAndPaneMode(t *testing.T) {
-	s := NewSession(1)
-	clientState := s.NewClient(clientID0)
+	s := NewSessionState(1)
+	clientState := newStandaloneClient(s)
 	clientState.TerminalCols, clientState.TerminalRows = 20, 6
-	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(20, 6)}
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 6)}
 	pane.initializeRuntime()
 	pane.terminal.MouseTracking = MouseTrackingMotion
 	pane.terminal.MouseEncoding = MouseEncodingSGR
 	pane.publishTerminalMetadata()
-	s.CreateWindow(pane, clientID0)
-	layout, err := s.WindowLayout(clientID0)
+	createTestWindow(s, pane)
+	layout, err := testWindowLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	frontend := newClientInstance(nil, nil)
+	frontend := newFrontendTestClient(s)
 	frontend.rememberLayout(layout)
-	s.clientInstance = frontend
+	setTestClient(s, frontend)
 
 	event := frontendPointerEvent{Action: frontendPointerWheelDown, X: 4, Y: 2}
-	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, event); err != nil {
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision, event); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -439,7 +439,7 @@ func TestMouseRoutingUsesStampedLayoutAndPaneMode(t *testing.T) {
 		{Action: frontendPointerMove, Button: 0, X: 5, Y: 2},
 		{Action: frontendPointerRelease, Button: 0, X: 5, Y: 2},
 	} {
-		if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, pointer); err != nil {
+		if err := frontend.handleFrontendPointer(layout.LayoutRevision, pointer); err != nil {
 			t.Fatal(err)
 		}
 		want := []string{"\x1b[<0;5;3M", "\x1b[<32;6;3M", "\x1b[<0;6;3m"}[index]
@@ -458,7 +458,7 @@ func TestMouseRoutingUsesStampedLayoutAndPaneMode(t *testing.T) {
 
 	pane.terminal.MouseTracking = MouseTrackingNone
 	pane.publishTerminalMetadata()
-	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerWheelUp, X: 4, Y: 2}); err != nil {
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerWheelUp, X: 4, Y: 2}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -471,7 +471,7 @@ func TestMouseRoutingUsesStampedLayoutAndPaneMode(t *testing.T) {
 	}
 	pane.terminal.ApplicationCursorKeys = true
 	pane.publishTerminalMetadata()
-	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerWheelDown, X: 4, Y: 2}); err != nil {
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerWheelDown, X: 4, Y: 2}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -484,7 +484,7 @@ func TestMouseRoutingUsesStampedLayoutAndPaneMode(t *testing.T) {
 	}
 	pane.terminal.KittyFlags = 3
 	pane.publishTerminalMetadata()
-	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerWheelUp, X: 4, Y: 2}); err != nil {
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerWheelUp, X: 4, Y: 2}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -496,7 +496,7 @@ func TestMouseRoutingUsesStampedLayoutAndPaneMode(t *testing.T) {
 		t.Fatal("Kitty wheel fallback was not delivered")
 	}
 
-	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision+999, event); err != nil {
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision+999, event); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -506,18 +506,79 @@ func TestMouseRoutingUsesStampedLayoutAndPaneMode(t *testing.T) {
 	}
 }
 
-func TestMouseSelectionCopiesThroughOSC52AndReturnsToLivePane(t *testing.T) {
-	s := NewSession(1)
-	clientState := s.NewClient(clientID0)
-	clientState.TerminalCols, clientState.TerminalRows = 12, 4
-	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4)}
-	pane.terminal.Apply([]byte("hello"))
-	s.CreateWindow(pane, clientID0)
-	layout, err := s.WindowLayout(clientID0)
+func TestMousePressFocusesClickedPaneAndPublishesProjection(t *testing.T) {
+	s := NewSessionState(1)
+	clientState := newStandaloneClient(s)
+	clientState.TerminalCols, clientState.TerminalRows = 20, 6
+	first := &Pane{ID: testAddPaneID(s), terminal: newTerminal(10, 6)}
+	second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(10, 6)}
+	first.initializeRuntime()
+	second.initializeRuntime()
+	createTestWindow(s, first)
+	if _, _, err := splitTestFocusedPane(s, second, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := focusTestSessionPane(s, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := testWindowLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
+	secondPlacement, ok := panePlacement(layout, second.ID)
+	if !ok {
+		t.Fatalf("second pane missing from layout: %#v", layout)
+	}
+
 	frontend := newClientInstance(nil, nil)
+	frontend.controlOut = make(chan protocol.Frame, 1)
+	frontend.rememberLayout(layout)
+	setLeasedTestClient(t, s, frontend, 9)
+	renderedRevision := frontend.highestLayoutRevision.Load()
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{
+		Action: frontendPointerPress,
+		Button: 0,
+		X:      secondPlacement.Rect.X,
+		Y:      secondPlacement.Rect.Y,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	frame := <-frontend.controlOut
+	published, err := protocol.DecodeWindowLayout(frame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.FocusedPaneID != second.ID {
+		t.Fatalf("published focused pane = %d, want %d", published.FocusedPaneID, second.ID)
+	}
+	if published.LayoutRevision != renderedRevision {
+		t.Fatalf("mouse focus-only layout revision = %d, want existing rendered revision %d", published.LayoutRevision, renderedRevision)
+	}
+	if got := frontend.ensureClientState().FocusedPaneID; got != second.ID {
+		t.Fatalf("client focused pane = %d, want %d", got, second.ID)
+	}
+	if active, _ := testActivePane(s); active != second {
+		t.Fatalf("input target = %#v, want pane %d", active, second.ID)
+	}
+	if detach, err := frontend.handleInputBytes(published.LayoutRevision, []byte("clicked")); err != nil || detach {
+		t.Fatalf("input after click detach=%v err=%v", detach, err)
+	}
+	assertOnlyPaneInput(t, second.ptyInput, "clicked")
+}
+
+func TestMouseSelectionCopiesThroughOSC52AndReturnsToLivePane(t *testing.T) {
+	s := NewSessionState(1)
+	clientState := newStandaloneClient(s)
+	clientState.TerminalCols, clientState.TerminalRows = 12, 4
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4)}
+	pane.terminal.Apply([]byte("hello"))
+	createTestWindow(s, pane)
+	layout, err := testWindowLayout(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontend := newFrontendTestClient(s)
 	frontend.controlOut = make(chan protocol.Frame, 1)
 	frontend.rememberLayout(layout)
 	placement := layout.Panes[0]
@@ -527,7 +588,7 @@ func TestMouseSelectionCopiesThroughOSC52AndReturnsToLivePane(t *testing.T) {
 		{Action: frontendPointerMove, Button: 0, X: placement.Rect.X + 4, Y: placement.Rect.Y},
 		{Action: frontendPointerRelease, Button: 0, X: placement.Rect.X + 4, Y: placement.Rect.Y},
 	} {
-		if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, pointer); err != nil {
+		if err := frontend.handleFrontendPointer(layout.LayoutRevision, pointer); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -549,20 +610,20 @@ func TestMouseSelectionCopiesThroughOSC52AndReturnsToLivePane(t *testing.T) {
 }
 
 func TestMouseClickWithoutDragDoesNotCopy(t *testing.T) {
-	s := NewSession(1)
-	clientState := s.NewClient(clientID0)
+	s := NewSessionState(1)
+	clientState := newStandaloneClient(s)
 	clientState.TerminalCols, clientState.TerminalRows = 12, 4
-	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4)}
-	s.CreateWindow(pane, clientID0)
-	layout, err := s.WindowLayout(clientID0)
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4)}
+	createTestWindow(s, pane)
+	layout, err := testWindowLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	frontend := newClientInstance(nil, nil)
+	frontend := newFrontendTestClient(s)
 	frontend.controlOut = make(chan protocol.Frame, 1)
 	frontend.rememberLayout(layout)
 	point := layout.Panes[0].Rect
-	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
 		t.Fatal(err)
 	}
 	if pane.isHistoryMode() {
@@ -571,7 +632,7 @@ func TestMouseClickWithoutDragDoesNotCopy(t *testing.T) {
 	if !frontend.pointerCapture.active || !frontend.pointerCapture.mejaSelection || frontend.pointerCapture.selecting {
 		t.Fatalf("mouse press capture = %#v", frontend.pointerCapture)
 	}
-	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerRelease, Button: 0, X: point.X, Y: point.Y}); err != nil {
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerRelease, Button: 0, X: point.X, Y: point.Y}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -588,23 +649,23 @@ func TestMouseClickWithoutDragDoesNotCopy(t *testing.T) {
 }
 
 func TestMousePressWithoutReleaseDoesNotBlockKey(t *testing.T) {
-	s := NewSession(1)
-	clientState := s.NewClient(clientID0)
+	s := NewSessionState(1)
+	clientState := newStandaloneClient(s)
 	clientState.TerminalCols, clientState.TerminalRows = 12, 4
-	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4), ptyInput: make(chan []byte, 1)}
-	s.CreateWindow(pane, clientID0)
-	layout, err := s.WindowLayout(clientID0)
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4), ptyInput: make(chan []byte, 1)}
+	createTestWindow(s, pane)
+	layout, err := testWindowLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	frontend := newClientInstance(nil, nil)
+	frontend := newFrontendTestClient(s)
 	frontend.rememberLayout(layout)
 	point := layout.Panes[0].Rect
-	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
 		t.Fatal(err)
 	}
 
-	if detach, err := s.handleFrontendKey(frontend, frontendKeyEvent{Code: frontendKeyRune, Rune: 'x', Action: frontendKeyPress}); err != nil || detach {
+	if detach, err := frontend.handleFrontendKey(frontendKeyEvent{Code: frontendKeyRune, Rune: 'x', Action: frontendKeyPress}); err != nil || detach {
 		t.Fatalf("key after truncated click detach=%v err=%v", detach, err)
 	}
 	if pane.isHistoryMode() || frontend.pointerCapture.active {
@@ -629,27 +690,27 @@ func TestMouseMotionWithoutHeldButtonCancelsTruncatedGesture(t *testing.T) {
 		{name: "active drag", activeDrag: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s := NewSession(1)
-			clientState := s.NewClient(clientID0)
+			s := NewSessionState(1)
+			clientState := newStandaloneClient(s)
 			clientState.TerminalCols, clientState.TerminalRows = 12, 4
-			pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4)}
-			s.CreateWindow(pane, clientID0)
-			layout, err := s.WindowLayout(clientID0)
+			pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4)}
+			createTestWindow(s, pane)
+			layout, err := testWindowLayout(s)
 			if err != nil {
 				t.Fatal(err)
 			}
-			frontend := newClientInstance(nil, nil)
+			frontend := newFrontendTestClient(s)
 			frontend.rememberLayout(layout)
 			point := layout.Panes[0].Rect
-			if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
+			if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
 				t.Fatal(err)
 			}
 			if test.activeDrag {
-				if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerMove, Button: 0, X: point.X + 1, Y: point.Y}); err != nil {
+				if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerMove, Button: 0, X: point.X + 1, Y: point.Y}); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerMove, Button: 3, X: point.X + 2, Y: point.Y}); err != nil {
+			if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerMove, Button: 3, X: point.X + 2, Y: point.Y}); err != nil {
 				t.Fatal(err)
 			}
 			if pane.isHistoryMode() || frontend.pointerCapture.active {
@@ -660,17 +721,17 @@ func TestMouseMotionWithoutHeldButtonCancelsTruncatedGesture(t *testing.T) {
 }
 
 func TestMouseSelectionWithoutReleaseCancelsAndForwardsKey(t *testing.T) {
-	s := NewSession(1)
-	clientState := s.NewClient(clientID0)
+	s := NewSessionState(1)
+	clientState := newStandaloneClient(s)
 	clientState.TerminalCols, clientState.TerminalRows = 12, 4
-	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4), ptyInput: make(chan []byte, 1)}
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4), ptyInput: make(chan []byte, 1)}
 	pane.terminal.Apply([]byte("hello"))
-	s.CreateWindow(pane, clientID0)
-	layout, err := s.WindowLayout(clientID0)
+	createTestWindow(s, pane)
+	layout, err := testWindowLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	frontend := newClientInstance(nil, nil)
+	frontend := newFrontendTestClient(s)
 	frontend.rememberLayout(layout)
 	point := layout.Panes[0].Rect
 
@@ -678,7 +739,7 @@ func TestMouseSelectionWithoutReleaseCancelsAndForwardsKey(t *testing.T) {
 		{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y},
 		{Action: frontendPointerMove, Button: 0, X: point.X + 2, Y: point.Y},
 	} {
-		if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, pointer); err != nil {
+		if err := frontend.handleFrontendPointer(layout.LayoutRevision, pointer); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -686,7 +747,7 @@ func TestMouseSelectionWithoutReleaseCancelsAndForwardsKey(t *testing.T) {
 		t.Fatalf("drag did not enter selection: pane history=%v capture=%#v", pane.isHistoryMode(), frontend.pointerCapture)
 	}
 
-	if detach, err := s.handleFrontendKey(frontend, frontendKeyEvent{Code: frontendKeyRune, Rune: 'x', Action: frontendKeyPress}); err != nil || detach {
+	if detach, err := frontend.handleFrontendKey(frontendKeyEvent{Code: frontendKeyRune, Rune: 'x', Action: frontendKeyPress}); err != nil || detach {
 		t.Fatalf("key after truncated drag detach=%v err=%v", detach, err)
 	}
 	if pane.isHistoryMode() || frontend.pointerCapture.active {
@@ -705,41 +766,43 @@ func TestMouseSelectionWithoutReleaseCancelsAndForwardsKey(t *testing.T) {
 func TestMouseSelectionWithoutReleaseCancelsOnFocusLossAndRelayout(t *testing.T) {
 	for _, test := range []struct {
 		name   string
-		cancel func(*Session, *ClientInstance) error
+		cancel func(*SessionState, *ClientInstance) error
 	}{
-		{name: "focus loss", cancel: func(s *Session, frontend *ClientInstance) error {
-			_, err := s.handleFrontendInputEvent(frontend, frontendInputEvent{Kind: frontendEventFocus, Focused: false})
+		{name: "focus loss", cancel: func(s *SessionState, frontend *ClientInstance) error {
+			_, err := frontend.handleFrontendInputEvent(frontendInputEvent{Kind: frontendEventFocus, Focused: false})
 			return err
 		}},
-		{name: "split relayout", cancel: func(s *Session, frontend *ClientInstance) error {
-			second := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4)}
-			_, clientState, err := s.SplitFocusedPane(clientID0, second, SplitVertical)
+		{name: "split relayout", cancel: func(s *SessionState, frontend *ClientInstance) error {
+			second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4)}
+			_, clientState, err := splitTestFocusedPane(s, second, SplitVertical)
 			if err != nil {
 				return err
 			}
-			s.ResizeAll(clientState.TerminalCols, clientState.TerminalRows)
-			return s.rebindOutputsAndPublishLayout(nil)
+			if err := resizeTestSessionActiveWindow(s, clientState.TerminalCols, clientState.TerminalRows); err != nil {
+				return err
+			}
+			return clientForState(s).applyCurrentTestViewWithHandoff(nil)
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			s := NewSession(1)
-			clientState := s.NewClient(clientID0)
+			s := NewSessionState(1)
+			clientState := newStandaloneClient(s)
 			clientState.TerminalCols, clientState.TerminalRows = 12, 4
-			pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(12, 4)}
-			s.CreateWindow(pane, clientID0)
-			layout, err := s.WindowLayout(clientID0)
+			pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(12, 4)}
+			createTestWindow(s, pane)
+			layout, err := testWindowLayout(s)
 			if err != nil {
 				t.Fatal(err)
 			}
-			frontend := newClientInstance(nil, nil)
+			frontend := newFrontendTestClient(s)
 			frontend.rememberLayout(layout)
-			s.clientInstance = frontend
+			setTestClient(s, frontend)
 			point := layout.Panes[0].Rect
 			for _, pointer := range []frontendPointerEvent{
 				{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y},
 				{Action: frontendPointerMove, Button: 0, X: point.X + 2, Y: point.Y},
 			} {
-				if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, pointer); err != nil {
+				if err := frontend.handleFrontendPointer(layout.LayoutRevision, pointer); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -760,29 +823,29 @@ func TestOSC52ClipboardWrite(t *testing.T) {
 }
 
 func TestFallbackWheelBurstsCoalesceNetDeltaWithoutTouchingNativeMouse(t *testing.T) {
-	s := NewSession(1)
-	clientState := s.NewClient(clientID0)
+	s := NewSessionState(1)
+	clientState := newStandaloneClient(s)
 	clientState.TerminalCols, clientState.TerminalRows = 20, 6
-	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(20, 6)}
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 6)}
 	pane.initializeRuntime()
-	s.CreateWindow(pane, clientID0)
-	layout, err := s.WindowLayout(clientID0)
+	createTestWindow(s, pane)
+	layout, err := testWindowLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	frontend := newClientInstance(nil, nil)
+	frontend := newFrontendTestClient(s)
 	frontend.rememberLayout(layout)
 
 	up := []byte("\x1b[<64;5;3M")
 	down := []byte("\x1b[<65;5;3M")
-	if _, err := s.handleInputBytes(frontend, layout.LayoutRevision, bytes.Repeat(up, 3)); err != nil {
+	if _, err := frontend.handleInputBytes(layout.LayoutRevision, bytes.Repeat(up, 3)); err != nil {
 		t.Fatal(err)
 	}
 	assertOnlyPaneInput(t, pane.ptyInput, "\x1b[A")
 
 	left := []byte("\x1b[<66;5;3M")
 	jitter := append(append(append(append([]byte(nil), up...), left...), up...), down...)
-	if _, err := s.handleInputBytes(frontend, layout.LayoutRevision, jitter); err != nil {
+	if _, err := frontend.handleInputBytes(layout.LayoutRevision, jitter); err != nil {
 		t.Fatal(err)
 	}
 	assertOnlyPaneInput(t, pane.ptyInput, "\x1b[A")
@@ -790,7 +853,7 @@ func TestFallbackWheelBurstsCoalesceNetDeltaWithoutTouchingNativeMouse(t *testin
 	pane.terminal.MouseTracking = MouseTrackingMotion
 	pane.terminal.MouseEncoding = MouseEncodingSGR
 	pane.publishTerminalMetadata()
-	if _, err := s.handleInputBytes(frontend, layout.LayoutRevision, bytes.Repeat(up, 3)); err != nil {
+	if _, err := frontend.handleInputBytes(layout.LayoutRevision, bytes.Repeat(up, 3)); err != nil {
 		t.Fatal(err)
 	}
 	for index := 0; index < 3; index++ {
@@ -803,7 +866,7 @@ func TestFallbackWheelBurstsCoalesceNetDeltaWithoutTouchingNativeMouse(t *testin
 			t.Fatalf("missing native mouse event %d", index)
 		}
 	}
-	if _, err := s.handleInputBytes(frontend, layout.LayoutRevision, left); err != nil {
+	if _, err := frontend.handleInputBytes(layout.LayoutRevision, left); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -834,21 +897,21 @@ func assertOnlyPaneInput(t *testing.T, inputs <-chan []byte, want string) {
 }
 
 func TestMouseWheelScrollsMejaHistoryBeforePaneMouseMode(t *testing.T) {
-	s := NewSession(1)
-	clientState := s.NewClient(clientID0)
+	s := NewSessionState(1)
+	clientState := newStandaloneClient(s)
 	clientState.TerminalCols, clientState.TerminalRows = 20, 6
-	pane := &Pane{ID: s.AddPaneID(), terminal: newTerminal(20, 6)}
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(20, 6)}
 	pane.initializeRuntime()
 	pane.terminal.Apply([]byte("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\nnine\r\nten\r\neleven\r\ntwelve\r\nthirteen\r\nfourteen\r\nfifteen"))
 	pane.terminal.MouseTracking = MouseTrackingMotion
 	pane.terminal.MouseEncoding = MouseEncodingSGR
 	pane.publishTerminalMetadata()
-	s.CreateWindow(pane, clientID0)
-	layout, err := s.WindowLayout(clientID0)
+	createTestWindow(s, pane)
+	layout, err := testWindowLayout(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	frontend := newClientInstance(nil, nil)
+	frontend := newFrontendTestClient(s)
 	frontend.rememberLayout(layout)
 	request := paneHistoryRequest{Action: paneHistoryEnter}
 	if result := pane.handleHistoryRequest(&request); result.Err != nil {
@@ -860,7 +923,7 @@ func TestMouseWheelScrollsMejaHistoryBeforePaneMouseMode(t *testing.T) {
 	pane.historyView.CursorRow = pane.historyView.ViewTop
 	before := pane.historyView.ViewTop
 
-	if err := s.handleFrontendPointer(frontend, layout.LayoutRevision, frontendPointerEvent{
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{
 		Action: frontendPointerWheelUp,
 		X:      4,
 		Y:      2,

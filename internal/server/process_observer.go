@@ -20,8 +20,10 @@ import (
 )
 
 type PaneKey struct {
-	SessionID uint64 `json:"sessionId"`
-	PaneID    uint64 `json:"paneId"`
+	// Pane IDs are allocated by the daemon and are never recycled. A shared
+	// pane therefore has one process-monitor identity regardless of how many
+	// sessions currently link to its window.
+	PaneID uint64 `json:"paneId"`
 }
 
 // Identity distinguishes a live process from a later process that reused its
@@ -66,13 +68,13 @@ func (s ProcessStatus) String() string {
 }
 
 type ObservedProcess struct {
-	Identity Identity `json:"identity"`
-	Name     string   `json:"name"`
-	PPID     int      `json:"ppid"`
-	PGID     int      `json:"pgid"`
-	Session  int      `json:"session"`
-	TTY      int64    `json:"tty"`
-	State    byte     `json:"state"`
+	Identity     Identity `json:"identity"`
+	Name         string   `json:"name"`
+	PPID         int      `json:"ppid"`
+	PGID         int      `json:"pgid"`
+	SessionState int      `json:"session"`
+	TTY          int64    `json:"tty"`
+	State        byte     `json:"state"`
 
 	Argv          []string `json:"argv,omitempty"`
 	ArgvAvailable bool     `json:"argvAvailable"`
@@ -134,14 +136,14 @@ func (systemObserver) Observe(ctx context.Context, anchors []Anchor) map[PaneKey
 }
 
 type procStat struct {
-	Identity Identity
-	Name     string
-	PPID     int
-	PGID     int
-	Session  int
-	TTY      int64
-	TPGID    int
-	State    byte
+	Identity     Identity
+	Name         string
+	PPID         int
+	PGID         int
+	SessionState int
+	TTY          int64
+	TPGID        int
+	State        byte
 }
 
 func identifyProc(pid int) (Identity, error) {
@@ -220,9 +222,9 @@ func observeProcBatchAttempt(ctx context.Context, anchors []Anchor, scan func(co
 	for _, state := range prepared {
 		rootAfter, ok := afterByPID[state.anchor.Root.PID]
 		foregroundAfter, foregroundErr := foregroundProcessGroup(state.anchor.PTY)
-		groupAfter := filterProcessGroup(after, state.rootBefore.Session, state.rootBefore.TTY, state.foregroundPGID)
+		groupAfter := filterProcessGroup(after, state.rootBefore.SessionState, state.rootBefore.TTY, state.foregroundPGID)
 		if !ok || rootAfter.Identity != state.rootBefore.Identity ||
-			rootAfter.Session != state.rootBefore.Session || rootAfter.TTY != state.rootBefore.TTY ||
+			rootAfter.SessionState != state.rootBefore.SessionState || rootAfter.TTY != state.rootBefore.TTY ||
 			rootAfter.TPGID != state.foregroundPGID || foregroundErr != nil || foregroundAfter != state.foregroundPGID ||
 			!sameProcessGroup(state.groupBefore, groupAfter) {
 			unstable = append(unstable, state.anchor)
@@ -262,7 +264,7 @@ func prepareProcObservation(anchor Anchor, table []procStat, byPID map[int]procS
 	}
 	state.foregroundPGID = foregroundPGID
 	state.rootBefore = rootBefore
-	state.groupBefore = filterProcessGroup(table, rootBefore.Session, rootBefore.TTY, foregroundPGID)
+	state.groupBefore = filterProcessGroup(table, rootBefore.SessionState, rootBefore.TTY, foregroundPGID)
 	state.observation.ForegroundPGID = foregroundPGID
 	state.observation.Processes = make([]ObservedProcess, 0, len(state.groupBefore))
 	for _, stat := range state.groupBefore {
@@ -363,7 +365,7 @@ func scanProcTable(ctx context.Context) ([]procStat, error) {
 func filterProcessGroup(table []procStat, session int, tty int64, pgid int) []procStat {
 	stats := make([]procStat, 0, 4)
 	for _, stat := range table {
-		if stat.Session == session && stat.TTY == tty && stat.PGID == pgid && stat.State != 'Z' && stat.State != 'X' && stat.State != 'x' {
+		if stat.SessionState == session && stat.TTY == tty && stat.PGID == pgid && stat.State != 'Z' && stat.State != 'X' && stat.State != 'x' {
 			stats = append(stats, stat)
 		}
 	}
@@ -393,13 +395,13 @@ func sameProcessGroup(first, second []procStat) bool {
 
 func readProcess(stat procStat) (ObservedProcess, []string, error) {
 	process := ObservedProcess{
-		Identity: stat.Identity,
-		Name:     stat.Name,
-		PPID:     stat.PPID,
-		PGID:     stat.PGID,
-		Session:  stat.Session,
-		TTY:      stat.TTY,
-		State:    stat.State,
+		Identity:     stat.Identity,
+		Name:         stat.Name,
+		PPID:         stat.PPID,
+		PGID:         stat.PGID,
+		SessionState: stat.SessionState,
+		TTY:          stat.TTY,
+		State:        stat.State,
 	}
 	base := filepath.Join("/proc", strconv.Itoa(stat.Identity.PID))
 	beforeExe, beforeExeErr := os.Readlink(filepath.Join(base, "exe"))
@@ -425,7 +427,7 @@ func readProcess(stat procStat) (ObservedProcess, []string, error) {
 
 	after, err := readProcStat(stat.Identity.PID)
 	if err != nil || after.Identity != stat.Identity || after.PPID != stat.PPID ||
-		after.PGID != stat.PGID || after.Session != stat.Session || after.TTY != stat.TTY {
+		after.PGID != stat.PGID || after.SessionState != stat.SessionState || after.TTY != stat.TTY {
 		return ObservedProcess{}, nil, errObservationChanged
 	}
 	if beforeExeErr == nil {
@@ -523,14 +525,14 @@ func parseProcStat(data []byte) (procStat, error) {
 		return procStat{}, fmt.Errorf("parse /proc stat start time: %w", err)
 	}
 	return procStat{
-		Identity: Identity{PID: pid, BirthToken: startTime},
-		Name:     line[open+2 : close],
-		PPID:     ppid,
-		PGID:     pgid,
-		Session:  session,
-		TTY:      tty,
-		TPGID:    tpgid,
-		State:    fields[0][0],
+		Identity:     Identity{PID: pid, BirthToken: startTime},
+		Name:         line[open+2 : close],
+		PPID:         ppid,
+		PGID:         pgid,
+		SessionState: session,
+		TTY:          tty,
+		TPGID:        tpgid,
+		State:        fields[0][0],
 	}, nil
 }
 

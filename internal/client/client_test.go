@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/quic-go/quic-go"
 
 	"github.com/garindra/meja/internal/protocol"
@@ -187,6 +188,9 @@ func TestRunForwardsArbitraryNonAttachCommandWithoutTerminal(t *testing.T) {
 		if err == nil && request.CallerSessionTarget != "17" {
 			err = fmt.Errorf("caller session target = %q, want 17", request.CallerSessionTarget)
 		}
+		if err == nil && request.CallerPaneID != 41 {
+			err = fmt.Errorf("caller pane ID = %d, want 41", request.CallerPaneID)
+		}
 		if err == nil {
 			err = protocol.WriteCommandOutput(conn, protocol.CommandFrameStdout, []byte("future output\n"))
 		}
@@ -205,6 +209,7 @@ func TestRunForwardsArbitraryNonAttachCommandWithoutTerminal(t *testing.T) {
 		Local:               true,
 		SocketSelector:      SocketSelector{Path: socket},
 		CallerSessionTarget: "17",
+		CallerPaneID:        41,
 		CommandArgs:         wantArgs,
 		Stdin:               stdin,
 		Stdout:              &stdout,
@@ -218,6 +223,61 @@ func TestRunForwardsArbitraryNonAttachCommandWithoutTerminal(t *testing.T) {
 	}
 	if stdout.String() != "future output\n" {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestRunNestedCommandReportsThePaneDrawableHeight(t *testing.T) {
+	socket := shortUnixSocketPath(t)
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		request, err := protocol.ReadCommandRequest(conn)
+		var validationErr error
+		if err == nil && (request.TerminalCols != 80 || request.TerminalRows != 23) {
+			validationErr = fmt.Errorf("nested terminal size = %dx%d, want drawable pane size 80x23", request.TerminalCols, request.TerminalRows)
+		}
+		if err == nil {
+			err = protocol.WriteCommandFrame(conn, protocol.CommandFrame{Type: protocol.CommandFrameExit})
+		}
+		if err == nil {
+			err = validationErr
+		}
+		done <- err
+	}()
+	terminal, frontend, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer terminal.Close()
+	defer frontend.Close()
+	if err := pty.Setsize(terminal, &pty.Winsize{Cols: 80, Rows: 23}); err != nil {
+		t.Fatal(err)
+	}
+	err = Run(context.Background(), Config{
+		Local:               true,
+		SocketSelector:      SocketSelector{Path: socket},
+		CallerSessionTarget: "17",
+		CallerPaneID:        41,
+		CommandArgs:         []string{"new"},
+		Stdin:               frontend,
+		Stdout:              io.Discard,
+		Stderr:              io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -280,6 +340,7 @@ func TestIncomingRenderBurstLog(t *testing.T) {
 	diagnostics.reportCommand(0, protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteText, Text: []byte("x")}, 3)
 	diagnostics.reportCommand(0, protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}, 1)
 	diagnostics.reportRedraw("test", 7)
+	diagnostics.reportProjection("layout received revision=9 activated=false")
 	diagnostics.close()
 
 	got := log.String()
@@ -292,6 +353,7 @@ func TestIncomingRenderBurstLog(t *testing.T) {
 		"types=WriteText:1,Present:1",
 		"redraw request #1: test",
 		"redraw write #1 bytes=7",
+		"projection layout received revision=9 activated=false",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("incoming burst log missing %q: %q", want, got)
@@ -338,7 +400,7 @@ func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
 	encoder := protocol.NewDisplayEncoder(nil)
 	encoder.AppendStartRender(protocol.StartRender{LayoutRevision: 1, Cols: 8, Rows: 3})
 	write(encoder.Bytes())
-	encoder.Reset(nil)
+	encoder = protocol.NewDisplayEncoder(nil)
 	encoder.AppendSetWritePosition(protocol.SetWritePosition{})
 	encoder.AppendSetWriteStyle(protocol.SetWriteStyle{})
 	encoder.AppendWriteTextUTF8([]byte("x"))
@@ -347,7 +409,7 @@ func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("rendered %d bytes before PRESENT", stdout.Len())
 	}
-	encoder.Reset(nil)
+	encoder = protocol.NewDisplayEncoder(nil)
 	encoder.AppendPresent()
 	write(encoder.Bytes())
 	deadline := time.Now().Add(time.Second)
@@ -374,7 +436,7 @@ func TestForwardInputBatchesContiguousBytes(t *testing.T) {
 	control.Store(&controlDestination{frames: controlFrames, done: ctx.Done()})
 	ui := &runtimeState{events: make(chan renderEvent, 1)}
 	ui.appliedLayoutRevision.Store(42)
-	go forwardInput(ctx, stdinR, &control, ui, errs, cancel)
+	go forwardInputWithInitial(ctx, stdinR, &control, ui, errs, cancel, nil)
 
 	if _, err := stdinW.Write([]byte("abc")); err != nil {
 		t.Fatalf("stdin write = %v", err)
@@ -569,7 +631,7 @@ func TestCtrlCExitsWhileDisconnected(t *testing.T) {
 	var control atomic.Pointer[controlDestination]
 	ui := &runtimeState{events: make(chan renderEvent, 1)}
 	errs := make(chan error, 1)
-	go forwardInput(ctx, stdinR, &control, ui, errs, cancel)
+	go forwardInputWithInitial(ctx, stdinR, &control, ui, errs, cancel, nil)
 
 	if _, err := stdinW.Write([]byte{0x03}); err != nil {
 		t.Fatalf("stdin write = %v", err)
@@ -620,7 +682,7 @@ func TestDroppedFrontendInputDoesNotQueuePredictionEvents(t *testing.T) {
 	var control atomic.Pointer[controlDestination]
 	control.Store(&controlDestination{frames: frames, done: done})
 	ui := &runtimeState{events: make(chan renderEvent, 2)}
-	if _, err := sendCurrentFrontendInput(&control, ui, []byte("a"), []byte("a")); err != nil {
+	if _, err := sendFrontendInput(control.Load(), ui, ui.appliedLayoutRevision.Load(), false, []byte("a"), []byte("a")); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -636,7 +698,7 @@ func TestQueuedFrontendInputQueuesDecodedPrediction(t *testing.T) {
 	var control atomic.Pointer[controlDestination]
 	control.Store(&controlDestination{frames: frames, done: done})
 	ui := &runtimeState{events: make(chan renderEvent, 1)}
-	if _, err := sendCurrentFrontendInput(&control, ui, []byte("\x1b[97u"), []byte("a")); err != nil {
+	if _, err := sendFrontendInput(control.Load(), ui, ui.appliedLayoutRevision.Load(), false, []byte("\x1b[97u"), []byte("a")); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -937,6 +999,117 @@ func TestLayoutActivationPreservesStatusRow(t *testing.T) {
 	if !strings.Contains(out, "\x1b[1;1H\x1b[2K") || strings.Contains(out, "\x1b[4;1H\x1b[2K") {
 		t.Fatalf("layout activation did not clear only content rows: %q", out)
 	}
+}
+
+func TestStaleWideStatusFrameIsClippedAfterNarrowResize(t *testing.T) {
+	state := newScanoutState(true)
+	state.cols, state.rows = 20, 4
+	status := renderFrame{
+		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "indexed", Index: 4}}}},
+		spans: []paintSpan{
+			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: 'x', fillColumns: 80},
+			{kind: paintText, column: 70, styleID: 1, cellWidth: 1, text: []byte("offscreen")},
+		},
+	}
+	if _, err := state.acceptFrame(protocol.StatusRenderSlot, status); err != nil {
+		t.Fatal(err)
+	}
+	out := string(state.takeANSI())
+	if got := strings.Count(out, "x"); got != 20 {
+		t.Fatalf("narrow status emitted %d cells from stale wide frame, want 20: %q", got, out)
+	}
+	if strings.Contains(out, "offscreen") {
+		t.Fatalf("narrow status emitted off-screen stale text: %q", out)
+	}
+}
+
+func TestStatusFrameCannotWrapWhileLocalResizeEventIsPending(t *testing.T) {
+	state := newScanoutState(true)
+	// The kernel terminal is already 20 columns wide, but the render loop has
+	// not consumed its sizeEvent yet and still believes the old width is 80.
+	state.cols, state.rows = 80, 4
+	status := renderFrame{
+		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "indexed", Index: 4}}}},
+		spans:         []paintSpan{{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: 'x', fillColumns: 80}},
+	}
+	if _, err := state.acceptFrame(protocol.StatusRenderSlot, status); err != nil {
+		t.Fatal(err)
+	}
+	out := state.takeANSI()
+	if _, scrolled := ansiWrapResult(out, 20, 4); scrolled {
+		t.Fatalf("status output can wrap and scroll before pending resize is applied: %q", out)
+	}
+}
+
+func TestPaneFrameCannotWrapWhileLocalResizeEventIsPending(t *testing.T) {
+	state := newScanoutState(true)
+	state.cols, state.rows = 80, 4
+	state.layout = protocol.WindowLayout{
+		WindowID: 1, LayoutRevision: 1, FocusedPaneID: 1,
+		Panes: []protocol.PanePlacement{{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 80, Height: 3}}},
+	}
+	frame := renderFrame{
+		layoutRevision: 1, cols: 80, rows: 3,
+		spans: []paintSpan{{kind: paintFill, cellWidth: 1, fillRune: 'x', fillColumns: 80}},
+	}
+	if _, err := state.acceptFrame(0, frame); err != nil {
+		t.Fatal(err)
+	}
+	out := state.takeANSI()
+	if wrapped, _ := ansiWrapResult(out, 20, 4); wrapped {
+		t.Fatalf("pane output can wrap and scroll before pending resize is applied: %q", out)
+	}
+}
+
+func ansiWrapResult(data []byte, width, height int) (bool, bool) {
+	row, column := 0, 0
+	wrapped := false
+	autoWrap, wrapPending := true, false
+	for index := 0; index < len(data); {
+		if data[index] == 0x1b && index+1 < len(data) && data[index+1] == '[' {
+			end := index + 2
+			for end < len(data) && (data[end] < 0x40 || data[end] > 0x7e) {
+				end++
+			}
+			if end >= len(data) {
+				return wrapped, false
+			}
+			params, final := string(data[index+2:end]), data[end]
+			switch {
+			case final == 'l' && params == "?7":
+				autoWrap, wrapPending = false, false
+			case final == 'h' && params == "?7":
+				autoWrap = true
+			case final == 'H':
+				var terminalRow, terminalColumn int
+				if _, err := fmt.Sscanf(params, "%d;%d", &terminalRow, &terminalColumn); err == nil {
+					row = min(max(terminalRow-1, 0), height-1)
+					column = min(max(terminalColumn-1, 0), width-1)
+					wrapPending = false
+				}
+			}
+			index = end + 1
+			continue
+		}
+		if data[index] >= 0x20 && data[index] != 0x7f {
+			if wrapPending && autoWrap {
+				wrapped = true
+				row++
+				column = 0
+				wrapPending = false
+				if row >= height {
+					return true, true
+				}
+			}
+			if column == width-1 {
+				wrapPending = autoWrap
+			} else {
+				column++
+			}
+		}
+		index++
+	}
+	return wrapped, false
 }
 
 type failingReader struct{ err error }
@@ -1344,6 +1517,105 @@ func TestNativeScrollUsesRectangularMargins(t *testing.T) {
 	out := string(s.takeANSI())
 	if !strings.Contains(out, "\x1b[1;4r") || !strings.Contains(out, "\x1b[7;12s") || !strings.Contains(out, "\x1b[1S") {
 		t.Fatalf("native scroll output = %q", out)
+	}
+}
+
+func TestScanoutDropsGeometryMismatchedPaneFrame(t *testing.T) {
+	const revision = 7
+	layout := protocol.WindowLayout{
+		WindowID:       1,
+		LayoutRevision: revision,
+		FocusedPaneID:  1,
+		Panes: []protocol.PanePlacement{{
+			PaneID: 1,
+			Slot:   0,
+			Rect:   protocol.Rect{Width: 102, Height: 23},
+		}},
+	}
+
+	t.Run("active layout", func(t *testing.T) {
+		s := newScanoutState(false)
+		s.cols, s.rows = 102, 24
+		if activated, err := s.acceptLayout(layout); err != nil || activated {
+			t.Fatalf("accept layout activated=%v err=%v", activated, err)
+		}
+		if activated, err := s.acceptFrame(0, renderFrame{layoutRevision: revision, cols: 102, rows: 23}); err != nil || !activated {
+			t.Fatalf("matching initial frame activated=%v err=%v", activated, err)
+		}
+		_ = s.takeANSI()
+		cache := s.caches[0]
+
+		present, err := s.acceptFrame(0, renderFrame{
+			layoutRevision: revision,
+			cols:           94,
+			rows:           23,
+			spans:          []paintSpan{{kind: paintText, row: 0, text: []byte("stale")}},
+		})
+		if err != nil || present {
+			t.Fatalf("mismatched active frame present=%v err=%v", present, err)
+		}
+		if got := s.takeANSI(); len(got) != 0 {
+			t.Fatalf("mismatched active frame emitted %q", got)
+		}
+		if s.caches[0] != cache {
+			t.Fatal("mismatched active frame replaced pane cache")
+		}
+	})
+
+	t.Run("pending layout", func(t *testing.T) {
+		s := newScanoutState(false)
+		s.cols, s.rows = 102, 24
+		if activated, err := s.acceptLayout(layout); err != nil || activated {
+			t.Fatalf("accept layout activated=%v err=%v", activated, err)
+		}
+		if activated, err := s.acceptFrame(0, renderFrame{layoutRevision: revision, cols: 94, rows: 23}); err != nil || activated {
+			t.Fatalf("mismatched pending frame activated=%v err=%v", activated, err)
+		}
+		if s.layout.LayoutRevision != 0 {
+			t.Fatalf("mismatched pending frame installed revision %d", s.layout.LayoutRevision)
+		}
+		if activated, err := s.acceptFrame(0, renderFrame{layoutRevision: revision, cols: 102, rows: 23}); err != nil || !activated {
+			t.Fatalf("matching replacement frame activated=%v err=%v", activated, err)
+		}
+		if s.layout.LayoutRevision != revision {
+			t.Fatalf("matching replacement installed revision %d, want %d", s.layout.LayoutRevision, revision)
+		}
+	})
+}
+
+func TestFocusOnlyLayoutActivatesWithoutReplacementPaneFrames(t *testing.T) {
+	const revision = 8
+	layout := protocol.WindowLayout{
+		WindowID:       1,
+		LayoutRevision: revision,
+		FocusedPaneID:  1,
+		Panes: []protocol.PanePlacement{
+			{PaneID: 1, Slot: 0, Rect: protocol.Rect{Width: 10, Height: 4}},
+			{PaneID: 2, Slot: 1, Rect: protocol.Rect{X: 10, Width: 10, Height: 4}},
+		},
+	}
+	s := newScanoutState(false)
+	s.cols, s.rows = 20, 5
+	if activated, err := s.acceptLayout(layout); err != nil || activated {
+		t.Fatalf("initial layout activated=%v err=%v", activated, err)
+	}
+	if activated, err := s.acceptFrame(0, renderFrame{layoutRevision: revision, cols: 10, rows: 4}); err != nil || activated {
+		t.Fatalf("first pane activated=%v err=%v", activated, err)
+	}
+	if activated, err := s.acceptFrame(1, renderFrame{layoutRevision: revision, cols: 10, rows: 4}); err != nil || !activated {
+		t.Fatalf("second pane activated=%v err=%v", activated, err)
+	}
+	_ = s.takeANSI()
+
+	layout.FocusedPaneID = 2
+	if activated, err := s.acceptLayout(layout); err != nil || !activated {
+		t.Fatalf("focus-only layout activated=%v err=%v", activated, err)
+	}
+	if s.layout.FocusedPaneID != 2 {
+		t.Fatalf("installed focus = %d, want pane 2", s.layout.FocusedPaneID)
+	}
+	if len(s.pendingLayouts) != 0 {
+		t.Fatalf("focus-only layout waited for pane frames: pending=%#v", s.pendingLayouts)
 	}
 }
 

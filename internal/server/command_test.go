@@ -2,9 +2,7 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -31,7 +29,7 @@ func shortUnixSocketDir(t *testing.T) string {
 
 func TestNewSessionCommandCreatesInitialPaneBeforeAttach(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	callerCwd := t.TempDir()
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:             []string{"new", "-s", "work", "--", "/bin/sleep", "30"},
@@ -47,7 +45,7 @@ func TestNewSessionCommandCreatesInitialPaneBeforeAttach(t *testing.T) {
 	if session == nil || !session.HasWindows() || len(session.PanesSnapshot()) != 1 {
 		t.Fatalf("new session state = %#v", session)
 	}
-	pane, _ := session.ActivePane(clientID0)
+	pane, _ := testActivePane(session)
 	if pane == nil {
 		t.Fatal("new session has no focused pane")
 	}
@@ -65,7 +63,7 @@ func TestNewSessionCommandCreatesInitialPaneBeforeAttach(t *testing.T) {
 
 func TestDetachedNewSessionPrintsInitialPaneWithoutBootstrapOrAttachment(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	root := t.TempDir()
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:             []string{"new-session", "-d", "-P", "-F", "#{session_id}:#{pane_id}", "-s", "worker", "--", "/bin/sleep", "30"},
@@ -81,20 +79,20 @@ func TestDetachedNewSessionPrintsInitialPaneWithoutBootstrapOrAttachment(t *test
 		t.Fatalf("detached creation left attach grants: %#v", d.attachGrants)
 	}
 	session := d.sessionByName("worker")
-	if session == nil || session.clientInstance != nil || len(session.Panes) != 1 {
+	if session == nil || testClientOf(session) != nil || len(session.Panes) != 1 {
 		t.Fatalf("detached session state = %#v", session)
 	}
 }
 
-func TestDetachedNewSessionDoesNotContextuallyHandoff(t *testing.T) {
+func TestDetachedNewSessionDoesNotActivateInvokingClient(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	defer d.disconnectActiveClients()
-	d.sessionPersistenceDir = t.TempDir()
-	source := NewSession(1)
+	setCommandTestPersistenceDir(t, d)
+	source := NewSessionState(1)
 	source.daemon = d
 	source.setSessionName("source")
-	source.CreateWindow(&Pane{ID: source.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
-	source.SetClientSize(clientID0, 80, 23)
+	createTestWindow(source, &Pane{ID: testAddPaneID(source), terminal: newTerminal(80, 23)})
+	setTestClientSize(source, 80, 23)
 	d.sessions[source.ID] = source
 	d.names[source.Name] = source
 	d.nextID = 2
@@ -102,21 +100,9 @@ func TestDetachedNewSessionDoesNotContextuallyHandoff(t *testing.T) {
 	credential := &reconnectCredential{EncodedToken: "detached-test"}
 	instance := newClientInstance(d, credential)
 	credential.Instance = instance
-	source.clientInstance = instance
+	setTestClient(source, instance)
 	d.clientSessions[credential] = source.ID
 	d.attachments[source.ID] = credential
-
-	switchSeen := make(chan *sessionSwitchRequest, 1)
-	stopWatcher := make(chan struct{})
-	t.Cleanup(func() { close(stopWatcher) })
-	go func() {
-		select {
-		case request := <-instance.sessionSwitches:
-			switchSeen <- request
-			completeSessionSwitch(request, errors.New("detached new-session must not switch the client"))
-		case <-stopWatcher:
-		}
-	}()
 
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:                []string{"new-session", "-d", "-P", "-F", "#{session_id}:#{pane_id}", "-s", "detached"},
@@ -126,33 +112,32 @@ func TestDetachedNewSessionDoesNotContextuallyHandoff(t *testing.T) {
 		TerminalRows:        23,
 	})
 	if result.exitCode != 0 || result.bootstrap != nil || string(result.stdout) != "2:2\n" {
-		t.Fatalf("contextual detached new result = %#v", result)
+		t.Fatalf("pane CLI detached new result = %#v", result)
 	}
-	if source.clientInstance != instance {
+	if testClientOf(source) != instance {
 		t.Fatal("source client was moved from the invoking session")
 	}
 	created := d.sessionByName("detached")
-	if created == nil || created.clientInstance != nil {
+	if created == nil || testClientOf(created) != nil {
 		t.Fatalf("detached session state = %#v", created)
 	}
 	if len(d.attachGrants) != 0 {
 		t.Fatalf("detached creation left attach grants: %#v", d.attachGrants)
-	}
-	select {
-	case request := <-switchSeen:
-		t.Fatalf("detached new-session requested a contextual switch: %#v", request)
-	default:
 	}
 }
 
 func TestDetachedNewSessionDoesNotRequireAttachedSource(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	defer d.disconnectActiveClients()
-	d.sessionPersistenceDir = t.TempDir()
-	source := NewSession(1)
+	setCommandTestPersistenceDir(t, d)
+	source := NewSessionState(1)
 	source.daemon = d
 	source.setSessionName("source")
-	source.CreateWindow(&Pane{ID: source.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
+	createTestWindow(source, &Pane{ID: testAddPaneID(source), terminal: newTerminal(80, 23)})
+	// The fixture creates windows through a synthetic ClientInstance so the
+	// normal projection boundary is exercised. Remove it here because this test
+	// specifically models a detached source session.
+	setTestClient(source, nil)
 	d.sessions[source.ID] = source
 	d.names[source.Name] = source
 	d.nextID = 2
@@ -167,11 +152,11 @@ func TestDetachedNewSessionDoesNotRequireAttachedSource(t *testing.T) {
 	if result.exitCode != 0 || result.bootstrap != nil || string(result.stdout) != "2:2\n" {
 		t.Fatalf("detached new without attached source = %#v", result)
 	}
-	if source.clientInstance != nil || source.SessionName() != "source" || len(source.Panes) != 1 {
+	if testClientOf(source) != nil || source.SessionName() != "source" || len(source.Panes) != 1 {
 		t.Fatalf("source session changed = %#v", source)
 	}
 	created := d.sessionByName("detached")
-	if created == nil || created.clientInstance != nil {
+	if created == nil || testClientOf(created) != nil {
 		t.Fatalf("detached session state = %#v", created)
 	}
 	if len(d.attachGrants) != 0 {
@@ -200,7 +185,7 @@ func TestNewSessionDetachedPreflightStopsAtCommandSeparator(t *testing.T) {
 
 func TestDetachedNewSessionRollbackRemovesFailedSession(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:         []string{"new", "-d", "-s", "broken", "--", "/does/not/exist"},
 		TerminalCols: 80,
@@ -213,7 +198,7 @@ func TestDetachedNewSessionRollbackRemovesFailedSession(t *testing.T) {
 
 func TestPaneIDsAreDaemonWideMonotonicAndNotReused(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	defer d.disconnectActiveClients()
 	newDetached := func(name string) string {
 		result := d.executeCommand(protocol.CommandRequest{
@@ -243,7 +228,7 @@ func TestPaneIDsAreDaemonWideMonotonicAndNotReused(t *testing.T) {
 
 func TestNewWindowAndSplitUseDaemonPaneIDs(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	created := d.executeCommand(protocol.CommandRequest{
 		Args:         []string{"new", "-d", "-s", "work"},
 		TerminalCols: 80,
@@ -262,6 +247,68 @@ func TestNewWindowAndSplitUseDaemonPaneIDs(t *testing.T) {
 	listing := d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-a", "-F", "#{pane_id}"}})
 	if listing.exitCode != 0 || string(listing.stdout) != "1\n2\n3\n" {
 		t.Fatalf("new-window/split pane IDs = %#v", listing)
+	}
+	if len(d.clients) != 0 {
+		t.Fatalf("detached commands manufactured live clients: %#v", d.clients)
+	}
+}
+
+func TestCommandEngineRegistryIsCanonicalAndExcludesClientUX(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	engine := d.commandEngine()
+	if engine == nil || d.commandEngine() != engine {
+		t.Fatal("daemon did not retain one command engine")
+	}
+	alias, ok := engine.lookup("neww")
+	if !ok || alias.Name != "new-window" {
+		t.Fatalf("neww lookup = %#v, %v", alias, ok)
+	}
+	for _, localUX := range []string{"command-prompt", "confirm-before"} {
+		if command, exists := engine.lookup(localUX); exists {
+			t.Fatalf("client-local UX %q registered as command %#v", localUX, command)
+		}
+	}
+}
+
+func TestAttachedAdapterRejectsCommandStdout(t *testing.T) {
+	s := NewSessionState(1)
+	newStandaloneClient(s)
+	createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)})
+	client := clientForState(s)
+	if _, err := client.executeAttachedCommand([]string{"set-buffer", "payload"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.executeAttachedCommand([]string{"show-buffer"}); err == nil || !strings.Contains(err.Error(), "only available through the CLI") {
+		t.Fatalf("attached show-buffer error = %v", err)
+	}
+}
+
+func TestContextualKillPaneUsesInjectedCallerPaneID(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	s := NewSessionState(1)
+	s.daemon = d
+	d.sessions[s.ID] = s
+	d.ensureSessionGroupInActor(s)
+	newStandaloneClient(s)
+	first := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
+	createTestWindow(s, first)
+	second := &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)}
+	if _, _, err := splitTestFocusedPane(s, second, SplitVertical); err != nil {
+		t.Fatal(err)
+	}
+	syncTestProjection(t, s)
+	setTestClient(s, nil)
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"kill-pane"},
+		CallerSessionTarget: strconv.FormatUint(s.ID, 10),
+		CallerPaneID:        first.ID,
+	})
+	if result.exitCode != 0 {
+		t.Fatalf("kill pane CLI pane = %#v", result)
+	}
+	if s.Pane(first.ID) != nil || s.Pane(second.ID) == nil {
+		t.Fatalf("panes after contextual kill: first=%#v second=%#v", s.Pane(first.ID), s.Pane(second.ID))
 	}
 }
 
@@ -341,12 +388,13 @@ func TestNewSessionFileRejectsDetachedFormatFlags(t *testing.T) {
 	}
 }
 
-func newFormatTestSession(id uint64, name string, paneID uint64) *Session {
-	session := NewSession(id)
+func newFormatTestSession(id uint64, name string, paneID uint64) *SessionState {
+	session := NewSessionState(id)
+	session.daemon = testDaemonForState(session)
 	session.setSessionName(name)
 	pane := &Pane{ID: paneID, Launch: PaneLaunch{Shell: "/bin/bash", Cwd: "/launch"}, terminal: newTerminal(80, 24)}
-	session.CreateWindow(pane, clientID0)
-	session.processObservations[paneID] = ProcessObservation{
+	createTestWindow(session, pane)
+	session.daemon.processObservations[paneID] = ProcessObservation{
 		Status: StatusDetected,
 		Root:   &ObservedProcess{Cwd: "/observed"},
 		Candidate: &ObservedProcess{
@@ -369,8 +417,8 @@ func TestSharedPaneFormatExpandsRequiredValuesAndStableCreationTime(t *testing.T
 	d.names[first.Name] = first
 	d.names[second.Name] = second
 	t.Cleanup(func() {
-		first.stopOperations()
-		second.stopOperations()
+		stopState(first)
+		stopState(second)
 	})
 
 	format := "#{session_id}|#{session_name}|#{session_created}|#{window_index}|#{pane_id}|#{pane_dead}|#{pane_current_command}|#{pane_current_path}|#{pane_in_mode}|#{pane_index}|#{pane_width}|#{pane_height}|#{pane_in_copy_mode}|#{unknown}"
@@ -392,13 +440,14 @@ func TestSharedPaneFormatExpandsRequiredValuesAndStableCreationTime(t *testing.T
 
 func TestPaneFormatUsesLaunchedCommandAndCwdFallbacks(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	session := NewSession(1)
+	session := NewSessionState(1)
+	newStandaloneClient(session)
 	session.setSessionName("fallback")
 	pane := &Pane{ID: 7, Launch: PaneLaunch{Shell: "/bin/zsh", RequestedArgv: []string{"/bin/sleep", "5"}, Cwd: "/launch"}, terminal: newTerminal(10, 2)}
-	session.CreateWindow(pane, clientID0)
+	createTestWindow(session, pane)
 	d.sessions[session.ID] = session
 	d.names[session.Name] = session
-	t.Cleanup(session.stopOperations)
+	t.Cleanup(func() { stopState(session) })
 	result := d.executeCommand(protocol.CommandRequest{Args: []string{"list-panes", "-t", "fallback", "-F", "#{pane_current_command}|#{pane_current_path}"}})
 	if result.exitCode != 0 || string(result.stdout) != "sleep|/launch\n" {
 		t.Fatalf("launch fallback = %#v", result)
@@ -426,9 +475,9 @@ func TestListSessionsFormatUsesActiveWindowAndPane(t *testing.T) {
 	session := newFormatTestSession(8, "active", 10)
 	session.CreatedAt = 987654321
 	secondPane := &Pane{ID: 11, Launch: PaneLaunch{Shell: "/bin/zsh", Cwd: "/second"}, terminal: newTerminal(90, 30)}
-	secondWindow, _ := session.CreateWindow(secondPane, clientID0)
+	secondWindow, _ := createTestWindow(session, secondPane)
 	secondWindow.DisplayIndex = 7
-	session.processObservations[secondPane.ID] = ProcessObservation{
+	session.daemon.processObservations[secondPane.ID] = ProcessObservation{
 		Status: StatusDetected,
 		Root:   &ObservedProcess{Cwd: "/observed-second"},
 		Candidate: &ObservedProcess{
@@ -437,11 +486,11 @@ func TestListSessionsFormatUsesActiveWindowAndPane(t *testing.T) {
 	}
 	d.sessions[session.ID] = session
 	d.names[session.Name] = session
-	t.Cleanup(session.stopOperations)
+	t.Cleanup(func() { stopState(session) })
 
 	format := "#{session_id}|#{session_name}|#{session_created}|#{window_index}|#{pane_id}|#{pane_dead}|#{pane_current_command}|#{pane_current_path}|#{pane_in_mode}"
 	result := d.executeCommand(protocol.CommandRequest{Args: []string{"list-sessions", "-F", format}})
-	want := fmt.Sprintf("8|active|987654321|7|11|0|editor|/observed-second|0\n")
+	want := "8|active|987654321|7|11|0|editor|/observed-second|0\n"
 	if result.exitCode != 0 || string(result.stdout) != want {
 		t.Fatalf("active session format = %#v, want %q", result, want)
 	}
@@ -456,8 +505,8 @@ func TestListSessionsKeepsTableAndListPanesAllUsesDaemonWideIDs(t *testing.T) {
 	d.names[first.Name] = first
 	d.names[second.Name] = second
 	t.Cleanup(func() {
-		first.stopOperations()
-		second.stopOperations()
+		stopState(first)
+		stopState(second)
 	})
 
 	table := d.executeCommand(protocol.CommandRequest{Args: []string{"list-sessions"}})
@@ -488,7 +537,7 @@ func TestListSessionsKeepsTableAndListPanesAllUsesDaemonWideIDs(t *testing.T) {
 
 func TestNewSessionRootFlagsSetRootAndInitialPaneCwd(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	callerCwd := t.TempDir()
 	root := t.TempDir()
 	result := d.executeCommand(protocol.CommandRequest{
@@ -500,7 +549,7 @@ func TestNewSessionRootFlagsSetRootAndInitialPaneCwd(t *testing.T) {
 		t.Fatalf("new --root result = %#v", result)
 	}
 	session := d.sessionByName("work")
-	pane, _ := session.ActivePane(clientID0)
+	pane, _ := testActivePane(session)
 	if session.rootDir != root || pane == nil || pane.Launch.Cwd != root {
 		t.Fatalf("created root/pane = %q %#v", session.rootDir, pane)
 	}
@@ -512,7 +561,7 @@ func TestNewSessionRootFlagsSetRootAndInitialPaneCwd(t *testing.T) {
 
 func TestNewSessionShortRootFlagResolvesRelativeToCaller(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	callerCwd := t.TempDir()
 	root := filepath.Join(callerCwd, "project")
 	if err := os.Mkdir(root, 0o755); err != nil {
@@ -531,7 +580,7 @@ func TestNewSessionShortRootFlagResolvesRelativeToCaller(t *testing.T) {
 
 func TestCommandAliasesAreResolvedByDaemon(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	created := d.executeCommand(protocol.CommandRequest{Args: []string{"new", "-s", "work"}, TerminalCols: 80, TerminalRows: 23})
 	defer d.disconnectActiveClients()
 	if created.bootstrap == nil {
@@ -568,7 +617,7 @@ func TestKillSessionCommandTargetsByNameAndID(t *testing.T) {
 	}
 
 	killedByID := d.executeCommand(protocol.CommandRequest{Args: []string{"kill-session", "-t", strconv.FormatUint(second.session.ID, 10)}})
-	if killedByID.exitCode != 0 || d.session(second.session.ID) != nil {
+	if killedByID.exitCode != 0 || testDaemonSession(d, second.session.ID) != nil {
 		t.Fatalf("kill-session by ID = %#v", killedByID)
 	}
 
@@ -578,6 +627,25 @@ func TestKillSessionCommandTargetsByNameAndID(t *testing.T) {
 	missingTarget := d.executeCommand(protocol.CommandRequest{Args: []string{"kill-session"}})
 	if missingTarget.exitCode == 0 || !strings.Contains(string(missingTarget.stderr), "requires -t") {
 		t.Fatalf("kill-session missing target = %#v", missingTarget)
+	}
+}
+
+func TestPaneCLIKillSessionInfersInjectedSession(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	created, err := d.executeSessionOperation("create-session", commandSessionTarget{name: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"kill-session"},
+		CallerSessionTarget: strconv.FormatUint(created.session.ID, 10),
+	})
+	if result.exitCode != 0 {
+		t.Fatalf("contextual kill-session = %#v", result)
+	}
+	if testDaemonSession(d, created.session.ID) != nil {
+		t.Fatal("contextual kill-session did not remove the injected session")
 	}
 }
 
@@ -599,8 +667,12 @@ func TestHelpIsGeneratedFromRegisteredCommands(t *testing.T) {
 			t.Fatalf("help output omitted %q:\n%s", want, output)
 		}
 	}
-	if strings.Contains(output, "server (stop)") {
-		t.Fatalf("help exposed legacy server command:\n%s", output)
+	if _, ok := d.commandEngine().lookup("server"); ok {
+		t.Fatal("removed server compatibility command remains registered")
+	}
+	removed := d.executeCommand(protocol.CommandRequest{Args: []string{"server", "stop"}})
+	if removed.exitCode == 0 || !strings.Contains(string(removed.stderr), `unknown command "server"`) {
+		t.Fatalf("removed server command result = %#v", removed)
 	}
 }
 
@@ -628,9 +700,42 @@ func TestHelpRejectsUnknownCommand(t *testing.T) {
 	}
 }
 
+func TestAttachedOutputCommandsRejectBeforeProducingOutputOrSideEffects(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	s := NewSessionState(71)
+	t.Cleanup(func() { stopState(s) })
+	s.daemon = d
+	s.setSessionName("work")
+	s.rootDir = t.TempDir()
+	d.sessions[s.ID] = s
+	d.names[s.Name] = s
+	d.ensureSessionGroupInActor(s)
+	createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)})
+	client := clientForState(s)
+
+	for _, argv := range [][]string{
+		{"help"},
+		{"new-session", "--help"},
+		{"list-sessions"},
+	} {
+		if _, err := client.executeAttachedCommand(argv); err == nil || !strings.Contains(err.Error(), "output is only available through the CLI") {
+			t.Fatalf("attached %v error = %v", argv, err)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "must-not-exist.meja")
+	_, err := client.executeAttachedCommand([]string{"save-session", "-t", "work", "-o", path})
+	if err == nil || !strings.Contains(err.Error(), "output is only available through the CLI") {
+		t.Fatalf("attached save-session error = %v", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("attached save-session wrote %q before rejecting it: %v", path, statErr)
+	}
+}
+
 func TestSaveAndNewFileCommandsRoundTripSession(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	root := t.TempDir()
 	created := d.executeCommand(protocol.CommandRequest{
 		Args: []string{"new", "-s", "work", "--", "/bin/sleep", "30"}, WorkingDirectory: root,
@@ -641,9 +746,29 @@ func TestSaveAndNewFileCommandsRoundTripSession(t *testing.T) {
 		t.Fatalf("new session = %#v", created)
 	}
 	path := filepath.Join(t.TempDir(), "dev.meja")
-	saved := d.executeCommand(protocol.CommandRequest{Args: []string{"save-session", "-t", "work", "-o", path}})
+	work := d.sessionByName("work")
+	if work == nil {
+		t.Fatal("created work session is unavailable")
+	}
+	saved := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"save-session", "-o", path},
+		CallerSessionTarget: strconv.FormatUint(work.ID, 10),
+		WorkingDirectory:    root,
+	})
 	if saved.exitCode != 0 {
-		t.Fatalf("save = %#v", saved)
+		t.Fatalf("contextual save = %#v", saved)
+	}
+	if output := string(saved.stdout); !strings.Contains(output, "Session root: "+root) ||
+		!strings.Contains(output, "Written to: "+path) || strings.Contains(output, "Warning: save was run from the current directory") {
+		t.Fatalf("same-root save output = %q", output)
+	}
+	standalonePath := filepath.Join(t.TempDir(), "must-not-exist.meja")
+	missingTarget := d.executeCommand(protocol.CommandRequest{Args: []string{"save-session", "-o", standalonePath}})
+	if missingTarget.exitCode == 0 || !strings.Contains(string(missingTarget.stderr), "requires -t") {
+		t.Fatalf("standalone save without target = %#v", missingTarget)
+	}
+	if _, err := os.Stat(standalonePath); !os.IsNotExist(err) {
+		t.Fatalf("standalone save wrote before rejecting its missing target: %v", err)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -670,9 +795,96 @@ func TestSaveAndNewFileCommandsRoundTripSession(t *testing.T) {
 	}
 }
 
+func TestSaveUnnamedSessionUsesOutputFilenameAsRestoreName(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	setCommandTestPersistenceDir(t, d)
+	created := d.executeCommand(protocol.CommandRequest{
+		Args: []string{"new-session", "--", "/bin/sleep", "30"}, WorkingDirectory: t.TempDir(),
+		TerminalCols: 80, TerminalRows: 23,
+	})
+	defer d.disconnectActiveClients()
+	if created.exitCode != 0 || created.session == nil || created.session.SessionName() != "" {
+		t.Fatalf("unnamed session creation = %#v", created)
+	}
+
+	path := filepath.Join(t.TempDir(), "dev7.meja")
+	saved := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"save-session", "-o", path},
+		CallerSessionTarget: strconv.FormatUint(created.session.ID, 10),
+	})
+	if saved.exitCode != 0 {
+		t.Fatalf("unnamed session save = %#v", saved)
+	}
+	plan, err := readUserSessionPlan(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Name != "dev7" {
+		t.Fatalf("restored plan name = %q, want filename-derived dev7", plan.Name)
+	}
+	restored := d.executeCommand(protocol.CommandRequest{
+		Args: []string{"new-session", "-f", path, "--commands=skip"}, WorkingDirectory: t.TempDir(),
+		TerminalCols: 80, TerminalRows: 23,
+	})
+	if restored.exitCode != 0 || d.sessionByName("dev7") == nil {
+		t.Fatalf("restore of unnamed-session save = %#v", restored)
+	}
+}
+
+func TestPaneCLISelectWindowUsesInjectedSessionWithWindowOnlyTarget(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	s := NewSessionState(17)
+	t.Cleanup(func() { stopState(s) })
+	s.daemon = d
+	s.setSessionName("work")
+	client := clientForState(s)
+	first, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)})
+	second, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)})
+	d.sessions[s.ID] = s
+	d.names[s.Name] = s
+	d.windowLeases[second.ID] = &WindowViewLease{
+		WindowID: second.ID, SessionID: s.ID, AttachmentID: client.AttachmentID, Generation: 1,
+	}
+	s.ActiveWindowID = second.ID
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"select-window", "-t", strconv.Itoa(first.DisplayIndex)},
+		CallerSessionTarget: strconv.FormatUint(s.ID, 10),
+	})
+	if result.exitCode != 0 {
+		t.Fatalf("contextual select-window = %#v", result)
+	}
+	if s.ActiveWindowID != first.ID {
+		t.Fatalf("active window = %d, want %d", s.ActiveWindowID, first.ID)
+	}
+}
+
+func TestPaneCLIRenameWindowUsesInjectedSessionWithWindowOnlyTarget(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	s := NewSessionState(17)
+	t.Cleanup(func() { stopState(s) })
+	s.daemon = d
+	s.setSessionName("work")
+	clientForState(s)
+	window, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)})
+	d.sessions[s.ID] = s
+	d.names[s.Name] = s
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"rename-window", "-t", strconv.Itoa(window.DisplayIndex), "renamed"},
+		CallerSessionTarget: strconv.FormatUint(s.ID, 10),
+	})
+	if result.exitCode != 0 {
+		t.Fatalf("contextual rename-window = %#v", result)
+	}
+	if window.Name != "renamed" {
+		t.Fatalf("window name = %q, want renamed", window.Name)
+	}
+}
+
 func TestSaveRelativeOutputUsesTargetSessionRoot(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	base := t.TempDir()
 	created := d.executeCommand(protocol.CommandRequest{
 		Args: []string{"new", "-s", "work", "--", "/bin/sleep", "30"}, WorkingDirectory: base,
@@ -700,15 +912,31 @@ func TestSaveRelativeOutputUsesTargetSessionRoot(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(invokerCwd, ".meja", "dev.meja")); !os.IsNotExist(err) {
 		t.Fatalf("save used invoking cwd: %v", err)
 	}
-	if !strings.Contains(string(saved.stdout), "Saved dev.meja.") ||
-		!strings.Contains(string(saved.stdout), "Reminder: scrub sensitive values") {
+	output := string(saved.stdout)
+	for _, want := range []string{
+		"Saved session.",
+		"Session root: " + base,
+		"Written to: " + wantPath,
+		"Warning: save was run from the current directory:\n  " + invokerCwd,
+		"which differs from the current session root:\n  " + base,
+		"If the current directory is the intended project root",
+		"run `meja set-root .` here and save again",
+		"reconstructed pane paths relative to that project root",
+		"project directory is mirrored on another machine",
+		"Reminder: review captured pane commands and scrub any sensitive values",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("save output omitted %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "Saved dev.meja.") {
 		t.Fatalf("save output = %q", saved.stdout)
 	}
 }
 
 func TestRestoreRejectsMalformedPersistenceWithoutCreatingSession(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	if err := os.MkdirAll(d.sessionPersistenceDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -728,7 +956,7 @@ func TestRestoreRejectsMalformedPersistenceWithoutCreatingSession(t *testing.T) 
 
 func TestRestoreDoesNotReadLegacyPersistenceFilename(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	if err := os.MkdirAll(d.sessionPersistenceDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -743,7 +971,7 @@ func TestRestoreDoesNotReadLegacyPersistenceFilename(t *testing.T) {
 
 func TestNewFileRejectsMalformedUserMejaWithoutCreatingSession(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	path := filepath.Join(t.TempDir(), "broken.meja")
 	if err := os.WriteFile(path, []byte("meja 1\nsession \"broken\" active-window=\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -790,7 +1018,7 @@ func TestNewFileRejectsRootAndInitialCommand(t *testing.T) {
 
 func TestNewSessionCommandRollsBackWhenInitialPaneFails(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:         []string{"new-session", "-s", "broken", "--", "/does/not/exist"},
 		TerminalCols: 80,
@@ -954,39 +1182,38 @@ func TestParseCommandLinePreservesQuotedAndEscapedArguments(t *testing.T) {
 	}
 }
 
-func TestCommandPromptAndPrefixUseTheSameSessionCommandEngine(t *testing.T) {
-	s := NewSession(1)
-	client := s.NewClient(clientID0)
+func TestCommandPromptIsClientLocalAndSubmitsToCommandEngine(t *testing.T) {
+	s := NewSessionState(1)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 80, 23
-	pane := &Pane{ID: s.AddPaneID(), Title: "bash", terminal: newTerminal(80, 23)}
-	window, _ := s.CreateWindow(pane, clientID0)
-	connection := &ClientInstance{}
-
-	s.ConsumeInputByte(clientID0, 0x02)
-	event := s.ConsumeInputByte(clientID0, ':')
-	if !isCommandInput(event, "command-prompt") {
+	pane := &Pane{ID: testAddPaneID(s), Title: "bash", terminal: newTerminal(80, 23)}
+	window, _ := createTestWindow(s, pane)
+	clientForState(s).ConsumeInputByte(0x02)
+	event := clientForState(s).ConsumeInputByte(':')
+	if event.Command != serverCommandOpenCommandPrompt {
 		t.Fatalf("command prompt binding = %#v", event)
 	}
-	if detach, err := s.handleServerInputEvent(connection, event); err != nil || detach {
+	if detach, err := clientForState(s).handleServerInputEvent(event); err != nil || detach {
 		t.Fatalf("open command prompt: detach=%v err=%v", detach, err)
 	}
-	prompt := s.ActivePrompt(clientID0)
-	if prompt == nil || prompt.Kind != PromptKindCommand || prompt.Label != ":" {
+	prompt := clientForState(s).ActivePrompt()
+	if prompt == nil || prompt.Mode != PromptModeText || prompt.Label != ":" {
 		t.Fatalf("command prompt = %#v", prompt)
 	}
 	for _, b := range []byte(`rename-window "build output"`) {
-		if detach, err := s.handleServerInputEvent(connection, s.ConsumeInputByte(clientID0, b)); err != nil || detach {
+		if detach, err := clientForState(s).handleServerInputEvent(clientForState(s).ConsumeInputByte(b)); err != nil || detach {
 			t.Fatalf("type command prompt: detach=%v err=%v", detach, err)
 		}
 	}
-	if detach, err := s.handleServerInputEvent(connection, s.ConsumeInputByte(clientID0, '\r')); err != nil || detach {
+	if detach, err := clientForState(s).handleServerInputEvent(clientForState(s).ConsumeInputByte('\r')); err != nil || detach {
 		t.Fatalf("submit command prompt: detach=%v err=%v", detach, err)
 	}
 	if got := s.Windows[window.ID].Name; got != "build output" {
 		t.Fatalf("window name = %q, want build output", got)
 	}
 
-	if _, err := s.executeSessionCommand(connection, []string{"rename-window", "direct"}); err != nil {
+	instance := clientForState(s)
+	if _, err := instance.executeAttachedCommand([]string{"rename-window", "direct"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.Windows[window.ID].Name; got != "direct" {
@@ -995,60 +1222,128 @@ func TestCommandPromptAndPrefixUseTheSameSessionCommandEngine(t *testing.T) {
 }
 
 func TestCommandPromptReportsCommandErrorsWithoutClosingInput(t *testing.T) {
-	s := NewSession(1)
-	client := s.NewClient(clientID0)
+	s := NewSessionState(1)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 80, 23
-	s.CreateWindow(&Pane{ID: s.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
-	connection := &ClientInstance{}
-
-	if _, err := s.executeSessionCommand(connection, []string{"command-prompt"}); err != nil {
+	createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 23)})
+	if _, err := clientForState(s).BeginCommandPrompt(); err != nil {
 		t.Fatal(err)
 	}
 	for _, b := range []byte("not-a-command\r") {
-		detach, err := s.handleServerInputEvent(connection, s.ConsumeInputByte(clientID0, b))
+		detach, err := clientForState(s).handleServerInputEvent(clientForState(s).ConsumeInputByte(b))
 		if err != nil || detach {
 			t.Fatalf("prompt error escaped command engine: detach=%v err=%v", detach, err)
 		}
 	}
-	state := s.SnapshotClient(clientID0)
-	if state.Prompt != nil || state.StatusMessage != `unknown command "not-a-command"` {
+	state := snapshotTestClient(s)
+	message, _ := clientForState(s).statusMessage.Load().(string)
+	if state.Prompt != nil || message != `unknown command "not-a-command"` {
 		t.Fatalf("client after command error = %#v", state)
 	}
 }
 
-func TestSwitchSessionCommandReturnsLiveHandoffRequest(t *testing.T) {
+func TestSwitchSessionCommandAppliesPreparedTransition(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	source := NewSession(1)
-	target := NewSession(2)
-	t.Cleanup(source.stopOperations)
-	t.Cleanup(target.stopOperations)
+	source := NewSessionState(1)
+	target := NewSessionState(2)
+	t.Cleanup(func() { stopState(source) })
+	t.Cleanup(func() { stopState(target) })
 	source.setSessionName("source")
 	target.setSessionName("target")
 	d.sessions[source.ID] = source
 	d.sessions[target.ID] = target
 	d.names[source.Name] = source
 	d.names[target.Name] = target
-	clientState := source.NewClient(clientID0)
+	source.daemon = d
+	target.daemon = d
+	d.ensureSessionGroupInActor(source)
+	d.ensureSessionGroupInActor(target)
+	createTestWindow(source, &Pane{ID: testAddPaneID(source), terminal: newTerminal(101, 37)})
+	createTestWindow(target, &Pane{ID: testAddPaneID(target), terminal: newTerminal(101, 37)})
+	clientState := newStandaloneClient(source)
 	clientState.TerminalCols, clientState.TerminalRows = 101, 37
-	client := &ClientInstance{Daemon: d}
-
-	_, err := source.executeSessionCommand(client, []string{"switch-session", "-t", "target"})
-	var request *sessionSwitchRequest
-	if !errors.As(err, &request) {
-		t.Fatalf("switch command error = %v, want handoff request", err)
+	clientForState(source).terminalCols.Store(101)
+	clientForState(source).terminalRows.Store(37)
+	client := clientForState(source)
+	credential := &reconnectCredential{EncodedToken: "switch-command", Instance: client}
+	client.credential = credential
+	d.clientSessions[credential] = source.ID
+	d.attachments[source.ID] = credential
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: client.AttachmentID, Generation: 1}
+	if _, err := client.executeAttachedCommand([]string{"switch-session", "-t", "target"}); err != nil {
+		t.Fatal(err)
 	}
-	if request.rawTarget != "target" || request.cols != 101 || request.rows != 37 {
-		t.Fatalf("switch request = %#v", request)
+	if client.sessionState() != target || testClientOf(source) != nil || testClientOf(target) != client {
+		t.Fatalf("switch did not install target: source=%#v target=%#v client-session=%#v", testClientOf(source), testClientOf(target), client.sessionState())
 	}
 
-	if _, err := source.executeSessionCommand(client, []string{"switch-session", "target"}); err == nil || err.Error() != "switch-session requires -t <session-target>" {
+	if _, err := client.executeAttachedCommand([]string{"switch-session", "target"}); err == nil || err.Error() != "switch-session requires -t <session-target>" {
 		t.Fatalf("missing target flag error = %v", err)
 	}
 }
 
-func TestAttachedRestoreCreatesSessionAndReturnsHandoffRequest(t *testing.T) {
+func TestSwitchSessionHandlerPreparesButDoesNotApplyClientView(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	source := NewSessionState(51)
+	target := NewSessionState(52)
+	t.Cleanup(func() { stopState(source) })
+	t.Cleanup(func() { stopState(target) })
+	for _, state := range []*SessionState{source, target} {
+		state.daemon = d
+		d.sessions[state.ID] = state
+		d.ensureSessionGroupInActor(state)
+		createTestWindow(state, &Pane{ID: testAddPaneID(state), terminal: newTerminal(80, 23)})
+	}
+	source.setSessionName("source")
+	target.setSessionName("target")
+	d.names[source.Name] = source
+	d.names[target.Name] = target
+
+	client := clientForState(source)
+	client.terminalCols.Store(80)
+	client.terminalRows.Store(23)
+	credential := &reconnectCredential{EncodedToken: "prepare-only", Instance: client}
+	client.credential = credential
+	d.clientSessions[credential] = source.ID
+	d.attachments[source.ID] = credential
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{
+		WindowID: source.ActiveWindowID, SessionID: source.ID,
+		AttachmentID: client.AttachmentID, Generation: 1,
+	}
+
+	outcome, err := d.commandEngine().run(client.commandContext(), []string{"switch-session", "-t", "target"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, ok := outcome.Action.(applyViewTransitionAction)
+	if !ok {
+		t.Fatalf("switch-session action = %T, want applyViewTransitionAction", outcome.Action)
+	}
+	if action.Transition.Projection.SessionID != target.ID {
+		t.Fatalf("prepared target session = %d, want %d", action.Transition.Projection.SessionID, target.ID)
+	}
+	if d.clients[target.ID] != client || d.clients[source.ID] != nil {
+		t.Fatalf("daemon assignment was not committed during preparation: source=%p target=%p", d.clients[source.ID], d.clients[target.ID])
+	}
+	if client.sessionID != source.ID {
+		t.Fatalf("handler applied client state: session=%d, want still %d", client.sessionID, source.ID)
+	}
+
+	// Applying a prepared transition must also support an empty client-local
+	// starting point. This is the same application path used by initial
+	// activation; daemon authorization in the prepared plan is sufficient.
+	client.sessionID = 0
+	if _, err := client.applyAttachedCommandOutcome(outcome); err != nil {
+		t.Fatal(err)
+	}
+	if client.sessionID != target.ID || client.sessionState() != target {
+		t.Fatalf("applied session = %d/%p, want %d/%p", client.sessionID, client.sessionState(), target.ID, target)
+	}
+}
+
+func TestAttachedRestoreCreatesSessionAndAppliesPreparedTransition(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	setCommandTestPersistenceDir(t, d)
 	project := t.TempDir()
 	plan := SessionPlan{
 		Version: mejaFormatVersion, Name: "persisted", Root: project, ActiveWindow: 1,
@@ -1063,72 +1358,62 @@ func TestAttachedRestoreCreatesSessionAndReturnsHandoffRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	source := NewSession(41)
-	t.Cleanup(source.stopOperations)
+	source := NewSessionState(41)
+	t.Cleanup(func() { stopState(source) })
 	source.daemon = d
 	source.setSessionName("source")
 	source.rootDir = project
-	state := source.NewClient(clientID0)
+	state := newStandaloneClient(source)
 	state.TerminalCols, state.TerminalRows = 101, 37
-	source.CreateWindow(&Pane{
-		ID: source.AddPaneID(), Launch: PaneLaunch{Cwd: project}, terminal: newTerminal(101, 37),
-	}, clientID0)
+	createTestWindow(source, &Pane{
+		ID: testAddPaneID(source), Launch: PaneLaunch{Cwd: project}, terminal: newTerminal(101, 37),
+	})
+	clientForState(source).terminalCols.Store(101)
+	clientForState(source).terminalRows.Store(37)
+
 	d.sessions[source.ID] = source
 	d.names[source.Name] = source
+	client := clientForState(source)
+	credential := &reconnectCredential{EncodedToken: "restore-command", Instance: client}
+	client.credential = credential
+	d.clientSessions[credential] = source.ID
+	d.attachments[source.ID] = credential
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: client.AttachmentID, Generation: 1}
 
-	client := &ClientInstance{Daemon: d}
-	_, err := source.executeSessionCommand(client, []string{
+	_, err := client.executeAttachedCommand([]string{
 		"restore", "-t", "persisted", "-s", "mynewsession", "--commands=skip",
 	})
-	var request *sessionSwitchRequest
-	if !errors.As(err, &request) {
-		t.Fatalf("attached restore error = %v, want handoff request", err)
+	if err != nil {
+		t.Fatal(err)
 	}
 	restored := d.sessionByName("mynewsession")
 	if restored == nil {
 		t.Fatal("attached restore did not create mynewsession")
 	}
-	if request.rawTarget != strconv.FormatUint(restored.ID, 10) || request.cols != 101 || request.rows != 37 {
-		t.Fatalf("restore handoff request = %#v, restored session ID %d", request, restored.ID)
+	if client.sessionState() != restored || testClientOf(restored) != client {
+		t.Fatalf("restore did not install restored session: client=%#v restored-client=%#v", client.sessionState(), testClientOf(restored))
 	}
 	if restored.rootDir != project {
 		t.Fatalf("restored root = %q, want %q", restored.rootDir, project)
 	}
 
-	if err := restored.coordinate(func() error {
-		restored.daemon = nil
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
 	for _, pane := range restored.PanesSnapshot() {
 		_ = terminatePane(pane)
 	}
-	select {
-	case <-restored.operationsDone:
-	case <-time.After(time.Second):
-		t.Fatal("restored session did not stop after its panes were terminated")
-	}
-	if restored.persistenceStarted.Load() {
-		select {
-		case <-restored.persistenceDone:
-		case <-time.After(time.Second):
-			t.Fatal("restored session persistence did not stop")
-		}
-	}
+	stopState(restored)
 }
 
-func TestContextualCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
+func TestPaneCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	s := NewSession(17)
-	t.Cleanup(s.stopOperations)
+	s := NewSessionState(17)
+	t.Cleanup(func() { stopState(s) })
 	s.daemon = d
 	s.setSessionName("renamed-session")
 	s.rootDir = t.TempDir()
-	s.processObserver = emptyProcessObserver{}
+	s.daemon.processObserver = emptyProcessObserver{}
 	project := t.TempDir()
-	s.NewClient(clientID0)
-	s.CreateWindow(&Pane{ID: s.AddPaneID(), Launch: PaneLaunch{Cwd: project}}, clientID0)
+	newStandaloneClient(s)
+	createTestWindow(s, &Pane{ID: testAddPaneID(s), Launch: PaneLaunch{Cwd: project}})
 	d.sessions[s.ID] = s
 	d.names[s.Name] = s
 
@@ -1138,24 +1423,51 @@ func TestContextualCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
 		CallerSessionTarget: "17",
 	})
 	if result.exitCode != 0 {
-		t.Fatalf("contextual set-root = %#v", result)
+		t.Fatalf("pane CLI set-root = %#v", result)
 	}
 	if s.rootDir != project {
-		t.Fatalf("contextual set-root changed root to %q, want %q", s.rootDir, project)
+		t.Fatalf("pane CLI set-root changed root to %q, want %q", s.rootDir, project)
+	}
+}
+
+func TestPaneCLIGroupTargetResolvesToThePaneWindowLeaseSession(t *testing.T) {
+	d := groupedTestDaemon()
+	base := groupedTestSession(d, 1, "base")
+	clientForState(base)
+	pane := &Pane{ID: testAddPaneID(base), terminal: newTerminal(80, 23)}
+	window, _ := createTestWindow(base, pane)
+	mirror := groupedTestSession(d, 2, "mirror")
+	if err := d.groupSession(base, mirror); err != nil {
+		t.Fatal(err)
+	}
+	d.windowLeases[window.ID] = &WindowViewLease{
+		WindowID: window.ID, SessionID: mirror.ID, AttachmentID: 22, Generation: 1,
+	}
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"rename-session", "renamed-mirror"},
+		CallerSessionTarget: "@" + strconv.FormatUint(base.GroupID, 10),
+		CallerPaneID:        pane.ID,
+	})
+	if result.exitCode != 0 {
+		t.Fatalf("group-contextual rename-session = %#v", result)
+	}
+	if base.SessionName() != "base" || mirror.SessionName() != "renamed-mirror" {
+		t.Fatalf("renamed sessions: base=%q mirror=%q", base.SessionName(), mirror.SessionName())
 	}
 }
 
 func TestCLIAndAttachedInvocationShareOperationalCommandHandler(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	s := NewSession(41)
-	t.Cleanup(s.stopOperations)
+	s := NewSessionState(41)
+	t.Cleanup(func() { stopState(s) })
 	s.setSessionName("work")
-	client := s.NewClient(clientID0)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 80, 23
-	left := &Pane{ID: s.AddPaneID(), Title: "left", terminal: newTerminal(80, 23)}
-	window, _ := s.CreateWindow(left, clientID0)
-	right := &Pane{ID: s.AddPaneID(), Title: "right", terminal: newTerminal(80, 23)}
-	if _, _, err := s.SplitFocusedPane(clientID0, right, SplitVertical); err != nil {
+	left := &Pane{ID: testAddPaneID(s), Title: "left", terminal: newTerminal(80, 23)}
+	window, _ := createTestWindow(s, left)
+	right := &Pane{ID: testAddPaneID(s), Title: "right", terminal: newTerminal(80, 23)}
+	if _, _, err := splitTestFocusedPane(s, right, SplitVertical); err != nil {
 		t.Fatal(err)
 	}
 	d.sessions[s.ID] = s
@@ -1176,14 +1488,14 @@ func TestCLIAndAttachedInvocationShareOperationalCommandHandler(t *testing.T) {
 		t.Fatalf("width after CLI resize = %d, want %d", placements[0].Rect.Width, initialLeftWidth+2)
 	}
 
-	connection := &ClientInstance{Daemon: d}
-	if _, err := s.executeSessionCommand(connection, []string{"rename-window", "from-prompt"}); err != nil {
+	clientInstance := clientForState(s)
+	if _, err := clientInstance.executeAttachedCommand([]string{"rename-window", "from-prompt"}); err != nil {
 		t.Fatal(err)
 	}
 	if s.Windows[window.ID].Name != "from-prompt" {
 		t.Fatalf("attached rename = %q", s.Windows[window.ID].Name)
 	}
-	if _, err := s.executeSessionCommand(connection, []string{"resize-pane", "-L", "1"}); err != nil {
+	if _, err := clientInstance.executeAttachedCommand([]string{"resize-pane", "-L", "1"}); err != nil {
 		t.Fatal(err)
 	}
 	placements = s.Windows[window.ID].Layout.Compute(Rect{Width: 80, Height: 23})
@@ -1193,8 +1505,8 @@ func TestCLIAndAttachedInvocationShareOperationalCommandHandler(t *testing.T) {
 }
 
 func TestSetRootUsesObservedPaneCwdAndDoesNotMoveExistingPane(t *testing.T) {
-	s := NewSession(42)
-	t.Cleanup(s.stopOperations)
+	s := NewSessionState(42)
+	t.Cleanup(func() { stopState(s) })
 	oldRoot := t.TempDir()
 	observedCwd := t.TempDir()
 	relativeRoot := filepath.Join(observedCwd, "project")
@@ -1203,17 +1515,18 @@ func TestSetRootUsesObservedPaneCwdAndDoesNotMoveExistingPane(t *testing.T) {
 	}
 	s.rootDir = oldRoot
 	s.setSessionName("work")
-	s.processObserver = &changingProcessObserver{name: "bash", cwd: observedCwd}
+	s.daemon = testDaemonForState(s)
+	s.daemon.processObserver = &changingProcessObserver{name: "bash", cwd: observedCwd}
 	pane := &Pane{ID: 0, Root: Identity{PID: 100, BirthToken: 1000}, Launch: PaneLaunch{Cwd: oldRoot, Shell: "/bin/sh"}}
-	s.CreateWindow(pane, clientID0)
-	connection := &ClientInstance{}
-	if _, err := s.executeSessionCommand(connection, []string{"set-root"}); err != nil {
+	createTestWindow(s, pane)
+	client := clientForState(s)
+	if _, err := client.executeAttachedCommand([]string{"set-root"}); err != nil {
 		t.Fatal(err)
 	}
-	if s.rootDir != observedCwd || pane.Launch.Cwd != oldRoot || s.sessionPersistence.Root != observedCwd {
-		t.Fatalf("set-root without path: root=%q pane=%q persistence=%#v", s.rootDir, pane.Launch.Cwd, s.sessionPersistence)
+	if s.rootDir != observedCwd || pane.Launch.Cwd != oldRoot || s.persistenceRecord().Root != observedCwd {
+		t.Fatalf("set-root without path: root=%q pane=%q persistence=%#v", s.rootDir, pane.Launch.Cwd, s.persistenceRecord())
 	}
-	if _, err := s.executeSessionCommand(connection, []string{"set-root", "project"}); err != nil {
+	if _, err := client.executeAttachedCommand([]string{"set-root", "project"}); err != nil {
 		t.Fatal(err)
 	}
 	if s.rootDir != relativeRoot || pane.Launch.Cwd != oldRoot {
@@ -1223,7 +1536,7 @@ func TestSetRootUsesObservedPaneCwdAndDoesNotMoveExistingPane(t *testing.T) {
 
 func TestSetRootControlsFutureWindowsPanesAndSaveLocation(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
 	oldRoot := t.TempDir()
 	newRoot := t.TempDir()
 	created := d.executeCommand(protocol.CommandRequest{
@@ -1256,16 +1569,19 @@ func TestSetRootControlsFutureWindowsPanesAndSaveLocation(t *testing.T) {
 	if session.rootDir != newRoot || oldCount != 1 || newCount != 2 {
 		t.Fatalf("future pane roots: session=%q old=%d new=%d", session.rootDir, oldCount, newCount)
 	}
-	recoveryPath, err := session.flushPersistence(context.Background(), d.sessionPersistenceDir)
-	if err != nil {
-		t.Fatal(err)
+	recoveryPath := filepath.Join(d.sessionPersistenceDir, "work.session.meja")
+	deadline := time.Now().Add(time.Second)
+	var recovery []byte
+	var recoveryErr error
+	for time.Now().Before(deadline) {
+		recovery, recoveryErr = os.ReadFile(recoveryPath)
+		if recoveryErr == nil && strings.Contains(string(recovery), `root "`+newRoot+`"`) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	recovery, err := os.ReadFile(recoveryPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(recovery), `root "`+newRoot+`"`) {
-		t.Fatalf("recovery file retained old root:\n%s", recovery)
+	if recoveryErr != nil || !strings.Contains(string(recovery), `root "`+newRoot+`"`) {
+		t.Fatalf("recovery file did not converge to root %q: %v\n%s", newRoot, recoveryErr, recovery)
 	}
 	saved := d.executeCommand(protocol.CommandRequest{Args: []string{"save", "-t", "work", "-o", "dev.meja"}})
 	if saved.exitCode != 0 {

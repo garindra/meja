@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +21,22 @@ import (
 
 func newCommandTestDaemon(t *testing.T) *Daemon {
 	return newCommandTestDaemonMode(t, false)
+}
+
+func setCommandTestPersistenceDir(t *testing.T, d *Daemon) string {
+	t.Helper()
+	directory := t.TempDir()
+	d.sessionPersistenceDir = directory
+	// Stop the writer before TempDir's previously registered cleanup removes
+	// its directory. The daemon's generic cleanup was registered too early to
+	// provide that ordering on its own.
+	t.Cleanup(func() {
+		d.stopPersistence()
+		if d.persistenceStarted.Load() {
+			<-d.persistenceDone
+		}
+	})
+	return directory
 }
 
 func newCommandTestDaemonWithActor(t *testing.T) *Daemon {
@@ -34,8 +52,10 @@ func newCommandTestDaemonMode(t *testing.T, withActor bool) *Daemon {
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Daemon{
 		nextID:               1,
-		sessions:             map[uint64]*Session{},
-		names:                map[string]*Session{},
+		sessions:             map[uint64]*SessionState{},
+		panes:                map[uint64]*Pane{},
+		names:                map[string]*SessionState{},
+		windowLeases:         map[uint64]*WindowViewLease{},
 		reconnectCredentials: map[string]*reconnectCredential{},
 		clientSessions:       map[*reconnectCredential]uint64{},
 		attachments:          map[uint64]*reconnectCredential{},
@@ -43,6 +63,15 @@ func newCommandTestDaemonMode(t *testing.T, withActor bool) *Daemon {
 		certHash:             hash,
 		serverCtx:            ctx,
 	}
+	d.processObserver = NewProcessObserver()
+	d.processObservations = make(map[uint64]ProcessObservation)
+	d.processSaveCandidates = make(map[uint64]processSaveCandidate)
+	d.sessionPersistions = make(map[uint64]*SessionPersistence)
+	d.obsoletePersistenceNames = make(map[uint64]map[string]struct{})
+	d.persistenceNow = make(chan struct{}, 1)
+	d.persistenceStop = make(chan struct{})
+	d.persistenceDone = make(chan struct{})
+	d.persistenceUpdates = make(chan persistenceSnapshot, 1)
 	var stopActor context.CancelFunc
 	if withActor {
 		var actorCtx context.Context
@@ -52,6 +81,10 @@ func newCommandTestDaemonMode(t *testing.T, withActor bool) *Daemon {
 	}
 	t.Cleanup(func() {
 		d.disconnectActiveClients()
+		d.stopPersistence()
+		if d.persistenceStarted.Load() {
+			<-d.persistenceDone
+		}
 		cancel()
 		d.closeQUIC()
 		if stopActor != nil {
@@ -59,6 +92,19 @@ func newCommandTestDaemonMode(t *testing.T, withActor bool) *Daemon {
 		}
 	})
 	return d
+}
+
+func prepareTestDaemonSession(d *Daemon, session *SessionState, cols, rows uint16) {
+	session.daemon = d
+	d.sessions[session.ID] = session
+	d.sessionIndex.Store(session.ID, session)
+	d.ensureSessionGroupInActor(session)
+	client := newStandaloneClient(session)
+	client.TerminalCols, client.TerminalRows = cols, rows
+	paneID, _ := d.allocatePaneIDNow()
+	if _, clientState := createTestWindow(session, &Pane{ID: paneID, terminal: newTerminal(int(cols), int(rows))}); clientState != nil {
+		clientState.TerminalCols, clientState.TerminalRows = cols, rows
+	}
 }
 
 func TestDaemonAllocatesMonotonicSessionIDsAndSingleUseAttach(t *testing.T) {
@@ -89,6 +135,18 @@ func TestSessionAttachedLogIsEmittedForEveryAttach(t *testing.T) {
 	d.logSessionAttached(7)
 	if got, want := log.String(), "meja server: session 7 attached\nmeja server: session 7 attached\n"; got != want {
 		t.Fatalf("log = %q, want %q", got, want)
+	}
+}
+
+func TestClientActorReportsPostedEventFailure(t *testing.T) {
+	var log bytes.Buffer
+	d := &Daemon{stderr: &log}
+	client := &ClientInstance{Daemon: d, AttachmentID: 17, sessionID: 9}
+	client.runPostedEvent(func() error { return fmt.Errorf("publish fallback: %w", io.ErrClosedPipe) })
+	for _, want := range []string{"client event failed", "attachment=17", "session=9", "publish fallback", "closed pipe"} {
+		if !strings.Contains(log.String(), want) {
+			t.Fatalf("client event log %q missing %q", log.String(), want)
+		}
 	}
 }
 
@@ -196,8 +254,8 @@ func TestClosedClientInstanceIsDiscardedButReconnectCredentialPersists(t *testin
 	conn := &recordingQUICConnection{}
 	instance.QUIC = conn
 	session := bootstrap.session
-	session.clientInstance = instance
-	d.detachClientInstance(instance, session)
+	setTestClient(session, instance)
+	d.detachClientInstance(instance)
 	if instance.credential.Instance != nil {
 		t.Fatal("closed client instance remained in the reconnect record")
 	}
@@ -220,16 +278,16 @@ func TestFailedReplacementAllowsObsoleteInstanceToDetachSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session.clientInstance = old
+	setTestClient(session, old)
 
 	replacement, _, err := d.resumeClientInstance(old.credential.EncodedToken)
 	if err != nil {
 		t.Fatal(err)
 	}
 	d.discardUnattachedClientInstance(replacement)
-	d.detachClientInstance(old, session)
+	d.detachClientInstance(old)
 
-	if session.clientInstance != nil {
+	if testClientOf(session) != nil {
 		t.Fatal("obsolete instance remained attached after its replacement failed")
 	}
 	if old.credential.Instance != nil {
@@ -251,7 +309,7 @@ func TestClientInstanceAssignmentMovesAtomicallyBetweenSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d.call(func() { d.assignClientInstanceLocked(instance.credential, secondBootstrap.session) })
+	d.call(func() { d.assignClientInstanceInActor(instance.credential, secondBootstrap.session) })
 	if d.clientSessions[instance.credential] != secondBootstrap.session.ID || d.attachments[firstBootstrap.session.ID] != nil || d.attachments[secondBootstrap.session.ID] != instance.credential {
 		t.Fatalf("moved instance = %#v, attachments = %#v", instance, d.attachments)
 	}
@@ -259,33 +317,37 @@ func TestClientInstanceAssignmentMovesAtomicallyBetweenSessions(t *testing.T) {
 
 func TestLiveSwitchMovesClientAssignmentWithoutChangingReconnectToken(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	source := NewSession(1)
-	target := NewSession(2)
-	t.Cleanup(source.stopOperations)
-	t.Cleanup(target.stopOperations)
-	for _, session := range []*Session{source, target} {
-		client := session.NewClient(clientID0)
-		client.TerminalCols, client.TerminalRows = 80, 23
-		session.CreateWindow(&Pane{ID: session.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
-		session.daemon = d
-		d.sessions[session.ID] = session
-	}
+	source := NewSessionState(1)
+	target := NewSessionState(2)
+	t.Cleanup(func() { stopState(source) })
+	t.Cleanup(func() { stopState(target) })
+	prepareTestDaemonSession(d, source, 80, 23)
+	// A command launched inside a Meja pane historically measured the already
+	// drawable PTY and subtracted the status row again. Model that mismatched
+	// target so the switch must reconcile it to the live client's dimensions.
+	prepareTestDaemonSession(d, target, 80, 22)
 
 	credential := &reconnectCredential{EncodedToken: "stable-token"}
 	instance := newClientInstance(d, credential)
 	instance.controlOut = make(chan protocol.Frame, 8)
+	var paneOutput bytes.Buffer
+	instance.Output[0] = testOutputLease(0, &paneOutput)
 	credential.Instance = instance
 	d.reconnectCredentials[credential.EncodedToken] = credential
 	d.clientSessions[credential] = source.ID
 	d.attachments[source.ID] = credential
-	source.clientInstance = instance
+	setTestClient(source, instance)
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: instance.AttachmentID, Generation: 1}
 
-	switched, err := d.switchClientInstance(instance, source, "2", 80, 23)
+	transition, err := d.transitionClientToSession(instance, target.ID, 80, 23)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if switched != target {
-		t.Fatalf("switched session = %#v, want target", switched)
+	if err := instance.applyViewTransition(transition); err != nil {
+		t.Fatal(err)
+	}
+	if instance.sessionState() != target {
+		t.Fatalf("switched session = %#v, want target", instance.sessionState())
 	}
 	if d.reconnectCredentials["stable-token"] != credential || credential.EncodedToken != "stable-token" {
 		t.Fatal("switch changed the reconnect-token association")
@@ -293,8 +355,21 @@ func TestLiveSwitchMovesClientAssignmentWithoutChangingReconnectToken(t *testing
 	if d.clientSessions[credential] != target.ID || d.attachments[source.ID] != nil || d.attachments[target.ID] != credential {
 		t.Fatalf("client assignment after switch: sessions=%#v attachments=%#v", d.clientSessions, d.attachments)
 	}
-	if source.clientInstance != nil || target.clientInstance != instance {
-		t.Fatalf("session clients after switch: source=%#v target=%#v", source.clientInstance, target.clientInstance)
+	if testClientOf(source) != nil || testClientOf(target) != instance {
+		t.Fatalf("session clients after switch: source=%#v target=%#v", testClientOf(source), testClientOf(target))
+	}
+	layout := decodeTestWindowLayout(t, <-instance.controlOut)
+	if len(layout.Panes) != 1 {
+		t.Fatalf("switched layout panes = %#v", layout.Panes)
+	}
+	commands := decodePendingCommands(t, paneOutput.Bytes())
+	if len(commands) == 0 || commands[0].Opcode != protocol.DisplayOpcodeStartRender {
+		t.Fatalf("switched pane output = %#v, want START_RENDER", commands)
+	}
+	if commands[0].LayoutRevision != layout.LayoutRevision || commands[0].GridCols != layout.Panes[0].Rect.Width || commands[0].GridRows != layout.Panes[0].Rect.Height {
+		t.Fatalf("switched pane grid = revision %d %dx%d, layout = revision %d %dx%d",
+			commands[0].LayoutRevision, commands[0].GridCols, commands[0].GridRows,
+			layout.LayoutRevision, layout.Panes[0].Rect.Width, layout.Panes[0].Rect.Height)
 	}
 	resumed, resumedSession, err := d.resumeClientInstance("stable-token")
 	if err != nil {
@@ -303,11 +378,103 @@ func TestLiveSwitchMovesClientAssignmentWithoutChangingReconnectToken(t *testing
 	if resumed == instance || resumedSession != target || resumed.credential != credential {
 		t.Fatalf("resume after switch = (%#v, %#v), want rebuilt client targeting %#v", resumed, resumedSession, target)
 	}
+	if resumed.AttachmentID != 0 {
+		t.Fatalf("resumed client retained attachment ID %d from its dead transport", resumed.AttachmentID)
+	}
+	if testClientOf(target) != nil {
+		t.Fatal("detached client remained in daemon client registry during reconnect")
+	}
 }
 
-func TestContextualCLIRestoreResolvesInvokerCwdAndSwitchesOuterClient(t *testing.T) {
+func TestPaneCLINewReconcilesNestedPTYSizeToLiveViewport(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	setCommandTestPersistenceDir(t, d)
+	source := NewSessionState(1)
+	prepareTestDaemonSession(d, source, 80, 23)
+	source.setSessionName("source")
+	d.names[source.Name] = source
+	d.nextID = 2
+	t.Cleanup(func() { stopState(source) })
+
+	credential := &reconnectCredential{EncodedToken: "contextual-new"}
+	instance := newClientInstance(d, credential)
+	instance.clientState.TerminalCols, instance.clientState.TerminalRows = 80, 23
+	instance.controlOut = make(chan protocol.Frame, 8)
+	var paneOutput synchronizedBuffer
+	instance.Output[0] = testOutputLease(0, &paneOutput)
+	credential.Instance = instance
+	d.reconnectCredentials[credential.EncodedToken] = credential
+	d.clientSessions[credential] = source.ID
+	d.attachments[source.ID] = credential
+	setTestClient(source, instance)
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{
+		WindowID: source.ActiveWindowID, SessionID: source.ID,
+		AttachmentID: instance.AttachmentID, Generation: 1,
+	}
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"new", "-s", "target", "--", "/bin/sleep", "30"},
+		CallerSessionTarget: "source",
+		WorkingDirectory:    t.TempDir(),
+		TerminalCols:        80,
+		// A nested CLI sees the pane's already-drawable PTY and historically
+		// reports one row less than the outer ClientInstance viewport.
+		TerminalRows: 22,
+	})
+	if result.exitCode != 0 || result.bootstrap != nil {
+		t.Fatalf("pane CLI new result = %#v", result)
+	}
+	target := d.sessionByName("target")
+	if target == nil {
+		t.Fatal("pane CLI new did not create target")
+	}
+	t.Cleanup(func() {
+		for _, pane := range target.PanesSnapshot() {
+			_ = terminatePane(pane)
+		}
+		stopState(target)
+	})
+
+	layout := decodeTestWindowLayout(t, <-instance.controlOut)
+	if len(layout.Panes) != 1 {
+		t.Fatalf("pane CLI new layout panes = %#v", layout.Panes)
+	}
+	pane := target.activePane()
+	if pane == nil {
+		t.Fatal("pane CLI new target has no active pane")
+	}
+	cols, rows := pane.TerminalSize()
+	if cols != layout.Panes[0].Rect.Width || rows != layout.Panes[0].Rect.Height || cols != 80 || rows != 23 {
+		t.Fatalf("target pane size = %dx%d, switched layout = %#v", cols, rows, layout.Panes)
+	}
+
+	type decodedCommand struct {
+		command protocol.DisplayCommand
+		err     error
+	}
+	decoded := make(chan decodedCommand, 1)
+	go func() {
+		command, _, err := protocol.NewDisplayDecoder(&paneOutput).ReadCommand()
+		decoded <- decodedCommand{command: command, err: err}
+	}()
+	select {
+	case got := <-decoded:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.command.Opcode != protocol.DisplayOpcodeStartRender ||
+			got.command.LayoutRevision != layout.LayoutRevision ||
+			got.command.GridCols != layout.Panes[0].Rect.Width ||
+			got.command.GridRows != layout.Panes[0].Rect.Height {
+			t.Fatalf("target START_RENDER = %#v, layout = %#v", got.command, layout)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pane CLI new target did not publish pane output")
+	}
+}
+
+func TestPaneCLIRestoreResolvesInvokerCwdAndSwitchesOuterClient(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	setCommandTestPersistenceDir(t, d)
 	project := t.TempDir()
 	if err := os.WriteFile(filepath.Join(project, "dev6.meja"), []byte(`root "."
 window {
@@ -317,13 +484,13 @@ window {
 		t.Fatal(err)
 	}
 
-	source := NewSession(17)
-	t.Cleanup(source.stopOperations)
+	source := NewSessionState(17)
+	t.Cleanup(func() { stopState(source) })
 	source.daemon = d
 	source.rootDir = t.TempDir()
-	state := source.NewClient(clientID0)
+	state := newStandaloneClient(source)
 	state.TerminalCols, state.TerminalRows = 100, 30
-	source.CreateWindow(&Pane{ID: source.AddPaneID(), terminal: newTerminal(100, 30)}, clientID0)
+	createTestWindow(source, &Pane{ID: testAddPaneID(source), terminal: newTerminal(100, 30)})
 	d.sessions[source.ID] = source
 
 	credential := &reconnectCredential{EncodedToken: "stable-token"}
@@ -333,69 +500,44 @@ window {
 	d.reconnectCredentials[credential.EncodedToken] = credential
 	d.clientSessions[credential] = source.ID
 	d.attachments[source.ID] = credential
-	source.clientInstance = instance
-	switchDone := completeOneTestClientSwitch(d, instance, source)
-
+	setTestClient(source, instance)
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: instance.AttachmentID, Generation: 1}
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:                []string{"new", "-f", "dev6.meja", "-s", "mynewsession", "--commands=skip"},
 		WorkingDirectory:    project,
 		CallerSessionTarget: "17",
 	})
 	if result.exitCode != 0 || result.bootstrap != nil {
-		t.Fatalf("contextual restore result = %#v", result)
-	}
-	if err := <-switchDone; err != nil {
-		t.Fatal(err)
+		t.Fatalf("pane CLI restore result = %#v", result)
 	}
 	restored := d.sessionByName("mynewsession")
 	if restored == nil {
-		t.Fatal("contextual restore did not create mynewsession")
+		t.Fatal("pane CLI restore did not create mynewsession")
 	}
 	if restored.rootDir != project {
 		t.Fatalf("restored root = %q, want %q", restored.rootDir, project)
 	}
-	if source.clientInstance != nil || restored.clientInstance != instance ||
+	if testClientOf(source) != nil || testClientOf(restored) != instance ||
 		d.clientSessions[credential] != restored.ID || d.attachments[source.ID] != nil || d.attachments[restored.ID] != credential {
-		t.Fatalf("outer client was not handed off: source=%#v restored=%#v assignments=%#v attachments=%#v",
-			source.clientInstance, restored.clientInstance, d.clientSessions, d.attachments)
+		t.Fatalf("calling client was not activated: source=%#v restored=%#v assignments=%#v attachments=%#v",
+			testClientOf(source), testClientOf(restored), d.clientSessions, d.attachments)
 	}
 
-	d.detachClientInstance(instance, restored)
-	if err := restored.coordinate(func() error {
-		restored.daemon = nil
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+	d.detachClientInstance(instance)
 	for _, pane := range restored.PanesSnapshot() {
 		_ = terminatePane(pane)
 	}
-	select {
-	case <-restored.operationsDone:
-	case <-time.After(time.Second):
-		t.Fatal("restored session did not stop")
-	}
-	if restored.persistenceStarted.Load() {
-		select {
-		case <-restored.persistenceDone:
-		case <-time.After(time.Second):
-			t.Fatal("restored persistence did not stop")
-		}
-	}
+	stopState(restored)
 }
 
-func TestContextualCLIAttachUsesGenericOuterClientHandoff(t *testing.T) {
+func TestPaneCLIAttachUsesPreparedTransitionToCallingClient(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	source := NewSession(17)
-	target := NewSession(18)
-	t.Cleanup(source.stopOperations)
-	t.Cleanup(target.stopOperations)
-	for _, session := range []*Session{source, target} {
-		state := session.NewClient(clientID0)
-		state.TerminalCols, state.TerminalRows = 80, 23
-		session.CreateWindow(&Pane{ID: session.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
-		session.daemon = d
-		d.sessions[session.ID] = session
+	source := NewSessionState(17)
+	target := NewSessionState(18)
+	t.Cleanup(func() { stopState(source) })
+	t.Cleanup(func() { stopState(target) })
+	for _, session := range []*SessionState{source, target} {
+		prepareTestDaemonSession(d, session, 80, 23)
 	}
 	target.setSessionName("target")
 	d.names[target.Name] = target
@@ -406,43 +548,24 @@ func TestContextualCLIAttachUsesGenericOuterClientHandoff(t *testing.T) {
 	credential.Instance = instance
 	d.clientSessions[credential] = source.ID
 	d.attachments[source.ID] = credential
-	source.clientInstance = instance
-	switchDone := completeOneTestClientSwitch(d, instance, source)
-
+	setTestClient(source, instance)
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: instance.AttachmentID, Generation: 1}
 	result := d.executeCommand(protocol.CommandRequest{
 		Args: []string{"attach", "-t", "target"}, CallerSessionTarget: "17",
 	})
-	if result.exitCode != 0 || result.bootstrap != nil || target.clientInstance != instance || source.clientInstance != nil {
-		t.Fatalf("contextual attach did not use generic handoff: result=%#v source=%#v target=%#v", result, source.clientInstance, target.clientInstance)
+	if result.exitCode != 0 || result.bootstrap != nil || testClientOf(target) != instance || testClientOf(source) != nil {
+		t.Fatalf("pane CLI attach did not apply its prepared view transition: result=%#v source=%#v target=%#v", result, testClientOf(source), testClientOf(target))
 	}
-	if err := <-switchDone; err != nil {
-		t.Fatal(err)
-	}
-}
-
-func completeOneTestClientSwitch(d *Daemon, instance *ClientInstance, source *Session) <-chan error {
-	done := make(chan error, 1)
-	go func() {
-		request := <-instance.sessionSwitches
-		_, err := d.switchClientInstance(instance, source, request.rawTarget, request.cols, request.rows)
-		completeSessionSwitch(request, err)
-		done <- err
-	}()
-	return done
 }
 
 func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	source := NewSession(1)
-	target := NewSession(2)
-	t.Cleanup(source.stopOperations)
-	t.Cleanup(target.stopOperations)
-	for _, session := range []*Session{source, target} {
-		client := session.NewClient(clientID0)
-		client.TerminalCols, client.TerminalRows = 80, 23
-		session.CreateWindow(&Pane{ID: session.AddPaneID(), terminal: newTerminal(80, 23)}, clientID0)
-		session.daemon = d
-		d.sessions[session.ID] = session
+	source := NewSessionState(1)
+	target := NewSessionState(2)
+	t.Cleanup(func() { stopState(source) })
+	t.Cleanup(func() { stopState(target) })
+	for _, session := range []*SessionState{source, target} {
+		prepareTestDaemonSession(d, session, 80, 23)
 	}
 
 	credential := &reconnectCredential{EncodedToken: "stable-token"}
@@ -452,21 +575,29 @@ func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 	d.clientSessions[credential] = source.ID
 	d.attachments[source.ID] = credential
 
-	if err := source.attachClientInstance(instance, 80, 23, false); err != nil {
+	instance.sessionID = source.ID
+	setTestClient(source, instance)
+	if err := instance.attachClientInstance(80, 23, false); err != nil {
 		t.Fatal(err)
 	}
 	first := decodeTestWindowLayout(t, <-instance.controlOut)
 
-	switched, err := d.switchClientInstance(instance, source, "2", 80, 23)
+	transition, err := d.transitionClientToSession(instance, target.ID, 80, 23)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.applyViewTransition(transition); err != nil {
 		t.Fatal(err)
 	}
 	second := decodeTestWindowLayout(t, <-instance.controlOut)
 	if second.LayoutRevision <= first.LayoutRevision {
 		t.Fatalf("first switch revision = %d, want greater than %d", second.LayoutRevision, first.LayoutRevision)
 	}
-
-	if _, err := d.switchClientInstance(instance, switched, "1", 80, 23); err != nil {
+	transition, err = d.transitionClientToSession(instance, source.ID, 80, 23)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.applyViewTransition(transition); err != nil {
 		t.Fatal(err)
 	}
 	third := decodeTestWindowLayout(t, <-instance.controlOut)
@@ -487,9 +618,31 @@ func decodeTestWindowLayout(t *testing.T, frame protocol.Frame) protocol.WindowL
 	return layout
 }
 
+func TestQueuedResizeBurstCollapsesBeforeInput(t *testing.T) {
+	events := make(chan clientControlEvent, 128)
+	first := clientControlEvent{frame: encodedTestFrame(t, protocol.MsgFrontendResize, protocol.FrontendResize{Cols: 1, Rows: 10}, protocol.EncodeFrontendResize)}
+	for cols := uint16(2); cols <= 100; cols++ {
+		events <- clientControlEvent{frame: encodedTestFrame(t, protocol.MsgFrontendResize, protocol.FrontendResize{Cols: cols, Rows: 10}, protocol.EncodeFrontendResize)}
+	}
+	input := clientControlEvent{frame: protocol.Frame{Type: protocol.MsgFrontendInputBytes}}
+	events <- input
+
+	batch := coalesceQueuedResizeEvents(first, events)
+	if len(batch) != 2 || batch[1].frame.Type != protocol.MsgFrontendInputBytes {
+		t.Fatalf("coalesced batch types = %#v, want latest resize then input", batch)
+	}
+	resize, err := protocol.DecodeFrontendResize(batch[0].frame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resize.Cols != 100 {
+		t.Fatalf("coalesced resize width = %d, want latest width 100", resize.Cols)
+	}
+}
+
 func TestDaemonQUICListenerResumesByClientInstance(t *testing.T) {
 	d := newCommandTestDaemonWithActor(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:         []string{"new", "--", "/bin/sleep", "30"},
 		TerminalCols: 80,
@@ -501,6 +654,17 @@ func TestDaemonQUICListenerResumesByClientInstance(t *testing.T) {
 	bootstrap := *result.bootstrap
 
 	firstConn, _, _, resumeToken := dialTestClientInstance(t, bootstrap, "")
+	var firstInstance *ClientInstance
+	var firstAttachmentID uint64
+	d.call(func() {
+		firstInstance = d.clients[result.session.ID]
+		if firstInstance != nil {
+			firstAttachmentID = firstInstance.AttachmentID
+		}
+	})
+	if firstInstance == nil || firstAttachmentID == 0 {
+		t.Fatal("initial transport was not registered as the live client instance")
+	}
 	_ = firstConn.CloseWithError(1, "test disconnect")
 	secondConn, _, _, resumedToken := dialTestClientInstance(t, bootstrap, resumeToken)
 	defer secondConn.CloseWithError(0, "")
@@ -508,11 +672,31 @@ func TestDaemonQUICListenerResumesByClientInstance(t *testing.T) {
 	if resumeToken == "" || resumedToken != resumeToken {
 		t.Fatalf("resume credential changed from %q to %q", resumeToken, resumedToken)
 	}
+	var secondInstance *ClientInstance
+	var secondAttachmentID uint64
+	deadline := time.Now().Add(time.Second)
+	for secondInstance == nil && time.Now().Before(deadline) {
+		d.call(func() {
+			secondInstance = d.clients[result.session.ID]
+			if secondInstance != nil {
+				secondAttachmentID = secondInstance.AttachmentID
+			}
+		})
+		if secondInstance == nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if secondInstance == nil || secondInstance == firstInstance {
+		t.Fatalf("reconnect registry client = %#v, want a replacement for %#v", secondInstance, firstInstance)
+	}
+	if secondAttachmentID == 0 || secondAttachmentID == firstAttachmentID {
+		t.Fatalf("reconnect attachment ID = %d, want fresh ID distinct from %d", secondAttachmentID, firstAttachmentID)
+	}
 }
 
 func TestNormalDetachWaitsForFrontendTerminalExitCompletion(t *testing.T) {
 	d := newCommandTestDaemonWithActor(t)
-	d.sessionPersistenceDir = t.TempDir()
+	setCommandTestPersistenceDir(t, d)
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:         []string{"new", "--", "/bin/sleep", "30"},
 		TerminalCols: 80,
@@ -559,9 +743,66 @@ func TestNormalDetachWaitsForFrontendTerminalExitCompletion(t *testing.T) {
 	}
 }
 
-func TestContextualRestoreRetargetsLiveInputLoop(t *testing.T) {
+func TestResizeBurstPreservesDetachInput(t *testing.T) {
 	d := newCommandTestDaemonWithActor(t)
-	d.sessionPersistenceDir = filepath.Join(t.TempDir(), "sessions")
+	var serverLog bytes.Buffer
+	d.stderr = &serverLog
+	setCommandTestPersistenceDir(t, d)
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:         []string{"new", "--", "/bin/sleep", "30"},
+		TerminalCols: 80,
+		TerminalRows: 23,
+	})
+	if result.exitCode != 0 || result.bootstrap == nil {
+		t.Fatalf("create result = %#v", result)
+	}
+
+	conn, control, decoder, _ := dialTestClientInstance(t, *result.bootstrap, "")
+	defer conn.CloseWithError(0, "")
+	encoder := protocol.NewEncoder(control)
+	for index := 0; index < 64; index++ {
+		resize := protocol.FrontendResize{Cols: uint16(40 + index%41), Rows: uint16(12 + index%13)}
+		if index == 63 {
+			resize = protocol.FrontendResize{Cols: 47, Rows: 18}
+		}
+		frame := encodedTestFrame(t, protocol.MsgFrontendResize, resize, protocol.EncodeFrontendResize)
+		if got, err := protocol.DecodeFrontendResize(frame.Payload); err != nil || got != resize {
+			t.Fatalf("encoded resize = %#v, %v, want %#v", got, err, resize)
+		}
+		if err := encoder.WriteFrame(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	detach := encodedTestFrame(t, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: []byte{0x02, 'd'}}, protocol.EncodeFrontendInputBytes)
+	if err := encoder.WriteFrame(detach); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := control.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		frame, err := decoder.ReadFrame()
+		if err != nil {
+			t.Fatalf("detach input was starved behind resize burst: %v; server log: %s", err, serverLog.String())
+		}
+		if frame.Type == protocol.MsgFrontendExecuteTerminalExitCommand {
+			break
+		}
+	}
+
+	client := clientForState(result.session)
+	if client == nil {
+		t.Fatal("attached client disappeared before detach completed")
+	}
+	if gotCols, gotRows := client.terminalCols.Load(), client.terminalRows.Load(); gotCols != 47 || gotRows != 18 {
+		t.Fatalf("terminal size before detach = %dx%d, want latest queued size 47x18", gotCols, gotRows)
+	}
+}
+
+func TestPaneCLIRestoreRetargetsLiveInputLoop(t *testing.T) {
+	d := newCommandTestDaemonWithActor(t)
+	setCommandTestPersistenceDir(t, d)
 	sourceRoot := t.TempDir()
 	created := d.executeCommand(protocol.CommandRequest{
 		Args: []string{"new", "-s", "source", "--", "/bin/sleep", "30"}, WorkingDirectory: sourceRoot,
@@ -588,11 +829,11 @@ window {
 		CallerSessionTarget: strconv.FormatUint(source.ID, 10),
 	})
 	if result.exitCode != 0 || result.bootstrap != nil {
-		t.Fatalf("contextual restore = %#v", result)
+		t.Fatalf("pane CLI restore = %#v", result)
 	}
 	target := d.sessionByName("target")
 	if target == nil {
-		t.Fatal("contextual restore did not create target")
+		t.Fatal("pane CLI restore did not create target")
 	}
 
 	resize := encodedTestFrame(t, protocol.MsgFrontendResize, protocol.FrontendResize{Cols: 99, Rows: 31}, protocol.EncodeFrontendResize)
@@ -602,9 +843,9 @@ window {
 	deadline := time.Now().Add(time.Second)
 	for {
 		var cols, rows uint16
-		if err := target.coordinate(func() error {
-			if state := target.Clients[clientID0]; state != nil {
-				cols, rows = state.TerminalCols, state.TerminalRows
+		if err := runStateOperation(target, func() error {
+			if window := target.Windows[target.ActiveWindowID]; window != nil {
+				cols, rows = window.Cols, window.Rows
 			}
 			return nil
 		}); err != nil {
@@ -614,7 +855,7 @@ window {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("post-handoff input remained frozen: target size=%dx%d", cols, rows)
+			t.Fatalf("post-transition input remained frozen: target size=%dx%d", cols, rows)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -623,13 +864,13 @@ window {
 	stopPersistenceTestSession(t, target)
 }
 
-func waitForAttachedClient(t *testing.T, session *Session) {
+func waitForAttachedClient(t *testing.T, session *SessionState) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
 		attached := false
-		if err := session.coordinate(func() error {
-			attached = session.clientInstance != nil
+		if err := runStateOperation(session, func() error {
+			attached = testClientOf(session) != nil
 			return nil
 		}); err != nil {
 			t.Fatal(err)
@@ -644,29 +885,12 @@ func waitForAttachedClient(t *testing.T, session *Session) {
 	}
 }
 
-func stopPersistenceTestSession(t *testing.T, session *Session) {
+func stopPersistenceTestSession(t *testing.T, session *SessionState) {
 	t.Helper()
-	if err := session.coordinate(func() error {
-		session.daemon = nil
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
 	for _, pane := range session.PanesSnapshot() {
 		_ = terminatePane(pane)
 	}
-	select {
-	case <-session.operationsDone:
-	case <-time.After(time.Second):
-		t.Fatal("session did not stop")
-	}
-	if session.persistenceStarted.Load() {
-		select {
-		case <-session.persistenceDone:
-		case <-time.After(time.Second):
-			t.Fatal("session persistence did not stop")
-		}
-	}
+	stopState(session)
 }
 
 func dialTestClientInstance(t *testing.T, bootstrap protocol.CommandBootstrap, token string) (quic.Connection, quic.Stream, *protocol.Decoder, string) {
@@ -760,7 +984,7 @@ func encodedTestFrame[T any](t *testing.T, frameType uint64, message T, encode f
 }
 
 func TestDaemonListsSessionIDsInOrder(t *testing.T) {
-	d := &Daemon{sessions: map[uint64]*Session{9: {}, 2: {}, 4: {}}}
+	d := &Daemon{sessions: map[uint64]*SessionState{9: {}, 2: {}, 4: {}}}
 	operation, err := d.executeSessionOperation("list-sessions", commandSessionTarget{})
 	if err != nil {
 		t.Fatal(err)
@@ -832,7 +1056,7 @@ func TestSessionsShareDaemonQUICPort(t *testing.T) {
 		t.Fatal("reconnect reused the initial attach token")
 	}
 
-	if err := first.session.shutdown(); err != nil {
+	if err := d.shutdownSession(first.session); err != nil {
 		t.Fatal(err)
 	}
 	if rebound, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: int(first.bootstrap.Port)}); err == nil {

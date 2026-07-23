@@ -21,6 +21,7 @@ type renderDiagnosticKind uint8
 const (
 	renderDiagnosticCommand renderDiagnosticKind = iota + 1
 	renderDiagnosticRedraw
+	renderDiagnosticProjection
 	renderDiagnosticStop
 )
 
@@ -98,6 +99,13 @@ func (d *renderDiagnostics) reportRedraw(reason string, writeBytes int) {
 	d.report(renderDiagnosticReport{kind: renderDiagnosticRedraw, reason: reason, writeBytes: writeBytes})
 }
 
+func (d *renderDiagnostics) reportProjection(reason string) {
+	if d == nil {
+		return
+	}
+	d.report(renderDiagnosticReport{kind: renderDiagnosticProjection, reason: reason})
+}
+
 func (d *renderDiagnostics) report(report renderDiagnosticReport) {
 	select {
 	case d.reports <- report:
@@ -136,6 +144,8 @@ func (d *renderDiagnostics) run(writer io.Writer) {
 				state.recordCommand(report)
 			case renderDiagnosticRedraw:
 				state.recordRedraw(report)
+			case renderDiagnosticProjection:
+				state.logf("projection %s", report.reason)
 			case renderDiagnosticStop:
 				if timer != nil {
 					timer.Stop()

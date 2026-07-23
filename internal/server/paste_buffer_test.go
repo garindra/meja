@@ -87,11 +87,11 @@ func TestPasteBufferCommandsRoundTripAndDelete(t *testing.T) {
 
 func TestPasteBufferCommandUsesTmuxSeparatorsAndDeletes(t *testing.T) {
 	d := newCommandTestDaemon(t)
-	s := NewSession(1)
-	t.Cleanup(s.stopOperations)
+	s := NewSessionState(1)
+	t.Cleanup(func() { stopState(s) })
 	s.daemon = d
 	s.setSessionName("work")
-	client := s.NewClient(clientID0)
+	client := newStandaloneClient(s)
 	client.TerminalCols, client.TerminalRows = 8, 1
 	reader, writer, err := os.Pipe()
 	if err != nil {
@@ -99,9 +99,9 @@ func TestPasteBufferCommandUsesTmuxSeparatorsAndDeletes(t *testing.T) {
 	}
 	defer reader.Close()
 	defer writer.Close()
-	pane := &Pane{ID: s.AddPaneID(), PTY: writer, terminal: newTerminal(8, 1)}
+	pane := &Pane{ID: testAddPaneID(s), PTY: writer, terminal: newTerminal(8, 1)}
 	pane.metadata.Store(&paneTerminalMetadata{bracketedPaste: true})
-	s.CreateWindow(pane, clientID0)
+	createTestWindow(s, pane)
 	d.sessions[s.ID] = s
 	d.names[s.Name] = s
 
