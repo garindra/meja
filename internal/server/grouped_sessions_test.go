@@ -197,6 +197,9 @@ func TestGroupedSessionViewsKeepFocusIndependent(t *testing.T) {
 	if base.WindowViews[1].FocusedPaneID != 2 || mirror.WindowViews[1].FocusedPaneID != 1 {
 		t.Fatalf("independent views base=%#v mirror=%#v", base.WindowViews[1], mirror.WindowViews[1])
 	}
+	if base.persistenceRecord().WindowViews[0].FocusedPaneIndex != 1 || mirror.persistenceRecord().WindowViews[0].FocusedPaneIndex != 0 {
+		t.Fatalf("persisted focus positions base=%#v mirror=%#v", base.persistenceRecord().WindowViews, mirror.persistenceRecord().WindowViews)
+	}
 }
 
 func TestGroupedNewWindowLinksEverySessionButActivatesOnlyInvoker(t *testing.T) {
@@ -230,6 +233,9 @@ func TestGroupedResizeChangesOnlyViewedWindow(t *testing.T) {
 	firstRevision, secondRevision := first.LayoutRevision, second.LayoutRevision
 	if _, _, err := selectTestSessionWindow(base, first.ID); err != nil {
 		t.Fatal(err)
+	}
+	if base.persistenceRecord().Plan.ActiveWindowIndex != 0 {
+		t.Fatalf("persisted active window index = %d, want 0", base.persistenceRecord().Plan.ActiveWindowIndex)
 	}
 	if err := resizeTestSessionActiveWindow(base, 120, 30); err != nil {
 		t.Fatal(err)

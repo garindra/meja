@@ -351,7 +351,7 @@ func TestRestoreRemapsLayoutLocalPaneReferencesToFreshDaemonIDs(t *testing.T) {
 	base := t.TempDir()
 	path := filepath.Join(t.TempDir(), "project.meja")
 	plan := SessionPlan{
-		Version: mejaFormatVersion, Name: "project", Root: base, ActiveWindow: 1,
+		Version: mejaFormatVersion, Name: "project", Root: base, ActiveWindowIndex: 0,
 		Windows: []PlanWindow{
 			{Cwd: base, ActivePane: 0, Layout: PlanLayout{Pane: paneIDRef(0)}, Panes: []PlanPane{{ID: 0, Cwd: base}}},
 			{Cwd: base, ActivePane: 0, Layout: PlanLayout{Pane: paneIDRef(0)}, Panes: []PlanPane{{ID: 0, Cwd: base}}},
@@ -1355,7 +1355,7 @@ func TestAttachedRestoreCreatesSessionAndAppliesPreparedTransition(t *testing.T)
 	setCommandTestPersistenceDir(t, d)
 	project := t.TempDir()
 	plan := SessionPlan{
-		Version: mejaFormatVersion, Name: "persisted", Root: project, ActiveWindow: 1,
+		Version: mejaFormatVersion, Name: "persisted", Root: project, ActiveWindowIndex: 0,
 		Windows: []PlanWindow{{
 			ID: 1, Cwd: project, ActivePane: 1, Layout: PlanLayout{Pane: paneIDRef(1)},
 			Panes: []PlanPane{{ID: 1, Cwd: project}},

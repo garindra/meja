@@ -24,7 +24,7 @@ var errSessionChangedDuringCapture = errors.New("session changed while it was be
 
 const (
 	mejaFormatVersion         = 1
-	persistenceSchemaVersion  = 2
+	persistenceSchemaVersion  = 3
 	sessionPersistenceTimeout = 10 * time.Second
 )
 
@@ -69,36 +69,36 @@ type SessionPlan struct {
 	// Name is restore context, not part of the user-owned .meja document.
 	// Readers derive it from the filename and callers may override it with -s.
 	// Private SessionPersistence validates and stores its own required name.
-	Name         string
-	Root         string
-	ActiveWindow int
-	Windows      []PlanWindow
+	Name              string
+	Root              string
+	ActiveWindowIndex int
+	Windows           []PlanWindow
 }
 
 // SessionPersistence is Meja's private recovery record for one named live
 // session. Plan paths and Root are absolute machine-local paths in memory.
 type SessionPersistence struct {
-	Version          int
-	Schema           int
-	SessionID        uint64
-	GroupID          uint64
-	Name             string
-	SavedAt          time.Time
-	Profile          string
-	Root             string
-	ActiveWindowID   uint64
-	PreviousWindowID uint64
-	WindowViews      []SessionViewPersistence
-	Plan             SessionPlan
+	Version                int
+	Schema                 int
+	SessionID              uint64
+	GroupID                uint64
+	Name                   string
+	SavedAt                time.Time
+	Profile                string
+	Root                   string
+	PreviousWindowIndex    int
+	HasPreviousWindowIndex bool
+	WindowViews            []SessionWindowViewPersistence
+	Plan                   SessionPlan
 }
 
-// SessionViewPersistence is durable session-local view state. It never
+// SessionWindowViewPersistence is durable session-local window-view state. It never
 // contains leases, clients, transports, or pane runtime state.
-type SessionViewPersistence struct {
-	WindowID      uint64
-	DisplayIndex  int
-	FocusedPaneID uint64
-	ZoomedPaneID  uint64
+type SessionWindowViewPersistence struct {
+	WindowIndex        int
+	FocusedPaneIndex   int
+	ZoomedPaneIndex    int
+	HasZoomedPaneIndex bool
 }
 
 type PlanWindow struct {
@@ -321,13 +321,15 @@ func sessionPlanFromCapture(capture SessionCapture) (SessionPlan, error) {
 		Root:    capture.SessionRoot,
 		Windows: make([]PlanWindow, 0, len(capture.Windows)),
 	}
+	foundActiveWindow := false
 	panes := make(map[uint64]PaneCapture, len(capture.Panes))
 	for _, pane := range capture.Panes {
 		panes[pane.PaneID] = pane
 	}
 	for index, window := range capture.Windows {
 		if window.WindowID == capture.ActiveWindowID {
-			plan.ActiveWindow = index + 1
+			plan.ActiveWindowIndex = index
+			foundActiveWindow = true
 		}
 		output := PlanWindow{
 			ID:            window.WindowID,
@@ -351,8 +353,8 @@ func sessionPlanFromCapture(capture SessionCapture) (SessionPlan, error) {
 		}
 		plan.Windows = append(plan.Windows, output)
 	}
-	if plan.ActiveWindow == 0 && len(plan.Windows) > 0 {
-		plan.ActiveWindow = 1
+	if !foundActiveWindow {
+		plan.ActiveWindowIndex = 0
 	}
 	if err := validateSessionPlan(plan); err != nil {
 		return SessionPlan{}, err
@@ -413,7 +415,7 @@ func validateSessionPlan(plan SessionPlan) error {
 	if len(plan.Windows) == 0 {
 		return errors.New(".meja session contains no windows")
 	}
-	if plan.ActiveWindow < 1 || plan.ActiveWindow > len(plan.Windows) {
+	if plan.ActiveWindowIndex < 0 || plan.ActiveWindowIndex >= len(plan.Windows) {
 		return errors.New(".meja active window is out of range")
 	}
 	for windowIndex, window := range plan.Windows {
@@ -465,10 +467,7 @@ func validateSessionPersistence(persistence SessionPersistence) error {
 	if persistence.Version != mejaFormatVersion {
 		return fmt.Errorf("unsupported .meja version %d", persistence.Version)
 	}
-	if persistence.Schema == 0 {
-		persistence.Schema = 1
-	}
-	if persistence.Schema != 1 && persistence.Schema != persistenceSchemaVersion {
+	if persistence.Schema != persistenceSchemaVersion {
 		return fmt.Errorf("unsupported session persistence schema %d", persistence.Schema)
 	}
 	if err := validateSessionName(persistence.Name); err != nil {
@@ -573,6 +572,8 @@ func (s *SessionState) persistWindowForPersistence(windowID uint64) {
 	for index := range persisted.Plan.Windows {
 		if persisted.Plan.Windows[index].ID == windowID {
 			persisted.Plan.Windows[index] = projected
+			record := s.newPersistenceRecord(persisted.Plan)
+			s.setPersistenceRecord(&record)
 			s.queuePersistenceWrite()
 			return
 		}
@@ -649,35 +650,51 @@ func (s *SessionState) ensureSessionPersistence() *SessionPersistence {
 		return nil
 	}
 	s.setPersistenceRecord(&SessionPersistence{
-		Version:   mejaFormatVersion,
-		SessionID: s.ID,
-		Name:      s.Name,
-		SavedAt:   time.Now(),
-		Root:      s.rootDir,
-		Plan:      *plan,
+		Version: mejaFormatVersion, Schema: persistenceSchemaVersion,
+		SessionID: s.ID, Name: s.Name, SavedAt: time.Now(),
+		Root: s.rootDir, Plan: *plan,
 	})
 	return s.persistenceRecord()
 }
 
 func (s *SessionState) newPersistenceRecord(plan SessionPlan) SessionPersistence {
 	record := SessionPersistence{
-		Version:          mejaFormatVersion,
-		Schema:           persistenceSchemaVersion,
-		SessionID:        s.ID,
-		GroupID:          s.GroupID,
-		Name:             s.Name,
-		SavedAt:          time.Now(),
-		Root:             s.rootDir,
-		ActiveWindowID:   s.ActiveWindowID,
-		PreviousWindowID: s.PreviousWindowID,
-		Plan:             plan,
+		Version:   mejaFormatVersion,
+		Schema:    persistenceSchemaVersion,
+		SessionID: s.ID,
+		GroupID:   s.GroupID,
+		Name:      s.Name,
+		SavedAt:   time.Now(),
+		Root:      s.rootDir,
+		Plan:      plan,
+	}
+	for index, window := range plan.Windows {
+		if window.ID == s.PreviousWindowID {
+			record.PreviousWindowIndex = index
+			record.HasPreviousWindowIndex = true
+			break
+		}
 	}
 	for _, link := range s.Links {
 		view := s.WindowViews[link.WindowID]
-		record.WindowViews = append(record.WindowViews, SessionViewPersistence{
-			WindowID: link.WindowID, DisplayIndex: link.DisplayIndex,
-			FocusedPaneID: view.FocusedPaneID, ZoomedPaneID: view.ZoomedPaneID,
-		})
+		savedView := SessionWindowViewPersistence{}
+		for windowIndex, window := range plan.Windows {
+			if window.ID != link.WindowID {
+				continue
+			}
+			savedView.WindowIndex = windowIndex
+			for paneIndex, pane := range window.Panes {
+				if pane.ID == view.FocusedPaneID {
+					savedView.FocusedPaneIndex = paneIndex
+				}
+				if view.ZoomedPaneID != 0 && pane.ID == view.ZoomedPaneID {
+					savedView.ZoomedPaneIndex = paneIndex
+					savedView.HasZoomedPaneIndex = true
+				}
+			}
+			break
+		}
+		record.WindowViews = append(record.WindowViews, savedView)
 	}
 	return record
 }
@@ -700,7 +717,7 @@ func (s *SessionState) projectSessionPlan(processes map[uint64]processSaveProjec
 		}
 		plan.Windows = append(plan.Windows, projected)
 	}
-	plan.ActiveWindow = s.plannedActiveWindow()
+	plan.ActiveWindowIndex = s.plannedActiveWindowIndex()
 	return plan, nil
 }
 
@@ -751,16 +768,16 @@ func (s *SessionState) planWindows() []*Window {
 	return windows
 }
 
-func (s *SessionState) plannedActiveWindow() int {
+func (s *SessionState) plannedActiveWindowIndex() int {
 	activeID := s.ActiveWindowID
 	windows := s.planWindows()
 	for index, window := range windows {
 		if window.ID == activeID {
-			return index + 1
+			return index
 		}
 	}
 	if len(windows) > 0 {
-		return 1
+		return 0
 	}
 	return 0
 }
@@ -926,10 +943,10 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 			s.daemon.paneIndex.Store(restored.pane.ID, restored.pane)
 		}
 	}
-	windowIDs := make(map[uint64]uint64, len(plan.Windows))
+	windowsByDisplay := make(map[int]uint64, len(plan.Windows))
 	for index, persistedWindow := range plan.Windows {
 		windowID := uint64(index + 1)
-		windowIDs[persistedWindow.ID] = windowID
+		windowsByDisplay[index] = windowID
 		layoutCycleIndex := layoutPresetCustom
 		if preset, ok := namedLayoutPreset(persistedWindow.NamedLayout); ok {
 			layoutCycleIndex = preset
@@ -946,6 +963,9 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 			LayoutRevision:   s.lastWindowLayoutRevision,
 			layoutCycleIndex: layoutCycleIndex,
 		}
+		if !windowHasPane(window, window.ActivePaneID) {
+			window.ActivePaneID = windowPrimaryPaneID(window)
+		}
 		s.Windows[windowID] = window
 		if s.daemon != nil {
 			s.daemon.windowIndex.Store(windowID, window)
@@ -956,7 +976,7 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 			}
 		}
 		s.Links = append(s.Links, WindowLink{WindowID: windowID, DisplayIndex: index})
-		s.WindowViews[windowID] = SessionWindowView{FocusedPaneID: persistedWindow.ActivePane}
+		s.WindowViews[windowID] = SessionWindowView{FocusedPaneID: window.ActivePaneID}
 		if s.group != nil {
 			s.group.Windows[windowID] = window
 		}
@@ -969,21 +989,34 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 			s.group.Panes[paneID] = pane
 		}
 	}
-	s.ActiveWindowID = uint64(plan.ActiveWindow)
+	s.ActiveWindowID = uint64(plan.ActiveWindowIndex + 1)
 	if persisted != nil {
-		if active := windowIDs[persisted.ActiveWindowID]; active != 0 {
-			s.ActiveWindowID = active
-		}
-		if previous := windowIDs[persisted.PreviousWindowID]; previous != 0 {
-			s.PreviousWindowID = previous
+		if persisted.HasPreviousWindowIndex {
+			s.PreviousWindowID = windowsByDisplay[persisted.PreviousWindowIndex]
 		}
 		for _, savedView := range persisted.WindowViews {
-			windowID := windowIDs[savedView.WindowID]
+			windowID := windowsByDisplay[savedView.WindowIndex]
 			if windowID == 0 {
 				continue
 			}
-			s.WindowViews[windowID] = SessionWindowView{FocusedPaneID: savedView.FocusedPaneID, ZoomedPaneID: savedView.ZoomedPaneID}
+			window := s.Windows[windowID]
+			view := s.WindowViews[windowID]
+			plannedWindow := plan.Windows[savedView.WindowIndex]
+			if savedView.FocusedPaneIndex >= 0 && savedView.FocusedPaneIndex < len(plannedWindow.Panes) {
+				view.FocusedPaneID = plannedWindow.Panes[savedView.FocusedPaneIndex].ID
+			} else {
+				view.FocusedPaneID = windowPrimaryPaneID(window)
+			}
+			if savedView.HasZoomedPaneIndex && savedView.ZoomedPaneIndex >= 0 && savedView.ZoomedPaneIndex < len(plannedWindow.Panes) {
+				view.ZoomedPaneID = plannedWindow.Panes[savedView.ZoomedPaneIndex].ID
+			} else {
+				view.ZoomedPaneID = 0
+			}
+			s.WindowViews[windowID] = view
 		}
+	}
+	if s.Windows[s.ActiveWindowID] == nil {
+		s.ActiveWindowID = windowsByDisplay[0]
 	}
 	s.rootDir = plan.Root
 	s.initializeRestoredPersistence(plan)
@@ -1013,19 +1046,26 @@ func (d *Daemon) restoreSessionView(s *SessionState, persisted SessionPersistenc
 		byDisplay[window.DisplayIndex] = window
 	}
 	for _, savedView := range persisted.WindowViews {
-		window := byDisplay[savedView.DisplayIndex]
+		window := byDisplay[savedView.WindowIndex]
 		if window == nil {
 			continue
 		}
-		s.WindowViews[window.ID] = SessionWindowView{FocusedPaneID: savedView.FocusedPaneID, ZoomedPaneID: savedView.ZoomedPaneID}
-	}
-	if persisted.ActiveWindowID != 0 {
-		for _, window := range group.Windows {
-			if window.ID == persisted.ActiveWindowID {
-				s.ActiveWindowID = window.ID
-				break
-			}
+		view := s.WindowViews[window.ID]
+		paneIDs := window.Layout.PaneIDs()
+		if savedView.FocusedPaneIndex >= 0 && savedView.FocusedPaneIndex < len(paneIDs) {
+			view.FocusedPaneID = paneIDs[savedView.FocusedPaneIndex]
+		} else {
+			view.FocusedPaneID = windowPrimaryPaneID(window)
 		}
+		if savedView.HasZoomedPaneIndex && savedView.ZoomedPaneIndex >= 0 && savedView.ZoomedPaneIndex < len(paneIDs) {
+			view.ZoomedPaneID = paneIDs[savedView.ZoomedPaneIndex]
+		} else {
+			view.ZoomedPaneID = 0
+		}
+		s.WindowViews[window.ID] = view
+	}
+	if window := byDisplay[persisted.Plan.ActiveWindowIndex]; window != nil {
+		s.ActiveWindowID = window.ID
 	}
 	if s.ActiveWindowID == 0 {
 		ids := s.orderedWindowIDs()
@@ -1033,8 +1073,10 @@ func (d *Daemon) restoreSessionView(s *SessionState, persisted SessionPersistenc
 			s.ActiveWindowID = ids[0]
 		}
 	}
-	if persisted.PreviousWindowID != 0 {
-		s.PreviousWindowID = persisted.PreviousWindowID
+	if persisted.HasPreviousWindowIndex {
+		if window := byDisplay[persisted.PreviousWindowIndex]; window != nil {
+			s.PreviousWindowID = window.ID
+		}
 	}
 	if d.sessions[s.ID] != s {
 		return errSessionUnavailable
@@ -1142,7 +1184,7 @@ func planDocumentNodes(plan SessionPlan, private bool) []*document.Node {
 	nodes = append(nodes, root)
 	if private {
 		activeWindow := node("active-window")
-		activeWindow.AddArgument(plan.ActiveWindow-1, "")
+		activeWindow.AddArgument(plan.ActiveWindowIndex, "")
 		nodes = append(nodes, activeWindow)
 	}
 	for _, persistedWindow := range plan.Windows {
@@ -1214,6 +1256,9 @@ func encodeUserSessionPlan(plan SessionPlan, outputPath string) ([]byte, PlanPor
 }
 
 func encodeSessionPersistence(persistence SessionPersistence) ([]byte, error) {
+	if persistence.Schema == 0 {
+		persistence.Schema = persistenceSchemaVersion
+	}
 	if err := validateSessionPersistence(persistence); err != nil {
 		return nil, err
 	}
@@ -1231,22 +1276,18 @@ func encodeSessionPersistence(persistence SessionPersistence) ([]byte, error) {
 		session.AddProperty("group-id", persistence.GroupID, "")
 	}
 	session.AddProperty("saved-at", persistence.SavedAt.Format(time.RFC3339), "").Flag = document.FlagQuoted
-	if persistence.ActiveWindowID != 0 {
-		session.AddProperty("active-window-id", persistence.ActiveWindowID, "")
-	}
-	if persistence.PreviousWindowID != 0 {
-		session.AddProperty("previous-window-id", persistence.PreviousWindowID, "")
+	if persistence.HasPreviousWindowIndex {
+		session.AddProperty("previous-window-index", persistence.PreviousWindowIndex, "")
 	}
 	if persistence.Profile != "" {
 		session.AddProperty("profile", persistence.Profile, "").Flag = document.FlagQuoted
 	}
 	for _, view := range persistence.WindowViews {
 		n := node("view")
-		n.AddProperty("window-id", view.WindowID, "")
-		n.AddProperty("display-index", view.DisplayIndex, "")
-		n.AddProperty("focused-pane-id", view.FocusedPaneID, "")
-		if view.ZoomedPaneID != 0 {
-			n.AddProperty("zoomed-pane-id", view.ZoomedPaneID, "")
+		n.AddProperty("window-index", view.WindowIndex, "")
+		n.AddProperty("focused-pane-index", view.FocusedPaneIndex, "")
+		if view.HasZoomedPaneIndex {
+			n.AddProperty("zoomed-pane-index", view.ZoomedPaneIndex, "")
 		}
 		session.AddNode(n)
 	}
@@ -1538,7 +1579,7 @@ func cloneSessionPlan(plan SessionPlan) SessionPlan {
 func cloneSessionPersistence(persistence SessionPersistence) SessionPersistence {
 	clone := persistence
 	clone.Plan = cloneSessionPlan(persistence.Plan)
-	clone.WindowViews = append([]SessionViewPersistence(nil), persistence.WindowViews...)
+	clone.WindowViews = append([]SessionWindowViewPersistence(nil), persistence.WindowViews...)
 	return clone
 }
 
@@ -1682,48 +1723,40 @@ func parseSessionPersistenceNode(n *document.Node) (SessionPersistence, error) {
 			return persistence, errors.New("session group-id must be a non-negative integer")
 		}
 	}
-	if activeValue, exists := n.Properties.Get("active-window-id"); exists {
-		persistence.ActiveWindowID, err = valueUint(activeValue)
+	if previousValue, exists := n.Properties.Get("previous-window-index"); exists {
+		previous, valueErr := valueUint(previousValue)
+		err = valueErr
 		if err != nil {
-			return persistence, errors.New("session active-window-id must be a non-negative integer")
+			return persistence, errors.New("session previous-window-index must be a non-negative integer")
 		}
-	}
-	if previousValue, exists := n.Properties.Get("previous-window-id"); exists {
-		persistence.PreviousWindowID, err = valueUint(previousValue)
-		if err != nil {
-			return persistence, errors.New("session previous-window-id must be a non-negative integer")
-		}
+		persistence.PreviousWindowIndex = int(previous)
+		persistence.HasPreviousWindowIndex = true
 	}
 	for _, child := range n.Children {
 		if child.Name.ValueString() != "view" {
 			continue
 		}
-		var view SessionViewPersistence
-		windowID, ok := child.Properties.Get("window-id")
-		if !ok {
-			return persistence, errors.New("session view requires window-id")
-		}
-		view.WindowID, err = valueUint(windowID)
-		if err != nil {
-			return persistence, errors.New("session view window-id must be a non-negative integer")
-		}
-		if focused, ok := child.Properties.Get("focused-pane-id"); ok {
-			view.FocusedPaneID, err = valueUint(focused)
-			if err != nil {
-				return persistence, errors.New("session view focused-pane-id must be a non-negative integer")
+		var view SessionWindowViewPersistence
+		if focused, ok := child.Properties.Get("focused-pane-index"); ok {
+			value, valueErr := valueUint(focused)
+			if valueErr != nil {
+				return persistence, errors.New("session view focused-pane-index must be a non-negative integer")
 			}
+			view.FocusedPaneIndex = int(value)
 		}
-		if zoomed, ok := child.Properties.Get("zoomed-pane-id"); ok {
-			view.ZoomedPaneID, err = valueUint(zoomed)
-			if err != nil {
-				return persistence, errors.New("session view zoomed-pane-id must be a non-negative integer")
+		if zoomed, ok := child.Properties.Get("zoomed-pane-index"); ok {
+			value, valueErr := valueUint(zoomed)
+			if valueErr != nil {
+				return persistence, errors.New("session view zoomed-pane-index must be a non-negative integer")
 			}
+			view.ZoomedPaneIndex = int(value)
+			view.HasZoomedPaneIndex = true
 		}
-		if display, ok := child.Properties.Get("display-index"); ok {
-			if value, valueErr := valueUint(display); valueErr == nil {
-				view.DisplayIndex = int(value)
+		if windowIndex, ok := child.Properties.Get("window-index"); ok {
+			if value, valueErr := valueUint(windowIndex); valueErr == nil {
+				view.WindowIndex = int(value)
 			} else {
-				return persistence, errors.New("session view display-index must be a non-negative integer")
+				return persistence, errors.New("session view window-index must be a non-negative integer")
 			}
 		}
 		persistence.WindowViews = append(persistence.WindowViews, view)
@@ -1735,9 +1768,6 @@ func parseSessionPersistenceNode(n *document.Node) (SessionPersistence, error) {
 	persistence.Root = persistence.Plan.Root
 	if err := validateSessionPersistence(persistence); err != nil {
 		return persistence, err
-	}
-	if persistence.ActiveWindowID == 0 {
-		persistence.ActiveWindowID = uint64(persistence.Plan.ActiveWindow)
 	}
 	return persistence, nil
 }
@@ -1793,7 +1823,7 @@ func parsePlanNodes(nodes []*document.Node, parent, name string, userOwned bool)
 		plan.Root = filepath.Clean(rawRoot)
 	}
 	if activeWindowID >= uint64(len(windowNodes)) {
-		return plan, fmt.Errorf("active window %d is not defined", activeWindowID)
+		activeWindowID = 0
 	}
 	for index, windowNode := range windowNodes {
 		window, err := parseMejaWindow(windowNode, plan.Root, !userOwned)
@@ -1803,7 +1833,7 @@ func parsePlanNodes(nodes []*document.Node, parent, name string, userOwned bool)
 		window.ID = uint64(index)
 		plan.Windows = append(plan.Windows, window)
 	}
-	plan.ActiveWindow = int(activeWindowID) + 1
+	plan.ActiveWindowIndex = int(activeWindowID)
 	return plan, nil
 }
 
@@ -1884,7 +1914,7 @@ func parseMejaWindow(n *document.Node, parent string, private bool) (PlanWindow,
 	}
 	window.Cwd = windowCwd
 	if window.ActivePane >= uint64(len(window.Panes)) {
-		return window, fmt.Errorf("active pane %d is not defined", window.ActivePane)
+		window.ActivePane = 0
 	}
 	if len(window.Panes) == 1 {
 		window.Layout = PlanLayout{Pane: paneIDRef(0)}
