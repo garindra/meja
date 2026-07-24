@@ -449,10 +449,10 @@ For `-S /path/to/meja.sock`, they are stored under `/path/to/sessions/`. Directo
 
 Persistence is change-driven rather than timer-based. Meja writes after recoverable structure changes and after stable process observations change a pane's recorded command or directory.
 
-Grouped recovery records use schema 2 metadata while keeping the existing
-`<name>.session.meja` location. Each named session records its stable group ID,
-active and previous windows, and independent focus/zoom views; version-1 files
-restore as singleton groups. Live leases, client instances, output bindings,
+Grouped recovery metadata uses the existing `<name>.session.meja` location.
+Each named session records its stable group ID,
+active and previous windows, and independent focus/zoom views; records without
+a group identity restore as singleton groups. Live leases, client instances, output bindings,
 transports, and terminal contents are never persisted.
 
 When another view from a group is restored while that group is already live,

@@ -718,6 +718,7 @@ func (d *Daemon) selectWindow(clientID ClientID, sessionID, windowID uint64) (Vi
 			view.FocusedPaneID = target.ActivePaneID
 		}
 		state.setGroupWindowViewNow(windowID, view)
+		state.markSessionChangedForPersistence()
 		transition = d.prepareViewTransitionNow(viewTransitionSelectWindow, client, state)
 	})
 	return transition, err

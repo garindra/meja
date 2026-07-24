@@ -195,18 +195,16 @@ func TestSessionPersistenceWritesPrivateRecoveryFile(t *testing.T) {
 func TestGroupedPersistenceRoundTripsIndependentSessionViewMetadata(t *testing.T) {
 	root := t.TempDir()
 	persistence := SessionPersistence{
-		Version:          mejaFormatVersion,
-		Schema:           persistenceSchemaVersion,
-		SessionID:        9,
-		GroupID:          42,
-		Name:             "mirror",
-		SavedAt:          time.Now(),
-		Root:             root,
-		ActiveWindowID:   8,
-		PreviousWindowID: 7,
-		WindowViews:      []SessionViewPersistence{{WindowID: 8, DisplayIndex: 1, FocusedPaneID: 99, ZoomedPaneID: 100}},
+		Version:             mejaFormatVersion,
+		SessionID:           9,
+		GroupID:             42,
+		Name:                "mirror",
+		SavedAt:             time.Now(),
+		Root:                root,
+		PreviousWindowIndex: 0, HasPreviousWindowIndex: true,
+		WindowViews: []SessionWindowViewPersistence{{WindowIndex: 0, FocusedPaneIndex: 0, ZoomedPaneIndex: 0, HasZoomedPaneIndex: true}},
 		Plan: SessionPlan{
-			Version: mejaFormatVersion, Name: "mirror", Root: root, ActiveWindow: 1,
+			Version: mejaFormatVersion, Name: "mirror", Root: root, ActiveWindowIndex: 0,
 			Windows: []PlanWindow{{ID: 8, Cwd: root, ActivePane: 99, Layout: PlanLayout{Pane: paneIDRef(99)}, Panes: []PlanPane{{ID: 99, Cwd: root}}}},
 		},
 	}
@@ -214,14 +212,52 @@ func TestGroupedPersistenceRoundTripsIndependentSessionViewMetadata(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "previous-window-index=0") || !strings.Contains(text, "window-index=0") ||
+		!strings.Contains(text, "focused-pane-index=0") ||
+		!strings.Contains(text, "zoomed-pane-index=0") || strings.Contains(text, "window-id") ||
+		strings.Contains(text, "focused-pane-id") || strings.Contains(text, "active-window-id") {
+		t.Fatalf("private view metadata is not positional:\n%s", text)
+	}
 	parsed, err := readSessionPersistence(path, "mirror")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Schema != persistenceSchemaVersion || parsed.GroupID != persistence.GroupID ||
-		parsed.ActiveWindowID != persistence.ActiveWindowID || parsed.PreviousWindowID != persistence.PreviousWindowID ||
-		len(parsed.WindowViews) != 1 || parsed.WindowViews[0] != persistence.WindowViews[0] {
+	if parsed.GroupID != persistence.GroupID ||
+		!parsed.HasPreviousWindowIndex || parsed.PreviousWindowIndex != 0 || len(parsed.WindowViews) != 1 ||
+		parsed.WindowViews[0].WindowIndex != 0 || parsed.WindowViews[0].FocusedPaneIndex != 0 ||
+		!parsed.WindowViews[0].HasZoomedPaneIndex || parsed.WindowViews[0].ZoomedPaneIndex != 0 {
 		t.Fatalf("grouped persistence metadata = %#v", parsed)
+	}
+}
+
+func TestPersistenceWindowIndexIsIndependentOfDisplayIndex(t *testing.T) {
+	session := NewSessionState(9)
+	session.ActiveWindowID = 20
+	session.PreviousWindowID = 10
+	session.Links = []WindowLink{
+		{WindowID: 10, DisplayIndex: 0},
+		{WindowID: 20, DisplayIndex: 7},
+	}
+	session.WindowViews[10] = SessionWindowView{FocusedPaneID: 100}
+	session.WindowViews[20] = SessionWindowView{FocusedPaneID: 200}
+	plan := SessionPlan{
+		Version: mejaFormatVersion, Name: "gapped", Root: t.TempDir(), ActiveWindowIndex: 1,
+		Windows: []PlanWindow{
+			{ID: 10, ActivePane: 100, Panes: []PlanPane{{ID: 100}}},
+			{ID: 20, ActivePane: 200, Panes: []PlanPane{{ID: 200}}},
+		},
+	}
+	record := session.newPersistenceRecord(plan)
+	if len(record.WindowViews) != 2 || record.WindowViews[0].WindowIndex != 0 || record.WindowViews[1].WindowIndex != 1 {
+		t.Fatalf("window indexes = %#v, want 0 and 1", record.WindowViews)
+	}
+	if !record.HasPreviousWindowIndex || record.PreviousWindowIndex != 0 {
+		t.Fatalf("previous window index = %d/%v, want 0/true", record.PreviousWindowIndex, record.HasPreviousWindowIndex)
 	}
 }
 
@@ -345,7 +381,7 @@ func TestSessionPlanEncodesAsTerseEditableMeja(t *testing.T) {
 
 func TestSessionPlanRejectsCommandsThatCouldExecuteDuringPrepare(t *testing.T) {
 	capture := SessionPlan{
-		Version: mejaFormatVersion, Name: "work", Root: "/repo", ActiveWindow: 1,
+		Version: mejaFormatVersion, Name: "work", Root: "/repo", ActiveWindowIndex: 0,
 		Windows: []PlanWindow{{
 			Cwd: "/repo", ActivePane: 1, Layout: PlanLayout{Pane: paneIDRef(1)},
 			Panes: []PlanPane{{ID: 1, Cwd: "/repo", Command: "echo safe\necho unsafe"}},
@@ -373,7 +409,7 @@ func TestDaemonRestoresPersistenceWindowsLayoutsAndPanes(t *testing.T) {
 	setCommandTestPersistenceDir(t, d)
 	base := t.TempDir()
 	plan := SessionPlan{
-		Version: mejaFormatVersion, Name: "work", Root: base, ActiveWindow: 1,
+		Version: mejaFormatVersion, Name: "work", Root: base, ActiveWindowIndex: 0,
 		Windows: []PlanWindow{{
 			Cwd: base, Name: "editor", ActivePane: 1,
 			Layout: PlanLayout{Split: "vertical", Ratio: 0.6, Children: []PlanLayout{{Pane: paneIDRef(0)}, {Pane: paneIDRef(1)}}},
@@ -412,6 +448,89 @@ func TestDaemonRestoresPersistenceWindowsLayoutsAndPanes(t *testing.T) {
 		_ = terminatePane(pane)
 	}
 	stopState(session)
+}
+
+func TestDaemonRestoresPositionalWindowMetadataWithSafePaneFallback(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	setCommandTestPersistenceDir(t, d)
+	root := t.TempDir()
+	oldPaneIDs := []uint64{103, 96, 89}
+	windows := make([]PlanWindow, len(oldPaneIDs))
+	views := make([]SessionWindowViewPersistence, len(oldPaneIDs))
+	for index, paneID := range oldPaneIDs {
+		windows[index] = PlanWindow{
+			ID: paneID, Cwd: root, ActivePane: paneID,
+			Layout: PlanLayout{Pane: paneIDRef(paneID)},
+			Panes:  []PlanPane{{ID: paneID, Cwd: root, Shell: "/bin/sh"}},
+		}
+		views[index] = SessionWindowViewPersistence{
+			WindowIndex: index, FocusedPaneIndex: 0,
+		}
+	}
+	views[2].FocusedPaneIndex = 99
+	persistence := SessionPersistence{
+		Version:   mejaFormatVersion,
+		SessionID: 13, GroupID: 13, Name: "driver2", SavedAt: time.Now(), Root: root,
+		PreviousWindowIndex: 1, HasPreviousWindowIndex: true, WindowViews: views,
+		Plan: SessionPlan{
+			Version: mejaFormatVersion, Name: "driver2", Root: root,
+			ActiveWindowIndex: 2, Windows: windows,
+		},
+	}
+	if _, err := writeSessionPersistence(d.sessionPersistenceDir, persistence); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := d.executeSessionOperation("restore-session", commandSessionTarget{name: "driver2", restoreMode: restoreCommandsSkip})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := bootstrap.session
+	var panes []*Pane
+	if err := runStateOperation(session, func() error {
+		if session.ActiveWindowID != 3 || session.PreviousWindowID != 2 {
+			return fmt.Errorf("restored active/previous windows = %d/%d, want 3/2", session.ActiveWindowID, session.PreviousWindowID)
+		}
+		for windowID, window := range session.Windows {
+			view := session.WindowViews[windowID]
+			if !windowHasPane(window, view.FocusedPaneID) {
+				return fmt.Errorf("window %d restored stale focused pane %d", windowID, view.FocusedPaneID)
+			}
+		}
+		for _, pane := range session.Panes {
+			panes = append(panes, pane)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pane := range panes {
+		_ = terminatePane(pane)
+	}
+	stopState(session)
+}
+
+func TestPrivatePersistenceFallsBackForOutOfRangeViewPositions(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "fallback.session.meja")
+	data := fmt.Sprintf(`session name="fallback" id=1 saved-at="2026-07-24T16:45:38+07:00" previous-window-index=99 {
+    view window-index=99 focused-pane-index=99 zoomed-pane-index=99
+    root %q
+    active-window 99
+    window active-pane=99 {
+        pane
+    }
+}
+`, root)
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	persistence, err := readSessionPersistence(path, "fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persistence.Plan.ActiveWindowIndex != 0 || persistence.Plan.Windows[0].ActivePane != 0 {
+		t.Fatalf("fallback active window/pane indexes = %d/%d, want 0/0", persistence.Plan.ActiveWindowIndex, persistence.Plan.Windows[0].ActivePane)
+	}
 }
 
 func TestPersistenceLoopWritesOnlyAfterSessionChange(t *testing.T) {
@@ -750,7 +869,7 @@ func TestMejaEncodingUsesSessionRootAndWindowCwds(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "acme-admin")
 	zero, one := uint64(0), uint64(1)
 	capture := SessionPlan{
-		Version: mejaFormatVersion, Name: "dev", Root: root, ActiveWindow: 1,
+		Version: mejaFormatVersion, Name: "dev", Root: root, ActiveWindowIndex: 0,
 		Windows: []PlanWindow{{
 			ID: 0, Cwd: filepath.Join(root, "frontend"), ActivePane: 0,
 			Layout: PlanLayout{Split: "vertical", Ratio: .72, Children: []PlanLayout{{Pane: &zero}, {Pane: &one}}},
@@ -786,7 +905,7 @@ func TestUserMejaDropsStaleWindowCwdOutsideChangedRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := SessionPlan{
-		Version: mejaFormatVersion, Name: "dev", Root: root, ActiveWindow: 1,
+		Version: mejaFormatVersion, Name: "dev", Root: root, ActiveWindowIndex: 0,
 		Windows: []PlanWindow{{
 			Cwd: home, ActivePane: 0, Layout: PlanLayout{Pane: paneIDRef(0)},
 			Panes: []PlanPane{{ID: 0, Cwd: root}},
@@ -858,7 +977,7 @@ func TestUserMejaRootIsRelativeToOutputFile(t *testing.T) {
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			plan := SessionPlan{
-				Version: mejaFormatVersion, Name: "dev", Root: test.root, ActiveWindow: 1,
+				Version: mejaFormatVersion, Name: "dev", Root: test.root, ActiveWindowIndex: 0,
 				Windows: []PlanWindow{{Cwd: test.root, ActivePane: 0, Layout: PlanLayout{Pane: paneIDRef(0)}, Panes: []PlanPane{{ID: 0, Cwd: test.root}}}},
 			}
 			encoded, _, err := encodeUserSessionPlan(plan, test.outputPath)
@@ -875,7 +994,7 @@ func TestUserMejaRootIsRelativeToOutputFile(t *testing.T) {
 func TestMejaEncodingIsDeterministic(t *testing.T) {
 	base := t.TempDir()
 	plan := SessionPlan{
-		Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindow: 1,
+		Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindowIndex: 0,
 		Windows: []PlanWindow{{
 			ID: 0, Cwd: base, Name: "editor", ActivePane: 0, Layout: PlanLayout{Pane: paneIDRef(0)},
 			Panes: []PlanPane{{ID: 0, Cwd: base}},
@@ -906,7 +1025,7 @@ func TestMejaNamedLayoutsRoundTripWithoutTiles(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			plan := SessionPlan{Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindow: 1}
+			plan := SessionPlan{Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindowIndex: 0}
 			window := PlanWindow{Cwd: base, ActivePane: 0, Layout: layout}
 			for _, paneID := range paneIDs {
 				window.Panes = append(window.Panes, PlanPane{ID: paneID, Cwd: base})
@@ -939,7 +1058,7 @@ func TestMejaFlatFormatUsesDocumentOrderAndImplicitDefaultFocus(t *testing.T) {
 	base := t.TempDir()
 	firstPane, secondPane := uint64(3), uint64(7)
 	plan := SessionPlan{
-		Version: mejaFormatVersion, Name: "ignored", Root: base, ActiveWindow: 1,
+		Version: mejaFormatVersion, Name: "ignored", Root: base, ActiveWindowIndex: 0,
 		Windows: []PlanWindow{
 			{ID: 10, Cwd: base, Name: "frontend", ActivePane: firstPane, Layout: PlanLayout{Pane: &firstPane}, Panes: []PlanPane{{ID: firstPane, Cwd: base, Command: "vite"}}},
 			{ID: 20, Cwd: base, Name: "server", ActivePane: secondPane, Layout: PlanLayout{Pane: &secondPane}, Panes: []PlanPane{{ID: secondPane, Cwd: base, Command: "npm run dev"}}},
@@ -968,7 +1087,7 @@ func TestMejaFlatFormatUsesDocumentOrderAndImplicitDefaultFocus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Name != "dev" || parsed.ActiveWindow != 1 || parsed.Windows[0].ActivePane != 0 || parsed.Windows[1].ActivePane != 0 {
+	if parsed.Name != "dev" || parsed.ActiveWindowIndex != 0 || parsed.Windows[0].ActivePane != 0 || parsed.Windows[1].ActivePane != 0 {
 		t.Fatalf("parsed defaults/name = %#v", parsed)
 	}
 }
@@ -977,7 +1096,7 @@ func TestUserMejaEncodingOmitsAllActiveState(t *testing.T) {
 	base := t.TempDir()
 	zero, one, two := uint64(0), uint64(1), uint64(2)
 	plan := SessionPlan{
-		Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindow: 2,
+		Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindowIndex: 1,
 		Windows: []PlanWindow{
 			{Cwd: base, ActivePane: zero, Layout: PlanLayout{Pane: &zero}, Panes: []PlanPane{{ID: zero, Cwd: base}}},
 			{Cwd: base, ActivePane: two, Layout: PlanLayout{Split: "vertical", Ratio: .5, Children: []PlanLayout{{Pane: &one}, {Pane: &two}}}, Panes: []PlanPane{{ID: one, Cwd: base}, {ID: two, Cwd: base}}},
@@ -1013,7 +1132,7 @@ window active-pane=1 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.ActiveWindow != 1 || plan.Windows[0].ActivePane != 0 || plan.Windows[1].ActivePane != 0 {
+	if plan.ActiveWindowIndex != 0 || plan.Windows[0].ActivePane != 0 || plan.Windows[1].ActivePane != 0 {
 		t.Fatalf("user plan retained private active state: %#v", plan)
 	}
 }
@@ -1022,7 +1141,7 @@ func TestPrivateMejaRetainsPositionalActiveState(t *testing.T) {
 	base := t.TempDir()
 	zero, one, two := uint64(0), uint64(1), uint64(2)
 	plan := SessionPlan{
-		Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindow: 2,
+		Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindowIndex: 1,
 		Windows: []PlanWindow{
 			{Cwd: base, ActivePane: zero, Layout: PlanLayout{Pane: &zero}, Panes: []PlanPane{{ID: zero, Cwd: base, Shell: "/bin/zsh"}}},
 			{Cwd: base, ActivePane: two, Layout: PlanLayout{Split: "vertical", Ratio: .5, Children: []PlanLayout{{Pane: &one}, {Pane: &two}}}, Panes: []PlanPane{{ID: one, Cwd: filepath.Join(base, "web"), Shell: "/bin/zsh"}, {ID: two, Cwd: filepath.Join(base, "api"), Shell: "/bin/zsh"}}},
@@ -1046,7 +1165,7 @@ func TestPrivateMejaRetainsPositionalActiveState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Plan.ActiveWindow != 2 || parsed.Plan.Windows[1].ActivePane != 1 {
+	if parsed.Plan.ActiveWindowIndex != 1 || parsed.Plan.Windows[1].ActivePane != 1 {
 		t.Fatalf("private active state did not round trip: %#v", parsed.Plan)
 	}
 }
@@ -1056,7 +1175,7 @@ func TestMejaEncodingOmitsAutomaticBashWindowNameOnly(t *testing.T) {
 	encode := func(automatic bool) string {
 		t.Helper()
 		plan := SessionPlan{
-			Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindow: 1,
+			Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindowIndex: 0,
 			Windows: []PlanWindow{{
 				Cwd: base, Name: "bash", AutomaticName: automatic, ActivePane: 0,
 				Layout: PlanLayout{Pane: paneIDRef(0)}, Panes: []PlanPane{{ID: 0, Cwd: base}},
@@ -1079,7 +1198,7 @@ func TestMejaEncodingOmitsAutomaticBashWindowNameOnly(t *testing.T) {
 func TestMejaEncodingKeepsPaneOutsideSessionRootAbsolute(t *testing.T) {
 	base := "/srv/acme"
 	plan := SessionPlan{
-		Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindow: 1,
+		Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindowIndex: 0,
 		Windows: []PlanWindow{{
 			ID: 0, Cwd: base, ActivePane: 0, Layout: PlanLayout{Pane: paneIDRef(0)},
 			Panes: []PlanPane{{ID: 0, Cwd: "/srv/shared/logs"}},
@@ -1153,7 +1272,7 @@ func TestMejaFileRejectsOverlappingCustomTiles(t *testing.T) {
 func TestUserPlanAndSessionPersistenceEnvelopesAreNotInterchangeable(t *testing.T) {
 	base := t.TempDir()
 	plan := SessionPlan{
-		Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindow: 1,
+		Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindowIndex: 0,
 		Windows: []PlanWindow{{
 			ID: 0, Cwd: base, ActivePane: 0, Layout: PlanLayout{Pane: paneIDRef(0)},
 			Panes: []PlanPane{{ID: 0, Cwd: base}},

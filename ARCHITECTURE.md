@@ -543,11 +543,11 @@ The final pane exiting ends the session. A network connection ending does not.
 
 ## Grouped persistence
 
-Named recovery records use schema 2 metadata in the existing session file
-location. The record identifies the shared graph with a stable group ID and
+Named recovery records store grouped-session metadata in the existing session
+file location. The record identifies the shared graph with a stable group ID and
 stores the session's active/previous windows plus independent focus and zoom
-views. Version-1 records have no group identity and restore as singleton
-groups. Runtime leases, ClientInstances, output bindings, transports, and
+views. Records without a group identity restore as singleton groups. Runtime
+leases, ClientInstances, output bindings, transports, and
 terminal contents never enter a snapshot.
 
 The daemon supplies immutable persistence snapshots to the persistence worker;
