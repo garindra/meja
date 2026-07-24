@@ -337,6 +337,18 @@ func (b *synchronizedBuffer) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func (b *synchronizedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.data.Len()
+}
+
+func (b *synchronizedBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.data.Bytes()...)
+}
+
 func newStatusTestClient() *statusTestClient {
 	c := &statusTestClient{status: testStatusBar{Styles: make(map[uint32]protocol.Style)}}
 	c.decoder = protocol.NewDisplayDecoder(&c.wire)

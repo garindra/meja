@@ -1014,7 +1014,7 @@ func TestPrefixWindowNavigationMovesTheLiveProjectionAndInputTarget(t *testing.T
 	firstWindow, _ := createTestWindow(session, first)
 
 	frames := make(chan protocol.Frame, 5)
-	var output bytes.Buffer
+	var output synchronizedBuffer
 	client := testClientInstance(frames, map[int]*OutputLease{0: testOutputLease(0, &output)})
 	client.shell = "/bin/sh"
 	attachDisplayTestClient(t, session, client)
