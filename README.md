@@ -1,11 +1,19 @@
-# meja
+<h1 align="center">
+  <img src="logo.png" alt="Meja logo" width="140">
+  <br>
+  MEJA
+</h1>
 
-meja is a tmux-style multiplexer with native remote capability and restorable & shareable sessions.
+<div align="center">
+  <img src="screenshot.png" alt="Meja screenshot" width="720">
+</div>
 
-![Meja screenshot](screenshot.png)
+## Overview
 
----
+`meja` is a tmux-style multiplexer with native remote capability and restorable &amp; shareable sessions. It brings tmux's familiar workflow to local and remote sessions, keeping remote work responsive through latency and alive through disconnects.
 
+Sessions can be recovered after reboots, reconstructing the same windows, panes, working directories, and commands.
+Readable `.meja` files can live in version control, letting anyone recreate the same workspace on their machine.
 
 ## Installation
 
@@ -26,7 +34,7 @@ curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.10/meja_0.0.1
 You can also install the latest version with Go:
 
 ```sh
-go install github.com/garindra/meja@latest
+go install -v github.com/garindra/meja@latest
 ```
 
 Check that your meja installation is successful:
@@ -35,7 +43,9 @@ Check that your meja installation is successful:
 meja version
 ```
 
-For remote `meja -h <host>` sessions, make sure to also install the binary on the target machine, reachable on `$PATH`.
+> [!NOTE]
+> For remote `meja -h <host>` sessions, make sure to also install the binary on the target machine, reachable on `$PATH`.
+
 
 ---
 
@@ -96,7 +106,7 @@ You can also run `save` to save the current session as a readable and editable `
 meja save -t work -o dev.meja
 ```
 
-Then create a fresh session from it:
+Then create a fresh session from it and again have your workspace reconstructed:
 
 ```
 meja new -f dev.meja
@@ -108,25 +118,20 @@ The file is readable and editable. Check it into version control so your team ca
 
 ## Why `meja`
 
-### Familiar by design
-
-Meja follows tmux wherever practical.
-
-It uses the same `Ctrl+b` prefix, command set, and the familiar model of sessions, windows, panes, splits, history, detaching, and attaching. Existing tmux knowledge transfers directly.
-
-### Editable `.meja` files
-
-`meja save` writes a live session's plan to a readable `.meja` file.
-
-These files can be edited, kept with a project, checked into version control, and used by other people to create the same session arrangement.
-
-
-
-### Named-session recovery
+### Session recovery
 
 Meja persists the recoverable state of every named session.
 
-After a reboot or ended session, `meja restore -t <session-name>` creates a new session from its latest recovery record. It preserves the session's windows, panes, layout, working directories, shells, commands, and active selection—not process memory or application state.
+After a reboot or ended session, `meja restore -t <session-name>` creates a new session from its latest recovery record. It preserves the session's windows, panes, layout, working directories, shells, commands, and active selection.
+
+### Shareable `.meja` files
+
+`meja save` writes a live session's reconstructable workspace state to a
+readable `.meja` file.
+
+These files can be edited, kept with a project, checked into version control, and used by other people to create the same session arrangement.
+
+See the [`.meja` file format](REFERENCE.md#project-meja-files).
 
 ### The client survives disconnections
 
@@ -140,45 +145,36 @@ Eligible keystrokes are applied optimistically on the client, keeping remote typ
 
 The server remains authoritative. Confirmed renders reconcile the local display with the actual terminal state.
 
+### Familiar by design
 
-## Command Bindings
+Meja uses tmux's default `Ctrl+b` prefix and familiar model of sessions,
+windows, panes, splits, history, detaching, and attaching. Existing tmux users
+should feel at home.
 
-As does `tmux`, `meja` uses `Ctrl+b` as its command prefix.
+> Meja follows tmux wherever practical. See [REFERENCE.md](REFERENCE.md) for
+> currently supported commands and functionality.
 
-Press `Ctrl+b`, release it, and then press the command key.
+## Everyday keybindings
 
-Normal typing continues to go to the focused pane.
+Like tmux, Meja uses `Ctrl+b` as its command prefix. Press `Ctrl+b`, release
+it, then press the command key. Normal typing continues to the focused pane.
 
-### Sessions and panes
+| Keys | Everyday use |
+| --- | --- |
+| `Ctrl+b`, `d` | Detach while leaving the session running. |
+| `Ctrl+b`, `c` | Create a window. |
+| `Ctrl+b`, `%` / `"` | Split left/right or top/bottom. |
+| `Ctrl+b`, arrow | Focus a pane in that direction. |
+| `Ctrl+b`, `Ctrl+arrow` / `Alt+arrow` | Resize by one or five cells. |
+| `Ctrl+b`, `n` / `p` / `l` | Select the next, previous, or last window. |
+| `Ctrl+b`, `0`–`9` | Select a window by status-bar index. |
+| `Ctrl+b`, `Space` | Cycle through preset pane layouts. |
+| `Ctrl+b`, `z` | Toggle pane zoom. |
+| `Ctrl+b`, `[` / `]` | Enter copy mode or paste the newest buffer. |
+| `Ctrl+b`, `x` | Confirm and close the focused pane. |
+| `Ctrl+b`, `:` | Open the command prompt. |
 
-| Keys                                                | Behavior                                                                |
-| --------------------------------------------------- | ----------------------------------------------------------------------- |
-| `Ctrl+b`, `d`                                       | Leave the session while keeping it and its processes running.           |
-| `Ctrl+b`, `c`                                       | Create a new window.                                                    |
-| `Ctrl+b`, `Space`                                   | Cycle through preset pane layouts.                                      |
-| `Ctrl+b`, `%`                                       | Split the focused pane left/right.                                      |
-| `Ctrl+b`, `"`                                       | Split the focused pane top/bottom.                                      |
-| `Ctrl+b`, `↑` / `↓` / `←` / `→`                     | Focus the pane in that direction.                                       |
-| `Ctrl+b`, `Ctrl+↑` / `Ctrl+↓` / `Ctrl+←` / `Ctrl+→` | Move a pane boundary by one row or column.                              |
-| `Ctrl+b`, `Alt+↑` / `Alt+↓` / `Alt+←` / `Alt+→`     | Move a pane boundary by five rows or columns.                           |
-| `Ctrl+b`, `z`                                       | Toggle the focused pane between its split position and the full window. |
-| `Ctrl+b`, `{`                                       | Swap the focused pane with the previous pane.                           |
-| `Ctrl+b`, `}`                                       | Swap the focused pane with the next pane.                               |
-| `Ctrl+b`, `x`                                       | Ask for confirmation, then close the focused pane.                      |
-| `Ctrl+b`, `:`                                       | Open the command prompt in the status bar.                              |
-| `Ctrl+b`, `Ctrl+b`                                  | Send a literal `Ctrl+b` to the focused pane.                            |
-
-
-### Windows
-
-| Keys              | Behavior                                      |
-| ----------------- | --------------------------------------------- |
-| `Ctrl+b`, `n`     | Select the next window.                       |
-| `Ctrl+b`, `p`     | Select the previous window.                   |
-| `Ctrl+b`, `l`     | Return to the last selected window.           |
-| `Ctrl+b`, `0`–`9` | Select the window with that status-bar index. |
-| `Ctrl+b`, `,`     | Rename the current window.                    |
-| `Ctrl+b`, `$`     | Name or rename the current session.           |
+See [all keybindings and in-session interactions](REFERENCE.md#in-session-interaction).
 
 ---
 
