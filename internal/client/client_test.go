@@ -300,7 +300,7 @@ func TestResizeThrottleReadsTheFinalTerminalSize(t *testing.T) {
 	errs := make(chan error, 1)
 	signals := make(chan os.Signal, 2)
 	const delay = 20 * time.Millisecond
-	go forwardResizeSignals(ctx, frontend, &control, ui, errs, signals, delay)
+	go forwardResizeSignals(ctx, int(frontend.Fd()), &control, ui, errs, signals, delay)
 
 	if err := pty.Setsize(terminal, &pty.Winsize{Cols: 120, Rows: 40}); err != nil {
 		t.Fatal(err)
