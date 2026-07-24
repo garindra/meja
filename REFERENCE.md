@@ -22,7 +22,7 @@ This is the complete user-facing command, file-format, and interaction reference
 ## Synopsis
 
 ```text
-meja version
+meja version [--verbose]
 meja [transport-options] [command [command-args...]]
 ```
 
@@ -74,14 +74,20 @@ meja --help
 meja help resize-pane
 meja resize-pane --help
 meja -h prod help
+meja version --verbose
+meja server-version
 ```
 
-Help is server-backed and may start the selected server. `version` is a local client command and prints `meja <version>`.
+Help is server-backed and may start the selected server. `version` is a local
+client command and prints `meja <version>`; `version --verbose` also prints the
+local command-protocol and QUIC-profile versions. `server-version` reports the
+same compatibility fields from the selected running daemon.
 
 ## Public names and aliases
 
 | Command | Aliases |
 | --- | --- |
+| `help` | `--help` |
 | `new-session` | `new` |
 | `attach-session` | `attach`, `a` |
 | `restore-session` | `restore` |
@@ -98,6 +104,16 @@ Help is server-backed and may start the selected server. `version` is a local cl
 | `swap-pane` | `swapp` |
 | `select-pane` | `selectp` |
 | `resize-pane` | `resizep` |
+| `send-keys` | `send` |
+| `capture-pane` | `capturep` |
+| `list-panes` | `lsp` |
+| `set-buffer` | `setb` |
+| `show-buffer` | `showb` |
+| `list-buffers` | `lsb` |
+| `delete-buffer` | `deleteb` |
+| `load-buffer` | `loadb` |
+| `save-buffer` | `saveb` |
+| `paste-buffer` | `pasteb` |
 | `rename-window` | `renamew` |
 | `rename-session` | `rename`, `renames` |
 
@@ -381,8 +397,9 @@ names such as `buffer0001`; the newest automatic buffer is used when `-b` is
 omitted. Up to 50 automatic buffers are retained, while named buffers persist
 until deleted. `paste-buffer` replaces linefeeds with carriage returns by
 default, `-r` preserves linefeeds, `-s` selects a separator, `-p` requests
-bracketed paste when the application supports it, and `-d` deletes the buffer
-after a successful paste. The default `Ctrl+b ]` binding runs `paste-buffer`.
+bracketed paste when the application supports it, `-S` disables control-byte
+sanitization, and `-d` deletes the buffer after a successful paste. The default
+`Ctrl+b ]` binding runs `paste-buffer`.
 
 ## Targets and in-pane context
 
@@ -559,6 +576,7 @@ Meja uses `Ctrl+b`. Press it, release it, then press the command key.
 | `Ctrl+b`, `{` / `}` | Swap previous/next pane. |
 | `Ctrl+b`, `x` | Confirm and close pane. |
 | `Ctrl+b`, `[` | Enter history/copy mode. |
+| `Ctrl+b`, `]` | Paste the newest buffer. |
 | `Ctrl+b`, `:` | Open command prompt. |
 | `Ctrl+b`, `n` / `p` / `l` | Next/previous/last window. |
 | `Ctrl+b`, `0`–`9` | Select window index. |
