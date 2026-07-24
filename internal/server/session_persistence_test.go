@@ -379,6 +379,79 @@ func TestSessionPlanEncodesAsTerseEditableMeja(t *testing.T) {
 	}
 }
 
+func TestObservedProcessCommandRepairsRewrittenProcessTitlePadding(t *testing.T) {
+	process := &ObservedProcess{
+		Name:          "npm exec nodemo",
+		Exe:           "/opt/node/bin/node",
+		Argv:          []string{"npm exec nodemon index.js", "", "", ""},
+		ArgvAvailable: true,
+	}
+	if got, want := observedProcessCommand(process), "npm exec nodemon index.js"; got != want {
+		t.Fatalf("observed npm command = %q, want %q", got, want)
+	}
+}
+
+func TestObservedProcessCommandPreservesUncorroboratedAndUnusualArguments(t *testing.T) {
+	tests := []struct {
+		name    string
+		process ObservedProcess
+		want    string
+	}{
+		{
+			name: "ordinary embedded and trailing empty arguments",
+			process: ObservedProcess{
+				Name: "worker",
+				Exe:  "/usr/bin/worker",
+				Argv: []string{"worker", "", "argument with spaces", ""},
+			},
+			want: "worker '' 'argument with spaces' ''",
+		},
+		{
+			name: "npm executable with genuine arguments",
+			process: ObservedProcess{
+				Name: "npm",
+				Exe:  "/opt/node/bin/node",
+				Argv: []string{"npm", "run", "dev", ""},
+			},
+			want: "npm run dev ''",
+		},
+		{
+			name: "npm-looking title from another executable",
+			process: ObservedProcess{
+				Name: "npm run dev",
+				Exe:  "/usr/bin/python3",
+				Argv: []string{"npm run dev", "", ""},
+			},
+			want: "'npm run dev' '' ''",
+		},
+		{
+			name: "npm-looking title without matching task name",
+			process: ObservedProcess{
+				Name: "node",
+				Exe:  "/opt/node/bin/node",
+				Argv: []string{"npm run dev", "", ""},
+			},
+			want: "'npm run dev' '' ''",
+		},
+		{
+			name: "ambiguous npm title with shell syntax",
+			process: ObservedProcess{
+				Name: "npm exec tool ;",
+				Exe:  "/opt/node/bin/node",
+				Argv: []string{"npm exec tool ; echo changed", "", ""},
+			},
+			want: "'npm exec tool ; echo changed' '' ''",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := observedProcessCommand(&test.process); got != test.want {
+				t.Fatalf("observed command = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSessionPlanRejectsCommandsThatCouldExecuteDuringPrepare(t *testing.T) {
 	capture := SessionPlan{
 		Version: mejaFormatVersion, Name: "work", Root: "/repo", ActiveWindowIndex: 0,
@@ -1170,14 +1243,14 @@ func TestPrivateMejaRetainsPositionalActiveState(t *testing.T) {
 	}
 }
 
-func TestMejaEncodingOmitsAutomaticBashWindowNameOnly(t *testing.T) {
+func TestMejaEncodingOnlyPersistsExplicitWindowNames(t *testing.T) {
 	base := t.TempDir()
-	encode := func(automatic bool) string {
+	encode := func(name string, automatic bool) string {
 		t.Helper()
 		plan := SessionPlan{
 			Version: mejaFormatVersion, Name: "dev", Root: base, ActiveWindowIndex: 0,
 			Windows: []PlanWindow{{
-				Cwd: base, Name: "bash", AutomaticName: automatic, ActivePane: 0,
+				Cwd: base, Name: name, AutomaticName: automatic, ActivePane: 0,
 				Layout: PlanLayout{Pane: paneIDRef(0)}, Panes: []PlanPane{{ID: 0, Cwd: base}},
 			}},
 		}
@@ -1187,11 +1260,15 @@ func TestMejaEncodingOmitsAutomaticBashWindowNameOnly(t *testing.T) {
 		}
 		return string(encoded)
 	}
-	if text := encode(true); strings.Contains(text, `name="bash"`) {
-		t.Fatalf("automatic bash name was persisted:\n%s", text)
+	for _, name := range []string{"bash", "python", "npm"} {
+		if text := encode(name, true); strings.Contains(text, `name=`) {
+			t.Fatalf("automatic %q name was persisted:\n%s", name, text)
+		}
 	}
-	if text := encode(false); !strings.Contains(text, `name="bash"`) {
-		t.Fatalf("explicit bash name was omitted:\n%s", text)
+	for _, name := range []string{"bash", "python"} {
+		if text := encode(name, false); !strings.Contains(text, `name="`+name+`"`) {
+			t.Fatalf("explicit %q name was omitted:\n%s", name, text)
+		}
 	}
 }
 

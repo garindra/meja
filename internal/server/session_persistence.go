@@ -1182,7 +1182,7 @@ func planDocumentNodes(plan SessionPlan, private bool) []*document.Node {
 	}
 	for _, persistedWindow := range plan.Windows {
 		window := node("window")
-		if persistedWindow.Name != "" && !(persistedWindow.AutomaticName && persistedWindow.Name == "bash") {
+		if persistedWindow.Name != "" && !persistedWindow.AutomaticName {
 			window.AddProperty("name", persistedWindow.Name, "").Flag = document.FlagQuoted
 		}
 		if private {
