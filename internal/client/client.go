@@ -370,8 +370,12 @@ func Run(ctx context.Context, cfg Config) error {
 				if err := waitReconnect(clientCtx, backoff); err != nil {
 					return clientExitError(clientCtx)
 				}
+				reconnectCols, reconnectRows, sizeErr := terminalSize(cfg.Stdin)
+				if sizeErr != nil {
+					return sizeErr
+				}
 				ui.beginConnection(true, lastContact)
-				candidate, reconnectErr := openConnection(clientCtx, bootstrap, hostname, cols, rows, cfg, resumeToken, ui, nil)
+				candidate, reconnectErr := openConnection(clientCtx, bootstrap, hostname, reconnectCols, reconnectRows, cfg, resumeToken, ui, nil)
 				if reconnectErr == nil {
 					live = candidate
 					ui.beginConnection(false, lastContact)
@@ -1307,20 +1311,43 @@ func forwardInputReads(ctx context.Context, reads <-chan terminalInputRead, cont
 	}
 }
 
+const resizeReadDelay = 16 * time.Millisecond
+
 func forwardResize(ctx context.Context, tty *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error) {
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, syscall.SIGWINCH)
 	defer signal.Stop(sigch)
+	forwardResizeSignals(ctx, tty, control, ui, errs, sigch, resizeReadDelay)
+}
+
+func forwardResizeSignals(ctx context.Context, tty *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error, sigch <-chan os.Signal, delay time.Duration) {
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	var readSize <-chan time.Time
+	var lastCols, lastRows uint16
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-sigch:
+			if readSize == nil {
+				timer.Reset(delay)
+				readSize = timer.C
+			}
+		case <-readSize:
+			readSize = nil
 			cols, rows, err := terminalSize(tty)
 			if err != nil {
 				errs <- err
 				return
 			}
+			if cols == lastCols && rows == lastRows {
+				continue
+			}
+			lastCols, lastRows = cols, rows
 			ui.emit(sizeEvent{cols: int(cols), rows: int(rows)})
 			if sendErr := sendCurrentControlEncoded(control, protocol.MsgFrontendResize, protocol.FrontendResize{
 				Cols: cols,
