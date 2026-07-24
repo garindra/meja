@@ -240,22 +240,26 @@ func (d *Daemon) applyExternalCommandAction(action commandAction) error {
 		return nil
 	case applyViewTransitionAction:
 		plan := action.Transition.Projection
-		var client *ClientInstance
+		var client *ClientIdentity
 		d.call(func() {
-			candidate := d.clients[plan.SessionID]
-			if candidate != nil && candidate.AttachmentID == plan.AttachmentID {
+			session := d.sessions[plan.SessionID]
+			if session == nil {
+				return
+			}
+			candidate := d.clients[session.ClientID]
+			if candidate != nil && candidate.ID == plan.ClientID {
 				client = candidate
 			}
 		})
 		if client == nil {
 			return errors.New("view transition target client is no longer attached")
 		}
-		return client.applyCommandViewTransition(action.Transition)
+		return sendClientCommand(client.State.Active, clientInstanceCommand{Transition: &action.Transition})
 	case publishClientStatusAction:
-		var client *ClientInstance
+		var client *ClientIdentity
 		d.call(func() {
 			for _, candidate := range d.clients {
-				if candidate != nil && candidate.AttachmentID == action.AttachmentID {
+				if candidate != nil && candidate.ID == action.ClientID {
 					client = candidate
 					break
 				}
@@ -264,7 +268,31 @@ func (d *Daemon) applyExternalCommandAction(action commandAction) error {
 		if client == nil {
 			return errors.New("status update target client is no longer attached")
 		}
-		return client.publishCommandStatus()
+		return sendClientCommand(client.State.Active, clientInstanceCommand{RefreshStatus: true})
+	case focusClientDirectionAction:
+		client := commandClientValue(d, CommandContext{Caller: CommandCaller{Origin: CommandOriginStandaloneCLI}}, action.SessionID)
+		if client == nil || client.ID != action.ClientID {
+			return errors.New("focus target client is no longer attached")
+		}
+		return sendClientCommand(client.State.Active, clientInstanceCommand{FocusDirection: action.Direction})
+	case enterClientHistoryAction:
+		client := commandClientValue(d, CommandContext{Caller: CommandCaller{Origin: CommandOriginStandaloneCLI}}, action.SessionID)
+		if client == nil || client.ID != action.ClientID {
+			return errors.New("history target client is no longer attached")
+		}
+		return sendClientCommand(client.State.Active, clientInstanceCommand{EnterHistory: true})
+	case sendClientKeysAction:
+		client := commandClientValue(d, CommandContext{Caller: CommandCaller{Origin: CommandOriginStandaloneCLI}}, action.SessionID)
+		if client == nil || client.ID != action.ClientID {
+			return errors.New("send-keys target client is no longer attached")
+		}
+		return sendClientCommand(client.State.Active, clientInstanceCommand{RunSendKeys: true, SendKeys: action.Args})
+	case pasteClientBufferAction:
+		client := commandClientValue(d, CommandContext{Caller: CommandCaller{Origin: CommandOriginStandaloneCLI}}, action.SessionID)
+		if client == nil || client.ID != action.ClientID {
+			return errors.New("paste-buffer target client is no longer attached")
+		}
+		return sendClientCommand(client.State.Active, clientInstanceCommand{RunPasteBuffer: true, PasteBuffer: action.Args})
 	case detachClientAction:
 		return errors.New("external detach action is not implemented")
 	case promptAction:
@@ -274,15 +302,12 @@ func (d *Daemon) applyExternalCommandAction(action commandAction) error {
 	}
 }
 
-func (c *ClientInstance) applyCommandViewTransition(transition PreparedViewTransition) error {
+func (c *ClientInstance) applyCommandViewTransition(transition ViewTransition) error {
 	if c == nil {
 		return errors.New("view transition target client is unavailable")
 	}
 	result := make(chan error, 1)
-	c.post(func() error {
-		result <- c.applyViewTransition(transition)
-		return nil
-	})
+	c.postCommand(clientInstanceCommand{Transition: &transition, Done: result})
 	if c.lifetimeDone == nil {
 		return <-result
 	}
@@ -304,10 +329,7 @@ func (c *ClientInstance) publishCommandStatus() error {
 		return errors.New("status update target client is unavailable")
 	}
 	result := make(chan error, 1)
-	c.post(func() error {
-		result <- c.publishStatusBar()
-		return nil
-	})
+	c.postCommand(clientInstanceCommand{RefreshStatus: true, Done: result})
 	if c.lifetimeDone == nil {
 		return <-result
 	}
@@ -332,7 +354,7 @@ const (
 // pointers. They resolve only the semantics their own command requires.
 type CommandCaller struct {
 	Origin              CommandOrigin
-	AttachmentID        uint64
+	ClientID            ClientID
 	SessionID           uint64
 	PaneID              uint64
 	WorkingDirectory    string
@@ -347,7 +369,7 @@ type CommandContext struct {
 
 type commandAction interface{ commandAction() }
 
-type detachClientAction struct{ AttachmentID uint64 }
+type detachClientAction struct{ ClientID ClientID }
 
 func (detachClientAction) commandAction() {}
 
@@ -355,13 +377,44 @@ type stopServerAction struct{}
 
 func (stopServerAction) commandAction() {}
 
-type applyViewTransitionAction struct{ Transition PreparedViewTransition }
+type applyViewTransitionAction struct{ Transition ViewTransition }
 
 func (applyViewTransitionAction) commandAction() {}
 
-type publishClientStatusAction struct{ AttachmentID uint64 }
+type publishClientStatusAction struct{ ClientID ClientID }
 
 func (publishClientStatusAction) commandAction() {}
+
+type focusClientDirectionAction struct {
+	ClientID  ClientID
+	SessionID uint64
+	Direction byte
+}
+
+func (focusClientDirectionAction) commandAction() {}
+
+type enterClientHistoryAction struct {
+	ClientID  ClientID
+	SessionID uint64
+}
+
+func (enterClientHistoryAction) commandAction() {}
+
+type sendClientKeysAction struct {
+	ClientID  ClientID
+	SessionID uint64
+	Args      []string
+}
+
+func (sendClientKeysAction) commandAction() {}
+
+type pasteClientBufferAction struct {
+	ClientID  ClientID
+	SessionID uint64
+	Args      []string
+}
+
+func (pasteClientBufferAction) commandAction() {}
 
 type PromptRequest struct {
 	Mode     PromptMode
@@ -478,14 +531,18 @@ func resolveCommandCallerSession(d *Daemon, ctx CommandContext) (*SessionState, 
 	return nil, errNoImplicitCommandSession
 }
 
-func commandClientValue(d *Daemon, ctx CommandContext, sessionID uint64) *ClientInstance {
+func commandClientValue(d *Daemon, ctx CommandContext, sessionID uint64) *ClientIdentity {
 	if d == nil {
 		return nil
 	}
-	var client *ClientInstance
+	var client *ClientIdentity
 	d.call(func() {
-		candidate := d.clients[sessionID]
-		if candidate != nil && (ctx.Caller.Origin != CommandOriginAttachedUI || candidate.AttachmentID == ctx.Caller.AttachmentID) {
+		session := d.sessions[sessionID]
+		if session == nil {
+			return
+		}
+		candidate := d.clients[session.ClientID]
+		if candidate != nil && (ctx.Caller.Origin != CommandOriginAttachedUI || candidate.ID == ctx.Caller.ClientID) {
 			client = candidate
 		}
 	})
@@ -572,7 +629,7 @@ func (c *ClientInstance) commandContext() CommandContext {
 	if c == nil {
 		return CommandContext{Caller: caller}
 	}
-	caller.AttachmentID = c.AttachmentID
+	caller.ClientID = c.identity.ID
 	caller.SessionID = c.sessionID
 	caller.TerminalCols = uint16(c.terminalCols.Load())
 	caller.TerminalRows = uint16(c.terminalRows.Load())
@@ -758,6 +815,10 @@ func (c *ClientInstance) applyAttachedCommandOutcome(outcome commandOutcome) (bo
 	if len(outcome.Stdout) > 0 || len(outcome.Stderr) > 0 {
 		return false, errors.New("command output is only available through the CLI")
 	}
+	if outcome.Action != nil && c.Daemon != nil &&
+		!c.Daemon.clientConnectionIsCurrent(c.identity, c.connection) {
+		return false, errors.New("command client connection is no longer active")
+	}
 	switch action := outcome.Action.(type) {
 	case nil:
 		return false, nil
@@ -797,15 +858,36 @@ func (c *ClientInstance) applyAttachedCommandOutcome(outcome commandOutcome) (bo
 		}
 		return false, c.publishStatusBar()
 	case applyViewTransitionAction:
-		if action.Transition.Projection.AttachmentID != c.AttachmentID {
+		if action.Transition.Projection.ClientID != c.identity.ID {
 			return false, errors.New("view transition belongs to another client")
 		}
 		return false, c.applyViewTransition(action.Transition)
 	case publishClientStatusAction:
-		if action.AttachmentID != c.AttachmentID {
+		if action.ClientID != c.identity.ID {
 			return false, errors.New("status update belongs to another client")
 		}
 		return false, c.publishStatusBar()
+	case focusClientDirectionAction:
+		if action.ClientID != c.identity.ID {
+			return false, errors.New("focus action belongs to another client")
+		}
+		_, _, err := c.FocusPaneDirection(action.Direction)
+		return false, err
+	case enterClientHistoryAction:
+		if action.ClientID != c.identity.ID {
+			return false, errors.New("history action belongs to another client")
+		}
+		return false, c.commandEnterHistory()
+	case sendClientKeysAction:
+		if action.ClientID != c.identity.ID {
+			return false, errors.New("send-keys action belongs to another client")
+		}
+		return false, sendKeysToClient(c, action.Args)
+	case pasteClientBufferAction:
+		if action.ClientID != c.identity.ID {
+			return false, errors.New("paste-buffer action belongs to another client")
+		}
+		return false, pasteBufferToClient(c, action.Args)
 	default:
 		return false, fmt.Errorf("command returned unsupported attached action %T", action)
 	}
@@ -852,7 +934,7 @@ func runKillPaneCommand(d *Daemon, ctx CommandContext, args []string) (commandOu
 	if err := requireNoCommandArgs("kill-pane", args); err != nil {
 		return commandOutcome{}, err
 	}
-	attachmentID, sessionID, paneID := ctx.Caller.AttachmentID, ctx.Caller.SessionID, ctx.Caller.PaneID
+	clientID, sessionID, paneID := ctx.Caller.ClientID, ctx.Caller.SessionID, ctx.Caller.PaneID
 	if sessionID == 0 || paneID == 0 {
 		return commandOutcome{}, errors.New("kill-pane requires an active pane")
 	}
@@ -860,10 +942,10 @@ func runKillPaneCommand(d *Daemon, ctx CommandContext, args []string) (commandOu
 		Mode:  PromptModeConfirm,
 		Label: "kill-pane? (y/N) ",
 		OnSubmit: func(d *Daemon, fresh CommandContext, _ string) (commandOutcome, error) {
-			if fresh.Caller.AttachmentID != attachmentID || fresh.Caller.SessionID != sessionID {
+			if fresh.Caller.ClientID != clientID || fresh.Caller.SessionID != sessionID {
 				return commandOutcome{}, errors.New("kill-pane caller changed while confirmation was open")
 			}
-			transition, err := d.closeCommandPane(attachmentID, sessionID, paneID)
+			transition, err := d.closeCommandPane(clientID, sessionID, paneID)
 			if err != nil {
 				return commandOutcome{}, err
 			}
@@ -903,7 +985,7 @@ func runNewWindowCommand(d *Daemon, ctx CommandContext, args []string) (commandO
 	if err := requireNoCommandArgs("new-window", remaining); err != nil {
 		return commandOutcome{}, err
 	}
-	transition, err := d.createCommandWindow(ctx.Caller.AttachmentID, sessionID, ctx.Caller.TerminalCols, ctx.Caller.TerminalRows)
+	transition, err := d.createCommandWindow(ctx.Caller.ClientID, sessionID, ctx.Caller.TerminalCols, ctx.Caller.TerminalRows)
 	if err != nil {
 		return commandOutcome{}, err
 	}
@@ -928,7 +1010,7 @@ func runSplitWindowCommand(d *Daemon, ctx CommandContext, args []string) (comman
 	if *horizontal {
 		direction = SplitVertical
 	}
-	transition, err := d.splitCommandWindow(ctx.Caller.AttachmentID, sessionID, direction)
+	transition, err := d.splitCommandWindow(ctx.Caller.ClientID, sessionID, direction)
 	if err != nil {
 		return commandOutcome{}, err
 	}
@@ -962,7 +1044,7 @@ func runRenameSessionCommand(d *Daemon, ctx CommandContext, args []string) (comm
 		return commandOutcome{}, err
 	}
 	if client := commandClientValue(d, ctx, sessionID); client != nil {
-		return commandOutcome{Action: publishClientStatusAction{AttachmentID: client.AttachmentID}}, nil
+		return commandOutcome{Action: publishClientStatusAction{ClientID: client.ID}}, nil
 	}
 	return commandOutcome{}, nil
 }
@@ -1073,7 +1155,7 @@ func runRenameWindowCommand(d *Daemon, ctx CommandContext, args []string) (comma
 		return commandOutcome{}, err
 	}
 	if client := commandClientValue(d, ctx, sessionID); client != nil {
-		return commandOutcome{Action: publishClientStatusAction{AttachmentID: client.AttachmentID}}, nil
+		return commandOutcome{Action: publishClientStatusAction{ClientID: client.ID}}, nil
 	}
 	return commandOutcome{}, nil
 }
@@ -1130,7 +1212,13 @@ func runSetRootCommand(d *Daemon, ctx CommandContext, args []string) (commandOut
 	if len(remaining) == 1 {
 		raw = remaining[0]
 	}
-	return commandOutcome{}, d.setCommandRoot(sessionID, raw, ctx.Caller.WorkingDirectory)
+	if err := d.setCommandRoot(sessionID, raw, ctx.Caller.WorkingDirectory); err != nil {
+		return commandOutcome{}, err
+	}
+	if client := commandClientValue(d, ctx, sessionID); client != nil {
+		return commandOutcome{Action: publishClientStatusAction{ClientID: client.ID}}, nil
+	}
+	return commandOutcome{}, nil
 }
 
 func runResizePaneCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
@@ -1151,7 +1239,7 @@ func runResizePaneCommand(d *Daemon, ctx CommandContext, args []string) (command
 		if *up || *down || *left || *right || len(fs.Args()) != 0 {
 			return commandOutcome{}, errors.New("resize-pane -Z cannot be combined with a direction or amount")
 		}
-		transition, err := d.resizeCommandPane(ctx.Caller.AttachmentID, sessionID, 0, 0, true)
+		transition, err := d.resizeCommandPane(ctx.Caller.ClientID, sessionID, 0, 0, true)
 		if err != nil {
 			return commandOutcome{}, err
 		}
@@ -1178,27 +1266,27 @@ func runResizePaneCommand(d *Daemon, ctx CommandContext, args []string) (command
 			return commandOutcome{}, errors.New("resize-pane amount must be a positive integer")
 		}
 	}
-	transition, err := d.resizeCommandPane(ctx.Caller.AttachmentID, sessionID, direction, amount, false)
+	transition, err := d.resizeCommandPane(ctx.Caller.ClientID, sessionID, direction, amount, false)
 	if err != nil {
 		return commandOutcome{}, err
 	}
 	return viewTransitionOutcome(transition), nil
 }
 
-func viewTransitionOutcome(transition *PreparedViewTransition) commandOutcome {
+func viewTransitionOutcome(transition *ViewTransition) commandOutcome {
 	if transition == nil {
 		return commandOutcome{}
 	}
 	return commandOutcome{Action: applyViewTransitionAction{Transition: *transition}}
 }
 
-func (d *Daemon) resizeCommandPane(attachmentID, sessionID uint64, direction PaneResizeDirection, amount int, zoom bool) (*PreparedViewTransition, error) {
-	state, client := d.commandSessionAndClient(attachmentID, sessionID)
+func (d *Daemon) resizeCommandPane(clientID ClientID, sessionID uint64, direction PaneResizeDirection, amount int, zoom bool) (*ViewTransition, error) {
+	state, client := d.commandSessionAndClient(clientID, sessionID)
 	if state == nil {
 		return nil, errSessionUnavailable
 	}
 	if client != nil {
-		var transition PreparedViewTransition
+		var transition ViewTransition
 		var err error
 		if zoom {
 			_, transition, _, err = d.toggleClientZoom(client)
@@ -1299,11 +1387,11 @@ const (
 	windowTarget
 )
 
-func commandOriginClient(d *Daemon, ctx CommandContext) (*ClientInstance, error) {
+func commandOriginClient(d *Daemon, ctx CommandContext) (*ClientIdentity, error) {
 	switch ctx.Caller.Origin {
 	case CommandOriginAttachedUI:
 		client := commandClientValue(d, ctx, ctx.Caller.SessionID)
-		if client == nil || client.AttachmentID != ctx.Caller.AttachmentID {
+		if client == nil || client.ID != ctx.Caller.ClientID {
 			return nil, errors.New("attached command client is no longer available")
 		}
 		return client, nil
@@ -1324,7 +1412,7 @@ func commandOriginClient(d *Daemon, ctx CommandContext) (*ClientInstance, error)
 	}
 }
 
-func commandViewport(ctx CommandContext, client *ClientInstance) (string, uint16, uint16) {
+func commandViewport(ctx CommandContext, client *ClientIdentity) (string, uint16, uint16) {
 	cols, rows := ctx.Caller.TerminalCols, ctx.Caller.TerminalRows
 	if client != nil {
 		cols = uint16(client.terminalCols.Load())
@@ -1336,7 +1424,7 @@ func commandViewport(ctx CommandContext, client *ClientInstance) (string, uint16
 // sessionActivationOutcome assigns an existing client to the resulting
 // session and returns the transition that installs that session's active view.
 // Without an existing client, it preserves the bootstrap for a new attachment.
-func sessionActivationOutcome(d *Daemon, client *ClientInstance, result sessionCommandResult) (commandOutcome, error) {
+func sessionActivationOutcome(d *Daemon, client *ClientIdentity, result sessionCommandResult) (commandOutcome, error) {
 	if client == nil || result.session == nil {
 		return commandOutcome{Stdout: result.stdout, Bootstrap: result.bootstrap, session: result.session}, nil
 	}
@@ -1352,7 +1440,7 @@ func sessionActivationOutcome(d *Daemon, client *ClientInstance, result sessionC
 }
 
 func runNewSessionCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
-	var client *ClientInstance
+	var client *ClientIdentity
 	var err error
 	if !newSessionRequestsDetached(args) {
 		client, err = commandOriginClient(d, ctx)
@@ -1392,7 +1480,7 @@ func runRestoreSessionCommand(d *Daemon, ctx CommandContext, args []string) (com
 	return sessionActivationOutcome(d, client, result)
 }
 
-func resolveSessionCommandContextValue(d *Daemon, ctx CommandContext, kind commandTargetKind, args []string) (*SessionState, *ClientInstance, []string, error) {
+func resolveSessionCommandContextValue(d *Daemon, ctx CommandContext, kind commandTargetKind, args []string) (*SessionState, *ClientIdentity, []string, error) {
 	rawTarget, remaining, hasTarget, err := extractCommandTarget(args)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1572,7 +1660,7 @@ func requireNoCommandArgs(name string, args []string) error {
 	return nil
 }
 
-func transitionCommandTarget(d *Daemon, ctx CommandContext, kind commandTargetKind, args []string) (*SessionState, *ClientInstance, []string, error) {
+func transitionCommandTarget(d *Daemon, ctx CommandContext, kind commandTargetKind, args []string) (*SessionState, *ClientIdentity, []string, error) {
 	session, client, normalized, err := resolveSessionCommandContextValue(d, ctx, kind, args)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1611,7 +1699,7 @@ func runRelativeWindowCommand(name string, delta int, last bool) commandHandler 
 		if !ok {
 			return commandOutcome{}, nil
 		}
-		transition, err := d.selectWindow(client.AttachmentID, session.ID, windowID)
+		transition, err := d.selectWindow(client.ID, session.ID, windowID)
 		if err != nil {
 			return commandOutcome{}, err
 		}
@@ -1648,7 +1736,7 @@ func runSelectWindowCommand(d *Daemon, ctx CommandContext, args []string) (comma
 	if windowID == 0 {
 		return commandOutcome{}, fmt.Errorf("unknown window %d", index)
 	}
-	transition, err := d.selectWindow(client.AttachmentID, session.ID, windowID)
+	transition, err := d.selectWindow(client.ID, session.ID, windowID)
 	if err != nil {
 		return commandOutcome{}, err
 	}
@@ -1679,7 +1767,7 @@ func runSwapPaneCommand(d *Daemon, ctx CommandContext, args []string) (commandOu
 }
 
 func runSelectPaneCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
-	_, client, remaining, err := transitionCommandTarget(d, ctx, sessionTarget, args)
+	session, client, remaining, err := transitionCommandTarget(d, ctx, sessionTarget, args)
 	if err != nil {
 		return commandOutcome{}, err
 	}
@@ -1690,14 +1778,12 @@ func runSelectPaneCommand(d *Daemon, ctx CommandContext, args []string) (command
 	if len(rest) != 0 {
 		return commandOutcome{}, errors.New("select-pane accepts no positional arguments")
 	}
-	if client.activeWindow() == nil {
+	if session.Windows[session.ActiveWindowID] == nil {
 		return commandOutcome{}, nil
 	}
-	_, _, err = client.FocusPaneDirection(direction)
-	if err != nil {
-		return commandOutcome{}, err
-	}
-	return commandOutcome{}, nil
+	return commandOutcome{Action: focusClientDirectionAction{
+		ClientID: client.ID, SessionID: session.ID, Direction: direction,
+	}}, nil
 }
 
 func runDetachClientCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
@@ -1712,12 +1798,10 @@ func runDetachClientCommand(d *Daemon, ctx CommandContext, args []string) (comma
 		return commandOutcome{}, errors.New("command requires an attached client")
 	}
 	if ctx.Caller.SessionID != session.ID {
-		if client.QUIC != nil {
-			_ = client.QUIC.CloseWithError(0, "detached by command")
-		}
+		postClientCommand(client.State.Active, clientInstanceCommand{Close: true, CloseReason: "detached by command"})
 		return commandOutcome{}, nil
 	}
-	return commandOutcome{Action: detachClientAction{AttachmentID: client.AttachmentID}}, nil
+	return commandOutcome{Action: detachClientAction{ClientID: client.ID}}, nil
 }
 
 func runCopyModeCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
@@ -1731,7 +1815,9 @@ func runCopyModeCommand(d *Daemon, ctx CommandContext, args []string) (commandOu
 	if client == nil {
 		return commandOutcome{}, errors.New("command requires an attached client")
 	}
-	return commandOutcome{}, client.commandEnterHistory()
+	return commandOutcome{Action: enterClientHistoryAction{
+		ClientID: client.ID, SessionID: client.SessionID,
+	}}, nil
 }
 
 func directionalCommandFlagSet(name string, args []string) (byte, []string, error) {

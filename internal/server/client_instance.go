@@ -22,34 +22,31 @@ import (
 // object is discarded when QUIC closes; only its ClientIdentity survives
 // so a later reconnect can rebuild it.
 type ClientInstance struct {
-	// sessionID is the daemon assignment for this transport. The passive state
-	// is resolved through Daemon.sessions for each operation; the client actor
-	// never retains an authoritative SessionState pointer.
-	sessionID           uint64
-	identity            *ClientIdentity
-	AttachmentID        uint64
+	identity   *ClientIdentity
+	connection *clientConnection
+
+	sessionID    uint64
+	detaching    atomic.Bool
+	terminalCols atomic.Uint32
+	terminalRows atomic.Uint32
+	shell        string
+	commands     chan clientInstanceCommand
+
 	ViewLeaseWindowID   uint64
 	ViewLeaseGeneration uint64
-	detaching           atomic.Bool
 	ended               atomic.Bool
 	statusStarted       atomic.Bool
 	// appliedProjectionRevision orders every daemon decision applied by this
-	// transport, including focus-only updates that reuse currentLayout's
+	// transport, including focus-only updates that reuse currentView.Layout's
 	// client-view revision.
 	appliedProjectionRevision atomic.Uint64
-	// lastPreparedProjectionRevision is advanced only by the daemon actor when
-	// it prepares work for this disposable instance.
-	lastPreparedProjectionRevision uint64
-	terminalCols                   atomic.Uint32
-	terminalRows                   atomic.Uint32
-	Daemon                         *Daemon
+	Daemon                    *Daemon
 	// inputState is the client actor's prefix, prompt, and directional-focus
 	// parser state. It contains no session, viewport, or installed-view data.
 	inputState clientInputState
-	// currentLayout is the last layout this client actor successfully
-	// published. It is also the source snapshot for output handoff; the daemon
-	// may already have changed the logical assignment.
-	currentLayout protocol.ClientLayout
+	// currentView is the last daemon-resolved view this client actor
+	// successfully published. It is also the exact source for output handoff.
+	currentView ClientView
 
 	QUIC         quic.Connection
 	Output       [protocol.MaxRenderSlots]*OutputLease
@@ -57,18 +54,32 @@ type ClientInstance struct {
 
 	controlOut            chan protocol.Frame
 	statusCommands        chan statusCommand
-	events                chan func() error
 	eventLoopStarted      atomic.Bool
 	statusMessage         atomic.Value // string
 	statusMessageID       atomic.Uint64
 	statusMessageDuration time.Duration
 	lifetimeDone          chan struct{}
-	shell                 string
 	frontendInput         frontendInputParser
 	heldKeys              map[frontendHeldKey]uint64
 	promptContinuation    promptContinuation
 	pointerCapture        frontendPaneCapture
 	pasteCapture          frontendPaneCapture
+}
+
+type clientInstanceCommand struct {
+	Transition         *ViewTransition
+	RefreshStatus      bool
+	ClearStatusMessage uint64
+	FocusDirection     byte
+	EnterHistory       bool
+	RunSendKeys        bool
+	SendKeys           []string
+	RunPasteBuffer     bool
+	PasteBuffer        []string
+	Close              bool
+	CloseCode          quic.ApplicationErrorCode
+	CloseReason        string
+	Done               chan<- error
 }
 
 type clientInputState struct {
@@ -86,11 +97,11 @@ func (c *ClientInstance) commitProjectionPlan(plan ClientProjectionPlan) error {
 	if err := c.validateProjectionPlan(plan); err != nil {
 		return err
 	}
-	if !plan.FullSnapshot && plan.Layout.LayoutRevision != c.currentLayout.LayoutRevision {
+	if !plan.FullSnapshot && plan.View.Layout.LayoutRevision != c.currentView.Layout.LayoutRevision {
 		return errors.New("focus projection changed client layout revision")
 	}
-	if plan.AttachmentID != 0 {
-		c.ViewLeaseWindowID = plan.Layout.WindowID
+	if plan.ClientID != 0 {
+		c.ViewLeaseWindowID = plan.View.Layout.WindowID
 		c.ViewLeaseGeneration = plan.ViewLeaseGeneration
 	}
 	return nil
@@ -102,14 +113,14 @@ func (c *ClientInstance) validateProjectionPlan(plan ClientProjectionPlan) error
 	if c == nil {
 		return errors.New("nil client projection")
 	}
-	if plan.AttachmentID != 0 && plan.AttachmentID != c.AttachmentID {
-		return errors.New("stale client projection attachment")
+	if plan.ClientID != 0 && plan.ClientID != c.identity.ID {
+		return errors.New("stale client projection")
 	}
 	// Lease generations are monotonic per window, not across windows. A newly
 	// created target legitimately starts at generation 1 even when the source
 	// window has been leased many times. ProjectionRevision provides the
 	// transport-wide stale-plan ordering across window transitions.
-	if plan.Layout.WindowID == c.ViewLeaseWindowID && plan.ViewLeaseGeneration < c.ViewLeaseGeneration {
+	if plan.View.Layout.WindowID == c.ViewLeaseWindowID && plan.ViewLeaseGeneration < c.ViewLeaseGeneration {
 		return errors.New("stale client projection lease")
 	}
 	if plan.ProjectionRevision == 0 {
@@ -125,7 +136,7 @@ func (c *ClientInstance) validateProjectionPlan(plan ClientProjectionPlan) error
 }
 
 func (c *ClientInstance) focusPane(paneID uint64) (*Window, error) {
-	window, transition, err := c.Daemon.focusClientPane(c, paneID)
+	window, transition, err := c.Daemon.focusClientPane(c.identity, paneID)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +160,7 @@ func (c *ClientInstance) activePane() *Pane {
 	if c == nil || c.Daemon == nil {
 		return nil
 	}
-	value, ok := c.Daemon.paneIndex.Load(c.currentLayout.FocusedPaneID)
+	value, ok := c.Daemon.paneIndex.Load(c.currentView.Layout.FocusedPaneID)
 	if !ok || value == nil {
 		return nil
 	}
@@ -164,41 +175,99 @@ func (c *ClientInstance) activeWindow() *Window {
 	if state == nil {
 		return nil
 	}
-	return cloneWindow(state.Windows[c.currentLayout.WindowID])
+	return cloneWindow(state.Windows[c.currentView.Layout.WindowID])
 }
 
 func (c *ClientInstance) currentPanePlacements() []protocol.PanePlacement {
 	if c == nil {
 		return nil
 	}
-	return append([]protocol.PanePlacement(nil), c.currentLayout.Panes...)
+	return append([]protocol.PanePlacement(nil), c.currentView.Layout.Panes...)
 }
 
 func (c *ClientInstance) isFocusedPane(paneID uint64) bool {
-	return c != nil && c.currentLayout.FocusedPaneID == paneID
+	return c != nil && c.currentView.Layout.FocusedPaneID == paneID
 }
 
-func (c *ClientInstance) post(run func() error) {
-	if c == nil || run == nil || c.events == nil {
+func postClientCommand(connection *clientConnection, command clientInstanceCommand) {
+	if connection == nil || connection.commands == nil {
+		return
+	}
+	connection.commands <- command
+}
+
+func (d *Daemon) clientConnectionIsActive(identity *ClientIdentity, connection *clientConnection, sessionID uint64) bool {
+	if d == nil || identity == nil || connection == nil {
+		return false
+	}
+	active := false
+	d.call(func() {
+		session := d.sessions[sessionID]
+		active = session != nil && session.ClientID == identity.ID &&
+			d.clients[identity.ID] == identity && identity.State.Active == connection
+	})
+	return active
+}
+
+func (d *Daemon) clientConnectionIsCurrent(identity *ClientIdentity, connection *clientConnection) bool {
+	if d == nil || identity == nil || connection == nil {
+		return false
+	}
+	current := false
+	d.call(func() {
+		current = d.clients[identity.ID] == identity && identity.State.Active == connection
+	})
+	return current
+}
+
+func (c *ClientInstance) postCommand(command clientInstanceCommand) {
+	if c == nil || c.connection == nil {
 		return
 	}
 	if !c.eventLoopStarted.Load() {
-		c.runPostedEvent(run)
+		c.runClientCommand(command)
 		return
 	}
 	select {
-	case c.events <- run:
+	case c.commands <- command:
 	case <-c.lifetimeDone:
 	}
 }
 
-func (c *ClientInstance) runPostedEvent(event func() error) {
-	if c == nil || event == nil {
+func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
+	if c == nil {
 		return
 	}
-	if err := event(); err != nil && c.Daemon != nil {
-		c.Daemon.logf("meja server: client event failed attachment=%d session=%d: %v\n",
-			c.AttachmentID, c.sessionID, err)
+	var err error
+	switch {
+	case command.Transition != nil:
+		err = c.applyViewTransition(*command.Transition)
+	case command.ClearStatusMessage != 0:
+		if c.sessionState() != nil && c.statusMessageID.Load() == command.ClearStatusMessage {
+			c.statusMessage.Store("")
+			err = c.publishStatusBar()
+		}
+	case command.RefreshStatus:
+		err = c.publishStatusBar()
+	case command.FocusDirection != 0:
+		_, _, err = c.FocusPaneDirection(command.FocusDirection)
+	case command.EnterHistory:
+		err = c.commandEnterHistory()
+	case command.RunSendKeys:
+		err = sendKeysToClient(c, command.SendKeys)
+	case command.RunPasteBuffer:
+		err = pasteBufferToClient(c, command.PasteBuffer)
+	case command.Close:
+		if c.QUIC != nil {
+			err = c.QUIC.CloseWithError(command.CloseCode, command.CloseReason)
+		}
+	}
+	if command.Done != nil {
+		command.Done <- err
+	}
+	if err != nil && command.Done == nil && c.Daemon != nil {
+		c.Daemon.logf("meja server: client event failed client=%d session=%d: %v\n",
+			c.identity.ID, c.sessionID, err)
 	}
 }
 
@@ -218,28 +287,116 @@ type frontendPaneCapture struct {
 	rect          protocol.Rect
 }
 
-// ClientIdentity is the stable identity retained across disposable transport
-// instances. The daemon owns its assignment, terminal state, and current live
-// instance separately.
+type ClientID uint64
+
+type clientPhase uint8
+
+const (
+	clientDetached clientPhase = iota
+	clientPending
+	clientActive
+	clientReplacing
+	clientClosing
+)
+
+// clientConnection is a passive address for one ClientInstance goroutine.
+// Channel identity distinguishes overlapping old and replacement connections.
+type clientConnection struct {
+	commands chan clientInstanceCommand
+	done     <-chan struct{}
+}
+
+type clientLifecycle struct {
+	Phase       clientPhase
+	Active      *clientConnection
+	Pending     *clientConnection
+	PendingCols uint16
+	PendingRows uint16
+	WaitFor     <-chan struct{}
+}
+
+// ClientIdentity is the daemon-owned canonical record for one resumable
+// logical client.
 type ClientIdentity struct {
+	ID          ClientID
 	ResumeToken string
+	SessionID   uint64
+	State       clientLifecycle
+
+	TerminalReason     string
+	terminalCols       atomic.Uint32
+	terminalRows       atomic.Uint32
+	projectionRevision uint64
+	shell              string
+
 	// lastAllocatedClientLayoutRevision is the daemon's monotonic allocator
 	// state for client-view/cache epochs across disposable transports.
 	lastAllocatedClientLayoutRevision protocol.ClientLayoutRevision
 }
 
-func newClientInstance(d *Daemon, identity *ClientIdentity) *ClientInstance {
+func newClientInstance(d *Daemon, identity *ClientIdentity, connections ...*clientConnection) *ClientInstance {
+	var connection *clientConnection
+	if len(connections) > 0 {
+		connection = connections[0]
+	}
+	if connection == nil {
+		connection = &clientConnection{commands: make(chan clientInstanceCommand, 64)}
+	}
+	if connection.commands == nil {
+		connection.commands = make(chan clientInstanceCommand, 64)
+	}
 	instance := &ClientInstance{
 		identity:       identity,
+		connection:     connection,
 		Daemon:         d,
+		shell:          defaultShell(),
+		commands:       connection.commands,
 		lifetimeDone:   make(chan struct{}),
 		statusCommands: make(chan statusCommand, 64),
-		events:         make(chan func() error, 64),
-		shell:          defaultShell(),
 		heldKeys:       make(map[frontendHeldKey]uint64),
 	}
+	if identity != nil {
+		instance.sessionID = identity.SessionID
+		if identity.shell != "" {
+			instance.shell = identity.shell
+		}
+		instance.terminalCols.Store(identity.terminalCols.Load())
+		instance.terminalRows.Store(identity.terminalRows.Load())
+	}
+	connection.done = instance.lifetimeDone
 	instance.startStatusOutput()
 	return instance
+}
+
+func (c *ClientInstance) adoptIdentityTerminalSize() {
+	if c == nil || c.identity == nil {
+		return
+	}
+	c.terminalCols.Store(c.identity.terminalCols.Load())
+	c.terminalRows.Store(c.identity.terminalRows.Load())
+}
+
+func sendClientCommand(connection *clientConnection, command clientInstanceCommand) error {
+	if connection == nil || connection.commands == nil {
+		return errors.New("client connection is unavailable")
+	}
+	if connection.done == nil {
+		connection.commands <- command
+		return nil
+	}
+	result := make(chan error, 1)
+	command.Done = result
+	select {
+	case connection.commands <- command:
+	case <-connection.done:
+		return errors.New("target client disconnected")
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-connection.done:
+		return errors.New("target client disconnected")
+	}
 }
 
 func (c *ClientInstance) startStatusOutput() {
@@ -250,10 +407,10 @@ func (c *ClientInstance) startStatusOutput() {
 }
 
 func (c *ClientInstance) inputLayoutForRevision(revision protocol.ClientLayoutRevision) (protocol.ClientLayout, bool) {
-	if c == nil || revision == 0 || c.currentLayout.LayoutRevision != revision {
+	if c == nil || revision == 0 || c.currentView.Layout.LayoutRevision != revision {
 		return protocol.ClientLayout{}, false
 	}
-	return c.currentLayout, true
+	return c.currentView.Layout, true
 }
 
 func (c *ClientInstance) resetInputForSessionSwitch() {
@@ -261,7 +418,7 @@ func (c *ClientInstance) resetInputForSessionSwitch() {
 	clear(c.heldKeys)
 	c.pointerCapture = frontendPaneCapture{}
 	c.pasteCapture = frontendPaneCapture{}
-	c.currentLayout = protocol.ClientLayout{}
+	c.currentView.Layout = protocol.ClientLayout{}
 }
 
 func (c *ClientInstance) registerFrontendTerminalExitCommand(data []byte) error {
@@ -336,45 +493,20 @@ func isSessionReplacedClose(err error) bool {
 	return errors.As(err, &applicationErr) && applicationErr.ErrorCode == protocol.SessionReplacedErrorCode
 }
 
-// initializeAttachedView initializes the frontend-owned portion of an attach
-// after the daemon has authoritatively registered the identity, session, and
-// transport.
-func (c *ClientInstance) initializeAttachedView(cols, rows uint16) error {
-	state := c.sessionState()
-	if state == nil {
-		return errors.New("client instance has no session")
-	}
-	if c.StatusOutput != nil {
-		if err := c.attachStatusOutput(c.StatusOutput); err != nil {
-			return err
-		}
-	}
-	if cols == 0 || rows == 0 {
-		pane := c.activePane()
-		if pane == nil {
-			return errors.New("session has no active pane")
-		}
-		paneCols, paneRows := pane.TerminalSize()
-		cols, rows = uint16(paneCols), uint16(paneRows)
-	}
-	c.terminalCols.Store(uint32(cols))
-	c.terminalRows.Store(uint32(rows))
-	transition, err := c.Daemon.prepareAttachedClientView(c, cols, rows)
-	if err != nil {
-		return err
-	}
-	return c.applyViewTransition(transition)
-}
-
 // releaseFrontendResources tears down transport-local status and pane output
 // resources after the daemon has fenced and unregistered this instance.
-func (c *ClientInstance) releaseFrontendResources(panes []*Pane) {
+func (c *ClientInstance) releaseFrontendResources() {
 	if c == nil || !c.detaching.Load() {
 		return
 	}
 	var detachErr error
-	for _, pane := range panes {
-		if err := pane.cancelHistorySelection(); err != nil && detachErr == nil {
+	panes := make([]*Pane, 0, len(c.currentView.Panes))
+	for _, resolved := range c.currentView.Panes {
+		if resolved.Pane == nil {
+			continue
+		}
+		panes = append(panes, resolved.Pane)
+		if err := resolved.Pane.cancelHistorySelection(); err != nil && detachErr == nil {
 			detachErr = err
 		}
 	}
@@ -527,15 +659,55 @@ func (d *Daemon) discardAttachGrant(encodedToken string) {
 	})
 }
 
-func (d *Daemon) beginClientInstance(encodedToken string) (*ClientInstance, *SessionState, error) {
+type connectionAdmissionKind uint8
+
+const (
+	admitSessionAttach connectionAdmissionKind = iota + 1
+	admitClientResume
+)
+
+type AdmitConnectionRequest struct {
+	Kind  connectionAdmissionKind
+	Token string
+}
+
+type ClientAdmission struct {
+	ClientID    ClientID
+	SessionID   uint64
+	ResumeToken string
+
+	identity   *ClientIdentity
+	connection *clientConnection
+}
+
+type ClientInitialized struct {
+	ClientID ClientID
+	Cols     uint16
+	Rows     uint16
+
+	connection *clientConnection
+}
+
+func (d *Daemon) admitConnection(request AdmitConnectionRequest) (ClientAdmission, error) {
+	switch request.Kind {
+	case admitSessionAttach:
+		return d.admitSessionConnection(request.Token)
+	case admitClientResume:
+		return d.admitResumedConnection(request.Token)
+	default:
+		return ClientAdmission{}, &clientHandshakeError{reason: "unknown client admission kind"}
+	}
+}
+
+func (d *Daemon) admitSessionConnection(encodedToken string) (ClientAdmission, error) {
 	reconnectToken, err := protocol.NewAuthToken()
 	if err != nil {
-		return nil, nil, err
+		return ClientAdmission{}, err
 	}
-	var instance *ClientInstance
+	var admission ClientAdmission
 	var session *SessionState
 	var attachErr error
-	var displaced *ClientInstance
+	var displaced *clientConnection
 	d.call(func() {
 		now := time.Now()
 		grantIndex := -1
@@ -558,80 +730,57 @@ func (d *Daemon) beginClientInstance(encodedToken string) (*ClientInstance, *Ses
 			return
 		}
 		encodedReconnectToken := protocol.EncodeAuthToken(reconnectToken)
+		if d.nextClientID == 0 {
+			d.nextClientID = 1
+		}
+		connection := &clientConnection{commands: make(chan clientInstanceCommand, 64)}
 		identity := &ClientIdentity{
-			ResumeToken: encodedReconnectToken,
+			ID: d.nextClientID, ResumeToken: encodedReconnectToken, SessionID: session.ID,
+			State: clientLifecycle{Phase: clientPending, Pending: connection},
+			shell: defaultShell(),
 		}
-		instance = newClientInstance(d, identity)
-		instance.sessionID = session.ID
-		d.clientIdentities[encodedReconnectToken] = identity
-		d.clientInstances[identity] = instance
-		displaced = d.assignClientInstanceInActor(identity, session)
+		d.nextClientID++
+		admission = ClientAdmission{
+			ClientID: identity.ID, SessionID: session.ID,
+			ResumeToken: identity.ResumeToken, identity: identity, connection: connection,
+		}
+		d.clients[identity.ID] = identity
+		d.clientTokens[encodedReconnectToken] = identity.ID
+		if previous := d.clients[session.ClientID]; previous != nil && previous != identity {
+			previous.TerminalReason = "session was taken over by another client"
+			if previous.State.Active != nil {
+				displaced = previous.State.Active
+				identity.State.WaitFor = displaced.done
+				previous.State.Phase = clientClosing
+			}
+		}
 	})
-	if displaced != nil && displaced.QUIC != nil {
-		_ = displaced.QUIC.CloseWithError(protocol.SessionReplacedErrorCode, "session taken over by another client")
+	if displaced != nil {
+		_ = sendClientCommand(displaced, clientInstanceCommand{
+			Close: true, CloseCode: protocol.SessionReplacedErrorCode,
+			CloseReason: "session taken over by another client",
+		})
 	}
-	return instance, session, attachErr
+	return admission, attachErr
 }
 
-// assignClientInstanceInActor establishes the initial daemon-side
-// one-client/one-session relationship. Live moves use
-// transitionClientToSession so assignment, lease transfer, and transition
-// preparation remain one transaction.
-func (d *Daemon) assignClientInstanceInActor(identity *ClientIdentity, session *SessionState) *ClientInstance {
-	if d.clients == nil {
-		d.clients = make(map[uint64]*ClientInstance)
-	}
-	if d.clientInstances == nil {
-		d.clientInstances = make(map[*ClientIdentity]*ClientInstance)
-	}
-	if d.clientTerminalReasons == nil {
-		d.clientTerminalReasons = make(map[*ClientIdentity]string)
-	}
-	instance := d.clientInstances[identity]
-	if instance != nil && instance.AttachmentID == 0 {
-		if d.nextAttachmentID == 0 {
-			d.nextAttachmentID = 1
-		}
-		instance.AttachmentID = d.nextAttachmentID
-		d.nextAttachmentID++
-	}
-	if oldSessionID := d.clientSessions[identity]; oldSessionID != 0 && oldSessionID != session.ID && d.attachments[oldSessionID] == identity {
-		delete(d.attachments, oldSessionID)
-		delete(d.clients, oldSessionID)
-		d.clientIndex.Delete(oldSessionID)
-	}
-	var displaced *ClientInstance
-	if previous := d.attachments[session.ID]; previous != nil && previous != identity {
-		delete(d.clientSessions, previous)
-		d.clientTerminalReasons[previous] = "session was taken over by another client"
-		displaced = d.clientInstances[previous]
-	}
-	d.clientSessions[identity] = session.ID
-	d.attachments[session.ID] = identity
-	if instance != nil {
-		d.clients[session.ID] = instance
-		d.clientIndex.Store(session.ID, instance)
-	}
-	return displaced
-}
-
-func (d *Daemon) resumeClientInstance(encodedToken string) (*ClientInstance, *SessionState, error) {
-	var instance *ClientInstance
+func (d *Daemon) admitResumedConnection(encodedToken string) (ClientAdmission, error) {
+	var admission ClientAdmission
 	var session *SessionState
-	var previous *ClientInstance
+	var previous *clientConnection
 	var resumeErr error
 	d.call(func() {
-		identity := d.clientIdentities[encodedToken]
+		identity := d.clients[d.clientTokens[encodedToken]]
 		if identity == nil {
 			resumeErr = &clientHandshakeError{reason: "client reconnect rejected"}
 			return
 		}
-		if reason := d.clientTerminalReasons[identity]; reason != "" {
-			resumeErr = &clientHandshakeError{reason: reason}
+		if identity.TerminalReason != "" {
+			resumeErr = &clientHandshakeError{reason: identity.TerminalReason}
 			return
 		}
-		sessionID := d.clientSessions[identity]
-		if sessionID == 0 || d.attachments[sessionID] != identity {
+		sessionID := identity.SessionID
+		if sessionID == 0 {
 			resumeErr = &clientHandshakeError{reason: "client instance is not assigned to a session"}
 			return
 		}
@@ -640,109 +789,142 @@ func (d *Daemon) resumeClientInstance(encodedToken string) (*ClientInstance, *Se
 			resumeErr = &clientHandshakeError{reason: "session is no longer available"}
 			return
 		}
-		previous = d.clientInstances[identity]
-		instance = newClientInstance(d, identity)
-		instance.sessionID = session.ID
-		d.clientInstances[identity] = instance
-		// The replacement is not authoritative until its transport attaches.
-		// Stop daemon deliveries from targeting the disconnected instance in
-		// the gap between resume authentication and attachClientInstance.
-		if d.clients[session.ID] == previous {
-			delete(d.clients, session.ID)
-			d.clientIndex.Delete(session.ID)
+		connection := &clientConnection{commands: make(chan clientInstanceCommand, 64)}
+		previous = identity.State.Active
+		identity.State = clientLifecycle{
+			Phase: clientPending, Pending: connection,
+		}
+		if previous != nil {
+			identity.State.Phase = clientReplacing
+			identity.State.Active = previous
+		}
+		admission = ClientAdmission{
+			ClientID: identity.ID, SessionID: session.ID, ResumeToken: identity.ResumeToken,
+			identity: identity, connection: connection,
 		}
 	})
 	if previous != nil {
-		previous.detaching.Store(true)
-		if previous.QUIC != nil {
-			_ = previous.QUIC.CloseWithError(protocol.SessionReplacedErrorCode, "client reconnected elsewhere")
-		}
+		_ = sendClientCommand(previous, clientInstanceCommand{
+			Close: true, CloseCode: protocol.SessionReplacedErrorCode,
+			CloseReason: "client reconnected elsewhere",
+		})
 	}
-	return instance, session, resumeErr
+	return admission, resumeErr
 }
 
-func (d *Daemon) attachClientInstance(instance *ClientInstance, conn quic.Connection, status io.Writer, output map[int]*OutputLease, controlOut chan protocol.Frame, cols, rows uint16) error {
+func (d *Daemon) initializeClient(request ClientInitialized) (ViewTransition, error) {
+	var transition ViewTransition
 	var session *SessionState
+	var previousDone <-chan struct{}
 	var activateErr error
 	d.call(func() {
-		identity := instance.identity
-		if instance.AttachmentID == 0 {
-			if d.nextAttachmentID == 0 {
-				d.nextAttachmentID = 1
-			}
-			instance.AttachmentID = d.nextAttachmentID
-			d.nextAttachmentID++
-		}
-		sessionID := d.clientSessions[identity]
-		if identity == nil || d.clientInstances[identity] != instance || d.clientTerminalReasons[identity] != "" || sessionID == 0 || d.attachments[sessionID] != identity {
-			reason := d.clientTerminalReasons[identity]
-			if reason == "" {
-				reason = "client instance is not assigned to a session"
-			}
-			activateErr = &clientHandshakeError{reason: reason}
+		identity := d.clients[request.ClientID]
+		if identity == nil || identity.State.Pending == nil ||
+			(request.connection != nil && identity.State.Pending != request.connection) {
+			activateErr = &clientHandshakeError{reason: "client admission is no longer active"}
 			return
 		}
-		session = d.sessions[sessionID]
+		if identity.TerminalReason != "" {
+			activateErr = &clientHandshakeError{reason: identity.TerminalReason}
+			return
+		}
+		session = d.sessions[identity.SessionID]
 		if session == nil {
 			activateErr = &clientHandshakeError{reason: "session is no longer available"}
 			return
 		}
-		instance.QUIC = conn
-		// A reconnect replaces the transport-local ClientInstance. The
-		// identity index was updated by resumeClientInstance, but daemon mutations
-		// authorize through this registry, so both references must move in the
-		// same actor transaction before the client can install its first view.
-		d.clients[sessionID] = instance
-		d.clientIndex.Store(sessionID, instance)
-		instance.StatusOutput = status
-		instance.controlOut = controlOut
-		for slot := range instance.Output {
-			instance.Output[slot] = output[slot]
+		if request.Cols == 0 || request.Rows == 0 {
+			if window := session.Windows[session.ActiveWindowID]; window != nil {
+				request.Cols, request.Rows = window.Cols, window.Rows
+			}
+		}
+		identity.State.PendingCols, identity.State.PendingRows = request.Cols, request.Rows
+		if identity.State.Active != nil {
+			previousDone = identity.State.Active.done
+		} else {
+			previousDone = identity.State.WaitFor
 		}
 	})
 	if activateErr != nil {
-		return activateErr
+		return transition, activateErr
 	}
-	instance.sessionID = session.ID
-	if err := instance.initializeAttachedView(cols, rows); err != nil {
-		d.detachClientInstance(instance)
-		return err
+	if previousDone != nil {
+		<-previousDone
 	}
-	return nil
+	d.call(func() {
+		identity := d.clients[request.ClientID]
+		if identity == nil || identity.State.Pending == nil ||
+			(request.connection != nil && identity.State.Pending != request.connection) {
+			activateErr = &clientHandshakeError{reason: "client admission is no longer active"}
+			return
+		}
+		if identity.TerminalReason != "" || d.sessions[identity.SessionID] != session {
+			reason := identity.TerminalReason
+			if reason == "" {
+				reason = "session is no longer available"
+			}
+			activateErr = &clientHandshakeError{reason: reason}
+			return
+		}
+		pending := identity.State.Pending
+		cols, rows := identity.State.PendingCols, identity.State.PendingRows
+		if current := d.clients[session.ClientID]; current != nil && current != identity &&
+			current.State.Phase != clientDetached {
+			activateErr = &clientHandshakeError{reason: "session is still attached to another client"}
+			return
+		}
+		identity.State = clientLifecycle{Phase: clientActive, Active: pending}
+		identity.terminalCols.Store(uint32(cols))
+		identity.terminalRows.Store(uint32(rows))
+		session.ClientID = identity.ID
+		transition, activateErr = d.prepareAttachedClientViewNow(identity, session, cols, rows)
+	})
+	return transition, activateErr
 }
 
 func (d *Daemon) detachClientInstance(instance *ClientInstance) {
 	deactivate := false
-	var panes []*Pane
 	d.call(func() {
 		identity := instance.identity
-		if identity != nil && d.clientInstances[identity] == instance {
+		if identity == nil {
+			return
+		}
+		switch {
+		case identity.State.Active == instance.connection:
 			instance.detaching.Store(true)
-			delete(d.clientInstances, identity)
+			identity.State.Active = nil
+			if identity.State.Pending != nil {
+				identity.State.Phase = clientPending
+			} else {
+				identity.State.Phase = clientDetached
+			}
 			deactivate = true
-		} else if instance.detaching.Load() {
+		case identity.State.Pending == instance.connection:
+			identity.State.Pending = nil
+			if identity.State.Active != nil {
+				identity.State.Phase = clientActive
+			} else {
+				identity.State.Phase = clientDetached
+			}
+			deactivate = true
+		case instance.detaching.Load():
 			deactivate = true
 		}
 		if !deactivate {
 			return
 		}
-		// Daemon lifecycle indexes are removed before transport-local cleanup.
-		// A superseded instance must not remove its replacement.
-		if d.clients[instance.sessionID] == instance {
-			delete(d.clients, instance.sessionID)
-			d.clientIndex.Delete(instance.sessionID)
-		}
-		if state := d.sessions[instance.sessionID]; state != nil {
-			panes = state.PanesSnapshot()
+		if session := d.sessions[instance.sessionID]; session != nil &&
+			session.ClientID == identity.ID && identity.State.Active == nil {
+			session.ClientID = 0
 		}
 	})
 	if deactivate {
 		if instance.ViewLeaseWindowID != 0 {
-			_ = d.releaseWindowView(instance.AttachmentID, instance.ViewLeaseWindowID, instance.ViewLeaseGeneration)
+			_ = d.releaseWindowView(instance.identity.ID, instance.ViewLeaseWindowID, instance.ViewLeaseGeneration)
 			instance.ViewLeaseWindowID = 0
 			instance.ViewLeaseGeneration = 0
 		}
-		instance.releaseFrontendResources(panes)
+		instance.releaseFrontendResources()
 	}
 }
 
@@ -750,11 +932,11 @@ func (d *Daemon) detachClientInstance(instance *ClientInstance) {
 // target session while retaining its transport, streams, output leases, and
 // reconnect token. It commits daemon ownership and returns the exact view for
 // the ClientInstance actor to apply; it never installs that view itself.
-func (d *Daemon) transitionClientToSession(instance *ClientInstance, targetSessionID uint64, cols, rows uint16) (PreparedViewTransition, error) {
+func (d *Daemon) transitionClientToSession(instance *ClientIdentity, targetSessionID uint64, cols, rows uint16) (ViewTransition, error) {
 	var source *SessionState
 	var target *SessionState
-	var displaced *ClientInstance
-	var transition PreparedViewTransition
+	var displaced *clientConnection
+	var transition ViewTransition
 	var switchErr error
 	if instance == nil {
 		return transition, errors.New("nil client instance")
@@ -768,9 +950,7 @@ func (d *Daemon) transitionClientToSession(instance *ClientInstance, targetSessi
 	instance.terminalCols.Store(uint32(cols))
 	instance.terminalRows.Store(uint32(rows))
 	d.call(func() {
-		if instance.identity != nil {
-			source = d.sessions[d.clientSessions[instance.identity]]
-		}
+		source = d.sessions[instance.SessionID]
 		if source == nil {
 			switchErr = errors.New("client instance is not attached to a session")
 			return
@@ -787,15 +967,15 @@ func (d *Daemon) transitionClientToSession(instance *ClientInstance, targetSessi
 			transition = d.prepareViewTransitionNow(viewTransitionSession, instance, target)
 			return
 		}
-		identity := instance.identity
-		if identity == nil || d.clientInstances[identity] != instance || d.clientTerminalReasons[identity] != "" ||
-			d.attachments[source.ID] != identity || d.sessions[target.ID] != target {
+		if d.clients[instance.ID] != instance || instance.State.Active == nil ||
+			instance.TerminalReason != "" || source.ClientID != instance.ID ||
+			d.sessions[target.ID] != target {
 			switchErr = errors.New("client instance can no longer switch sessions")
 			return
 		}
 		sourceWindowID := source.ActiveWindowID
 		if sourceWindowID == 0 {
-			sourceWindowID = instance.currentLayout.WindowID
+			sourceWindowID = d.windowForClientNow(instance.ID)
 		}
 		targetWindowID := target.ActiveWindowID
 		if targetWindowID == 0 {
@@ -809,7 +989,7 @@ func (d *Daemon) transitionClientToSession(instance *ClientInstance, targetSessi
 			return
 		}
 		sourceLease := d.windowLeases[sourceWindowID]
-		if sourceLease == nil || sourceLease.AttachmentID != instance.AttachmentID {
+		if sourceLease == nil || sourceLease.ClientID != instance.ID {
 			switchErr = errors.New("stale source window lease")
 			return
 		}
@@ -820,9 +1000,9 @@ func (d *Daemon) transitionClientToSession(instance *ClientInstance, targetSessi
 		}
 		targetLease := d.windowLeases[targetWindowID]
 		var displacedIdentity *ClientIdentity
-		if targetLease != nil && targetLease.AttachmentID != instance.AttachmentID {
-			assigned := d.attachments[target.ID]
-			if assigned == nil || assigned == identity || d.clients[target.ID] == nil {
+		if targetLease != nil && targetLease.ClientID != instance.ID {
+			assigned := d.clients[target.ClientID]
+			if assigned == nil || assigned == instance || assigned.State.Active == nil {
 				switchErr = fmt.Errorf("window %d is currently viewed by another client", targetWindow.DisplayIndex)
 				return
 			}
@@ -832,9 +1012,9 @@ func (d *Daemon) transitionClientToSession(instance *ClientInstance, targetSessi
 			return
 		}
 		if displacedIdentity != nil {
-			displaced = d.clientInstances[displacedIdentity]
-			d.clientTerminalReasons[displacedIdentity] = "session taken over by another client"
-			delete(d.clientSessions, displacedIdentity)
+			displaced = displacedIdentity.State.Active
+			displacedIdentity.TerminalReason = "session taken over by another client"
+			displacedIdentity.State.Phase = clientClosing
 		}
 		// Acquire the target lease before releasing the source lease. The
 		// assignment, lease transfer, and immutable projection are one daemon
@@ -842,39 +1022,47 @@ func (d *Daemon) transitionClientToSession(instance *ClientInstance, targetSessi
 		generation := uint64(1)
 		if targetLease != nil {
 			generation = targetLease.Generation
-			if targetLease.AttachmentID != instance.AttachmentID {
+			if targetLease.ClientID != instance.ID {
 				generation++
 			}
 		}
-		d.windowLeases[targetWindowID] = &WindowViewLease{WindowID: targetWindowID, SessionID: target.ID, AttachmentID: instance.AttachmentID, Generation: generation}
+		d.windowLeases[targetWindowID] = &WindowViewLease{WindowID: targetWindowID, SessionID: target.ID, ClientID: instance.ID, Generation: generation}
 		if sourceWindowID != targetWindowID {
 			delete(d.windowLeases, sourceWindowID)
 		}
 		if target.ActiveWindowID == 0 {
 			target.ActiveWindowID = targetWindowID
 		}
-		delete(d.attachments, source.ID)
-		delete(d.clients, source.ID)
-		d.clientIndex.Delete(source.ID)
-		d.clientSessions[identity] = target.ID
-		d.attachments[target.ID] = identity
-		d.clients[target.ID] = instance
-		d.clientIndex.Store(target.ID, instance)
+		source.ClientID = 0
+		instance.SessionID = target.ID
+		target.ClientID = instance.ID
 		transition = d.prepareViewTransitionNow(viewTransitionSession, instance, target)
 	})
 	if switchErr != nil {
 		return transition, switchErr
 	}
-	if displaced != nil && displaced != instance && displaced.QUIC != nil {
-		_ = displaced.QUIC.CloseWithError(protocol.SessionReplacedErrorCode, "session taken over by another client")
+	if displaced != nil && displaced != instance.State.Active {
+		postClientCommand(displaced, clientInstanceCommand{
+			Close: true, CloseCode: protocol.SessionReplacedErrorCode,
+			CloseReason: "session taken over by another client",
+		})
 	}
 	return transition, nil
 }
 
-func (d *Daemon) discardUnattachedClientInstance(instance *ClientInstance) {
+func (d *Daemon) discardPendingClientInstance(instance *ClientInstance) {
 	d.call(func() {
-		if identity := instance.identity; identity != nil && d.clientInstances[identity] == instance {
-			delete(d.clientInstances, identity)
+		identity := instance.identity
+		if identity == nil {
+			return
+		}
+		if identity.State.Pending == instance.connection {
+			identity.State.Pending = nil
+			if identity.State.Active != nil {
+				identity.State.Phase = clientActive
+			} else {
+				identity.State.Phase = clientDetached
+			}
 		}
 	})
 }
@@ -898,7 +1086,7 @@ type OutputLease struct {
 const (
 	quicMaxIdleTimeout  = 6 * time.Second
 	quicKeepAlivePeriod = 2 * time.Second
-	// The frontend stays in one rich, attachment-scoped capture mode. Terminals
+	// The frontend stays in one rich, connection-scoped capture mode. Terminals
 	// that do not implement Kitty keyboard enhancements safely ignore CSI > u.
 	frontendTerminalSetup = "\x1b[>3u\x1b[?1003;1006;1004;2004h"
 	// Pop exactly the keyboard-mode entry installed by setup. This is supported
@@ -921,8 +1109,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 	if err != nil {
 		return fmt.Errorf("read session attachment: %w", err)
 	}
-	var session *SessionState
-	var clientInstance *ClientInstance
+	var admission ClientAdmission
 	var attachCols, attachRows uint16
 	responseType := protocol.MsgSessionAttachOK
 	switch first.Type {
@@ -931,14 +1118,14 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		if decodeErr != nil {
 			return decodeErr
 		}
-		clientInstance, session, err = d.beginClientInstance(attach.Token)
+		admission, err = d.admitConnection(AdmitConnectionRequest{Kind: admitSessionAttach, Token: attach.Token})
 		attachCols, attachRows = attach.Cols, attach.Rows
 	case protocol.MsgClientResume:
 		resume, decodeErr := protocol.DecodeClientResume(first.Payload)
 		if decodeErr != nil {
 			return decodeErr
 		}
-		clientInstance, session, err = d.resumeClientInstance(resume.ResumeToken)
+		admission, err = d.admitConnection(AdmitConnectionRequest{Kind: admitClientResume, Token: resume.ResumeToken})
 		attachCols, attachRows = resume.Cols, resume.Rows
 		responseType = protocol.MsgClientResumeOK
 	default:
@@ -953,11 +1140,12 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		_ = sendEncodedDirect(controlStream, protocol.MsgSessionAttachFailed, protocol.SessionAttachFailed{Reason: reason}, protocol.EncodeSessionAttachFailed)
 		return err
 	}
+	clientInstance := newClientInstance(d, admission.identity, admission.connection)
 	defer close(clientInstance.lifetimeDone)
 	attached := false
 	defer func() {
 		if !attached {
-			d.discardUnattachedClientInstance(clientInstance)
+			d.discardPendingClientInstance(clientInstance)
 		}
 	}()
 	controlFrames := make(chan protocol.Frame, 256)
@@ -970,7 +1158,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 			return err
 		}
 	} else if err := sendEncoded(controlFrames, protocol.MsgSessionAttachOK, protocol.SessionAttachOK{
-		ResumeToken: clientInstance.identity.ResumeToken,
+		ResumeToken: admission.ResumeToken,
 	}, protocol.EncodeSessionAttachOK); err != nil {
 		return err
 	}
@@ -980,7 +1168,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 	if err := clientInstance.writeFrontendTerminal([]byte(frontendTerminalSetup)); err != nil {
 		return err
 	}
-	d.logSessionAttached(session.ID)
+	d.logSessionAttached(admission.SessionID)
 	statusOutput, err := conn.OpenUniStreamSync(ctx)
 	if err != nil {
 		return fmt.Errorf("open status output stream: %w", err)
@@ -1014,7 +1202,26 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		}
 	}
 
-	err = d.attachClientInstance(clientInstance, conn, statusOutput, outputLeases, controlFrames, attachCols, attachRows)
+	clientInstance.QUIC = conn
+	clientInstance.StatusOutput = statusOutput
+	for slot := range clientInstance.Output {
+		clientInstance.Output[slot] = outputLeases[slot]
+	}
+	if err := clientInstance.attachStatusOutput(statusOutput); err != nil {
+		return err
+	}
+	transition, err := d.initializeClient(ClientInitialized{
+		ClientID: admission.ClientID, Cols: attachCols, Rows: attachRows,
+		connection: admission.connection,
+	})
+	if err == nil {
+		// Admission commits the effective initial dimensions, including the
+		// fallback for clients which supplied zero. The disposable instance was
+		// created before that commit, so adopt them before its first status
+		// publication and view installation.
+		clientInstance.adoptIdentityTerminalSize()
+		err = clientInstance.applyViewTransition(transition)
+	}
 	if err != nil {
 		_ = conn.CloseWithError(protocol.SessionReplacedErrorCode, err.Error())
 		return err
@@ -1076,8 +1283,8 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 					return nil
 				}
 			}
-		case event := <-clientInstance.events:
-			clientInstance.runPostedEvent(event)
+		case command := <-clientInstance.commands:
+			clientInstance.runClientCommand(command)
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-conn.Context().Done():

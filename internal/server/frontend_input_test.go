@@ -19,7 +19,7 @@ func feedBytewise(parser *frontendInputParser, revision protocol.ClientLayoutRev
 
 func TestSessionSwitchResetsTransportInputStateAndDropsPreviousLayout(t *testing.T) {
 	client := newClientInstance(nil, nil)
-	client.currentLayout = protocol.ClientLayout{LayoutRevision: 5}
+	client.currentView.Layout = protocol.ClientLayout{LayoutRevision: 5}
 	client.frontendInput.Feed(5, []byte{0x1b})
 	client.heldKeys[frontendHeldKey{Code: frontendKeyRune, Rune: 'x'}] = 1
 	client.pointerCapture = frontendPaneCapture{active: true}
@@ -30,8 +30,8 @@ func TestSessionSwitchResetsTransportInputStateAndDropsPreviousLayout(t *testing
 	if client.frontendInput.state != frontendParserGround || len(client.heldKeys) != 0 || client.pointerCapture.active || client.pasteCapture.active {
 		t.Fatalf("frontend input state was not reset: %#v", client)
 	}
-	if client.currentLayout.LayoutRevision != 0 {
-		t.Fatalf("retained input layout = %#v", client.currentLayout)
+	if client.currentView.Layout.LayoutRevision != 0 {
+		t.Fatalf("retained input layout = %#v", client.currentView.Layout)
 	}
 }
 
@@ -176,7 +176,7 @@ func TestFrontendTransportDelayDoesNotLeakFragmentedSequences(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			layout = frontend.currentLayout
+			layout = frontend.currentView.Layout
 
 			escapePayload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{LayoutRevision: layout.LayoutRevision, Data: []byte{0x1b}})
 			if err != nil {
@@ -415,7 +415,7 @@ func TestMouseRoutingUsesStampedLayoutAndPaneMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
-	layout = frontend.currentLayout
+	layout = frontend.currentView.Layout
 
 	event := frontendPointerEvent{Action: frontendPointerWheelDown, X: 4, Y: 2}
 	if err := frontend.handleFrontendPointer(layout.LayoutRevision, event); err != nil {
@@ -528,7 +528,7 @@ func TestMousePressFocusesClickedPaneAndPublishesProjection(t *testing.T) {
 	frontend := newClientInstance(nil, nil)
 	frontend.controlOut = make(chan protocol.Frame, 1)
 	setLeasedTestClient(t, s, frontend, 9)
-	layout = frontend.currentLayout
+	layout = frontend.currentView.Layout
 	renderedRevision := layout.LayoutRevision
 	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{
 		Action: frontendPointerPress,
@@ -550,7 +550,7 @@ func TestMousePressFocusesClickedPaneAndPublishesProjection(t *testing.T) {
 	if published.LayoutRevision != renderedRevision {
 		t.Fatalf("mouse focus-only layout revision = %d, want existing rendered revision %d", published.LayoutRevision, renderedRevision)
 	}
-	if got := frontend.currentLayout.FocusedPaneID; got != second.ID {
+	if got := frontend.currentView.Layout.FocusedPaneID; got != second.ID {
 		t.Fatalf("client focused pane = %d, want %d", got, second.ID)
 	}
 	if active, _ := testActivePane(s); active != second {
@@ -581,7 +581,7 @@ func TestPointerInputForPreviousLayoutIsDropped(t *testing.T) {
 	current.LayoutRevision++
 
 	frontend := newFrontendTestClient(s)
-	frontend.currentLayout = current
+	frontend.currentView.Layout = current
 
 	if err := frontend.handleFrontendPointer(stale.LayoutRevision, frontendPointerEvent{
 		Action: frontendPointerPress,
@@ -614,7 +614,7 @@ func TestMouseSelectionCopiesThroughOSC52AndReturnsToLivePane(t *testing.T) {
 	}
 	frontend := newFrontendTestClient(s)
 	frontend.controlOut = make(chan protocol.Frame, 1)
-	layout = frontend.currentLayout
+	layout = frontend.currentView.Layout
 	placement := layout.Panes[0]
 
 	for _, pointer := range []frontendPointerEvent{
@@ -655,7 +655,7 @@ func TestMouseClickWithoutDragDoesNotCopy(t *testing.T) {
 	}
 	frontend := newFrontendTestClient(s)
 	frontend.controlOut = make(chan protocol.Frame, 1)
-	layout = frontend.currentLayout
+	layout = frontend.currentView.Layout
 	point := layout.Panes[0].Rect
 	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
 		t.Fatal(err)
@@ -693,7 +693,7 @@ func TestMousePressWithoutReleaseDoesNotBlockKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
-	layout = frontend.currentLayout
+	layout = frontend.currentView.Layout
 	point := layout.Panes[0].Rect
 	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
 		t.Fatal(err)
@@ -734,7 +734,7 @@ func TestMouseMotionWithoutHeldButtonCancelsTruncatedGesture(t *testing.T) {
 				t.Fatal(err)
 			}
 			frontend := newFrontendTestClient(s)
-			layout = frontend.currentLayout
+			layout = frontend.currentView.Layout
 			point := layout.Panes[0].Rect
 			if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y}); err != nil {
 				t.Fatal(err)
@@ -766,7 +766,7 @@ func TestMouseSelectionWithoutReleaseCancelsAndForwardsKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
-	layout = frontend.currentLayout
+	layout = frontend.currentView.Layout
 	point := layout.Panes[0].Rect
 
 	for _, pointer := range []frontendPointerEvent{
@@ -830,7 +830,7 @@ func TestMouseSelectionWithoutReleaseCancelsOnFocusLossAndRelayout(t *testing.T)
 				t.Fatal(err)
 			}
 			frontend := newFrontendTestClient(s)
-			layout = frontend.currentLayout
+			layout = frontend.currentView.Layout
 			point := layout.Panes[0].Rect
 			for _, pointer := range []frontendPointerEvent{
 				{Action: frontendPointerPress, Button: 0, X: point.X, Y: point.Y},
@@ -868,7 +868,7 @@ func TestFallbackWheelBurstsCoalesceNetDeltaWithoutTouchingNativeMouse(t *testin
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
-	layout = frontend.currentLayout
+	layout = frontend.currentView.Layout
 
 	up := []byte("\x1b[<64;5;3M")
 	down := []byte("\x1b[<65;5;3M")
@@ -946,7 +946,7 @@ func TestMouseWheelScrollsMejaHistoryBeforePaneMouseMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	frontend := newFrontendTestClient(s)
-	layout = frontend.currentLayout
+	layout = frontend.currentView.Layout
 	request := paneHistoryRequest{Action: paneHistoryEnter}
 	if result := pane.handleHistoryRequest(&request); result.Err != nil {
 		t.Fatal(result.Err)

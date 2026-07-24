@@ -12,14 +12,11 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
-func (s *SessionState) attachedClient() *ClientInstance {
+func (s *SessionState) attachedClient() *ClientIdentity {
 	if s == nil || s.daemon == nil {
 		return nil
 	}
-	if client, ok := s.daemon.clientIndex.Load(s.ID); ok {
-		return client.(*ClientInstance)
-	}
-	return nil
+	return s.daemon.clients[s.ClientID]
 }
 
 // SessionState is the externally visible passive session view. The daemon owns
@@ -27,6 +24,7 @@ func (s *SessionState) attachedClient() *ClientInstance {
 // durable model data only.
 type SessionState struct {
 	ID               uint64
+	ClientID         ClientID
 	Name             string
 	CreatedAt        int64
 	GroupID          uint64
@@ -286,7 +284,7 @@ func (s *SessionState) RenameWindow(windowID uint64, name string) (*Window, erro
 					continue
 				}
 				if member.attachedClient() != nil {
-					_ = member.attachedClient().publishStatusBar()
+					postClientCommand(member.attachedClient().State.Active, clientInstanceCommand{RefreshStatus: true})
 				}
 			}
 		}

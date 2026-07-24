@@ -234,7 +234,7 @@ func TestFixedLeaseBufferPresentsLargeRedrawInBoundedBatches(t *testing.T) {
 	defer close(ptyOutput)
 
 	wire := &renderBatchWriter{}
-	if err := pane.attachOutputStream(testOutputLease(0, wire), 1); err != nil {
+	if err := pane.installOutputLease(testOutputLease(0, wire), 1, uint16(pane.terminal.Cols), uint16(pane.terminal.Rows)); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, pane)
@@ -281,7 +281,9 @@ func testOutputLease(slot int, stream io.Writer) *OutputLease {
 }
 
 func attachTestOutputWithRefresh(pane *Pane, lease *OutputLease, refresh func(*renderOutput) error) error {
-	attachment := &paneOutputAttach{Lease: lease, Refresh: refresh}
+	installation := &paneOutputInstall{
+		Lease: lease, Cols: uint16(pane.terminal.Cols), Rows: uint16(pane.terminal.Rows), Refresh: refresh,
+	}
 	if pane.commands == nil {
 		if refresh == nil {
 			return nil
@@ -289,7 +291,7 @@ func attachTestOutputWithRefresh(pane *Pane, lease *OutputLease, refresh func(*r
 		return refresh(newRenderOutput(lease.Stream))
 	}
 	select {
-	case pane.commands <- paneCommand{attach: attachment}:
+	case pane.commands <- paneCommand{install: installation, done: make(chan error, 1)}:
 		return nil
 	case <-pane.mainDone:
 		return nil
@@ -356,7 +358,8 @@ func resizeTestSessionWindow(state *SessionState, windowID uint64, cols, rows ui
 }
 
 func testClientInstance(frames chan protocol.Frame, leases map[int]*OutputLease, status ...io.Writer) *ClientInstance {
-	connection := &ClientInstance{controlOut: frames}
+	connection := newClientInstance(nil, nil)
+	connection.controlOut = frames
 	if len(status) > 0 {
 		connection.StatusOutput = status[0]
 	}
@@ -372,9 +375,9 @@ func attachDisplayTestClient(t *testing.T, s *SessionState, client *ClientInstan
 }
 
 func (c *ClientInstance) applyCurrentTestViewWithHandoff(handoff *outputHandoff) error {
-	var transition PreparedViewTransition
+	var transition ViewTransition
 	c.Daemon.call(func() {
-		transition = c.Daemon.prepareViewTransitionNow(viewTransitionLayout, c, c.sessionState())
+		transition = c.Daemon.prepareViewTransitionNow(viewTransitionLayout, c.identity, c.sessionState())
 	})
 	if handoff == nil {
 		return c.applyViewTransition(transition)
@@ -382,27 +385,13 @@ func (c *ClientInstance) applyCurrentTestViewWithHandoff(handoff *outputHandoff)
 	if err := c.validateProjectionPlan(transition.Projection); err != nil {
 		return err
 	}
-	if len(transition.PaneResizes) > 0 {
-		if err := c.waitOutputHandoff(handoff); err != nil {
-			return err
-		}
-		for _, resize := range transition.PaneResizes {
-			if err := resize.Pane.resize(resize.Cols, resize.Rows); err != nil {
-				return err
-			}
-		}
-	}
-	prepared, err := c.prepareProjection(transition)
-	if err != nil {
-		return err
-	}
-	return c.installPreparedProjection(prepared, handoff)
+	return c.installClientView(transition, handoff)
 }
 
-func (c *ClientInstance) finishTestPreparedHandoff(handoff *outputHandoff, placements []protocol.PanePlacement) error {
-	prepared := PreparedProjection{Plan: ClientProjectionPlan{SessionID: c.sessionID}}
-	prepared.Plan.Layout.WindowID = c.currentLayout.WindowID
-	prepared.Plan.Layout.LayoutRevision = c.currentLayout.LayoutRevision
+func (c *ClientInstance) finishTestHandoff(handoff *outputHandoff, placements []protocol.PanePlacement) error {
+	plan := ClientProjectionPlan{SessionID: c.sessionID}
+	plan.View.Layout.WindowID = c.currentView.Layout.WindowID
+	plan.View.Layout.LayoutRevision = c.currentView.Layout.LayoutRevision
 	for _, placement := range placements {
 		value, ok := c.Daemon.paneIndex.Load(placement.PaneID)
 		if !ok || value == nil {
@@ -411,9 +400,9 @@ func (c *ClientInstance) finishTestPreparedHandoff(handoff *outputHandoff, place
 		pane := value.(*Pane)
 		cols, rows := pane.TerminalSize()
 		placement.Rect = protocol.Rect{Width: cols, Height: rows}
-		prepared.Panes = append(prepared.Panes, PreparedRenderPane{Placement: placement, Pane: pane})
+		plan.View.Panes = append(plan.View.Panes, ClientPanePlacement{Placement: placement, Pane: pane})
 	}
-	return c.finishPreparedOutputHandoff(handoff, prepared)
+	return c.finishOutputHandoff(handoff, plan)
 }
 
 func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
@@ -497,13 +486,14 @@ func TestOldStreamCleanupDoesNotDetachReplacement(t *testing.T) {
 	defer close(output)
 
 	var oldStream, replacement bytes.Buffer
-	if err := attachTestOutputWithRefresh(pane, testOutputLease(0, &oldStream), nil); err != nil {
+	oldLease := testOutputLease(0, &oldStream)
+	if err := attachTestOutputWithRefresh(pane, oldLease, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := attachTestOutputWithRefresh(pane, testOutputLease(0, &replacement), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := pane.detachOutputStream(&oldStream); err != nil {
+	if err := pane.detachOutputLease(oldLease); err != nil {
 		t.Fatal(err)
 	}
 	if err := applyTestRender(pane, func(output *renderOutput) error {
@@ -516,6 +506,49 @@ func TestOldStreamCleanupDoesNotDetachReplacement(t *testing.T) {
 	}
 	if replacement.Len() == 0 {
 		t.Fatal("old stream cleanup detached the replacement stream")
+	}
+}
+
+func TestInstallOutputLeaseAtomicallyReplacesAttachedGrid(t *testing.T) {
+	pane := &Pane{ID: 7, terminal: newTerminal(91, 49)}
+	output := startTestPaneLoop(pane)
+	defer close(output)
+
+	var oldWire bytes.Buffer
+	var replacementWire renderBatchWriter
+	oldLease := testOutputLease(0, &oldWire)
+	replacementLease := testOutputLease(0, &replacementWire)
+	if err := pane.installOutputLease(oldLease, 1, 91, 49); err != nil {
+		t.Fatal(err)
+	}
+	if err := pane.installOutputLease(replacementLease, 2, 103, 49); err != nil {
+		t.Fatalf("replace attached output and resize: %v", err)
+	}
+	if cols, rows := pane.TerminalSize(); cols != 103 || rows != 49 {
+		t.Fatalf("replacement grid = %dx%d, want 103x49", cols, rows)
+	}
+
+	// Cleanup from the disconnected transport may arrive after replacement.
+	if err := pane.detachOutputLease(oldLease); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(replacementWire.snapshotBatches()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(replacementWire.takeBatches()) == 0 {
+		t.Fatal("replacement output did not receive its initial snapshot")
+	}
+	if err := applyTestRender(pane, func(output *renderOutput) error {
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
+			return err
+		}
+		return output.commit()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(replacementWire.takeBatches()) == 0 {
+		t.Fatal("stale detach removed the replacement output lease")
 	}
 }
 
@@ -574,7 +607,7 @@ func TestOutputHandoffAttachesEachReleasedSlotImmediately(t *testing.T) {
 		pending:  map[int]struct{}{0: {}, 1: {}},
 	}
 	finished := make(chan error, 1)
-	go func() { finished <- clientForState(session).finishTestPreparedHandoff(handoff, placements) }()
+	go func() { finished <- clientForState(session).finishTestHandoff(handoff, placements) }()
 
 	handoff.released <- testOutputLease(0, firstWritten)
 	select {
@@ -617,7 +650,7 @@ func TestOutputHandoffAttachesReplacementAfterNilRelease(t *testing.T) {
 	}
 	handoff.released <- nil
 
-	if err := clientForState(session).finishTestPreparedHandoff(handoff, placements); err != nil {
+	if err := clientForState(session).finishTestHandoff(handoff, placements); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -750,7 +783,7 @@ func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 	syncPaneRenderer(t, first)
 	syncPaneRenderer(t, second)
 
-	handoff := clientForState(session).beginOutputHandoffWithRemovedPanes(nil)
+	handoff := clientForState(session).beginOutputHandoff()
 	third, thirdUpdates := startTestPaneRenderer(testAddPaneID(session), 16, 4)
 	defer close(thirdUpdates)
 	createTestWindow(session, third)
@@ -762,7 +795,7 @@ func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 	}
 	syncPaneRenderer(t, third)
 
-	handoff = clientForState(session).beginOutputHandoffWithRemovedPanes(nil)
+	handoff = clientForState(session).beginOutputHandoff()
 	if _, _, err := selectTestSessionWindow(session, firstWindow.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -818,7 +851,7 @@ func TestSplitCommandPublishesNewPaneAsFocused(t *testing.T) {
 	if layout.FocusedPaneID == first.ID || layout.FocusedPaneID != layout.Panes[1].PaneID {
 		t.Fatalf("published focused pane = %d, panes = %#v; want new pane", layout.FocusedPaneID, layout.Panes)
 	}
-	if got := client.currentLayout.FocusedPaneID; got != layout.FocusedPaneID {
+	if got := client.currentView.Layout.FocusedPaneID; got != layout.FocusedPaneID {
 		t.Fatalf("client focused pane = %d, published = %d", got, layout.FocusedPaneID)
 	}
 	newPane := session.Pane(layout.FocusedPaneID)
@@ -900,7 +933,7 @@ func TestPrefixDirectionalFocusPublishesAndRoutesInput(t *testing.T) {
 	if published.LayoutRevision != initial.LayoutRevision {
 		t.Fatalf("focus-only layout revision = %d, want existing rendered revision %d", published.LayoutRevision, initial.LayoutRevision)
 	}
-	if got := client.currentLayout.FocusedPaneID; got != top.ID {
+	if got := client.currentView.Layout.FocusedPaneID; got != top.ID {
 		t.Fatalf("installed focus = %d, want %d", got, top.ID)
 	}
 	if view := session.WindowViews[window.ID]; view.FocusedPaneID != top.ID {
@@ -958,8 +991,8 @@ func TestPrefixPaneResizePublishesGeometryAndKeepsInputTarget(t *testing.T) {
 	if !ok || leftAfter.Rect.Width != leftBefore.Rect.Width+1 {
 		t.Fatalf("resized layout = %#v; left width before=%d", published, leftBefore.Rect.Width)
 	}
-	if published.FocusedPaneID != left.ID || client.currentLayout.FocusedPaneID != left.ID {
-		t.Fatalf("focus moved during resize: layout=%d client=%d want=%d", published.FocusedPaneID, client.currentLayout.FocusedPaneID, left.ID)
+	if published.FocusedPaneID != left.ID || client.currentView.Layout.FocusedPaneID != left.ID {
+		t.Fatalf("focus moved during resize: layout=%d client=%d want=%d", published.FocusedPaneID, client.currentView.Layout.FocusedPaneID, left.ID)
 	}
 	leftCols, _ := left.TerminalSize()
 	rightCols, _ := right.TerminalSize()
@@ -983,7 +1016,6 @@ func TestPrefixWindowNavigationMovesTheLiveProjectionAndInputTarget(t *testing.T
 	frames := make(chan protocol.Frame, 5)
 	var output bytes.Buffer
 	client := testClientInstance(frames, map[int]*OutputLease{0: testOutputLease(0, &output)})
-	client.AttachmentID = 41
 	client.shell = "/bin/sh"
 	attachDisplayTestClient(t, session, client)
 	client.terminalCols.Store(80)
@@ -1096,7 +1128,7 @@ func TestPrefixWindowNavigationMovesTheLiveProjectionAndInputTarget(t *testing.T
 	}
 	syncPaneRenderer(t, first)
 	assertRenderRevision(t, output.Bytes()[renderOffset:], returned.LayoutRevision)
-	if current := client.currentLayout; current.WindowID != returned.WindowID || current.FocusedPaneID != returned.FocusedPaneID {
+	if current := client.currentView.Layout; current.WindowID != returned.WindowID || current.FocusedPaneID != returned.FocusedPaneID {
 		t.Fatalf("installed client layout window=%d pane=%d; published window=%d pane=%d", current.WindowID, current.FocusedPaneID, returned.WindowID, returned.FocusedPaneID)
 	}
 	if client.ViewLeaseWindowID != firstWindow.ID || client.ViewLeaseGeneration == 0 {
@@ -1257,7 +1289,7 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 	syncPaneRenderer(t, second)
 
 	instance := clientForState(session)
-	removal, err := session.daemon.removeClientPane(instance, instance.activePane().ID)
+	removal, err := session.daemon.removeClientPane(instance.identity, instance.activePane().ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1269,8 +1301,8 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if layout.FocusedPaneID != first.ID || clientForState(session).currentLayout.FocusedPaneID != first.ID {
-		t.Fatalf("focus after close: layout=%d client=%d, want %d", layout.FocusedPaneID, clientForState(session).currentLayout.FocusedPaneID, first.ID)
+	if layout.FocusedPaneID != first.ID || clientForState(session).currentView.Layout.FocusedPaneID != first.ID {
+		t.Fatalf("focus after close: layout=%d client=%d, want %d", layout.FocusedPaneID, clientForState(session).currentView.Layout.FocusedPaneID, first.ID)
 	}
 	syncPaneRenderer(t, first)
 	if detach, inputErr := clientForState(session).handleInputBytes(layout.LayoutRevision, []byte("after-close")); inputErr != nil || detach {
@@ -1356,8 +1388,8 @@ func TestExitedShellProcessRemovesWindowAndSelectsFallback(t *testing.T) {
 	if testDaemonSession(state.daemon, state.ID) != state || client.ended.Load() {
 		t.Fatal("shell exit destroyed the session despite a surviving fallback window")
 	}
-	if client.currentLayout.WindowID != firstWindow.ID || client.currentLayout.FocusedPaneID != first.ID {
-		t.Fatalf("installed fallback window=%d pane=%d, want window=%d pane=%d", client.currentLayout.WindowID, client.currentLayout.FocusedPaneID, firstWindow.ID, first.ID)
+	if client.currentView.Layout.WindowID != firstWindow.ID || client.currentView.Layout.FocusedPaneID != first.ID {
+		t.Fatalf("installed fallback window=%d pane=%d, want window=%d pane=%d", client.currentView.Layout.WindowID, client.currentView.Layout.FocusedPaneID, firstWindow.ID, first.ID)
 	}
 }
 
@@ -1382,8 +1414,8 @@ func TestPaneExitReclaimsRemovedPaneOutputBeforeBindingFallback(t *testing.T) {
 
 	second, secondUpdates := startTestPaneRenderer(testAddPaneID(state), 16, 4)
 	defer close(secondUpdates)
-	handoff := client.beginOutputHandoffWithRemovedPanes(nil)
-	secondWindow, plan, err := state.daemon.createClientWindow(client, second, 16, 4)
+	handoff := client.beginOutputHandoff()
+	secondWindow, plan, err := state.daemon.createClientWindow(client.identity, second, 16, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1548,8 +1580,8 @@ func TestDaemonPostedVisiblePaneExitTransfersPhysicalOutputToFallback(t *testing
 
 	exiting, exitingUpdates := startTestPaneRenderer(testAddPaneID(state), 16, 4)
 	defer close(exitingUpdates)
-	handoff := client.beginOutputHandoffWithRemovedPanes(nil)
-	exitingWindow, plan, err := state.daemon.createClientWindow(client, exiting, 16, 4)
+	handoff := client.beginOutputHandoff()
+	exitingWindow, plan, err := state.daemon.createClientWindow(client.identity, exiting, 16, 4)
 	if err != nil {
 		_ = terminatePane(exiting)
 		t.Fatal(err)
@@ -1623,8 +1655,8 @@ func TestPaneProcessExitResizesFallbackAndTransfersPhysicalOutput(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	handoff := client.beginOutputHandoffWithRemovedPanes(nil)
-	exitingWindow, plan, err := state.daemon.createClientWindow(client, exiting, 16, 4)
+	handoff := client.beginOutputHandoff()
+	exitingWindow, plan, err := state.daemon.createClientWindow(client.identity, exiting, 16, 4)
 	if err != nil {
 		_ = terminatePane(exiting)
 		t.Fatal(err)
@@ -1676,7 +1708,7 @@ func TestPaneProcessExitResizesFallbackAndTransfersPhysicalOutput(t *testing.T) 
 	if client.appliedProjectionRevision.Load() <= previousProjection {
 		t.Fatal("fallback projection was published but not installed")
 	}
-	installed := client.currentLayout
+	installed := client.currentView.Layout
 	if installed.WindowID != firstWindow.ID || installed.FocusedPaneID != first.ID {
 		t.Fatalf("installed fallback window=%d pane=%d, want window=%d pane=%d",
 			installed.WindowID, installed.FocusedPaneID, firstWindow.ID, first.ID)
@@ -1711,7 +1743,7 @@ func TestMissingPrefixWindowShowsStatusWithoutDetaching(t *testing.T) {
 	var status bytes.Buffer
 	client.StatusOutput = &status
 
-	detach, err := client.handleInputBytes(client.currentLayout.LayoutRevision, []byte{0x02, '2'})
+	detach, err := client.handleInputBytes(client.currentView.Layout.LayoutRevision, []byte{0x02, '2'})
 	if err != nil || detach {
 		t.Fatalf("missing prefix window detach=%v err=%v", detach, err)
 	}
@@ -1724,7 +1756,6 @@ func TestMissingPrefixWindowShowsStatusWithoutDetaching(t *testing.T) {
 func TestDaemonPostedPaneExitCannotDetachNewerFallbackProjection(t *testing.T) {
 	state := NewSessionState(1)
 	client := clientForState(state)
-	client.AttachmentID = 41
 	state.daemon.windowLeases = make(map[uint64]*WindowViewLease)
 	first, firstUpdates := startTestPaneRenderer(testAddPaneID(state), 16, 4)
 	second, secondUpdates := startTestPaneRenderer(testAddPaneID(state), 16, 4)
@@ -1743,7 +1774,10 @@ func TestDaemonPostedPaneExitCannotDetachNewerFallbackProjection(t *testing.T) {
 	if err := applyTestRender(first, func(*renderOutput) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	client.currentLayout.Panes = []protocol.PanePlacement{{PaneID: first.ID, Slot: 0}}
+	client.Output[0] = lease
+	firstPlacement := protocol.PanePlacement{PaneID: first.ID, Slot: 0}
+	client.currentView.Layout.Panes = []protocol.PanePlacement{firstPlacement}
+	client.currentView.Panes = []ClientPanePlacement{{Pane: first, Placement: firstPlacement}}
 	client.eventLoopStarted.Store(true)
 	defer client.eventLoopStarted.Store(false)
 
@@ -1758,18 +1792,15 @@ func TestDaemonPostedPaneExitCannotDetachNewerFallbackProjection(t *testing.T) {
 		t.Fatalf("pane exit left windows=%v active=%d, want fallback %d (pane=%v window=%v group=%v members=%v)", state.orderedWindowIDs(), state.ActiveWindowID, firstWindow.ID, paneIndexed, windowIndexed, groupIndexed, state.group.memberIDsSnapshot())
 	}
 
-	var newer PreparedViewTransition
-	state.daemon.call(func() { newer = state.daemon.prepareViewTransitionNow(viewTransitionSelectWindow, client, state) })
-	if err := commitTestProjection(client, newer); err != nil {
+	var newer ViewTransition
+	state.daemon.call(func() {
+		newer = state.daemon.prepareViewTransitionNow(viewTransitionSelectWindow, client.identity, state)
+	})
+	if err := sendClientCommand(client.connection, clientInstanceCommand{Transition: &newer}); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case delivery := <-client.events:
-		if err := delivery(); err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("pane exit did not post a client projection")
+	if err := sendClientCommand(client.connection, clientInstanceCommand{RefreshStatus: true}); err != nil {
+		t.Fatal(err)
 	}
 
 	released := make(chan *OutputLease, 1)

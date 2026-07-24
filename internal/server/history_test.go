@@ -134,7 +134,7 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	}
 
 	var wire bytes.Buffer
-	if err := pane.attachOutputStream(testOutputLease(0, &wire), 7); err != nil {
+	if err := pane.installOutputLease(testOutputLease(0, &wire), 7, uint16(pane.terminal.Cols), uint16(pane.terminal.Rows)); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, pane)

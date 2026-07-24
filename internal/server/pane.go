@@ -47,7 +47,8 @@ type Pane struct {
 	historyView            *paneHistoryView
 
 	// Held exclusively by the pane main goroutine. A lease contains the actual
-	// QUIC stream and is physically returned before another pane receives it.
+	// QUIC stream. Same-client handoff returns it; a new connection atomically
+	// replaces it and stale cleanup is conditional on the exact lease pointer.
 	outputLease *OutputLease
 }
 
@@ -83,8 +84,8 @@ type paneRequest struct {
 }
 
 type paneCommand struct {
-	attach  *paneOutputAttach
-	detach  io.Writer
+	install *paneOutputInstall
+	detach  *paneOutputDetach
 	release *paneOutputRelease
 	apply   func(*renderOutput) error
 	capture *paneCaptureRequest
@@ -93,10 +94,16 @@ type paneCommand struct {
 	done    chan error
 }
 
-type paneOutputAttach struct {
+type paneOutputInstall struct {
 	Lease          *OutputLease
 	LayoutRevision protocol.ClientLayoutRevision
+	Cols           uint16
+	Rows           uint16
 	Refresh        func(*renderOutput) error
+}
+
+type paneOutputDetach struct {
+	Lease *OutputLease
 }
 
 type paneViewMode uint32
