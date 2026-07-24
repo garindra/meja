@@ -196,7 +196,6 @@ func TestGroupedPersistenceRoundTripsIndependentSessionViewMetadata(t *testing.T
 	root := t.TempDir()
 	persistence := SessionPersistence{
 		Version:             mejaFormatVersion,
-		Schema:              persistenceSchemaVersion,
 		SessionID:           9,
 		GroupID:             42,
 		Name:                "mirror",
@@ -228,7 +227,7 @@ func TestGroupedPersistenceRoundTripsIndependentSessionViewMetadata(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Schema != persistenceSchemaVersion || parsed.GroupID != persistence.GroupID ||
+	if parsed.GroupID != persistence.GroupID ||
 		!parsed.HasPreviousWindowIndex || parsed.PreviousWindowIndex != 0 || len(parsed.WindowViews) != 1 ||
 		parsed.WindowViews[0].WindowIndex != 0 || parsed.WindowViews[0].FocusedPaneIndex != 0 ||
 		!parsed.WindowViews[0].HasZoomedPaneIndex || parsed.WindowViews[0].ZoomedPaneIndex != 0 {
@@ -470,7 +469,7 @@ func TestDaemonRestoresPositionalWindowMetadataWithSafePaneFallback(t *testing.T
 	}
 	views[2].FocusedPaneIndex = 99
 	persistence := SessionPersistence{
-		Version: mejaFormatVersion, Schema: persistenceSchemaVersion,
+		Version:   mejaFormatVersion,
 		SessionID: 13, GroupID: 13, Name: "driver2", SavedAt: time.Now(), Root: root,
 		PreviousWindowIndex: 1, HasPreviousWindowIndex: true, WindowViews: views,
 		Plan: SessionPlan{
@@ -513,7 +512,7 @@ func TestDaemonRestoresPositionalWindowMetadataWithSafePaneFallback(t *testing.T
 func TestPrivatePersistenceFallsBackForOutOfRangeViewPositions(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "fallback.session.meja")
-	data := fmt.Sprintf(`session name="fallback" id=1 schema=3 saved-at="2026-07-24T16:45:38+07:00" previous-window-index=99 {
+	data := fmt.Sprintf(`session name="fallback" id=1 saved-at="2026-07-24T16:45:38+07:00" previous-window-index=99 {
     view window-index=99 focused-pane-index=99 zoomed-pane-index=99
     root %q
     active-window 99

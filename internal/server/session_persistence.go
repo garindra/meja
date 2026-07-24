@@ -24,7 +24,6 @@ var errSessionChangedDuringCapture = errors.New("session changed while it was be
 
 const (
 	mejaFormatVersion         = 1
-	persistenceSchemaVersion  = 3
 	sessionPersistenceTimeout = 10 * time.Second
 )
 
@@ -79,7 +78,6 @@ type SessionPlan struct {
 // session. Plan paths and Root are absolute machine-local paths in memory.
 type SessionPersistence struct {
 	Version                int
-	Schema                 int
 	SessionID              uint64
 	GroupID                uint64
 	Name                   string
@@ -467,9 +465,6 @@ func validateSessionPersistence(persistence SessionPersistence) error {
 	if persistence.Version != mejaFormatVersion {
 		return fmt.Errorf("unsupported .meja version %d", persistence.Version)
 	}
-	if persistence.Schema != persistenceSchemaVersion {
-		return fmt.Errorf("unsupported session persistence schema %d", persistence.Schema)
-	}
 	if err := validateSessionName(persistence.Name); err != nil {
 		return fmt.Errorf("session persistence name: %w", err)
 	}
@@ -650,8 +645,7 @@ func (s *SessionState) ensureSessionPersistence() *SessionPersistence {
 		return nil
 	}
 	s.setPersistenceRecord(&SessionPersistence{
-		Version: mejaFormatVersion, Schema: persistenceSchemaVersion,
-		SessionID: s.ID, Name: s.Name, SavedAt: time.Now(),
+		Version: mejaFormatVersion, SessionID: s.ID, Name: s.Name, SavedAt: time.Now(),
 		Root: s.rootDir, Plan: *plan,
 	})
 	return s.persistenceRecord()
@@ -660,7 +654,6 @@ func (s *SessionState) ensureSessionPersistence() *SessionPersistence {
 func (s *SessionState) newPersistenceRecord(plan SessionPlan) SessionPersistence {
 	record := SessionPersistence{
 		Version:   mejaFormatVersion,
-		Schema:    persistenceSchemaVersion,
 		SessionID: s.ID,
 		GroupID:   s.GroupID,
 		Name:      s.Name,
@@ -1256,9 +1249,6 @@ func encodeUserSessionPlan(plan SessionPlan, outputPath string) ([]byte, PlanPor
 }
 
 func encodeSessionPersistence(persistence SessionPersistence) ([]byte, error) {
-	if persistence.Schema == 0 {
-		persistence.Schema = persistenceSchemaVersion
-	}
 	if err := validateSessionPersistence(persistence); err != nil {
 		return nil, err
 	}
@@ -1271,7 +1261,6 @@ func encodeSessionPersistence(persistence SessionPersistence) ([]byte, error) {
 	session := node("session")
 	session.AddProperty("name", persistence.Name, "").Flag = document.FlagQuoted
 	session.AddProperty("id", persistence.SessionID, "")
-	session.AddProperty("schema", persistenceSchemaVersion, "")
 	if persistence.GroupID != 0 {
 		session.AddProperty("group-id", persistence.GroupID, "")
 	}
@@ -1708,14 +1697,6 @@ func parseSessionPersistenceNode(n *document.Node) (SessionPersistence, error) {
 		if !ok {
 			return persistence, errors.New("session profile must be a string")
 		}
-	}
-	if schemaValue, exists := n.Properties.Get("schema"); exists {
-		var schema uint64
-		schema, err = valueUint(schemaValue)
-		if err != nil {
-			return persistence, errors.New("session schema must be a non-negative integer")
-		}
-		persistence.Schema = int(schema)
 	}
 	if groupValue, exists := n.Properties.Get("group-id"); exists {
 		persistence.GroupID, err = valueUint(groupValue)
