@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -278,6 +279,71 @@ func TestRunNestedCommandReportsThePaneDrawableHeight(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResizeThrottleReadsTheFinalTerminalSize(t *testing.T) {
+	terminal, frontend, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer terminal.Close()
+	defer frontend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ui := &runtimeState{events: make(chan renderEvent, 4)}
+	frames := make(chan protocol.Frame, 4)
+	connectionDone := make(chan struct{})
+	var control atomic.Pointer[controlDestination]
+	control.Store(&controlDestination{frames: frames, done: connectionDone})
+	errs := make(chan error, 1)
+	signals := make(chan os.Signal, 2)
+	const delay = 20 * time.Millisecond
+	go forwardResizeSignals(ctx, frontend, &control, ui, errs, signals, delay)
+
+	if err := pty.Setsize(terminal, &pty.Winsize{Cols: 120, Rows: 40}); err != nil {
+		t.Fatal(err)
+	}
+	signals <- syscall.SIGWINCH
+	if err := pty.Setsize(terminal, &pty.Winsize{Cols: 90, Rows: 30}); err != nil {
+		t.Fatal(err)
+	}
+	signals <- syscall.SIGWINCH
+
+	select {
+	case event := <-ui.events:
+		resize, ok := event.(sizeEvent)
+		if !ok || resize.cols != 90 || resize.rows != 30 {
+			t.Fatalf("local resize = %#v, want 90x30", event)
+		}
+	case err := <-errs:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for throttled resize")
+	}
+
+	select {
+	case frame := <-frames:
+		resize, err := protocol.DecodeFrontendResize(frame.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frame.Type != protocol.MsgFrontendResize || resize.Cols != 90 || resize.Rows != 29 {
+			t.Fatalf("frontend resize = type %d %#v, want 90x29", frame.Type, resize)
+		}
+	case err := <-errs:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for frontend resize")
+	}
+
+	select {
+	case event := <-ui.events:
+		t.Fatalf("duplicate resize event = %#v", event)
+	case err := <-errs:
+		t.Fatal(err)
+	case <-time.After(2 * delay):
 	}
 }
 
