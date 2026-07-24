@@ -1438,6 +1438,37 @@ func TestPaneCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
 	}
 }
 
+func TestPaneCLISetRootRefreshesAttachedStatus(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	s := NewSessionState(17)
+	t.Cleanup(func() { stopState(s) })
+	s.daemon = d
+	s.rootDir = t.TempDir()
+	s.daemon.processObserver = emptyProcessObserver{}
+	project := t.TempDir()
+	client := newTestClient(s)
+	client.setTestTerminalSize(80, 23)
+	createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash", Launch: PaneLaunch{Cwd: project}})
+	d.sessions[s.ID] = s
+
+	statusClient := newStatusTestClient()
+	attachStatusTestClient(t, s, testClientInstance(nil, nil, &statusClient.wire))
+	if err := clientForState(s).publishStatusBar(); err != nil {
+		t.Fatal(err)
+	}
+	statusClient.read(t)
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"set-root", "."},
+		WorkingDirectory:    project,
+		CallerSessionTarget: "17",
+	})
+	if result.exitCode != 0 {
+		t.Fatalf("pane CLI set-root = %#v", result)
+	}
+	assertStatusTextWithLocation(t, statusClient.read(t), "[17] 0:bash* ", currentStatusLocation(project))
+}
+
 func TestPaneCLIGroupTargetResolvesToThePaneWindowLeaseSession(t *testing.T) {
 	d := groupedTestDaemon()
 	base := groupedTestSession(d, 1, "base")

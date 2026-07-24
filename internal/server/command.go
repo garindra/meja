@@ -1212,7 +1212,13 @@ func runSetRootCommand(d *Daemon, ctx CommandContext, args []string) (commandOut
 	if len(remaining) == 1 {
 		raw = remaining[0]
 	}
-	return commandOutcome{}, d.setCommandRoot(sessionID, raw, ctx.Caller.WorkingDirectory)
+	if err := d.setCommandRoot(sessionID, raw, ctx.Caller.WorkingDirectory); err != nil {
+		return commandOutcome{}, err
+	}
+	if client := commandClientValue(d, ctx, sessionID); client != nil {
+		return commandOutcome{Action: publishClientStatusAction{ClientID: client.ID}}, nil
+	}
+	return commandOutcome{}, nil
 }
 
 func runResizePaneCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {

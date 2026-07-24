@@ -241,6 +241,7 @@ func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 func TestSuccessfulSetRootPromptRestoresNormalStatus(t *testing.T) {
 	s := NewSessionState(1)
 	root := t.TempDir()
+	nextRoot := t.TempDir()
 	s.rootDir = root
 	s.daemon = testDaemonForState(s)
 	s.daemon.processObserver = emptyProcessObserver{}
@@ -264,7 +265,8 @@ func TestSuccessfulSetRootPromptRestoresNormalStatus(t *testing.T) {
 	}
 	assertStatusTextWithLocation(t, statusClient.read(t), ":", currentStatusLocation(root))
 
-	for _, b := range []byte("set-root .\r") {
+	command := []byte("set-root " + nextRoot + "\r")
+	for _, b := range command {
 		event := clientForState(s).ConsumeInputByte(b)
 		if event.Command == serverCommandNone {
 			continue
@@ -274,7 +276,7 @@ func TestSuccessfulSetRootPromptRestoresNormalStatus(t *testing.T) {
 		}
 		status := statusClient.read(t)
 		if b == '\r' {
-			assertStatusTextWithLocation(t, status, "[1] 0:bash* ", currentStatusLocation(root))
+			assertStatusTextWithLocation(t, status, "[1] 0:bash* ", currentStatusLocation(nextRoot))
 			for i, cell := range status.Cells {
 				if cell.StyleID != statusNormalStyleID {
 					t.Fatalf("submitted status cell %d style=%d, want %d", i, cell.StyleID, statusNormalStyleID)

@@ -368,6 +368,14 @@ func newClientInstance(d *Daemon, identity *ClientIdentity, connections ...*clie
 	return instance
 }
 
+func (c *ClientInstance) adoptIdentityTerminalSize() {
+	if c == nil || c.identity == nil {
+		return
+	}
+	c.terminalCols.Store(c.identity.terminalCols.Load())
+	c.terminalRows.Store(c.identity.terminalRows.Load())
+}
+
 func sendClientCommand(connection *clientConnection, command clientInstanceCommand) error {
 	if connection == nil || connection.commands == nil {
 		return errors.New("client connection is unavailable")
@@ -1207,6 +1215,11 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		connection: admission.connection,
 	})
 	if err == nil {
+		// Admission commits the effective initial dimensions, including the
+		// fallback for clients which supplied zero. The disposable instance was
+		// created before that commit, so adopt them before its first status
+		// publication and view installation.
+		clientInstance.adoptIdentityTerminalSize()
 		err = clientInstance.applyViewTransition(transition)
 	}
 	if err != nil {
