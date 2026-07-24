@@ -4,6 +4,15 @@
   MEJA
 </h1>
 
+<p align="center">
+  <a href="https://github.com/garindra/meja/releases">
+    <img src="https://img.shields.io/github/v/release/garindra/meja" alt="Latest Release">
+  </a>
+  <a href="https://github.com/garindra/meja/actions/workflows/ci.yml">
+    <img src="https://github.com/garindra/meja/actions/workflows/ci.yml/badge.svg" alt="Tests">
+  </a>
+</p>
+
 <div align="center">
   <img src="screenshot.png" alt="Meja screenshot" width="840">
   <p><em>"what is this, a blue tmux?"</em></p>
