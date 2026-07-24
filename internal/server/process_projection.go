@@ -139,10 +139,52 @@ func observedProcessCommand(process *ObservedProcess) string {
 	if process == nil {
 		return ""
 	}
+	if command, ok := rewrittenCommandProcessTitle(process); ok {
+		return command
+	}
 	if len(process.Argv) > 0 {
 		return shellJoin(process.Argv)
 	}
 	return process.Name
+}
+
+// Some programs replace their argv storage with a display title. On Linux,
+// /proc/<pid>/cmdline then exposes that whole title as argv[0], followed by
+// NUL padding for the overwritten argv bytes. Those padding bytes are not real
+// empty arguments.
+//
+// The rewrite irreversibly loses the original argument boundaries. Only use
+// the title when the executable and task name corroborate a known
+// command-shaped title and the title is already shell-inert. Ambiguous titles
+// are left to the ordinary argv quoting path instead of being reinterpreted.
+func rewrittenCommandProcessTitle(process *ObservedProcess) (string, bool) {
+	if process == nil || len(process.Argv) < 2 {
+		return "", false
+	}
+	title := process.Argv[0]
+	for _, arg := range process.Argv[1:] {
+		if arg != "" {
+			return "", false
+		}
+	}
+	if process.Name != title && !(len(process.Name) == 15 && strings.HasPrefix(title, process.Name)) {
+		return "", false
+	}
+	if shellJoin(strings.Split(title, " ")) != title {
+		return "", false
+	}
+	if !isKnownCommandProcessTitle(process, title) {
+		return "", false
+	}
+	return title, true
+}
+
+// Process titles are descriptions by default, not commands. Keep recognition
+// as a separate policy so programs with equivalent, verified behavior can be
+// added without weakening the generic padding and safety checks above.
+func isKnownCommandProcessTitle(process *ObservedProcess, title string) bool {
+	executable := filepath.Base(strings.TrimSuffix(process.Exe, " (deleted)"))
+	return executable == "node" && (title == "npm" || strings.HasPrefix(title, "npm "))
 }
 
 func isTransientObservedCommand(process *ObservedProcess) bool {
