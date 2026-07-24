@@ -1,11 +1,12 @@
 <h1 align="center">
-  <img src="logo.png" alt="Meja logo" width="140">
+  <img src="logo.png" alt="Meja logo" width="180">
   <br>
   MEJA
 </h1>
 
 <div align="center">
-  <img src="screenshot.png" alt="Meja screenshot" width="720">
+  <img src="screenshot.png" alt="Meja screenshot" width="840">
+  <p><em>"what is this, a blue tmux?"</em></p>
 </div>
 
 ## Overview
