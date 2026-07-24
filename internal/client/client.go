@@ -187,10 +187,11 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Stdin == nil {
 		return errors.New("stdin is required")
 	}
+	stdinFD := int(cfg.Stdin.Fd())
 	if cfg.Stdout == nil {
 		return errors.New("stdout is required")
 	}
-	cols, rows, terminalErr := terminalSize(cfg.Stdin)
+	cols, rows, terminalErr := terminalSize(stdinFD)
 	if terminalErr == nil {
 		cfg.TerminalCols = cols
 		if cfg.CallerSessionTarget != "" {
@@ -331,7 +332,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	control.Store(live.controlDestination())
 	go forwardInputWithInitial(clientCtx, cfg.Stdin, &control, ui, streamErrs, cancelClient, pendingFrontendInput)
-	go forwardResize(clientCtx, cfg.Stdin, &control, ui, streamErrs)
+	go forwardResize(clientCtx, stdinFD, &control, ui, streamErrs)
 
 	for {
 		select {
@@ -370,7 +371,7 @@ func Run(ctx context.Context, cfg Config) error {
 				if err := waitReconnect(clientCtx, backoff); err != nil {
 					return clientExitError(clientCtx)
 				}
-				reconnectCols, reconnectRows, sizeErr := terminalSize(cfg.Stdin)
+				reconnectCols, reconnectRows, sizeErr := terminalSize(stdinFD)
 				if sizeErr != nil {
 					return sizeErr
 				}
@@ -1313,14 +1314,14 @@ func forwardInputReads(ctx context.Context, reads <-chan terminalInputRead, cont
 
 const resizeReadDelay = 16 * time.Millisecond
 
-func forwardResize(ctx context.Context, tty *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error) {
+func forwardResize(ctx context.Context, ttyFD int, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error) {
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, syscall.SIGWINCH)
 	defer signal.Stop(sigch)
-	forwardResizeSignals(ctx, tty, control, ui, errs, sigch, resizeReadDelay)
+	forwardResizeSignals(ctx, ttyFD, control, ui, errs, sigch, resizeReadDelay)
 }
 
-func forwardResizeSignals(ctx context.Context, tty *os.File, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error, sigch <-chan os.Signal, delay time.Duration) {
+func forwardResizeSignals(ctx context.Context, ttyFD int, control *atomic.Pointer[controlDestination], ui *runtimeState, errs chan<- error, sigch <-chan os.Signal, delay time.Duration) {
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
@@ -1339,7 +1340,7 @@ func forwardResizeSignals(ctx context.Context, tty *os.File, control *atomic.Poi
 			}
 		case <-readSize:
 			readSize = nil
-			cols, rows, err := terminalSize(tty)
+			cols, rows, err := terminalSize(ttyFD)
 			if err != nil {
 				errs <- err
 				return
@@ -1360,8 +1361,8 @@ func forwardResizeSignals(ctx context.Context, tty *os.File, control *atomic.Poi
 	}
 }
 
-func terminalSize(f *os.File) (uint16, uint16, error) {
-	cols, rows, err := term.GetSize(int(f.Fd()))
+func terminalSize(fd int) (uint16, uint16, error) {
+	cols, rows, err := term.GetSize(fd)
 	if err != nil {
 		return 0, 0, fmt.Errorf("get terminal size: %w", err)
 	}
