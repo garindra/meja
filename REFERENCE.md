@@ -311,7 +311,7 @@ whose target means a destination or creation input (`attach`, `restore`,
 | --- | --- | --- |
 | `new-window` | `new-window [-t session]` | Create a window at the session root. |
 | `next-layout` | `next-layout [-t session]` | Cycle the active window's preset layout. |
-| `split-window` | `split-window [-t session] [-h|-v]` | Split left/right (`-h`) or top/bottom (`-v`, also the default). |
+| `split-window` | `split-window [-t session] [-h \| -v]` | Split left/right (`-h`) or top/bottom (`-v`, also the default). |
 | `detach-client` | `detach-client [-t session]` | Detach the client. |
 | `next-window` | `next-window [-t session]` | Select the next window. |
 | `previous-window` | `previous-window [-t session]` | Select the previous window. |
@@ -320,7 +320,7 @@ whose target means a destination or creation input (`attach`, `restore`,
 | `kill-session` | `kill-session [-t session]` | Terminate a session and its panes. |
 | `kill-pane` | `kill-pane [-t session]` | Close the active pane; attached execution asks for confirmation, while CLI execution is immediate. |
 | `copy-mode` | `copy-mode [-t session]` | Enter history/copy mode. |
-| `send-keys` | `send-keys [-t session] [-X copy-mode-command | -l] key...` | Send keys or run a copy-mode command in the active pane. |
+| `send-keys` | `send-keys [-t session] [-X copy-mode-command \| -l] key...` | Send keys or run a copy-mode command in the active pane. |
 | `capture-pane` | `capture-pane [-t session] [-p] [-b buffer-name] [-S start-line] [-E end-line] [-e] [-C] [-J] [-N]` | Capture the active pane into stdout or a paste buffer. |
 | `list-panes` | `list-panes [-a] [-t session] [-F format]` | List panes and pane mode values. |
 | `set-buffer` | `set-buffer [-a] [-b buffer-name] [-n new-buffer-name] data` | Create or update a paste buffer. |
@@ -330,9 +330,9 @@ whose target means a destination or creation input (`attach`, `restore`,
 | `load-buffer` | `load-buffer [-b buffer-name] path` | Load a file into a paste buffer. |
 | `save-buffer` | `save-buffer [-a] [-b buffer-name] path` | Save a paste buffer to a file. |
 | `paste-buffer` | `paste-buffer [-t session] [-b buffer-name] [-dprS] [-s separator]` | Paste a buffer into the active pane. |
-| `swap-pane` | `swap-pane [-t session] (-U|-D)` | Swap with the previous or next pane. |
-| `select-pane` | `select-pane [-t session] (-U|-D|-L|-R)` | Focus an adjacent pane. |
-| `resize-pane` | `resize-pane [-t session] ((-U|-D|-L|-R) [amount] | -Z)` | Resize by cells or toggle zoom. |
+| `swap-pane` | `swap-pane [-t session] (-U \| -D)` | Swap with the previous or next pane. |
+| `select-pane` | `select-pane [-t session] (-U \| -D \| -L \| -R)` | Focus an adjacent pane. |
+| `resize-pane` | `resize-pane [-t session] ((-U \| -D \| -L \| -R) [amount] \| -Z)` | Resize by cells or toggle zoom. |
 | `rename-window` | `rename-window [-t session:window] [name]` | Rename, or prompt when attached and omitted. |
 | `rename-session` | `rename-session [-t session] [name]` | Name/rename, or prompt when attached and omitted. |
 | `set-root` | `set-root [-t session] [directory]` | Change the session root. |
