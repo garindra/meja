@@ -100,10 +100,7 @@ func TestDetachedNewSessionDoesNotActivateInvokingClient(t *testing.T) {
 
 	identity := &ClientIdentity{ResumeToken: "detached-test"}
 	instance := newClientInstance(d, identity)
-	d.clientInstances[identity] = instance
 	setTestClient(source, instance)
-	d.clientSessions[identity] = source.ID
-	d.attachments[source.ID] = identity
 
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:                []string{"new-session", "-d", "-P", "-F", "#{session_id}:#{pane_id}", "-s", "detached"},
@@ -844,7 +841,7 @@ func TestPaneCLISelectWindowUsesInjectedSessionWithWindowOnlyTarget(t *testing.T
 	d.sessions[s.ID] = s
 	d.names[s.Name] = s
 	d.windowLeases[second.ID] = &WindowViewLease{
-		WindowID: second.ID, SessionID: s.ID, AttachmentID: client.AttachmentID, Generation: 1,
+		WindowID: second.ID, SessionID: s.ID, ClientID: client.identity.ID, Generation: 1,
 	}
 	s.ActiveWindowID = second.ID
 
@@ -1279,12 +1276,10 @@ func TestSwitchSessionCommandAppliesPreparedTransition(t *testing.T) {
 	fixtureClient := newTestClient(source)
 	fixtureClient.setTestTerminalSize(101, 37)
 	client := clientForState(source)
-	identity := &ClientIdentity{ResumeToken: "switch-command", lastAllocatedClientLayoutRevision: client.currentLayout.LayoutRevision}
-	client.identity = identity
-	d.clientInstances[identity] = client
-	d.clientSessions[identity] = source.ID
-	d.attachments[source.ID] = identity
-	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: client.AttachmentID, Generation: 1}
+	identity := client.identity
+	identity.ResumeToken = "switch-command"
+	identity.lastAllocatedClientLayoutRevision = client.currentView.Layout.LayoutRevision
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: client.identity.ID, Generation: 1}
 	if _, err := client.executeAttachedCommand([]string{"switch-session", "-t", "target"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1317,14 +1312,12 @@ func TestSwitchSessionHandlerPreparesButDoesNotApplyClientView(t *testing.T) {
 	client := clientForState(source)
 	client.terminalCols.Store(80)
 	client.terminalRows.Store(23)
-	identity := &ClientIdentity{ResumeToken: "prepare-only", lastAllocatedClientLayoutRevision: client.currentLayout.LayoutRevision}
-	client.identity = identity
-	d.clientInstances[identity] = client
-	d.clientSessions[identity] = source.ID
-	d.attachments[source.ID] = identity
+	identity := client.identity
+	identity.ResumeToken = "prepare-only"
+	identity.lastAllocatedClientLayoutRevision = client.currentView.Layout.LayoutRevision
 	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{
 		WindowID: source.ActiveWindowID, SessionID: source.ID,
-		AttachmentID: client.AttachmentID, Generation: 1,
+		ClientID: client.identity.ID, Generation: 1,
 	}
 
 	outcome, err := d.commandEngine().run(client.commandContext(), []string{"switch-session", "-t", "target"})
@@ -1338,8 +1331,8 @@ func TestSwitchSessionHandlerPreparesButDoesNotApplyClientView(t *testing.T) {
 	if action.Transition.Projection.SessionID != target.ID {
 		t.Fatalf("prepared target session = %d, want %d", action.Transition.Projection.SessionID, target.ID)
 	}
-	if d.clients[target.ID] != client || d.clients[source.ID] != nil {
-		t.Fatalf("daemon assignment was not committed during preparation: source=%p target=%p", d.clients[source.ID], d.clients[target.ID])
+	if d.clients[target.ClientID] != client.identity || source.ClientID != 0 {
+		t.Fatalf("daemon assignment was not committed during preparation: source=%d target=%p", source.ClientID, d.clients[target.ClientID])
 	}
 	if client.sessionID != source.ID {
 		t.Fatalf("handler applied client state: session=%d, want still %d", client.sessionID, source.ID)
@@ -1390,12 +1383,10 @@ func TestAttachedRestoreCreatesSessionAndAppliesPreparedTransition(t *testing.T)
 	d.sessions[source.ID] = source
 	d.names[source.Name] = source
 	client := clientForState(source)
-	identity := &ClientIdentity{ResumeToken: "restore-command", lastAllocatedClientLayoutRevision: client.currentLayout.LayoutRevision}
-	client.identity = identity
-	d.clientInstances[identity] = client
-	d.clientSessions[identity] = source.ID
-	d.attachments[source.ID] = identity
-	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: client.AttachmentID, Generation: 1}
+	identity := client.identity
+	identity.ResumeToken = "restore-command"
+	identity.lastAllocatedClientLayoutRevision = client.currentView.Layout.LayoutRevision
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: client.identity.ID, Generation: 1}
 
 	_, err := client.executeAttachedCommand([]string{
 		"restore", "-t", "persisted", "-s", "mynewsession", "--commands=skip",
@@ -1458,7 +1449,7 @@ func TestPaneCLIGroupTargetResolvesToThePaneWindowLeaseSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.windowLeases[window.ID] = &WindowViewLease{
-		WindowID: window.ID, SessionID: mirror.ID, AttachmentID: 22, Generation: 1,
+		WindowID: window.ID, SessionID: mirror.ID, ClientID: 22, Generation: 1,
 	}
 
 	result := d.executeCommand(protocol.CommandRequest{

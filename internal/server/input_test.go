@@ -206,7 +206,7 @@ func TestRepeatedDetachInputExitsOnFirstAttempt(t *testing.T) {
 	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	handler := &ClientInstance{}
+	handler := newClientInstance(nil, nil)
 	setTestClient(s, handler)
 	if err := handleTestControlFrames(s, handler, protocol.NewDecoder(bytes.NewReader(input.Bytes()), protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
@@ -232,12 +232,10 @@ func TestSwitchSessionPromptAppliesPreparedTransition(t *testing.T) {
 	createTestWindow(source, &Pane{ID: testAddPaneID(source), terminal: newTerminal(90, 28)})
 	createTestWindow(target, &Pane{ID: testAddPaneID(target), terminal: newTerminal(90, 28)})
 	client := clientForState(source)
-	identity := &ClientIdentity{ResumeToken: "input-switch", lastAllocatedClientLayoutRevision: client.currentLayout.LayoutRevision}
-	client.identity = identity
-	d.clientInstances[identity] = client
-	d.clientSessions[identity] = source.ID
-	d.attachments[source.ID] = identity
-	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, AttachmentID: client.AttachmentID, Generation: 1}
+	identity := client.identity
+	identity.ResumeToken = "input-switch"
+	identity.lastAllocatedClientLayoutRevision = client.currentView.Layout.LayoutRevision
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: client.identity.ID, Generation: 1}
 
 	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: append([]byte{0x02, ':'}, []byte("switch-session -t logs\r")...)})
 	if err != nil {
@@ -586,7 +584,7 @@ func TestStaleTransportInputIsIgnoredAfterReconnect(t *testing.T) {
 	client := newClientInstance(nil, nil)
 	client.Daemon = s.daemon
 	client.sessionID = s.ID
-	currentClient := &ClientInstance{}
+	currentClient := newClientInstance(nil, nil)
 	currentClient.terminalCols.Store(80)
 	currentClient.terminalRows.Store(24)
 	setTestClient(s, currentClient)

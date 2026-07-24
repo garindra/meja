@@ -19,7 +19,7 @@ func (c *ClientInstance) BeginPrompt(mode PromptMode, label, initial string) (*P
 		return nil, errors.New("client is unavailable")
 	}
 	client := &c.inputState
-	windowID := c.currentLayout.WindowID
+	windowID := c.currentView.Layout.WindowID
 	if windowID == 0 {
 		windowID = state.ActiveWindowID
 	}
@@ -54,13 +54,7 @@ func (c *ClientInstance) showStatusMessage(message string) {
 		duration = time.Second
 	}
 	time.AfterFunc(duration, func() {
-		c.post(func() error {
-			if c.sessionState() == nil || c.statusMessageID.Load() != messageID {
-				return nil
-			}
-			c.statusMessage.Store("")
-			return c.publishStatusBar()
-		})
+		c.postCommand(clientInstanceCommand{ClearStatusMessage: messageID})
 	})
 }
 
@@ -576,22 +570,22 @@ func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, protocol.C
 		return nil, protocol.ClientLayout{}, errors.New("client is unavailable")
 	}
 	client := &c.inputState
-	windowID := c.currentLayout.WindowID
+	windowID := c.currentView.Layout.WindowID
 	window := c.sessionState().Windows[windowID]
 	if window == nil {
 		return nil, protocol.ClientLayout{}, fmt.Errorf("unknown window %d", windowID)
 	}
-	cols, rows := clientViewportSize(c, window)
+	cols, rows := clientViewportSize(c.identity, window)
 	placements := window.Layout.Compute(Rect{Width: int(cols), Height: int(rows)})
 	var current *PanePlacement
 	for i := range placements {
-		if placements[i].PaneID == c.currentLayout.FocusedPaneID {
+		if placements[i].PaneID == c.currentView.Layout.FocusedPaneID {
 			current = &placements[i]
 			break
 		}
 	}
 	if current == nil {
-		return cloneWindow(window), c.currentLayout, nil
+		return cloneWindow(window), c.currentView.Layout, nil
 	}
 	if !client.HasFocusPoint {
 		client.FocusX2 = rectCenterX2(current.Rect)
@@ -663,9 +657,9 @@ func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, protocol.C
 		if err != nil {
 			return nil, protocol.ClientLayout{}, err
 		}
-		return focusedWindow, c.currentLayout, nil
+		return focusedWindow, c.currentView.Layout, nil
 	}
-	return cloneWindow(window), c.currentLayout, nil
+	return cloneWindow(window), c.currentView.Layout, nil
 }
 
 func rectCenterX2(rect Rect) int {

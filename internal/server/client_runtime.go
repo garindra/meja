@@ -14,7 +14,7 @@ func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) 
 		return false, errors.New("client instance has no session")
 	}
 	if c.Daemon != nil && c.ViewLeaseWindowID != 0 && c.ViewLeaseGeneration != 0 {
-		if err := c.Daemon.validateWindowView(c.AttachmentID, c.ViewLeaseWindowID, c.ViewLeaseGeneration); err != nil {
+		if err := c.Daemon.validateWindowView(c.identity.ID, c.ViewLeaseWindowID, c.ViewLeaseGeneration); err != nil {
 			return false, err
 		}
 	}
@@ -28,7 +28,7 @@ func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) 
 			return false, errors.New("source-idle frontend input must contain one Escape byte")
 		}
 		var detach, stopped bool
-		if state.attachedClient() != c {
+		if !c.Daemon.clientConnectionIsActive(c.identity, c.connection, state.ID) {
 			return false, nil
 		}
 		var processErr error
@@ -50,7 +50,7 @@ func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) 
 		if err != nil {
 			return false, err
 		}
-		if state.attachedClient() != c {
+		if !c.Daemon.clientConnectionIsActive(c.identity, c.connection, state.ID) {
 			return false, nil
 		}
 		if err := c.resizeClient(msg.Cols, msg.Rows); err != nil {
@@ -220,7 +220,7 @@ func (c *ClientInstance) resizeClient(cols, rows uint16) error {
 	// resize being applied, rather than the previous scanout.
 	c.terminalCols.Store(uint32(cols))
 	c.terminalRows.Store(uint32(rows))
-	transition, err := c.Daemon.resizeClientView(c, cols, rows)
+	transition, err := c.Daemon.resizeClientView(c.identity, cols, rows)
 	if err != nil {
 		return err
 	}

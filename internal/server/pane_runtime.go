@@ -69,19 +69,31 @@ func (l *paneOutputRateLimiter) reserve(now time.Time, bytes int) time.Duration 
 	return time.Duration(-l.tokens / paneOutputBytesPerSecond * float64(time.Second))
 }
 
-func (p *Pane) attachOutputStream(lease *OutputLease, layoutRevision protocol.ClientLayoutRevision) error {
-	attachment := &paneOutputAttach{Lease: lease, LayoutRevision: layoutRevision}
+func (p *Pane) installOutputLease(lease *OutputLease, layoutRevision protocol.ClientLayoutRevision, cols, rows uint16) error {
+	installation := &paneOutputInstall{
+		Lease: lease, LayoutRevision: layoutRevision, Cols: cols, Rows: rows,
+	}
 	if p.commands == nil {
+		if p.terminal == nil {
+			p.outputLease = lease
+			return nil
+		}
+		if p.terminal.Cols != int(cols) || p.terminal.Rows != int(rows) {
+			if p.PTY != nil {
+				if err := pty.Setsize(p.PTY, &pty.Winsize{Cols: cols, Rows: rows}); err != nil {
+					return err
+				}
+			}
+			p.terminal.Resize(int(cols), int(rows))
+			p.publishTerminalMetadata()
+		}
+		p.outputLease = lease
+		if lease == nil {
+			return nil
+		}
 		return p.renderAttachedView(newRenderOutput(lease.Stream), layoutRevision)
 	}
-	select {
-	case p.commands <- paneCommand{attach: attachment}:
-		return nil
-	case <-p.mainDone:
-		return nil
-	case <-p.done:
-		return nil
-	}
+	return p.sendRenderCommand(paneCommand{install: installation})
 }
 
 func (p *Pane) renderAttachedView(output *renderOutput, layoutRevision protocol.ClientLayoutRevision) error {
@@ -101,11 +113,14 @@ func (p *Pane) renderAttachedView(output *renderOutput, layoutRevision protocol.
 	}
 }
 
-func (p *Pane) detachOutputStream(stream io.Writer) error {
+func (p *Pane) detachOutputLease(lease *OutputLease) error {
 	if p.commands == nil {
+		if p.outputLease == lease {
+			p.outputLease = nil
+		}
 		return nil
 	}
-	return p.sendRenderCommand(paneCommand{detach: stream})
+	return p.sendRenderCommand(paneCommand{detach: &paneOutputDetach{Lease: lease}})
 }
 
 func (p *Pane) releaseOutputStream(done chan<- *OutputLease) {
@@ -307,16 +322,34 @@ func (p *Pane) run() {
 				continue
 			}
 			if command.detach != nil {
-				if p.outputLease != nil && p.outputLease.Stream == command.detach {
+				if p.outputLease == command.detach.Lease {
 					p.outputLease = nil
 					renderer.detach()
 				}
 				command.done <- nil
 				continue
 			}
-			if command.attach != nil {
-				p.outputLease = command.attach.Lease
-				renderer.attach(command.attach.Lease, command.attach.LayoutRevision, command.attach.Refresh)
+			if command.install != nil {
+				installation := command.install
+				p.outputLease = nil
+				renderer.detach()
+				if p.terminal.Cols != int(installation.Cols) || p.terminal.Rows != int(installation.Rows) {
+					if p.PTY != nil {
+						if err := pty.Setsize(p.PTY, &pty.Winsize{Cols: installation.Cols, Rows: installation.Rows}); err != nil {
+							command.done <- err
+							continue
+						}
+					}
+					p.terminal.Resize(int(installation.Cols), int(installation.Rows))
+					p.publishTerminalMetadata()
+				}
+				p.outputLease = installation.Lease
+				if installation.Lease == nil {
+					command.done <- nil
+					continue
+				}
+				renderer.attach(installation.Lease, installation.LayoutRevision, installation.Refresh)
+				command.done <- nil
 				continue
 			}
 			if command.history != nil {

@@ -296,7 +296,7 @@ func (c *ClientInstance) publishStatusBar() error {
 	}})
 }
 
-func (c *ClientInstance) sendPreparedClientLayout(layout protocol.ClientLayout) error {
+func (c *ClientInstance) sendClientLayout(layout protocol.ClientLayout) error {
 	if c.controlOut == nil {
 		return nil
 	}
@@ -309,67 +309,54 @@ type outputHandoff struct {
 	waited   bool
 }
 
-func (c *ClientInstance) beginOutputHandoffWithRemovedPanes(removedPanes []*Pane) *outputHandoff {
-	placements := c.currentPanePlacements()
+func (c *ClientInstance) beginOutputHandoff() *outputHandoff {
+	placements := c.currentView.Panes
 	handoff := &outputHandoff{
 		released: make(chan *OutputLease, len(placements)),
 		pending:  make(map[int]struct{}, len(placements)),
 	}
-	for _, placement := range placements {
-		var pane *Pane
-		if c.Daemon != nil {
-			if value, ok := c.Daemon.paneIndex.Load(placement.PaneID); ok && value != nil {
-				pane = value.(*Pane)
-			}
-		}
-		if pane == nil {
-			for _, removed := range removedPanes {
-				if removed != nil && removed.ID == placement.PaneID {
-					pane = removed
-					break
-				}
-			}
-		}
-		if pane == nil {
+	for _, resolved := range placements {
+		if resolved.Pane == nil {
 			continue
 		}
-		handoff.pending[int(placement.Slot)] = struct{}{}
-		pane.releaseOutputStream(handoff.released)
+		handoff.pending[int(resolved.Placement.Slot)] = struct{}{}
+		resolved.Pane.releaseOutputStream(handoff.released)
 	}
 	return handoff
 }
 
-func (c *ClientInstance) finishPreparedOutputHandoff(handoff *outputHandoff, prepared PreparedProjection) error {
-	bySlot := make(map[int]PreparedRenderPane, len(prepared.Panes))
-	for _, pane := range prepared.Panes {
+func (c *ClientInstance) finishOutputHandoff(handoff *outputHandoff, plan ClientProjectionPlan) error {
+	bySlot := make(map[int]ClientPanePlacement, len(plan.View.Panes))
+	for _, pane := range plan.View.Panes {
 		bySlot[int(pane.Placement.Slot)] = pane
 	}
-	attach := func(preparedPane PreparedRenderPane) error {
-		placement := preparedPane.Placement
+	install := func(resolved ClientPanePlacement) error {
+		placement := resolved.Placement
 		lease := c.currentOutputLease(int(placement.Slot))
-		if lease == nil || preparedPane.Pane == nil {
-			return nil
+		if resolved.Pane == nil {
+			return fmt.Errorf("pane %d has no resolved actor", placement.PaneID)
 		}
-		cols, rows := preparedPane.Pane.TerminalSize()
-		if cols != placement.Rect.Width || rows != placement.Rect.Height {
-			return fmt.Errorf("pane %d grid changed from prepared layout %dx%d to %dx%d", preparedPane.Pane.ID, placement.Rect.Width, placement.Rect.Height, cols, rows)
-		}
-		c.Daemon.logf("meja projection: bind attachment=%d session=%d window=%d pane=%d slot=%d revision=%d grid=%dx%d\n",
-			c.AttachmentID, prepared.Plan.SessionID, prepared.Plan.Layout.WindowID, preparedPane.Pane.ID, placement.Slot,
-			prepared.Plan.Layout.LayoutRevision, cols, rows)
-		return preparedPane.Pane.attachOutputStream(lease, prepared.Plan.Layout.LayoutRevision)
+		c.Daemon.logf("meja projection: bind client=%d session=%d window=%d pane=%d slot=%d revision=%d grid=%dx%d\n",
+			c.identity.ID, plan.SessionID, plan.View.Layout.WindowID, resolved.Pane.ID, placement.Slot,
+			plan.View.Layout.LayoutRevision, placement.Rect.Width, placement.Rect.Height)
+		return resolved.Pane.installOutputLease(
+			lease,
+			plan.View.Layout.LayoutRevision,
+			uint16(placement.Rect.Width),
+			uint16(placement.Rect.Height),
+		)
 	}
 	if handoff == nil || handoff.waited {
-		for _, pane := range prepared.Panes {
-			if err := attach(pane); err != nil {
+		for _, pane := range plan.View.Panes {
+			if err := install(pane); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	for _, pane := range prepared.Panes {
+	for _, pane := range plan.View.Panes {
 		if _, waiting := handoff.pending[int(pane.Placement.Slot)]; !waiting {
-			if err := attach(pane); err != nil {
+			if err := install(pane); err != nil {
 				return err
 			}
 		}
@@ -385,14 +372,14 @@ func (c *ClientInstance) finishPreparedOutputHandoff(handoff *outputHandoff, pre
 		}
 		delete(stillPending, lease.Slot)
 		if binding, ok := bySlot[lease.Slot]; ok {
-			if err := attach(binding); err != nil {
+			if err := install(binding); err != nil {
 				return err
 			}
 		}
 	}
 	for slot := range stillPending {
 		if binding, ok := bySlot[slot]; ok {
-			if err := attach(binding); err != nil {
+			if err := install(binding); err != nil {
 				return err
 			}
 		}
@@ -414,7 +401,7 @@ func (c *ClientInstance) waitOutputHandoff(handoff *outputHandoff) error {
 func (c *ClientInstance) detachLeases(panes []*Pane, leases map[int]*OutputLease) error {
 	for _, pane := range panes {
 		for _, lease := range leases {
-			if err := pane.detachOutputStream(lease.Stream); err != nil {
+			if err := pane.detachOutputLease(lease); err != nil {
 				return err
 			}
 		}

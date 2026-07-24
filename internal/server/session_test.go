@@ -502,7 +502,7 @@ func TestResizePreservesVisualClientPaneOrder(t *testing.T) {
 		Second:    &PaneLayout{PaneID: second.ID},
 	}
 	clientInstance := clientForState(s)
-	clientInstance.currentLayout.Panes = []protocol.PanePlacement{{PaneID: first.ID, Slot: 0}, {PaneID: second.ID, Slot: 1}}
+	clientInstance.currentView.Layout.Panes = []protocol.PanePlacement{{PaneID: first.ID, Slot: 0}, {PaneID: second.ID, Slot: 1}}
 	if got := clientInstance.currentPanePlacements()[0].PaneID; got != first.ID {
 		t.Fatalf("initial slot 0 pane = %d, want %d", got, first.ID)
 	}
@@ -838,7 +838,7 @@ func TestReattachPreservesActiveClientLayoutRevision(t *testing.T) {
 	window, _ := createTestWindow(s, pane)
 	previousRevision := window.LayoutRevision
 
-	client := clientForState(s).currentLayout
+	client := clientForState(s).currentView.Layout
 	reattached := cloneWindow(s.Windows[client.WindowID])
 	activePane := s.Panes[client.FocusedPaneID]
 	if activePane != pane {
@@ -856,7 +856,7 @@ func TestSelectingWindowAdvancesClientProjectionWithoutChangingCanonicalLayout(t
 	second, _ := createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "two"})
 	firstRevision, secondRevision := first.LayoutRevision, second.LayoutRevision
 	client := clientForState(s)
-	clientLayoutRevision := client.currentLayout.LayoutRevision
+	clientLayoutRevision := client.currentView.Layout.LayoutRevision
 
 	selected, _, err := selectTestSessionWindow(s, first.ID)
 	if err != nil {
@@ -865,8 +865,8 @@ func TestSelectingWindowAdvancesClientProjectionWithoutChangingCanonicalLayout(t
 	if selected.LayoutRevision != firstRevision || second.LayoutRevision != secondRevision {
 		t.Fatalf("selection changed canonical revisions: first=%d want=%d second=%d want=%d", selected.LayoutRevision, firstRevision, second.LayoutRevision, secondRevision)
 	}
-	if client.currentLayout.LayoutRevision <= clientLayoutRevision {
-		t.Fatalf("selected client layout revision = %d, want newer than %d", client.currentLayout.LayoutRevision, clientLayoutRevision)
+	if client.currentView.Layout.LayoutRevision <= clientLayoutRevision {
+		t.Fatalf("selected client layout revision = %d, want newer than %d", client.currentView.Layout.LayoutRevision, clientLayoutRevision)
 	}
 }
 
@@ -956,7 +956,7 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	}
 
 	client := clientForState(s)
-	result, err := s.daemon.removeClientPane(client, second.ActivePaneID)
+	result, err := s.daemon.removeClientPane(client.identity, second.ActivePaneID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -989,7 +989,7 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	if _, _, err := selectTestSessionWindow(s, third.ID); err != nil {
 		t.Fatal(err)
 	}
-	if layout := clientForState(s).currentLayout; layout.WindowID != third.ID {
+	if layout := clientForState(s).currentView.Layout; layout.WindowID != third.ID {
 		t.Fatalf("numeric-selection target = %d, want %d", layout.WindowID, third.ID)
 	}
 }
@@ -1093,11 +1093,11 @@ func TestInitializeAttachedViewDoesNotReplaceDaemonClient(t *testing.T) {
 	fixtureClient := newTestClient(s)
 	fixtureClient.setTestTerminalSize(80, 24)
 	createTestWindow(s, &Pane{ID: testAddPaneID(s), terminal: newTerminal(80, 24)})
-	existing := &ClientInstance{}
+	existing := newClientInstance(s.daemon, nil)
 	setTestClient(s, existing)
-	replacement := &ClientInstance{sessionID: s.ID, Daemon: s.daemon}
+	replacement := newClientInstance(s.daemon, &ClientIdentity{SessionID: s.ID, ID: 999})
 
-	if err := replacement.initializeAttachedView(80, 24); err == nil {
+	if _, err := s.daemon.initializeClient(ClientInitialized{ClientID: replacement.identity.ID, Cols: 80, Rows: 24}); err == nil {
 		t.Fatal("unregistered replacement initialized a view")
 	}
 	if testClientOf(s) != existing {
@@ -1107,12 +1107,12 @@ func TestInitializeAttachedViewDoesNotReplaceDaemonClient(t *testing.T) {
 
 func TestStaleTransportCleanupDoesNotDetachReconnectedClientInstance(t *testing.T) {
 	s := NewSessionState(1)
-	stale := &ClientInstance{}
+	stale := newClientInstance(s.daemon, nil)
 	stale.detaching.Store(true)
-	current := &ClientInstance{}
+	current := newClientInstance(s.daemon, nil)
 	setTestClient(s, current)
 
-	stale.releaseFrontendResources(nil)
+	stale.releaseFrontendResources()
 
 	if testClientOf(s) != current {
 		t.Fatal("stale transport cleanup detached the replacement transport")

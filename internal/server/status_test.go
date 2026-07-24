@@ -200,6 +200,9 @@ func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 	if err := runStatusEvent(t, s, events[len(events)-1]); err != nil {
 		t.Fatal(err)
 	}
+	if got, _ := clientForState(s).statusMessage.Load().(string); got == "" {
+		t.Fatal("command error did not install a status message")
+	}
 	errorStatus := statusClient.read(t)
 	assertStatusText(t, errorStatus, `send-keys requires at least one key`)
 	for i, cell := range errorStatus.Cells {
@@ -470,7 +473,7 @@ func TestStatusOutputReconnectGetsBarrierlessFullRefresh(t *testing.T) {
 	}
 
 	firstConnection.detaching.Store(true)
-	firstConnection.releaseFrontendResources(nil)
+	firstConnection.releaseFrontendResources()
 	s.Name = "live"
 	if err := clientForState(s).publishStatusBar(); err != nil {
 		t.Fatal(err)

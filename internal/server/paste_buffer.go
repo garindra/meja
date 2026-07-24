@@ -467,7 +467,11 @@ func runPasteBufferCommand(d *Daemon, ctx CommandContext, args []string) (comman
 	if client == nil {
 		return commandOutcome{}, errors.New("command requires an attached client")
 	}
-	return commandOutcome{}, pasteBufferToClient(client, remaining)
+	return commandOutcome{Action: pasteClientBufferAction{
+		ClientID:  client.ID,
+		SessionID: client.SessionID,
+		Args:      append([]string(nil), remaining...),
+	}}, nil
 }
 
 func pasteBufferToClient(s *ClientInstance, args []string) error {
