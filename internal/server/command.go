@@ -1212,7 +1212,8 @@ func runSetRootCommand(d *Daemon, ctx CommandContext, args []string) (commandOut
 	if len(remaining) == 1 {
 		raw = remaining[0]
 	}
-	if err := d.setCommandRoot(sessionID, raw, ctx.Caller.WorkingDirectory); err != nil {
+	callerIsPane := ctx.Caller.Origin == CommandOriginAttachedUI || ctx.Caller.Origin == CommandOriginPaneCLI
+	if err := d.setCommandRoot(sessionID, raw, ctx.Caller.WorkingDirectory, ctx.Caller.PaneID, callerIsPane); err != nil {
 		return commandOutcome{}, err
 	}
 	if client := commandClientValue(d, ctx, sessionID); client != nil {
@@ -1344,7 +1345,7 @@ func (d *Daemon) renameCommandSession(sessionID uint64, name string) error {
 	return d.renameSession(state, name)
 }
 
-func (d *Daemon) setCommandRoot(sessionID uint64, raw, callerWorkingDirectory string) error {
+func (d *Daemon) setCommandRoot(sessionID uint64, raw, callerWorkingDirectory string, callerPaneID uint64, callerIsPane bool) error {
 	var state *SessionState
 	var current string
 	d.call(func() {
@@ -1376,6 +1377,9 @@ func (d *Daemon) setCommandRoot(sessionID uint64, raw, callerWorkingDirectory st
 			return
 		}
 		state.setRoot(resolved)
+		if callerIsPane && callerWorkingDirectory != "" && state.Panes[callerPaneID] != nil {
+			state.persistPaneCwdForPersistence(callerPaneID, callerWorkingDirectory)
+		}
 	})
 	return err
 }

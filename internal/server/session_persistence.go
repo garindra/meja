@@ -126,9 +126,10 @@ type PlanLayout struct {
 }
 
 type paneCaptureInput struct {
-	pane   *Pane
-	launch PaneLaunch
-	anchor Anchor
+	pane        *Pane
+	launch      PaneLaunch
+	fallbackCwd string
+	anchor      Anchor
 }
 
 type windowCaptureInput struct {
@@ -160,15 +161,30 @@ func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer P
 	sessionName = s.Name
 	sessionRoot = s.rootDir
 	activeWindowID = s.ActiveWindowID
+	persistedCwds := map[uint64]string{}
+	if persisted := s.persistenceRecord(); persisted != nil {
+		for _, window := range persisted.Plan.Windows {
+			for _, pane := range window.Panes {
+				if pane.Cwd != "" {
+					persistedCwds[pane.ID] = pane.Cwd
+				}
+			}
+		}
+	}
 	inputs = make([]paneCaptureInput, 0, len(s.Panes))
 	for _, pane := range s.Panes {
 		if pane == nil || pane.Root.PID <= 0 {
 			continue
 		}
 		launch := clonePaneLaunch(pane.Launch)
+		fallbackCwd := launch.Cwd
+		if persistedCwd := persistedCwds[pane.ID]; persistedCwd != "" {
+			fallbackCwd = persistedCwd
+		}
 		inputs = append(inputs, paneCaptureInput{
-			pane:   pane,
-			launch: launch,
+			pane:        pane,
+			launch:      launch,
+			fallbackCwd: fallbackCwd,
 			anchor: Anchor{
 				Key:         PaneKey{PaneID: pane.ID},
 				Root:        pane.Root,
@@ -258,7 +274,7 @@ func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer P
 				Issues: []string{"observer returned no result for pane"},
 			}
 		}
-		cwd := input.launch.Cwd
+		cwd := input.fallbackCwd
 		if observation.Root != nil && observation.Root.Cwd != "" {
 			cwd = observation.Root.Cwd
 		}
@@ -626,6 +642,24 @@ func (s *SessionState) persistObservedPaneForPersistence(paneID uint64, projecti
 			}
 			pane.Cwd = projection.Cwd
 			pane.Command = projection.Command
+			s.queuePersistenceWrite()
+			return
+		}
+	}
+}
+
+func (s *SessionState) persistPaneCwdForPersistence(paneID uint64, cwd string) {
+	persisted := s.ensureSessionPersistence()
+	if persisted == nil {
+		return
+	}
+	for windowIndex := range persisted.Plan.Windows {
+		for paneIndex := range persisted.Plan.Windows[windowIndex].Panes {
+			pane := &persisted.Plan.Windows[windowIndex].Panes[paneIndex]
+			if pane.ID != paneID {
+				continue
+			}
+			pane.Cwd = filepath.Clean(cwd)
 			s.queuePersistenceWrite()
 			return
 		}

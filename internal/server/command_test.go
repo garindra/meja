@@ -1434,11 +1434,13 @@ func TestPaneCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
 	t.Cleanup(func() { stopState(s) })
 	s.daemon = d
 	s.setSessionName("renamed-session")
-	s.rootDir = t.TempDir()
+	initialRoot := t.TempDir()
+	s.rootDir = initialRoot
 	s.daemon.processObserver = emptyProcessObserver{}
 	project := t.TempDir()
 	newTestClient(s)
-	createTestWindow(s, &Pane{ID: testAddPaneID(s), Launch: PaneLaunch{Cwd: project}})
+	pane := &Pane{ID: testAddPaneID(s), Launch: PaneLaunch{Cwd: initialRoot}}
+	createTestWindow(s, pane)
 	d.sessions[s.ID] = s
 	d.names[s.Name] = s
 
@@ -1446,12 +1448,21 @@ func TestPaneCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
 		Args:                []string{"set-root", "."},
 		WorkingDirectory:    project,
 		CallerSessionTarget: "17",
+		CallerPaneID:        pane.ID,
 	})
 	if result.exitCode != 0 {
 		t.Fatalf("pane CLI set-root = %#v", result)
 	}
 	if s.rootDir != project {
 		t.Fatalf("pane CLI set-root changed root to %q, want %q", s.rootDir, project)
+	}
+	if pane.Launch.Cwd != initialRoot {
+		t.Fatalf("pane launch cwd changed to %q, want existing cwd %q", pane.Launch.Cwd, initialRoot)
+	}
+	persisted := s.persistenceRecord()
+	if persisted == nil || len(persisted.Plan.Windows) != 1 || len(persisted.Plan.Windows[0].Panes) != 1 ||
+		persisted.Plan.Windows[0].Panes[0].Cwd != project {
+		t.Fatalf("persisted caller cwd = %#v, want %q", persisted, project)
 	}
 }
 
