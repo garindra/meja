@@ -317,6 +317,25 @@ func TestParsePSProcess(t *testing.T) {
 	}
 }
 
+func TestPSSessionMembersFiltersSessionAndDeadProcesses(t *testing.T) {
+	processes := []ObservedProcess{
+		{Identity: Identity{PID: 10, BirthToken: 1}, State: 'S'},
+		{Identity: Identity{PID: 11, BirthToken: 2}, State: 'R'},
+		{Identity: Identity{PID: 12, BirthToken: 3}, State: 'Z'},
+		{Identity: Identity{PID: 13, BirthToken: 4}, State: 'S'},
+	}
+	getSession := func(pid int) (int, error) {
+		if pid == 10 || pid == 11 || pid == 12 {
+			return 10, nil
+		}
+		return 13, nil
+	}
+	members := psSessionMembers(processes, 10, getSession)
+	if len(members) != 2 || members[0] != processes[0].Identity || members[1] != processes[1].Identity {
+		t.Fatalf("session members = %+v", members)
+	}
+}
+
 func TestDirectPSChildrenMatchesNumericParentID(t *testing.T) {
 	processes := []ObservedProcess{
 		{Identity: Identity{PID: 10, BirthToken: 1}, PPID: 7, Name: "vim"},

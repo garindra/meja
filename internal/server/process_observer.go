@@ -146,17 +146,25 @@ func processSessionMembers(ctx context.Context, sessionID int) ([]Identity, erro
 		return members, nil
 	}
 
-	processes, err := scanPS(ctx, "-s", strconv.Itoa(sessionID))
+	processes, err := scanPS(ctx, "-ax")
 	if err != nil {
 		return nil, err
 	}
+	return psSessionMembers(processes, sessionID, unix.Getsid), nil
+}
+
+func psSessionMembers(processes []ObservedProcess, sessionID int, getSession func(int) (int, error)) []Identity {
 	members := make([]Identity, 0, len(processes))
 	for _, process := range processes {
-		if process.State != 'Z' && process.State != 'X' && process.State != 'x' {
+		if process.State == 'Z' || process.State == 'X' || process.State == 'x' {
+			continue
+		}
+		currentSession, err := getSession(process.Identity.PID)
+		if err == nil && currentSession == sessionID {
 			members = append(members, process.Identity)
 		}
 	}
-	return members, nil
+	return members
 }
 
 func (systemObserver) Observe(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObservation {
