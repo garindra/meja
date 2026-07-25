@@ -139,6 +139,9 @@ func (s *SessionState) formatPaneSnapshot(pane *Pane, windowIndex int) formatPan
 		path = observation.Candidate.Cwd
 	}
 	if path == "" {
+		path = pane.KnownCwd
+	}
+	if path == "" {
 		path = pane.Launch.Cwd
 	}
 

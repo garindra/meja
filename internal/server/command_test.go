@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -1463,6 +1464,64 @@ func TestPaneCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
 	if persisted == nil || len(persisted.Plan.Windows) != 1 || len(persisted.Plan.Windows[0].Panes) != 1 ||
 		persisted.Plan.Windows[0].Panes[0].Cwd != project {
 		t.Fatalf("persisted caller cwd = %#v, want %q", persisted, project)
+	}
+}
+
+func TestPaneCLISetRootMakesUnnamedSessionPanePortable(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	initialRoot := t.TempDir()
+	project := t.TempDir()
+	s := NewSessionState(18)
+	t.Cleanup(func() { stopState(s) })
+	s.daemon = d
+	s.rootDir = initialRoot
+	pane := &Pane{
+		ID:     testAddPaneID(s),
+		Root:   Identity{PID: 101, BirthToken: 1001},
+		Launch: PaneLaunch{Cwd: initialRoot, Shell: "/bin/sh"},
+	}
+	createTestWindow(s, pane)
+	d.sessions[s.ID] = s
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"set-root", "."},
+		WorkingDirectory:    project,
+		CallerSessionTarget: strconv.FormatUint(s.ID, 10),
+		CallerPaneID:        pane.ID,
+	})
+	if result.exitCode != 0 {
+		t.Fatalf("set-root = %#v", result)
+	}
+	if s.persistenceRecord() != nil {
+		t.Fatal("unnamed session unexpectedly created private persistence")
+	}
+	if pane.Launch.Cwd != initialRoot || pane.KnownCwd != project {
+		t.Fatalf("pane launch/known cwd = %q/%q, want %q/%q", pane.Launch.Cwd, pane.KnownCwd, initialRoot, project)
+	}
+
+	anchor := Anchor{Key: PaneKey{PaneID: pane.ID}, Root: pane.Root, PTY: pane.PTY, RootIsShell: true}
+	if err := d.applyMonitoredProcessObservations(s, monitoredProcessBatch{{
+		anchor: anchor,
+		observation: ProcessObservation{
+			Key: anchor.Key, Status: StatusShellOwned, Root: &ObservedProcess{Identity: pane.Root},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	capture, err := d.captureSession(s, context.Background(), emptyProcessObserver{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := sessionPlanFromCapture(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _, err := encodeUserSessionPlan(plan, filepath.Join(project, "dev.meja"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "cwd ") {
+		t.Fatalf("portable unnamed session retained pane cwd:\n%s", encoded)
 	}
 }
 

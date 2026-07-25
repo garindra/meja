@@ -161,16 +161,6 @@ func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer P
 	sessionName = s.Name
 	sessionRoot = s.rootDir
 	activeWindowID = s.ActiveWindowID
-	persistedCwds := map[uint64]string{}
-	if persisted := s.persistenceRecord(); persisted != nil {
-		for _, window := range persisted.Plan.Windows {
-			for _, pane := range window.Panes {
-				if pane.Cwd != "" {
-					persistedCwds[pane.ID] = pane.Cwd
-				}
-			}
-		}
-	}
 	inputs = make([]paneCaptureInput, 0, len(s.Panes))
 	for _, pane := range s.Panes {
 		if pane == nil || pane.Root.PID <= 0 {
@@ -178,8 +168,8 @@ func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer P
 		}
 		launch := clonePaneLaunch(pane.Launch)
 		fallbackCwd := launch.Cwd
-		if persistedCwd := persistedCwds[pane.ID]; persistedCwd != "" {
-			fallbackCwd = persistedCwd
+		if pane.KnownCwd != "" {
+			fallbackCwd = pane.KnownCwd
 		}
 		inputs = append(inputs, paneCaptureInput{
 			pane:        pane,
@@ -648,24 +638,6 @@ func (s *SessionState) persistObservedPaneForPersistence(paneID uint64, projecti
 	}
 }
 
-func (s *SessionState) persistPaneCwdForPersistence(paneID uint64, cwd string) {
-	persisted := s.ensureSessionPersistence()
-	if persisted == nil {
-		return
-	}
-	for windowIndex := range persisted.Plan.Windows {
-		for paneIndex := range persisted.Plan.Windows[windowIndex].Panes {
-			pane := &persisted.Plan.Windows[windowIndex].Panes[paneIndex]
-			if pane.ID != paneID {
-				continue
-			}
-			pane.Cwd = filepath.Clean(cwd)
-			s.queuePersistenceWrite()
-			return
-		}
-	}
-}
-
 func (s *SessionState) ensureSessionPersistence() *SessionPersistence {
 	if s.persistenceRecord() != nil {
 		return s.persistenceRecord()
@@ -766,12 +738,18 @@ func (s *SessionState) projectPlanWindow(window *Window, processes map[uint64]pr
 		if pane == nil {
 			continue
 		}
-		output := PlanPane{ID: paneID, Cwd: pane.Launch.Cwd, Shell: pane.Launch.Shell}
+		cwd := pane.Launch.Cwd
+		if pane.KnownCwd != "" {
+			cwd = pane.KnownCwd
+		}
+		output := PlanPane{ID: paneID, Cwd: cwd, Shell: pane.Launch.Shell}
 		if len(pane.Launch.RequestedArgv) > 0 {
 			output.Command = shellJoin(pane.Launch.RequestedArgv)
 		}
 		if projection, ok := processes[paneID]; ok {
-			output.Cwd = projection.Cwd
+			if pane.KnownCwd == "" {
+				output.Cwd = projection.Cwd
+			}
 			output.Command = projection.Command
 		}
 		persisted.Panes = append(persisted.Panes, output)

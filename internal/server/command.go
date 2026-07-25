@@ -1376,9 +1376,16 @@ func (d *Daemon) setCommandRoot(sessionID uint64, raw, callerWorkingDirectory st
 			err = errSessionUnavailable
 			return
 		}
-		state.setRoot(resolved)
+		rootChanged := filepath.Clean(resolved) != state.rootDir
+		cwdChanged := false
 		if callerIsPane && callerWorkingDirectory != "" && state.Panes[callerPaneID] != nil {
-			state.persistPaneCwdForPersistence(callerPaneID, callerWorkingDirectory)
+			cwd := filepath.Clean(callerWorkingDirectory)
+			cwdChanged = cwd != state.Panes[callerPaneID].KnownCwd
+			state.Panes[callerPaneID].KnownCwd = cwd
+		}
+		state.setRoot(resolved)
+		if cwdChanged && !rootChanged {
+			state.markSessionChangedForPersistence()
 		}
 	})
 	return err
@@ -1875,6 +1882,9 @@ func (c *ClientInstance) observedPaneCwd(pane *Pane) string {
 	}})
 	if observation := observations[key]; observation.Root != nil && observation.Root.Cwd != "" {
 		return observation.Root.Cwd
+	}
+	if pane.KnownCwd != "" {
+		return pane.KnownCwd
 	}
 	if persisted := c.sessionState().persistenceRecord(); persisted != nil {
 		for _, window := range persisted.Plan.Windows {

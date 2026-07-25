@@ -649,26 +649,61 @@ func observePS(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObserva
 		root := *rootBefore
 		observation.Root = &root
 		observation.Processes = childrenBefore
-		observation.Issues = []string{"ps fallback does not provide structured argv, executable, or cwd data"}
+		observation.Issues = []string{"ps fallback does not provide executable or cwd data"}
 		if !anchor.RootIsShell {
 			observation.Status = StatusDetected
 			observation.Candidate = cloneObservedProcess(&root)
-			observations[anchor.Key] = observation
-			continue
+		} else {
+			switch len(childrenBefore) {
+			case 0:
+				observation.Status = StatusShellOwned
+			case 1:
+				observation.Status = StatusDetected
+				observation.Candidate = cloneObservedProcess(&childrenBefore[0])
+			default:
+				observation.Status = StatusAmbiguous
+				observation.Issues = append(observation.Issues, "pane shell has multiple immediate child processes")
+			}
 		}
-		switch len(childrenBefore) {
-		case 0:
-			observation.Status = StatusShellOwned
-		case 1:
-			observation.Status = StatusDetected
-			observation.Candidate = cloneObservedProcess(&childrenBefore[0])
-		default:
-			observation.Status = StatusAmbiguous
-			observation.Issues = append(observation.Issues, "pane shell has multiple immediate child processes")
+		if observation.Candidate != nil {
+			argv, argvErr := readStructuredProcessArgv(observation.Candidate.Identity.PID)
+			if argvErr == nil {
+				current, identifyErr := identifyPS(observation.Candidate.Identity.PID)
+				if identifyErr != nil || current != observation.Candidate.Identity {
+					observation.Status = StatusUnstable
+					observation.Candidate = nil
+					observation.Issues = append(observation.Issues, "pane command process changed while reading argv")
+					observations[anchor.Key] = observation
+					continue
+				}
+				observation.Candidate.Argv = argv
+				observation.Candidate.ArgvAvailable = true
+				copyObservedArgv(&observation, current, argv)
+			} else if errors.Is(argvErr, errStructuredProcessArgvUnavailable) {
+				observation.Issues = append(observation.Issues, "ps fallback does not provide structured argv data")
+			} else {
+				observation.Issues = append(observation.Issues, argvErr.Error())
+			}
 		}
 		observations[anchor.Key] = observation
 	}
 	return observations
+}
+
+func copyObservedArgv(observation *ProcessObservation, identity Identity, argv []string) {
+	if observation == nil {
+		return
+	}
+	if observation.Root != nil && observation.Root.Identity == identity {
+		observation.Root.Argv = append([]string(nil), argv...)
+		observation.Root.ArgvAvailable = true
+	}
+	for index := range observation.Processes {
+		if observation.Processes[index].Identity == identity {
+			observation.Processes[index].Argv = append([]string(nil), argv...)
+			observation.Processes[index].ArgvAvailable = true
+		}
+	}
 }
 
 type foregroundProcessGroupSample struct {

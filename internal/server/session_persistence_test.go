@@ -126,33 +126,6 @@ func TestCaptureSessionMarksMissingObserverResultUnavailable(t *testing.T) {
 	}
 }
 
-func TestCaptureSessionUsesPersistedPaneCwdWhenObservationIsUnavailable(t *testing.T) {
-	session := NewSessionState(8)
-	t.Cleanup(func() { stopState(session) })
-	pane := &Pane{
-		ID:     1,
-		Root:   Identity{PID: 101, BirthToken: 1001},
-		Launch: PaneLaunch{Shell: "/bin/sh", Cwd: "/initial"},
-	}
-	if err := runStateOperation(session, func() error {
-		session.Panes[pane.ID] = pane
-		session.setPersistenceRecord(&SessionPersistence{Plan: SessionPlan{
-			Windows: []PlanWindow{{Panes: []PlanPane{{ID: pane.ID, Cwd: "/current"}}}},
-		}})
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	capture, err := session.daemon.captureSession(session, context.Background(), emptyProcessObserver{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(capture.Panes) != 1 || capture.Panes[0].CurrentCwd != "/current" {
-		t.Fatalf("capture=%#v", capture)
-	}
-}
-
 type emptyProcessObserver struct{}
 
 func (emptyProcessObserver) Observe(context.Context, []Anchor) map[PaneKey]ProcessObservation {
@@ -919,6 +892,21 @@ func TestShellReturnRetainsLastMeaningfulCommandAndUpdatesCwd(t *testing.T) {
 	want := processSaveProjection{Cwd: "/new", Command: "nvim ."}
 	if got != want {
 		t.Fatalf("shell return projection = %#v, want %#v", got, want)
+	}
+}
+
+func TestShellObservationWithoutCwdRetainsLastKnownCwd(t *testing.T) {
+	pane := &Pane{Launch: PaneLaunch{Cwd: "/launch"}}
+	got, ok := observedProcessSaveProjection(pane, ProcessObservation{
+		Status: StatusShellOwned,
+		Root:   &ObservedProcess{},
+	}, processSaveProjection{Cwd: "/project", Command: "nvim ."})
+	if !ok {
+		t.Fatal("shell-owned observation was rejected")
+	}
+	want := processSaveProjection{Cwd: "/project", Command: "nvim ."}
+	if got != want {
+		t.Fatalf("shell-owned projection = %#v, want %#v", got, want)
 	}
 }
 

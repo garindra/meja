@@ -69,6 +69,9 @@ func (d *Daemon) applyMonitoredProcessObservations(s *SessionState, batch monito
 			continue
 		}
 		d.processObservations[paneID] = cloneProcessObservation(update.observation)
+		if update.observation.Root != nil && update.observation.Root.Cwd != "" {
+			pane.KnownCwd = update.observation.Root.Cwd
+		}
 		projection, valid := observedProcessSaveProjection(pane, update.observation, latest[paneID])
 		if valid {
 			candidate := d.processSaveCandidates[paneID]
@@ -109,6 +112,12 @@ func observedProcessSaveProjection(pane *Pane, observation ProcessObservation, p
 		return processSaveProjection{}, false
 	}
 	projection := processSaveProjection{Cwd: pane.Launch.Cwd}
+	if previous.Cwd != "" {
+		projection.Cwd = previous.Cwd
+	}
+	if pane.KnownCwd != "" {
+		projection.Cwd = pane.KnownCwd
+	}
 	if observation.Root != nil && observation.Root.Cwd != "" {
 		projection.Cwd = observation.Root.Cwd
 	}

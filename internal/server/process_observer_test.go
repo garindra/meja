@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,6 +50,43 @@ func TestParseCmdlinePreservesArgumentBoundaries(t *testing.T) {
 	for index := range want {
 		if got[index] != want[index] {
 			t.Fatalf("argv=%q want %q", got, want)
+		}
+	}
+}
+
+func TestParseDarwinProcArgsPreservesArgumentBoundaries(t *testing.T) {
+	var data bytes.Buffer
+	if err := binary.Write(&data, binary.LittleEndian, int32(4)); err != nil {
+		t.Fatal(err)
+	}
+	data.WriteString("/opt/homebrew/bin/node\x00\x00\x00")
+	data.WriteString("node\x00server.js\x00--title=hello world\x00\x00")
+	data.WriteString("PATH=/usr/bin\x00")
+
+	got, err := parseDarwinProcArgs(data.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"node", "server.js", "--title=hello world", ""}
+	if len(got) != len(want) {
+		t.Fatalf("argv=%q want %q", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("argv=%q want %q", got, want)
+		}
+	}
+}
+
+func TestParseDarwinProcArgsRejectsMalformedData(t *testing.T) {
+	for _, data := range [][]byte{
+		nil,
+		{1, 0, 0, 0, 'n', 'o', 'd', 'e'},
+		{2, 0, 0, 0, '/', 'n', 'o', 'd', 'e', 0, 0, 'n', 'o', 'd', 'e', 0},
+		{0xff, 0xff, 0xff, 0xff},
+	} {
+		if _, err := parseDarwinProcArgs(data); err == nil {
+			t.Fatalf("parseDarwinProcArgs(%q) unexpectedly succeeded", data)
 		}
 	}
 }

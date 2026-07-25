@@ -28,6 +28,7 @@ type Pane struct {
 	Title    string
 	Launch   PaneLaunch
 	Root     Identity
+	KnownCwd string
 
 	terminal               *TerminalState
 	terminationOnce        sync.Once
