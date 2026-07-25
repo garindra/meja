@@ -633,11 +633,11 @@ func (c *ClientInstance) commandContext() CommandContext {
 	caller.SessionID = c.sessionID
 	caller.TerminalCols = uint16(c.terminalCols.Load())
 	caller.TerminalRows = uint16(c.terminalRows.Load())
-	if pane := c.activePane(); pane != nil {
-		caller.PaneID = pane.ID
-		caller.WorkingDirectory = c.observedPaneCwd(pane)
-	} else if state := c.sessionState(); state != nil {
-		caller.WorkingDirectory = state.rootDir
+	paneID := c.currentView.Layout.FocusedPaneID
+	cwd, paneFound := c.observedPaneCwd(paneID)
+	caller.WorkingDirectory = cwd
+	if paneFound {
+		caller.PaneID = paneID
 	}
 	return CommandContext{Caller: caller}
 }
@@ -1863,42 +1863,76 @@ func directionalCommandFlagSet(name string, args []string) (byte, []string, erro
 	return direction, fs.Args(), nil
 }
 
-func (c *ClientInstance) observedPaneCwd(pane *Pane) string {
-	if pane == nil {
-		return c.sessionState().rootDir
+type observedPaneCwdSnapshot struct {
+	anchor       Anchor
+	knownCwd     string
+	persistedCwd string
+	launchCwd    string
+	rootDir      string
+	observer     ProcessObserver
+	paneFound    bool
+}
+
+func (c *ClientInstance) observedPaneCwd(paneID uint64) (string, bool) {
+	if c == nil || c.Daemon == nil {
+		return "", false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	key := PaneKey{PaneID: pane.ID}
-	observer := ProcessObserver(NewProcessObserver())
-	if c.Daemon != nil && c.Daemon.processObserver != nil {
-		observer = c.Daemon.processObserver
-	}
-	observations := observer.Observe(ctx, []Anchor{{
-		Key:         key,
-		Root:        pane.Root,
-		PTY:         pane.PTY,
-		RootIsShell: len(pane.Launch.RequestedArgv) == 0,
-	}})
-	if observation := observations[key]; observation.Root != nil && observation.Root.Cwd != "" {
-		return observation.Root.Cwd
-	}
-	if pane.KnownCwd != "" {
-		return pane.KnownCwd
-	}
-	if persisted := c.sessionState().persistenceRecord(); persisted != nil {
-		for _, window := range persisted.Plan.Windows {
-			for _, persistedPane := range window.Panes {
-				if persistedPane.ID == pane.ID && persistedPane.Cwd != "" {
-					return persistedPane.Cwd
+	var snapshot observedPaneCwdSnapshot
+	c.Daemon.call(func() {
+		state := c.Daemon.sessions[c.sessionID]
+		if state == nil {
+			return
+		}
+		snapshot.rootDir = state.rootDir
+		snapshot.observer = c.Daemon.processObserver
+		pane := state.Panes[paneID]
+		if pane == nil {
+			return
+		}
+		snapshot.paneFound = true
+		snapshot.anchor = Anchor{
+			Key:         PaneKey{PaneID: pane.ID},
+			Root:        pane.Root,
+			PTY:         pane.PTY,
+			RootIsShell: len(pane.Launch.RequestedArgv) == 0,
+		}
+		snapshot.knownCwd = pane.KnownCwd
+		snapshot.launchCwd = pane.Launch.Cwd
+		if persisted := state.persistenceRecord(); persisted != nil {
+			for _, window := range persisted.Plan.Windows {
+				for _, persistedPane := range window.Panes {
+					if persistedPane.ID == pane.ID && persistedPane.Cwd != "" {
+						snapshot.persistedCwd = persistedPane.Cwd
+						return
+					}
 				}
 			}
 		}
+	})
+	if !snapshot.paneFound {
+		return snapshot.rootDir, false
 	}
-	if pane.Launch.Cwd != "" {
-		return pane.Launch.Cwd
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	observer := snapshot.observer
+	if observer == nil {
+		observer = NewProcessObserver()
 	}
-	return c.sessionState().rootDir
+	observations := observer.Observe(ctx, []Anchor{snapshot.anchor})
+	if observation := observations[snapshot.anchor.Key]; observation.Root != nil && observation.Root.Cwd != "" {
+		return observation.Root.Cwd, true
+	}
+	if snapshot.knownCwd != "" {
+		return snapshot.knownCwd, true
+	}
+	if snapshot.persistedCwd != "" {
+		return snapshot.persistedCwd, true
+	}
+	if snapshot.launchCwd != "" {
+		return snapshot.launchCwd, true
+	}
+	return snapshot.rootDir, true
 }
 
 // parseCommandLine turns the command prompt's text into argv. It intentionally
