@@ -380,14 +380,48 @@ func TestSessionPlanEncodesAsTerseEditableMeja(t *testing.T) {
 }
 
 func TestObservedProcessCommandRepairsRewrittenProcessTitlePadding(t *testing.T) {
-	process := &ObservedProcess{
-		Name:          "npm exec nodemo",
-		Exe:           "/opt/node/bin/node",
-		Argv:          []string{"npm exec nodemon index.js", "", "", ""},
-		ArgvAvailable: true,
+	tests := []struct {
+		name    string
+		process ObservedProcess
+		want    string
+	}{
+		{
+			name: "npm command title",
+			process: ObservedProcess{
+				Name:          "npm exec nodemo",
+				Exe:           "/opt/node/bin/node",
+				Argv:          []string{"npm exec nodemon index.js", "", "", ""},
+				ArgvAvailable: true,
+			},
+			want: "npm exec nodemon index.js",
+		},
+		{
+			name: "redis wildcard endpoint",
+			process: ObservedProcess{
+				Name:          "redis-server",
+				Exe:           "/usr/bin/redis-check-rdb",
+				Argv:          []string{"redis-server *:6810", "", "", ""},
+				ArgvAvailable: true,
+			},
+			want: "redis-server '*:6810'",
+		},
+		{
+			name: "redis bound default endpoint",
+			process: ObservedProcess{
+				Name:          "redis-server",
+				Exe:           "/usr/bin/redis-server",
+				Argv:          []string{"redis-server 127.0.0.1:6379", "", ""},
+				ArgvAvailable: true,
+			},
+			want: "redis-server 127.0.0.1:6379",
+		},
 	}
-	if got, want := observedProcessCommand(process), "npm exec nodemon index.js"; got != want {
-		t.Fatalf("observed npm command = %q, want %q", got, want)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := observedProcessCommand(&test.process); got != test.want {
+				t.Fatalf("observed command = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
@@ -422,7 +456,7 @@ func TestObservedProcessCommandPreservesUncorroboratedAndUnusualArguments(t *tes
 				Exe:  "/usr/bin/python3",
 				Argv: []string{"npm run dev", "", ""},
 			},
-			want: "'npm run dev' '' ''",
+			want: "npm run dev",
 		},
 		{
 			name: "npm-looking title without matching task name",
@@ -440,7 +474,16 @@ func TestObservedProcessCommandPreservesUncorroboratedAndUnusualArguments(t *tes
 				Exe:  "/opt/node/bin/node",
 				Argv: []string{"npm exec tool ; echo changed", "", ""},
 			},
-			want: "'npm exec tool ; echo changed' '' ''",
+			want: "npm exec tool ';' echo changed",
+		},
+		{
+			name: "unrecognized redis status title",
+			process: ObservedProcess{
+				Name: "redis-server",
+				Exe:  "/usr/bin/redis-check-rdb",
+				Argv: []string{"redis-server unixsocket", "", ""},
+			},
+			want: "redis-server unixsocket",
 		},
 	}
 	for _, test := range tests {
@@ -849,6 +892,21 @@ func TestShellReturnRetainsLastMeaningfulCommandAndUpdatesCwd(t *testing.T) {
 	want := processSaveProjection{Cwd: "/new", Command: "nvim ."}
 	if got != want {
 		t.Fatalf("shell return projection = %#v, want %#v", got, want)
+	}
+}
+
+func TestShellObservationWithoutCwdRetainsLastKnownCwd(t *testing.T) {
+	pane := &Pane{Launch: PaneLaunch{Cwd: "/launch"}}
+	got, ok := observedProcessSaveProjection(pane, ProcessObservation{
+		Status: StatusShellOwned,
+		Root:   &ObservedProcess{},
+	}, processSaveProjection{Cwd: "/project", Command: "nvim ."})
+	if !ok {
+		t.Fatal("shell-owned observation was rejected")
+	}
+	want := processSaveProjection{Cwd: "/project", Command: "nvim ."}
+	if got != want {
+		t.Fatalf("shell-owned projection = %#v, want %#v", got, want)
 	}
 }
 

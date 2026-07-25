@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -994,13 +996,9 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	}
 }
 
-func TestSessionShutdownCleanlyClosesConnection(t *testing.T) {
+func TestSessionShutdownRequestsGracefulClientClose(t *testing.T) {
 	closed := false
-	var closeErr error
 	connection := &recordingQUICConnection{closeWithError: func(code quic.ApplicationErrorCode, message string) error {
-		if code != 0 || message != "" {
-			closeErr = fmt.Errorf("CloseWithError(%d, %q), want clean application close", code, message)
-		}
 		closed = true
 		return nil
 	}}
@@ -1008,16 +1006,21 @@ func TestSessionShutdownCleanlyClosesConnection(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	s.daemon = d
 	d.sessions[s.ID] = s
-	setTestClient(s, &ClientInstance{QUIC: connection})
+	client := &ClientInstance{QUIC: connection}
+	setTestClient(s, client)
 
 	if err := d.shutdownSession(s); err != nil {
 		t.Fatal(err)
 	}
-	if !closed {
-		t.Fatal("active QUIC connection was not closed")
+	deadline := time.Now().Add(time.Second)
+	for !client.ended.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	if closeErr != nil {
-		t.Fatal(closeErr)
+	if !client.ended.Load() {
+		t.Fatal("client was not marked for graceful close")
+	}
+	if closed {
+		t.Fatal("session shutdown bypassed the frontend terminal-exit handshake")
 	}
 }
 
@@ -1085,6 +1088,117 @@ func TestSessionShutdownEscalatesAndReapsPaneProcess(t *testing.T) {
 	case <-pane.processDone:
 	default:
 		t.Fatal("pane process waiter did not complete")
+	}
+}
+
+func TestTerminatePaneReturnsBeforeSignalEscalationCompletes(t *testing.T) {
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh is unavailable")
+	}
+	directory := t.TempDir()
+	ready := filepath.Join(directory, "ready")
+	pane, err := startPaneProcess(1, paneRequest{
+		Cwd: directory,
+		Command: []string{
+			shell,
+			"-c",
+			`trap '' HUP TERM; : > "$1"; while :; do sleep 1; done`,
+			"pane-root",
+			ready,
+		},
+		Cols:  80,
+		Rows:  24,
+		Shell: shell,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var daemon *Daemon
+	daemon.startPane(nil, pane)
+	t.Cleanup(func() {
+		_ = terminatePaneAndWait(pane, defaultPaneTerminationTimeouts)
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pane process did not become ready")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	started := time.Now()
+	if err := terminatePane(pane); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed >= 250*time.Millisecond {
+		t.Fatalf("terminatePane blocked for signal escalation: %v", elapsed)
+	}
+	select {
+	case <-pane.processDone:
+	case <-time.After(4 * time.Second):
+		t.Fatal("asynchronous pane termination did not finish")
+	}
+}
+
+func TestPaneLeaderExitTerminatesRemainingSessionProcesses(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+	directory := t.TempDir()
+	pidPath := filepath.Join(directory, "child.pid")
+	termPath := filepath.Join(directory, "child.term")
+	pane, err := startPaneProcess(1, paneRequest{
+		Cwd: directory,
+		Command: []string{
+			bash,
+			"--noprofile",
+			"--norc",
+			"-c",
+			`set -m
+trap '' HUP
+sh -c 'trap "" HUP; trap "echo term > \"$2\"; exit 0" TERM; echo $$ > "$1"; while :; do sleep 1; done' pane-child "$1" "$2" &
+while [ ! -s "$1" ]; do :; done`,
+			"pane-root",
+			pidPath,
+			termPath,
+		},
+		Cols:  80,
+		Rows:  24,
+		Shell: bash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var daemon *Daemon
+	daemon.startPane(nil, pane)
+
+	select {
+	case <-pane.processDone:
+	case <-time.After(4 * time.Second):
+		t.Fatal("pane waiter did not clean up the remaining process session")
+	}
+
+	pidBytes, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil {
+		t.Fatalf("parse child PID %q: %v", pidBytes, err)
+	}
+	if _, err := identifyProcess(childPID); err == nil {
+		t.Fatalf("pane child process %d survived its session leader", childPID)
+	}
+	if _, err := os.Stat(termPath); err != nil {
+		t.Fatalf("pane child did not receive the SIGTERM escalation: %v", err)
 	}
 }
 

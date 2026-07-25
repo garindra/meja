@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/garindra/meja/internal/protocol"
 )
@@ -39,6 +40,13 @@ func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) 
 			}
 		}
 		stopped = c.Daemon != nil && c.Daemon.isSessionStopping(state)
+		if errors.Is(processErr, io.ErrClosedPipe) {
+			// Pane exit and the replacement view transition are delivered
+			// asynchronously. Input can therefore briefly target a pane whose
+			// PTY writer has already stopped. Dropping that stale input keeps
+			// the frontend connection alive for the pending fallback view.
+			processErr = nil
+		}
 		if processErr != nil {
 			return false, processErr
 		}
@@ -75,12 +83,19 @@ func (d *Daemon) startPane(state *SessionState, pane *Pane) {
 	go runPTYWriter(pane, func(error) {
 		_ = terminatePane(pane)
 		if d != nil {
+			// A failed PTY writer can no longer serve frontend input. Publish
+			// removal immediately instead of waiting for process-session cleanup;
+			// the process waiter may safely post the same idempotent exit later.
 			d.postPaneProcessExit(pane.ID)
 		}
 	})
 	go func() {
 		_ = pane.Process.Wait()
-		pane.stop()
+		// The pane leader may exit while foreground or background jobs from
+		// the same terminal session are still alive. Finish tearing down that
+		// session before publishing the pane-exit event and losing its process
+		// ownership boundary.
+		_ = terminatePaneAndWait(pane, defaultPaneTerminationTimeouts)
 		close(pane.processDone)
 		if d != nil {
 			d.postPaneProcessExit(pane.ID)

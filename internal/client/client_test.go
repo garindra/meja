@@ -395,7 +395,7 @@ func TestQUICDialALPNRejectionReportsIncompatibleServer(t *testing.T) {
 		ErrorMessage: "tls: no application protocol",
 	}
 	err := quicDialError("example.com:60000", cause)
-	want := `server at example.com:60000 did not accept client QUIC profile "meja-quic/12"; the remote meja binary and running server must use the same QUIC profile as this client. Compare "meja version --verbose" locally with "meja server-version" using the same remote transport options, check --remote-path, and restart the remote server: CRYPTO_ERROR 0x178 (remote): tls: no application protocol`
+	want := `server at example.com:60000 did not accept client QUIC profile "meja-quic/13"; the remote meja binary and running server must use the same QUIC profile as this client. Compare "meja version --verbose" locally with "meja server-version" using the same remote transport options, check --remote-path, and restart the remote server: CRYPTO_ERROR 0x178 (remote): tls: no application protocol`
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err, want)
 	}
@@ -858,7 +858,12 @@ func TestControlLoopAppliesRegisteredExitCommandAndAcknowledges(t *testing.T) {
 	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendTerminalWrite, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
-	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendExecuteTerminalExitCommand}); err != nil {
+	exitRequest := protocol.FrontendExecuteTerminalExitCommand{Message: "[detached (from session 2)]"}
+	payload, err = protocol.EncodeFrontendExecuteTerminalExitCommand(nil, exitRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendExecuteTerminalExitCommand, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -869,9 +874,10 @@ func TestControlLoopAppliesRegisteredExitCommandAndAcknowledges(t *testing.T) {
 	go ui.renderLoop(ctx, make(chan error, 1))
 	done := make(chan connectionResult, 1)
 	controlFrames := make(chan protocol.Frame, 1)
-	controlLoop(protocol.NewDecoder(&wire, protocol.DefaultMaxFrameSize), ui, controlFrames, done, nil)
-	if result := <-done; result.err != nil {
-		t.Fatal(result.err)
+	reader := io.MultiReader(&wire, failingReader{err: &quic.ApplicationError{ErrorCode: 0}})
+	controlLoop(protocol.NewDecoder(reader, protocol.DefaultMaxFrameSize), ui, controlFrames, done, nil)
+	if result := <-done; result.err != nil || !result.graceful || result.terminalMessage != exitRequest.Message {
+		t.Fatalf("terminal result = %#v, want graceful exit message %q", result, exitRequest.Message)
 	}
 	ack := <-controlFrames
 	if ack.Type != protocol.MsgFrontendTerminalExitComplete || len(ack.Payload) != 0 {
@@ -1206,8 +1212,14 @@ func TestCleanQUICCloseWinsWhenOutputEOFArrivesFirst(t *testing.T) {
 	done := make(chan connectionResult, 1)
 	err := &quic.ApplicationError{ErrorCode: 0, ErrorMessage: "server stopped"}
 	controlLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), ui, nil, done, nil)
-	if result := <-done; !result.graceful || result.err != nil {
-		t.Fatalf("terminal result = %#v, want graceful", result)
+	if result := <-done; !result.graceful || result.err != nil || result.terminalMessage != "[exited]" {
+		t.Fatalf("terminal result = %#v, want graceful generic exit", result)
+	}
+}
+
+func TestPostExitMessageDropsTerminalControlCharacters(t *testing.T) {
+	if got, want := sanitizePostExitMessage("\x1b[31m[detached]\r\n"), "[31m[detached]"; got != want {
+		t.Fatalf("sanitized post-exit message = %q, want %q", got, want)
 	}
 }
 

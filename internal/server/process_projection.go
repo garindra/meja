@@ -69,6 +69,9 @@ func (d *Daemon) applyMonitoredProcessObservations(s *SessionState, batch monito
 			continue
 		}
 		d.processObservations[paneID] = cloneProcessObservation(update.observation)
+		if update.observation.Root != nil && update.observation.Root.Cwd != "" {
+			pane.KnownCwd = update.observation.Root.Cwd
+		}
 		projection, valid := observedProcessSaveProjection(pane, update.observation, latest[paneID])
 		if valid {
 			candidate := d.processSaveCandidates[paneID]
@@ -109,6 +112,12 @@ func observedProcessSaveProjection(pane *Pane, observation ProcessObservation, p
 		return processSaveProjection{}, false
 	}
 	projection := processSaveProjection{Cwd: pane.Launch.Cwd}
+	if previous.Cwd != "" {
+		projection.Cwd = previous.Cwd
+	}
+	if pane.KnownCwd != "" {
+		projection.Cwd = pane.KnownCwd
+	}
 	if observation.Root != nil && observation.Root.Cwd != "" {
 		projection.Cwd = observation.Root.Cwd
 	}
@@ -153,10 +162,10 @@ func observedProcessCommand(process *ObservedProcess) string {
 // NUL padding for the overwritten argv bytes. Those padding bytes are not real
 // empty arguments.
 //
-// The rewrite irreversibly loses the original argument boundaries. Only use
-// the title when the executable and task name corroborate a known
-// command-shaped title and the title is already shell-inert. Ambiguous titles
-// are left to the ordinary argv quoting path instead of being reinterpreted.
+// The rewrite irreversibly loses the original argument boundaries. Require
+// the task name to corroborate the title, then tokenize the display text and
+// quote every token instead of interpreting shell syntax from an untrusted
+// process title.
 func rewrittenCommandProcessTitle(process *ObservedProcess) (string, bool) {
 	if process == nil || len(process.Argv) < 2 {
 		return "", false
@@ -167,24 +176,17 @@ func rewrittenCommandProcessTitle(process *ObservedProcess) (string, bool) {
 			return "", false
 		}
 	}
-	if process.Name != title && !(len(process.Name) == 15 && strings.HasPrefix(title, process.Name)) {
+	nameMatchesTitle := process.Name == title ||
+		(len(process.Name) == 15 && strings.HasPrefix(title, process.Name)) ||
+		strings.HasPrefix(title, process.Name+" ")
+	if !nameMatchesTitle {
 		return "", false
 	}
-	if shellJoin(strings.Split(title, " ")) != title {
+	argv := strings.Fields(title)
+	if len(argv) < 2 {
 		return "", false
 	}
-	if !isKnownCommandProcessTitle(process, title) {
-		return "", false
-	}
-	return title, true
-}
-
-// Process titles are descriptions by default, not commands. Keep recognition
-// as a separate policy so programs with equivalent, verified behavior can be
-// added without weakening the generic padding and safety checks above.
-func isKnownCommandProcessTitle(process *ObservedProcess, title string) bool {
-	executable := filepath.Base(strings.TrimSuffix(process.Exe, " (deleted)"))
-	return executable == "node" && (title == "npm" || strings.HasPrefix(title, "npm "))
+	return shellJoin(argv), true
 }
 
 func isTransientObservedCommand(process *ObservedProcess) bool {

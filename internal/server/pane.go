@@ -28,8 +28,11 @@ type Pane struct {
 	Title    string
 	Launch   PaneLaunch
 	Root     Identity
+	KnownCwd string
 
 	terminal               *TerminalState
+	terminationOnce        sync.Once
+	terminationRemaining   bool
 	metadata               atomic.Pointer[paneTerminalMetadata]
 	ptyOutput              chan []byte
 	ptyInput               chan []byte

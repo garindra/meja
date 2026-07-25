@@ -382,6 +382,12 @@ Dropping disconnected input is a correctness choice. Buffering and later replayi
 
 On resume, the server installs a fresh frontend-terminal setup, rebinds the new connection's output leases, reapplies the current terminal size, publishes the layout, and starts a complete visible refresh for every pane. A refresh may arrive as several presented batches. The client does not depend on recovering the precise sequence of render bytes missed during the outage.
 
+On an intentional detach or session end, the server sends the frontend-terminal
+exit request with a post-exit message. The client writes the registered terminal
+cleanup command before acknowledging completion. Only then does the server
+close QUIC. After restoring the local terminal, the client prints the supplied
+message; a clean close without an exit request falls back to `[exited]`.
+
 ---
 
 # The actor-owned server
@@ -1301,7 +1307,7 @@ scrolling, and input-event coalescing.
 Meja has two live compatibility surfaces. The command protocol versions the
 Unix/SSH request and result framing; its attach result contains a separately
 validated bootstrap payload in the current implementation. The exact QUIC
-ALPN, currently `meja-quic/12`, versions the complete interactive profile:
+ALPN, currently `meja-quic/13`, versions the complete interactive profile:
 attachment and resume messages, stream topology, control codecs, display
 opcodes, scanout/cache semantics, reconnect behavior, and coupled terminal
 behavior such as DSCLRM probing. Attach and resume messages therefore do not

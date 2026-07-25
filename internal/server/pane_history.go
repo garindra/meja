@@ -54,21 +54,11 @@ func captureTerminalHistorySnapshot(state *TerminalState) *paneHistorySnapshot {
 	cols, rows := state.Cols, state.Rows
 	grid := state.grid.clone(cols, &state.clusters)
 	initialTop := int(grid.count) - rows
-	styleDefs := make([]protocol.StyleDefinition, 0, len(state.styleByID)+1)
+	styleDefs := make([]protocol.StyleDefinition, 0, len(state.styleByID))
 	for id, style := range state.styleByID {
 		styleID := uint32(id)
 		styleDefs = append(styleDefs, protocol.StyleDefinition{ID: styleID, Style: style})
 	}
-	counterStyle := uint32(len(state.styleByID))
-	counterDefinition := protocol.StyleDefinition{
-		ID: counterStyle,
-		Style: protocol.Style{
-			Bold: true,
-			FG:   protocol.Color{Mode: "indexed", Index: 226},
-			BG:   protocol.Color{Mode: "default"},
-		},
-	}
-	styleDefs = append(styleDefs, counterDefinition)
 	return &paneHistorySnapshot{
 		grid:          grid,
 		clusters:      &state.clusters,
@@ -77,7 +67,7 @@ func captureTerminalHistorySnapshot(state *TerminalState) *paneHistorySnapshot {
 		ViewportRows:  rows,
 		InitialTop:    initialTop,
 		InitialCursor: protocol.Cursor{X: state.CursorX, Y: state.CursorY},
-		CounterStyle:  counterStyle,
+		CounterStyle:  historyCounterStyleID,
 	}
 }
 
@@ -91,17 +81,6 @@ func (s *paneHistorySnapshot) row(row int) []cellWord {
 }
 
 func (s *paneHistorySnapshot) LookupStyle(id uint32) (protocol.Style, bool) {
-	if id&historySelectionStyleMask != 0 {
-		_, ok := s.LookupStyle(id &^ historySelectionStyleMask)
-		if !ok {
-			return protocol.Style{}, false
-		}
-		style := protocol.Style{
-			FG: protocol.Color{Mode: "indexed", Index: 0},
-			BG: protocol.Color{Mode: "indexed", Index: 226},
-		}
-		return style, true
-	}
 	if uint64(id) >= uint64(len(s.styles)) || s.styles[id].ID != id {
 		return protocol.Style{}, false
 	}

@@ -218,18 +218,22 @@ meja -h prod a -t work
 meja [transport-options] restore-session
      -t session-name
      [-s new-name]
-     [--commands=prepare|skip|run]
+     [--run | --commands=prepare|skip|run]
 ```
 
 ```sh
 meja restore -t work
 meja -h prod restore -t deploy
+meja restore -t work --run
 meja restore -t work -s recovered --commands=run
 ```
 
 `-t` must be a name, not a numeric ID. Restore reads the selected server's private recovery file, creates a new live session and processes, and attaches. `-s` changes the new name. It fails if a live session already uses that name.
 
 Restore does not read arbitrary project files; use `new -f`. It starts the selected server when needed, but restoration is always explicit.
+
+`--run` is shorthand for `--commands=run`. It cannot be combined with
+`--commands`.
 
 ## `save-session` / `save`
 

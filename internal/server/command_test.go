@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -1001,6 +1002,23 @@ func TestRestoreRequiresTargetAndRejectsFilesAndPositionalNames(t *testing.T) {
 	}
 }
 
+func TestRestoreRunShorthandAndCommandsConflict(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	setCommandTestPersistenceDir(t, d)
+
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "-t", "work", "--run"}})
+	if result.exitCode == 0 || !strings.Contains(string(result.stderr), "work.session.meja") {
+		t.Fatalf("restore --run was not accepted as a restore command mode: %#v", result)
+	}
+
+	result = d.executeCommand(protocol.CommandRequest{
+		Args: []string{"restore", "-t", "work", "--run", "--commands=skip"},
+	})
+	if result.exitCode == 0 || !strings.Contains(string(result.stderr), "--run cannot be combined with --commands") {
+		t.Fatalf("restore accepted conflicting command modes: %#v", result)
+	}
+}
+
 func TestNewFileRejectsRootAndInitialCommand(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	for _, args := range [][]string{
@@ -1249,7 +1267,7 @@ func TestServerVersionCommandReportsDaemonCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "server:           meja 1.2.3\ncommand protocol: 1\nQUIC profile:     meja-quic/12\n"
+	want := "server:           meja 1.2.3\ncommand protocol: 1\nQUIC profile:     meja-quic/13\n"
 	if got := string(outcome.Stdout); got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
@@ -1417,11 +1435,13 @@ func TestPaneCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
 	t.Cleanup(func() { stopState(s) })
 	s.daemon = d
 	s.setSessionName("renamed-session")
-	s.rootDir = t.TempDir()
+	initialRoot := t.TempDir()
+	s.rootDir = initialRoot
 	s.daemon.processObserver = emptyProcessObserver{}
 	project := t.TempDir()
 	newTestClient(s)
-	createTestWindow(s, &Pane{ID: testAddPaneID(s), Launch: PaneLaunch{Cwd: project}})
+	pane := &Pane{ID: testAddPaneID(s), Launch: PaneLaunch{Cwd: initialRoot}}
+	createTestWindow(s, pane)
 	d.sessions[s.ID] = s
 	d.names[s.Name] = s
 
@@ -1429,12 +1449,79 @@ func TestPaneCLITargetUsesExistingNumericTargetResolver(t *testing.T) {
 		Args:                []string{"set-root", "."},
 		WorkingDirectory:    project,
 		CallerSessionTarget: "17",
+		CallerPaneID:        pane.ID,
 	})
 	if result.exitCode != 0 {
 		t.Fatalf("pane CLI set-root = %#v", result)
 	}
 	if s.rootDir != project {
 		t.Fatalf("pane CLI set-root changed root to %q, want %q", s.rootDir, project)
+	}
+	if pane.Launch.Cwd != initialRoot {
+		t.Fatalf("pane launch cwd changed to %q, want existing cwd %q", pane.Launch.Cwd, initialRoot)
+	}
+	persisted := s.persistenceRecord()
+	if persisted == nil || len(persisted.Plan.Windows) != 1 || len(persisted.Plan.Windows[0].Panes) != 1 ||
+		persisted.Plan.Windows[0].Panes[0].Cwd != project {
+		t.Fatalf("persisted caller cwd = %#v, want %q", persisted, project)
+	}
+}
+
+func TestPaneCLISetRootMakesUnnamedSessionPanePortable(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	initialRoot := t.TempDir()
+	project := t.TempDir()
+	s := NewSessionState(18)
+	t.Cleanup(func() { stopState(s) })
+	s.daemon = d
+	s.rootDir = initialRoot
+	pane := &Pane{
+		ID:     testAddPaneID(s),
+		Root:   Identity{PID: 101, BirthToken: 1001},
+		Launch: PaneLaunch{Cwd: initialRoot, Shell: "/bin/sh"},
+	}
+	createTestWindow(s, pane)
+	d.sessions[s.ID] = s
+
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:                []string{"set-root", "."},
+		WorkingDirectory:    project,
+		CallerSessionTarget: strconv.FormatUint(s.ID, 10),
+		CallerPaneID:        pane.ID,
+	})
+	if result.exitCode != 0 {
+		t.Fatalf("set-root = %#v", result)
+	}
+	if s.persistenceRecord() != nil {
+		t.Fatal("unnamed session unexpectedly created private persistence")
+	}
+	if pane.Launch.Cwd != initialRoot || pane.KnownCwd != project {
+		t.Fatalf("pane launch/known cwd = %q/%q, want %q/%q", pane.Launch.Cwd, pane.KnownCwd, initialRoot, project)
+	}
+
+	anchor := Anchor{Key: PaneKey{PaneID: pane.ID}, Root: pane.Root, PTY: pane.PTY, RootIsShell: true}
+	if err := d.applyMonitoredProcessObservations(s, monitoredProcessBatch{{
+		anchor: anchor,
+		observation: ProcessObservation{
+			Key: anchor.Key, Status: StatusShellOwned, Root: &ObservedProcess{Identity: pane.Root},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	capture, err := d.captureSession(s, context.Background(), emptyProcessObserver{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := sessionPlanFromCapture(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _, err := encodeUserSessionPlan(plan, filepath.Join(project, "dev.meja"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "cwd ") {
+		t.Fatalf("portable unnamed session retained pane cwd:\n%s", encoded)
 	}
 }
 

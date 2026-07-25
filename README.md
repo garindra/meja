@@ -30,14 +30,14 @@ Readable `.meja` files can live in version control, letting anyone recreate the 
 On Linux x86-64:
 
 ```sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.13/meja_0.0.13_linux_amd64.tar.gz \
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.14/meja_0.0.14_linux_amd64.tar.gz \
   | sudo tar -xz -C /usr/local/bin meja
 ```
 
 On macOS with Apple Silicon:
 
 ```sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.13/meja_0.0.13_darwin_arm64.tar.gz \
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.14/meja_0.0.14_darwin_arm64.tar.gz \
   | sudo tar -xz -C /usr/local/bin meja
 ```
 
@@ -132,7 +132,7 @@ The file is readable and editable. Check it into version control so your team ca
 
 Meja persists the recoverable state of every named session.
 
-After a reboot or ended session, `meja restore -t <session-name>` creates a new session from its latest recovery record. It preserves the session's windows, panes, layout, working directories, shells, commands, and active selection.
+After a reboot or ended session, `meja restore -t <session-name>` creates a new session from its latest recovery record. It preserves the session's windows, panes, layout, working directories, shells, commands, and active selection. Add `--run` as shorthand for `--commands=run` to execute the restored commands immediately.
 
 ### Shareable `.meja` files
 

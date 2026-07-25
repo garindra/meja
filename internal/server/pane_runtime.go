@@ -437,8 +437,6 @@ func (p *Pane) run() {
 	}
 }
 
-const historySelectionStyleMask uint32 = 1 << 31
-
 func historySelectionContains(selection *paneHistorySelection, row, column int) bool {
 	if selection == nil {
 		return false

@@ -1,7 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,6 +51,43 @@ func TestParseCmdlinePreservesArgumentBoundaries(t *testing.T) {
 	for index := range want {
 		if got[index] != want[index] {
 			t.Fatalf("argv=%q want %q", got, want)
+		}
+	}
+}
+
+func TestParseDarwinProcArgsPreservesArgumentBoundaries(t *testing.T) {
+	var data bytes.Buffer
+	if err := binary.Write(&data, binary.LittleEndian, int32(4)); err != nil {
+		t.Fatal(err)
+	}
+	data.WriteString("/opt/homebrew/bin/node\x00\x00\x00")
+	data.WriteString("node\x00server.js\x00--title=hello world\x00\x00")
+	data.WriteString("PATH=/usr/bin\x00")
+
+	got, err := parseDarwinProcArgs(data.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"node", "server.js", "--title=hello world", ""}
+	if len(got) != len(want) {
+		t.Fatalf("argv=%q want %q", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("argv=%q want %q", got, want)
+		}
+	}
+}
+
+func TestParseDarwinProcArgsRejectsMalformedData(t *testing.T) {
+	for _, data := range [][]byte{
+		nil,
+		{1, 0, 0, 0, 'n', 'o', 'd', 'e'},
+		{2, 0, 0, 0, '/', 'n', 'o', 'd', 'e', 0, 0, 'n', 'o', 'd', 'e', 0},
+		{0xff, 0xff, 0xff, 0xff},
+	} {
+		if _, err := parseDarwinProcArgs(data); err == nil {
+			t.Fatalf("parseDarwinProcArgs(%q) unexpectedly succeeded", data)
 		}
 	}
 }
@@ -275,6 +315,37 @@ func TestParsePSProcess(t *testing.T) {
 	}
 	if process.PPID != 7 || process.PGID != 123 || process.Name != "bash" || process.State != 'S' {
 		t.Fatalf("process = %+v", process)
+	}
+}
+
+func TestPSSessionMembersFiltersSessionAndDeadProcesses(t *testing.T) {
+	processes := []ObservedProcess{
+		{Identity: Identity{PID: 10, BirthToken: 1}, State: 'S'},
+		{Identity: Identity{PID: 11, BirthToken: 2}, State: 'R'},
+		{Identity: Identity{PID: 12, BirthToken: 3}, State: 'Z'},
+		{Identity: Identity{PID: 13, BirthToken: 4}, State: 'S'},
+	}
+	getSession := func(pid int) (int, error) {
+		if pid == 10 || pid == 11 || pid == 12 {
+			return 10, nil
+		}
+		return 13, nil
+	}
+	members, err := psSessionMembers(context.Background(), processes, 10, getSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 2 || members[0] != processes[0].Identity || members[1] != processes[1].Identity {
+		t.Fatalf("session members = %+v", members)
+	}
+}
+
+func TestPSSessionMembersStopsAtContextDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	getSession := func(int) (int, error) { return 10, nil }
+	if _, err := psSessionMembers(ctx, []ObservedProcess{{Identity: Identity{PID: 10}}}, 10, getSession); !errors.Is(err, context.Canceled) {
+		t.Fatalf("session member cancellation error = %v, want context cancellation", err)
 	}
 }
 

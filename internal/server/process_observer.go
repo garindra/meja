@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -113,8 +114,9 @@ func NewProcessObserver() ProcessObserver {
 }
 
 const (
-	maxCmdlineBytes    = 1 << 20
-	observationRetries = 3
+	maxCmdlineBytes            = 1 << 20
+	observationRetries         = 3
+	portableProcessScanTimeout = 250 * time.Millisecond
 )
 
 var errObservationChanged = errors.New("foreground process group changed during observation")
@@ -126,6 +128,54 @@ func identifyProcess(pid int) (Identity, error) {
 		return identifyProc(pid)
 	}
 	return identifyPS(pid)
+}
+
+func processSessionMembers(ctx context.Context, sessionID int) ([]Identity, error) {
+	if sessionID <= 0 {
+		return nil, fmt.Errorf("invalid process session ID %d", sessionID)
+	}
+	if runtime.GOOS == "linux" {
+		table, err := scanProcTable(ctx)
+		if err != nil {
+			return nil, err
+		}
+		members := make([]Identity, 0, 4)
+		for _, stat := range table {
+			if stat.SessionState == sessionID && stat.State != 'Z' && stat.State != 'X' && stat.State != 'x' {
+				members = append(members, stat.Identity)
+			}
+		}
+		return members, nil
+	}
+
+	scanCtx, cancel := context.WithTimeout(ctx, portableProcessScanTimeout)
+	defer cancel()
+	processes, err := scanPS(scanCtx, "-ax")
+	if err != nil {
+		return nil, fmt.Errorf("scan portable process table for session %d: %w", sessionID, err)
+	}
+	members, err := psSessionMembers(scanCtx, processes, sessionID, unix.Getsid)
+	if err != nil {
+		return nil, fmt.Errorf("resolve portable process session %d: %w", sessionID, err)
+	}
+	return members, nil
+}
+
+func psSessionMembers(ctx context.Context, processes []ObservedProcess, sessionID int, getSession func(int) (int, error)) ([]Identity, error) {
+	members := make([]Identity, 0, len(processes))
+	for _, process := range processes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if process.State == 'Z' || process.State == 'X' || process.State == 'x' {
+			continue
+		}
+		currentSession, err := getSession(process.Identity.PID)
+		if err == nil && currentSession == sessionID {
+			members = append(members, process.Identity)
+		}
+	}
+	return members, nil
 }
 
 func (systemObserver) Observe(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObservation {
@@ -618,26 +668,61 @@ func observePS(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObserva
 		root := *rootBefore
 		observation.Root = &root
 		observation.Processes = childrenBefore
-		observation.Issues = []string{"ps fallback does not provide structured argv, executable, or cwd data"}
+		observation.Issues = []string{"ps fallback does not provide executable or cwd data"}
 		if !anchor.RootIsShell {
 			observation.Status = StatusDetected
 			observation.Candidate = cloneObservedProcess(&root)
-			observations[anchor.Key] = observation
-			continue
+		} else {
+			switch len(childrenBefore) {
+			case 0:
+				observation.Status = StatusShellOwned
+			case 1:
+				observation.Status = StatusDetected
+				observation.Candidate = cloneObservedProcess(&childrenBefore[0])
+			default:
+				observation.Status = StatusAmbiguous
+				observation.Issues = append(observation.Issues, "pane shell has multiple immediate child processes")
+			}
 		}
-		switch len(childrenBefore) {
-		case 0:
-			observation.Status = StatusShellOwned
-		case 1:
-			observation.Status = StatusDetected
-			observation.Candidate = cloneObservedProcess(&childrenBefore[0])
-		default:
-			observation.Status = StatusAmbiguous
-			observation.Issues = append(observation.Issues, "pane shell has multiple immediate child processes")
+		if observation.Candidate != nil {
+			argv, argvErr := readStructuredProcessArgv(observation.Candidate.Identity.PID)
+			if argvErr == nil {
+				current, identifyErr := identifyPS(observation.Candidate.Identity.PID)
+				if identifyErr != nil || current != observation.Candidate.Identity {
+					observation.Status = StatusUnstable
+					observation.Candidate = nil
+					observation.Issues = append(observation.Issues, "pane command process changed while reading argv")
+					observations[anchor.Key] = observation
+					continue
+				}
+				observation.Candidate.Argv = argv
+				observation.Candidate.ArgvAvailable = true
+				copyObservedArgv(&observation, current, argv)
+			} else if errors.Is(argvErr, errStructuredProcessArgvUnavailable) {
+				observation.Issues = append(observation.Issues, "ps fallback does not provide structured argv data")
+			} else {
+				observation.Issues = append(observation.Issues, argvErr.Error())
+			}
 		}
 		observations[anchor.Key] = observation
 	}
 	return observations
+}
+
+func copyObservedArgv(observation *ProcessObservation, identity Identity, argv []string) {
+	if observation == nil {
+		return
+	}
+	if observation.Root != nil && observation.Root.Identity == identity {
+		observation.Root.Argv = append([]string(nil), argv...)
+		observation.Root.ArgvAvailable = true
+	}
+	for index := range observation.Processes {
+		if observation.Processes[index].Identity == identity {
+			observation.Processes[index].Argv = append([]string(nil), argv...)
+			observation.Processes[index].ArgvAvailable = true
+		}
+	}
 }
 
 type foregroundProcessGroupSample struct {

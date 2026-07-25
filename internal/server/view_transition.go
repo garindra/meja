@@ -64,9 +64,6 @@ func (c *ClientInstance) applyViewTransition(transition ViewTransition) error {
 	}
 	if transition.Projection.Close {
 		c.ended.Store(true)
-		if c.QUIC != nil {
-			return c.QUIC.CloseWithError(0, transition.Projection.CloseReason)
-		}
 		return nil
 	}
 	if err := c.validateProjectionPlan(transition.Projection); err != nil {

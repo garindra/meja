@@ -669,7 +669,7 @@ func commandDefinitions() []commandDefinition {
 		{name: "server-version", usage: "server-version", description: "Show the running daemon build and protocol versions.", run: runServerVersionCommand},
 		{name: "new-session", aliases: []string{"new"}, usage: "new-session [-d] [-P] [-F format] [-s name] [-r directory] [-t base] [-- command args...] | new-session -f file [-s name] [--commands=prepare|skip|run]", description: "Create a session, optionally from a .meja file, and attach unless -d is supplied.", run: runNewSessionCommand},
 		{name: "attach-session", aliases: []string{"attach", "a"}, usage: "attach-session -t session-id-or-name", description: "Attach to an existing session.", run: runAttachSessionCommand},
-		{name: "restore-session", aliases: []string{"restore"}, usage: "restore-session -t name [-s new-name] [--commands=prepare|skip|run]", description: "Restore a named session's automatic snapshot and attach.", run: runRestoreSessionCommand},
+		{name: "restore-session", aliases: []string{"restore"}, usage: "restore-session -t name [-s new-name] [--run | --commands=prepare|skip|run]", description: "Restore a named session's automatic snapshot and attach.", run: runRestoreSessionCommand},
 		{name: "save-session", aliases: []string{"save"}, usage: "save-session [-t session-id-or-name] -o file [-f]", description: "Save a live session to a .meja file.", run: runSaveSessionCommand},
 		{name: "list-sessions", aliases: []string{"ls"}, usage: "list-sessions [-F format]", description: "List active sessions.", run: runListSessionsCommand},
 		{name: "kill-session", usage: "kill-session [-t session]", description: "Terminate a session and its panes.", run: runKillSessionCommand},
@@ -1212,7 +1212,8 @@ func runSetRootCommand(d *Daemon, ctx CommandContext, args []string) (commandOut
 	if len(remaining) == 1 {
 		raw = remaining[0]
 	}
-	if err := d.setCommandRoot(sessionID, raw, ctx.Caller.WorkingDirectory); err != nil {
+	callerIsPane := ctx.Caller.Origin == CommandOriginAttachedUI || ctx.Caller.Origin == CommandOriginPaneCLI
+	if err := d.setCommandRoot(sessionID, raw, ctx.Caller.WorkingDirectory, ctx.Caller.PaneID, callerIsPane); err != nil {
 		return commandOutcome{}, err
 	}
 	if client := commandClientValue(d, ctx, sessionID); client != nil {
@@ -1344,7 +1345,7 @@ func (d *Daemon) renameCommandSession(sessionID uint64, name string) error {
 	return d.renameSession(state, name)
 }
 
-func (d *Daemon) setCommandRoot(sessionID uint64, raw, callerWorkingDirectory string) error {
+func (d *Daemon) setCommandRoot(sessionID uint64, raw, callerWorkingDirectory string, callerPaneID uint64, callerIsPane bool) error {
 	var state *SessionState
 	var current string
 	d.call(func() {
@@ -1375,7 +1376,17 @@ func (d *Daemon) setCommandRoot(sessionID uint64, raw, callerWorkingDirectory st
 			err = errSessionUnavailable
 			return
 		}
+		rootChanged := filepath.Clean(resolved) != state.rootDir
+		cwdChanged := false
+		if callerIsPane && callerWorkingDirectory != "" && state.Panes[callerPaneID] != nil {
+			cwd := filepath.Clean(callerWorkingDirectory)
+			cwdChanged = cwd != state.Panes[callerPaneID].KnownCwd
+			state.Panes[callerPaneID].KnownCwd = cwd
+		}
 		state.setRoot(resolved)
+		if cwdChanged && !rootChanged {
+			state.markSessionChangedForPersistence()
+		}
 	})
 	return err
 }
@@ -1798,7 +1809,10 @@ func runDetachClientCommand(d *Daemon, ctx CommandContext, args []string) (comma
 		return commandOutcome{}, errors.New("command requires an attached client")
 	}
 	if ctx.Caller.SessionID != session.ID {
-		postClientCommand(client.State.Active, clientInstanceCommand{Close: true, CloseReason: "detached by command"})
+		postClientCommand(client.State.Active, clientInstanceCommand{
+			Close:       true,
+			CloseReason: fmt.Sprintf("[detached (from session %d)]", session.ID),
+		})
 		return commandOutcome{}, nil
 	}
 	return commandOutcome{Action: detachClientAction{ClientID: client.ID}}, nil
@@ -1868,6 +1882,9 @@ func (c *ClientInstance) observedPaneCwd(pane *Pane) string {
 	}})
 	if observation := observations[key]; observation.Root != nil && observation.Root.Cwd != "" {
 		return observation.Root.Cwd
+	}
+	if pane.KnownCwd != "" {
+		return pane.KnownCwd
 	}
 	if persisted := c.sessionState().persistenceRecord(); persisted != nil {
 		for _, window := range persisted.Plan.Windows {
@@ -2122,11 +2139,22 @@ func (d *Daemon) commandRestoreSession(args []string, issueBootstrap bool) (sess
 	target := fs.String("t", "", "persisted session name")
 	name := fs.String("s", "", "new session name")
 	mode := fs.String("commands", "prepare", "restore command mode")
+	run := fs.Bool("run", false, "run restored commands")
 	if err := fs.Parse(args); err != nil {
 		return sessionCommandResult{}, err
 	}
 	if *target == "" || len(fs.Args()) != 0 {
 		return sessionCommandResult{}, errors.New("restore-session requires -t <session-name>")
+	}
+	if *run {
+		commandsSet := false
+		fs.Visit(func(f *flag.Flag) {
+			commandsSet = commandsSet || f.Name == "commands"
+		})
+		if commandsSet {
+			return sessionCommandResult{}, errors.New("restore-session --run cannot be combined with --commands")
+		}
+		*mode = string(restoreCommandsRun)
 	}
 	restoreMode, err := parseRestoreCommandMode(*mode)
 	if err != nil {

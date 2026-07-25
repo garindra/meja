@@ -17,8 +17,24 @@ func TestCanonicalDefaultStyleOwnsIDZero(t *testing.T) {
 	}
 	term.CurrentStyle = Style{Bold: true}
 	term.Apply([]byte("x"))
-	if decodedRow(term, 0)[0].StyleID == protocol.CanonicalDefaultStyleID {
-		t.Fatal("dynamic style reused canonical style ID 0")
+	if got := decodedRow(term, 0)[0].StyleID; got != firstLiveTerminalStyleID {
+		t.Fatalf("first dynamic style ID = %d, want %d", got, firstLiveTerminalStyleID)
+	}
+}
+
+func TestPaneSyntheticStylesArePreallocated(t *testing.T) {
+	term := newTerminal(1, 1)
+	if got := len(term.styleByID); got != int(firstLiveTerminalStyleID) {
+		t.Fatalf("initial style table size = %d, want %d", got, firstLiveTerminalStyleID)
+	}
+	if term.styleByID[historyCounterStyleID] != historyCounterStyle {
+		t.Fatalf("counter style = %#v", term.styleByID[historyCounterStyleID])
+	}
+	if term.styleByID[historySelectionStyleID] != historySelectionStyle {
+		t.Fatalf("selection style = %#v", term.styleByID[historySelectionStyleID])
+	}
+	if term.nextStyleID != firstLiveTerminalStyleID {
+		t.Fatalf("next live style ID = %d, want %d", term.nextStyleID, firstLiveTerminalStyleID)
 	}
 }
 
@@ -530,7 +546,7 @@ func TestTerminalStyleTablePreallocatesCommonCapacity(t *testing.T) {
 		t.Fatalf("style capacity = %d, want at least %d", cap(term.styleByID), initialStyleCapacity)
 	}
 	first := &term.styleByID[0]
-	for i := 1; i < initialStyleCapacity; i++ {
+	for i := int(firstLiveTerminalStyleID); i < initialStyleCapacity; i++ {
 		term.styleID(Style{FG: protocol.Color{Mode: "indexed", Index: uint8(i)}})
 	}
 	if &term.styleByID[0] != first {

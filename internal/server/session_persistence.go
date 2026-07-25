@@ -126,9 +126,10 @@ type PlanLayout struct {
 }
 
 type paneCaptureInput struct {
-	pane   *Pane
-	launch PaneLaunch
-	anchor Anchor
+	pane        *Pane
+	launch      PaneLaunch
+	fallbackCwd string
+	anchor      Anchor
 }
 
 type windowCaptureInput struct {
@@ -166,9 +167,14 @@ func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer P
 			continue
 		}
 		launch := clonePaneLaunch(pane.Launch)
+		fallbackCwd := launch.Cwd
+		if pane.KnownCwd != "" {
+			fallbackCwd = pane.KnownCwd
+		}
 		inputs = append(inputs, paneCaptureInput{
-			pane:   pane,
-			launch: launch,
+			pane:        pane,
+			launch:      launch,
+			fallbackCwd: fallbackCwd,
 			anchor: Anchor{
 				Key:         PaneKey{PaneID: pane.ID},
 				Root:        pane.Root,
@@ -258,7 +264,7 @@ func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer P
 				Issues: []string{"observer returned no result for pane"},
 			}
 		}
-		cwd := input.launch.Cwd
+		cwd := input.fallbackCwd
 		if observation.Root != nil && observation.Root.Cwd != "" {
 			cwd = observation.Root.Cwd
 		}
@@ -732,12 +738,18 @@ func (s *SessionState) projectPlanWindow(window *Window, processes map[uint64]pr
 		if pane == nil {
 			continue
 		}
-		output := PlanPane{ID: paneID, Cwd: pane.Launch.Cwd, Shell: pane.Launch.Shell}
+		cwd := pane.Launch.Cwd
+		if pane.KnownCwd != "" {
+			cwd = pane.KnownCwd
+		}
+		output := PlanPane{ID: paneID, Cwd: cwd, Shell: pane.Launch.Shell}
 		if len(pane.Launch.RequestedArgv) > 0 {
 			output.Command = shellJoin(pane.Launch.RequestedArgv)
 		}
 		if projection, ok := processes[paneID]; ok {
-			output.Cwd = projection.Cwd
+			if pane.KnownCwd == "" {
+				output.Cwd = projection.Cwd
+			}
 			output.Command = projection.Command
 		}
 		persisted.Panes = append(persisted.Panes, output)
