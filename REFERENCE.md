@@ -136,7 +136,7 @@ meja [transport-options] new-session
 meja [transport-options] new-session
      -f file.meja
      [-s name]
-     [--commands=prepare|skip|run]
+     [--run | --commands=prepare|skip|run]
 ```
 
 Examples:
@@ -147,7 +147,11 @@ meja new -s work
 meja -h prod new -s deploy -r /srv/app
 meja -h prod new -s logs -- journalctl -f
 meja new -f dev.meja -s dev-alice
+meja new -f dev.meja --run
 ```
+
+For file-backed creation, `--run` is shorthand for `--commands=run`. It cannot
+be combined with `--commands`.
 
 `-s` assigns a unique name and enables private recovery persistence. `-r`/`--root` accepts an absolute path, `~`, `~/...`, or a path relative to the invoking directory on the selected machine. The resolved directory must exist.
 

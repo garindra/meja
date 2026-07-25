@@ -132,7 +132,7 @@ The file is readable and editable. Check it into version control so your team ca
 
 Meja persists the recoverable state of every named session.
 
-After a reboot or ended session, `meja restore -t <session-name>` creates a new session from its latest recovery record. It preserves the session's windows, panes, layout, working directories, shells, commands, and active selection. Add `--run` as shorthand for `--commands=run` to execute the restored commands immediately.
+After a reboot or ended session, `meja restore -t <session-name>` creates a new session from its latest recovery record. It preserves the session's windows, panes, layout, working directories, shells, commands, and active selection. Add `--run` as shorthand for `--commands=run` to execute the restored commands immediately. The same shorthand works with project files: `meja new -f project.meja --run`.
 
 ### Shareable `.meja` files
 
