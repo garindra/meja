@@ -30,6 +30,8 @@ type Pane struct {
 	Root     Identity
 
 	terminal               *TerminalState
+	terminationOnce        sync.Once
+	terminationRemaining   bool
 	metadata               atomic.Pointer[paneTerminalMetadata]
 	ptyOutput              chan []byte
 	ptyInput               chan []byte

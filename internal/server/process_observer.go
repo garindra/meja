@@ -128,6 +128,37 @@ func identifyProcess(pid int) (Identity, error) {
 	return identifyPS(pid)
 }
 
+func processSessionMembers(ctx context.Context, sessionID int) ([]Identity, error) {
+	if sessionID <= 0 {
+		return nil, fmt.Errorf("invalid process session ID %d", sessionID)
+	}
+	if runtime.GOOS == "linux" {
+		table, err := scanProcTable(ctx)
+		if err != nil {
+			return nil, err
+		}
+		members := make([]Identity, 0, 4)
+		for _, stat := range table {
+			if stat.SessionState == sessionID && stat.State != 'Z' && stat.State != 'X' && stat.State != 'x' {
+				members = append(members, stat.Identity)
+			}
+		}
+		return members, nil
+	}
+
+	processes, err := scanPS(ctx, "-s", strconv.Itoa(sessionID))
+	if err != nil {
+		return nil, err
+	}
+	members := make([]Identity, 0, len(processes))
+	for _, process := range processes {
+		if process.State != 'Z' && process.State != 'X' && process.State != 'x' {
+			members = append(members, process.Identity)
+		}
+	}
+	return members, nil
+}
+
 func (systemObserver) Observe(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObservation {
 	if runtime.GOOS == "linux" {
 		return observeProc(ctx, anchors)

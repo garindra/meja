@@ -74,13 +74,14 @@ func (d *Daemon) startPane(state *SessionState, pane *Pane) {
 	go relayPTYOutput(pane)
 	go runPTYWriter(pane, func(error) {
 		_ = terminatePane(pane)
-		if d != nil {
-			d.postPaneProcessExit(pane.ID)
-		}
 	})
 	go func() {
 		_ = pane.Process.Wait()
-		pane.stop()
+		// The pane leader may exit while foreground or background jobs from
+		// the same terminal session are still alive. Finish tearing down that
+		// session before publishing the pane-exit event and losing its process
+		// ownership boundary.
+		_ = terminatePaneAndWait(pane, defaultPaneTerminationTimeouts)
 		close(pane.processDone)
 		if d != nil {
 			d.postPaneProcessExit(pane.ID)

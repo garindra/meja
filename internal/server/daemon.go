@@ -916,10 +916,23 @@ func terminatePane(pane *Pane) error {
 	if pane == nil {
 		return nil
 	}
-	if pane.Process != nil && pane.Process.Process != nil {
-		_ = pane.Process.Process.Signal(syscall.SIGHUP)
-	}
 	pane.stop()
+	go func() {
+		_ = terminatePaneAndWait(pane, defaultPaneTerminationTimeouts)
+	}()
+	return nil
+}
+
+func terminatePaneAndWait(pane *Pane, timeouts paneTerminationTimeouts) error {
+	if pane == nil {
+		return nil
+	}
+	pane.terminationOnce.Do(func() {
+		pane.terminationRemaining = terminatePaneSession(pane, timeouts)
+	})
+	if pane.terminationRemaining {
+		return errors.New("pane processes did not exit before the shutdown deadline")
+	}
 	return nil
 }
 
@@ -935,79 +948,153 @@ var defaultPaneTerminationTimeouts = paneTerminationTimeouts{
 	kill:      time.Second,
 }
 
-// terminatePanesAndWait preserves terminal hangup semantics first, then
-// escalates stubborn pane leaders under one shared deadline per stage. The
-// process waiter remains the sole owner of Process.Wait and closes processDone.
+// terminatePanesAndWait terminates panes concurrently so each pane receives the
+// full escalation window without making shutdown latency grow with pane count.
+// The process waiter remains the sole owner of Process.Wait and closes
+// processDone.
 func terminatePanesAndWait(panes []*Pane, timeouts paneTerminationTimeouts) []*Pane {
-	pending := livePaneProcesses(panes)
-	for _, pane := range pending {
-		_ = pane.Process.Process.Signal(syscall.SIGHUP)
-		pane.stop()
+	type result struct {
+		pane      *Pane
+		remaining bool
 	}
-	pending = waitForPaneProcesses(pending, timeouts.hangup)
-	for _, pane := range pending {
-		_ = pane.Process.Process.Signal(syscall.SIGTERM)
+	results := make(chan result, len(panes))
+	count := 0
+	for _, pane := range panes {
+		if pane == nil {
+			continue
+		}
+		count++
+		go func(pane *Pane) {
+			pane.terminationOnce.Do(func() {
+				pane.terminationRemaining = terminatePaneSession(pane, timeouts)
+			})
+			results <- result{pane: pane, remaining: pane.terminationRemaining}
+		}(pane)
 	}
-	pending = waitForPaneProcesses(pending, timeouts.terminate)
-	for _, pane := range pending {
-		_ = pane.Process.Process.Signal(syscall.SIGKILL)
+	remaining := make([]*Pane, 0)
+	terminated := make([]*Pane, 0, count)
+	for range count {
+		result := <-results
+		if result.remaining {
+			remaining = append(remaining, result.pane)
+		} else {
+			terminated = append(terminated, result.pane)
+		}
 	}
-	return waitForPaneProcesses(pending, timeouts.kill)
+	remaining = append(remaining, waitForPaneWaiters(terminated, timeouts.kill)...)
+	return remaining
 }
 
-func livePaneProcesses(panes []*Pane) []*Pane {
-	live := make([]*Pane, 0, len(panes))
+func terminatePaneSession(pane *Pane, timeouts paneTerminationTimeouts) bool {
+	if pane == nil {
+		return false
+	}
+	_ = signalPaneSession(pane, syscall.SIGHUP)
+	pane.stop()
+	if !waitForPaneSession(pane, timeouts.hangup) {
+		return false
+	}
+	_ = signalPaneSession(pane, syscall.SIGTERM)
+	if !waitForPaneSession(pane, timeouts.terminate) {
+		return false
+	}
+	_ = signalPaneSession(pane, syscall.SIGKILL)
+	return waitForPaneSession(pane, timeouts.kill)
+}
+
+func signalPaneSession(pane *Pane, signal syscall.Signal) error {
+	if pane == nil || pane.Root.PID <= 0 {
+		return nil
+	}
+	members, err := processSessionMembers(context.Background(), pane.Root.PID)
+	if err != nil {
+		if pane.Process != nil && pane.Process.Process != nil {
+			return pane.Process.Process.Signal(signal)
+		}
+		return err
+	}
+	var signalErr error
+	for _, member := range members {
+		current, identifyErr := identifyProcess(member.PID)
+		if identifyErr != nil || current != member {
+			continue
+		}
+		if err := syscall.Kill(member.PID, signal); err != nil && !errors.Is(err, syscall.ESRCH) {
+			signalErr = errors.Join(signalErr, err)
+		}
+	}
+	return signalErr
+}
+
+// waitForPaneSession reports whether live processes remain after the timeout.
+func waitForPaneSession(pane *Pane, timeout time.Duration) bool {
+	live := func() bool {
+		members, err := processSessionMembers(context.Background(), pane.Root.PID)
+		if err == nil {
+			return len(members) > 0
+		}
+		if pane.Process == nil || pane.Process.Process == nil {
+			return false
+		}
+		return pane.Process.Process.Signal(syscall.Signal(0)) == nil
+	}
+	if !live() {
+		return false
+	}
+	if timeout <= 0 {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if !live() {
+				return false
+			}
+		case <-timer.C:
+			return live()
+		}
+	}
+}
+
+func waitForPaneWaiters(panes []*Pane, timeout time.Duration) []*Pane {
+	pending := make([]*Pane, 0, len(panes))
 	for _, pane := range panes {
-		if pane == nil || pane.Process == nil || pane.Process.Process == nil || pane.processDone == nil {
+		if pane == nil || pane.processDone == nil {
 			continue
 		}
 		select {
 		case <-pane.processDone:
 		default:
-			live = append(live, pane)
+			pending = append(pending, pane)
 		}
 	}
-	return live
-}
-
-func waitForPaneProcesses(panes []*Pane, timeout time.Duration) []*Pane {
-	pending := livePaneProcesses(panes)
 	if len(pending) == 0 || timeout <= 0 {
 		return pending
 	}
-
-	exited := make(chan *Pane, len(pending))
-	stop := make(chan struct{})
-	for _, pane := range pending {
-		go func(pane *Pane) {
-			select {
-			case <-pane.processDone:
-				exited <- pane
-			case <-stop:
-			}
-		}(pane)
-	}
-
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	remaining := make(map[*Pane]struct{}, len(pending))
-	for _, pane := range pending {
-		remaining[pane] = struct{}{}
-	}
-	for len(remaining) > 0 {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for len(pending) > 0 {
 		select {
-		case pane := <-exited:
-			delete(remaining, pane)
-		case <-timer.C:
-			close(stop)
-			out := make([]*Pane, 0, len(remaining))
-			for pane := range remaining {
-				out = append(out, pane)
+		case <-ticker.C:
+			remaining := pending[:0]
+			for _, pane := range pending {
+				select {
+				case <-pane.processDone:
+				default:
+					remaining = append(remaining, pane)
+				}
 			}
-			return out
+			pending = remaining
+		case <-timer.C:
+			return pending
 		}
 	}
-	close(stop)
 	return nil
 }
 
