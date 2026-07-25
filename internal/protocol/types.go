@@ -1,7 +1,7 @@
 package protocol
 
 const (
-	ALPN = "meja-quic/12"
+	ALPN = "meja-quic/13"
 
 	// SessionReplacedErrorCode is a terminal QUIC application close: another
 	// client has taken ownership of the session, so the displaced client must
@@ -73,6 +73,10 @@ type FrontendTerminalWrite struct {
 
 type FrontendRegisterTerminalExitCommand struct {
 	Data []byte
+}
+
+type FrontendExecuteTerminalExitCommand struct {
+	Message string
 }
 
 type Rect struct {

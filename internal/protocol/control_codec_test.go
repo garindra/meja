@@ -82,3 +82,15 @@ func TestFrontendRegisterTerminalExitCommandRoundTrip(t *testing.T) {
 		t.Fatalf("terminal exit command = %#v, err = %v", got, err)
 	}
 }
+
+func TestFrontendExecuteTerminalExitCommandRoundTrip(t *testing.T) {
+	want := FrontendExecuteTerminalExitCommand{Message: "[detached (from session 2)]"}
+	payload, err := EncodeFrontendExecuteTerminalExitCommand(nil, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeFrontendExecuteTerminalExitCommand(payload)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("terminal exit request = %#v, err = %v", got, err)
+	}
+}

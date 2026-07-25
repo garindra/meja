@@ -186,3 +186,21 @@ func DecodeFrontendRegisterTerminalExitCommand(payload []byte) (FrontendRegister
 	r := PayloadReader{Data: payload}
 	return FrontendRegisterTerminalExitCommand{Data: r.Remaining()}, nil
 }
+
+func EncodeFrontendExecuteTerminalExitCommand(dst []byte, msg FrontendExecuteTerminalExitCommand) ([]byte, error) {
+	w := PayloadWriter{Buf: dst}
+	w.String(msg.Message)
+	return w.Buf, nil
+}
+
+func DecodeFrontendExecuteTerminalExitCommand(payload []byte) (FrontendExecuteTerminalExitCommand, error) {
+	r := PayloadReader{Data: payload}
+	message, err := r.String(MaxStringLen)
+	if err != nil {
+		return FrontendExecuteTerminalExitCommand{}, fmt.Errorf("decode FrontendExecuteTerminalExitCommand message: %w", err)
+	}
+	if err := r.Done(); err != nil {
+		return FrontendExecuteTerminalExitCommand{}, fmt.Errorf("decode FrontendExecuteTerminalExitCommand: %w", err)
+	}
+	return FrontendExecuteTerminalExitCommand{Message: message}, nil
+}

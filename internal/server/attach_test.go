@@ -848,8 +848,13 @@ func TestNormalDetachWaitsForFrontendTerminalExitCompletion(t *testing.T) {
 		if frame.Type != protocol.MsgFrontendExecuteTerminalExitCommand {
 			continue
 		}
-		if len(frame.Payload) != 0 {
-			t.Fatalf("terminal exit request payload = %q", frame.Payload)
+		request, err := protocol.DecodeFrontendExecuteTerminalExitCommand(frame.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantMessage := fmt.Sprintf("[detached (from session %d)]", result.session.ID)
+		if request.Message != wantMessage {
+			t.Fatalf("terminal exit message = %q, want %q", request.Message, wantMessage)
 		}
 		break
 	}
@@ -860,6 +865,57 @@ func TestNormalDetachWaitsForFrontendTerminalExitCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := controlEncoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendTerminalExitComplete}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decoder.ReadFrame(); err == nil {
+		t.Fatal("connection remained open after terminal exit completion")
+	}
+}
+
+func TestConfirmedFinalPaneCloseWaitsForFrontendTerminalExitCompletion(t *testing.T) {
+	d := newCommandTestDaemonWithActor(t)
+	setCommandTestPersistenceDir(t, d)
+	result := d.executeCommand(protocol.CommandRequest{
+		Args:         []string{"new", "--", "/bin/sleep", "30"},
+		TerminalCols: 80,
+		TerminalRows: 23,
+	})
+	if result.exitCode != 0 || result.bootstrap == nil {
+		t.Fatalf("create result = %#v", result)
+	}
+
+	conn, control, decoder, _ := dialTestClientInstance(t, *result.bootstrap, "")
+	defer conn.CloseWithError(0, "")
+	encoder := protocol.NewEncoder(control)
+	for _, data := range [][]byte{{0x02, 'x'}, {'y'}} {
+		input := encodedTestFrame(t, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: data}, protocol.EncodeFrontendInputBytes)
+		if err := encoder.WriteFrame(input); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := control.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		frame, err := decoder.ReadFrame()
+		if err != nil {
+			t.Fatalf("read terminal exit request: %v", err)
+		}
+		if frame.Type != protocol.MsgFrontendExecuteTerminalExitCommand {
+			continue
+		}
+		request, err := protocol.DecodeFrontendExecuteTerminalExitCommand(frame.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantMessage := "[exited]"
+		if request.Message != wantMessage {
+			t.Fatalf("terminal exit message = %q, want %q", request.Message, wantMessage)
+		}
+		break
+	}
+	if err := encoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendTerminalExitComplete}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := decoder.ReadFrame(); err == nil {
@@ -910,9 +966,13 @@ func TestResizeBurstPreservesDetachInput(t *testing.T) {
 		if err != nil {
 			t.Fatalf("detach input was starved behind resize burst: %v; server log: %s", err, serverLog.String())
 		}
-		if frame.Type == protocol.MsgFrontendExecuteTerminalExitCommand {
-			break
+		if frame.Type != protocol.MsgFrontendExecuteTerminalExitCommand {
+			continue
 		}
+		if _, err := protocol.DecodeFrontendExecuteTerminalExitCommand(frame.Payload); err != nil {
+			t.Fatal(err)
+		}
+		break
 	}
 
 	var client *ClientIdentity

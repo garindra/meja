@@ -530,7 +530,7 @@ func (d *Daemon) shutdownSessionNow(state *SessionState) []*Pane {
 		connection = d.shutdownSessionInActor(state)
 	})
 	if connection != nil {
-		_ = sendClientCommand(connection, clientInstanceCommand{Close: true})
+		postClientCommand(connection, clientInstanceCommand{Close: true, CloseReason: "[exited]"})
 	}
 	return panes
 }

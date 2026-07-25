@@ -994,13 +994,9 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	}
 }
 
-func TestSessionShutdownCleanlyClosesConnection(t *testing.T) {
+func TestSessionShutdownRequestsGracefulClientClose(t *testing.T) {
 	closed := false
-	var closeErr error
 	connection := &recordingQUICConnection{closeWithError: func(code quic.ApplicationErrorCode, message string) error {
-		if code != 0 || message != "" {
-			closeErr = fmt.Errorf("CloseWithError(%d, %q), want clean application close", code, message)
-		}
 		closed = true
 		return nil
 	}}
@@ -1008,16 +1004,21 @@ func TestSessionShutdownCleanlyClosesConnection(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	s.daemon = d
 	d.sessions[s.ID] = s
-	setTestClient(s, &ClientInstance{QUIC: connection})
+	client := &ClientInstance{QUIC: connection}
+	setTestClient(s, client)
 
 	if err := d.shutdownSession(s); err != nil {
 		t.Fatal(err)
 	}
-	if !closed {
-		t.Fatal("active QUIC connection was not closed")
+	deadline := time.Now().Add(time.Second)
+	for !client.ended.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	if closeErr != nil {
-		t.Fatal(closeErr)
+	if !client.ended.Load() {
+		t.Fatal("client was not marked for graceful close")
+	}
+	if closed {
+		t.Fatal("session shutdown bypassed the frontend terminal-exit handshake")
 	}
 }
 

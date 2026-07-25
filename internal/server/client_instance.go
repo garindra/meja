@@ -258,7 +258,9 @@ func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
 	case command.RunPasteBuffer:
 		err = pasteBufferToClient(c, command.PasteBuffer)
 	case command.Close:
-		if c.QUIC != nil {
+		if command.CloseCode == 0 {
+			c.ended.Store(true)
+		} else if c.QUIC != nil {
 			err = c.QUIC.CloseWithError(command.CloseCode, command.CloseReason)
 		}
 	}
@@ -1238,6 +1240,24 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 	go readClientControl(controlDecoder, controlEvents)
 	clientInstance.eventLoopStarted.Store(true)
 	exitRequested := false
+	requestTerminalExit := func(message string) error {
+		if exitRequested {
+			return nil
+		}
+		request := protocol.FrontendExecuteTerminalExitCommand{
+			Message: message,
+		}
+		if err := sendEncoded(
+			clientInstance.controlOut,
+			protocol.MsgFrontendExecuteTerminalExitCommand,
+			request,
+			protocol.EncodeFrontendExecuteTerminalExitCommand,
+		); err != nil {
+			return err
+		}
+		exitRequested = true
+		return nil
+	}
 	handleControlEvent := func(event clientControlEvent) (bool, error) {
 		if event.err != nil {
 			if errors.Is(event.err, io.EOF) {
@@ -1259,12 +1279,13 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		}
 		stopped, err := clientInstance.handleControlFrame(event.frame)
 		if stopped {
-			if err := sendEncoded(clientInstance.controlOut, protocol.MsgFrontendExecuteTerminalExitCommand, struct{}{}, func(dst []byte, _ struct{}) ([]byte, error) {
-				return dst, nil
-			}); err != nil {
+			message := fmt.Sprintf("[detached (from session %d)]", clientInstance.sessionID)
+			if clientInstance.ended.Load() {
+				message = "[exited]"
+			}
+			if err := requestTerminalExit(message); err != nil {
 				return false, err
 			}
-			exitRequested = true
 			return false, nil
 		}
 		return false, err
@@ -1285,6 +1306,19 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 			}
 		case command := <-clientInstance.commands:
 			clientInstance.runClientCommand(command)
+			if command.Close && command.CloseCode == 0 {
+				message := command.CloseReason
+				if message == "" {
+					message = "[exited]"
+				}
+				if err := requestTerminalExit(message); err != nil {
+					return err
+				}
+			} else if clientInstance.ended.Load() {
+				if err := requestTerminalExit("[exited]"); err != nil {
+					return err
+				}
+			}
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-conn.Context().Done():

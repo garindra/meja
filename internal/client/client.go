@@ -260,6 +260,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	var rawState *term.State
 	terminalActive := false
+	postExitMessage := ""
 	var pendingFrontendInput []byte
 	enterTerminal := func() error {
 		if terminalActive {
@@ -320,6 +321,9 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		_ = term.Restore(int(cfg.Stdin.Fd()), rawState)
 		terminalActive = false
+		if message := sanitizePostExitMessage(postExitMessage); message != "" {
+			_ = writeAll(cfg.Stdout, []byte(message+"\r\n"))
+		}
 	}
 	defer restoreTerminal()
 
@@ -352,11 +356,7 @@ func Run(ctx context.Context, cfg Config) error {
 			live.destroy()
 			ui.sync(clientCtx)
 			if result.graceful {
-				if result.terminalMessage != "" {
-					ui.emit(terminalStatusEvent{message: result.terminalMessage})
-					ui.sync(clientCtx)
-					_ = waitReconnect(clientCtx, 2*time.Second)
-				}
+				postExitMessage = result.terminalMessage
 				return nil
 			}
 			if clientCtx.Err() != nil {
@@ -410,6 +410,16 @@ func Run(ctx context.Context, cfg Config) error {
 
 func fixedTerminalExit(cols uint16) []byte {
 	return []byte(fmt.Sprintf("\x1b[?1003;1006;1004;2004l\x1b[r\x1b[1;%ds\x1b[?69l\x1b[?25h\x1b[0m\x1b[?1049l", cols))
+}
+
+func sanitizePostExitMessage(message string) string {
+	var sanitized strings.Builder
+	for _, r := range message {
+		if r >= 0x20 && r != 0x7f {
+			sanitized.WriteRune(r)
+		}
+	}
+	return sanitized.String()
 }
 
 func clientExitError(ctx context.Context) error {
@@ -977,15 +987,23 @@ func (c *displayFrameCompiler) appendFill(fill protocol.Fill) error {
 }
 
 func controlLoop(decoder *protocol.Decoder, ui *runtimeState, controlFrames chan<- protocol.Frame, done chan<- connectionResult, lastContact *atomic.Int64) {
+	terminalExitMessage := ""
 	for {
 		frame, err := decoder.ReadFrame()
 		if err != nil {
 			if isTerminalQUICClose(err) {
 				var applicationErr *quic.ApplicationError
 				_ = errors.As(err, &applicationErr)
-				message := ""
-				if applicationErr != nil && applicationErr.ErrorCode == protocol.SessionReplacedErrorCode {
-					message = applicationErr.ErrorMessage
+				message := terminalExitMessage
+				if applicationErr != nil {
+					switch applicationErr.ErrorCode {
+					case protocol.SessionReplacedErrorCode:
+						message = applicationErr.ErrorMessage
+					case 0:
+						if message == "" {
+							message = "[exited]"
+						}
+					}
 				}
 				done <- connectionResult{graceful: true, terminalMessage: message}
 				return
@@ -1029,14 +1047,16 @@ func controlLoop(decoder *protocol.Decoder, ui *runtimeState, controlFrames chan
 				return
 			}
 		case protocol.MsgFrontendExecuteTerminalExitCommand:
-			if len(frame.Payload) != 0 {
-				done <- connectionResult{err: errors.New("frontend terminal exit request has a payload")}
+			msg, err := protocol.DecodeFrontendExecuteTerminalExitCommand(frame.Payload)
+			if err != nil {
+				done <- connectionResult{err: fmt.Errorf("decode FRONTEND_EXECUTE_TERMINAL_EXIT_COMMAND: %w", err)}
 				return
 			}
 			if err := ui.executeTerminalExitCommand(context.Background()); err != nil {
 				done <- connectionResult{err: err}
 				return
 			}
+			terminalExitMessage = msg.Message
 			if controlFrames == nil {
 				done <- connectionResult{err: errors.New("frontend terminal exit request has no control writer")}
 				return

@@ -1798,7 +1798,10 @@ func runDetachClientCommand(d *Daemon, ctx CommandContext, args []string) (comma
 		return commandOutcome{}, errors.New("command requires an attached client")
 	}
 	if ctx.Caller.SessionID != session.ID {
-		postClientCommand(client.State.Active, clientInstanceCommand{Close: true, CloseReason: "detached by command"})
+		postClientCommand(client.State.Active, clientInstanceCommand{
+			Close:       true,
+			CloseReason: fmt.Sprintf("[detached (from session %d)]", session.ID),
+		})
 		return commandOutcome{}, nil
 	}
 	return commandOutcome{Action: detachClientAction{ClientID: client.ID}}, nil
