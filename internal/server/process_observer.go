@@ -623,6 +623,11 @@ func observePS(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObserva
 	beforeByPID := indexPSProcesses(before)
 	afterByPID := indexPSProcesses(after)
 	foregroundAfter := sampleForegroundProcessGroups(anchors)
+	rootPIDs := make([]int, 0, len(anchors))
+	for _, anchor := range anchors {
+		rootPIDs = append(rootPIDs, anchor.Root.PID)
+	}
+	rootCwds, rootCwdErr := readStructuredProcessCwds(ctx, rootPIDs)
 
 	for _, anchor := range anchors {
 		observation := ProcessObservation{Key: anchor.Key, Status: StatusUnavailable}
@@ -666,9 +671,19 @@ func observePS(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObserva
 		}
 
 		root := *rootBefore
+		if cwd := rootCwds[root.Identity.PID]; cwd != "" {
+			root.Cwd = cwd
+		}
 		observation.Root = &root
 		observation.Processes = childrenBefore
-		observation.Issues = []string{"ps fallback does not provide executable or cwd data"}
+		observation.Issues = []string{"ps fallback does not provide executable data"}
+		if root.Cwd == "" {
+			if rootCwdErr != nil && !errors.Is(rootCwdErr, errStructuredProcessCwdUnavailable) {
+				observation.Issues = append(observation.Issues, rootCwdErr.Error())
+			} else {
+				observation.Issues = append(observation.Issues, "ps fallback does not provide cwd data")
+			}
+		}
 		if !anchor.RootIsShell {
 			observation.Status = StatusDetected
 			observation.Candidate = cloneObservedProcess(&root)

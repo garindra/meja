@@ -161,6 +161,16 @@ func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer P
 	sessionName = s.Name
 	sessionRoot = s.rootDir
 	activeWindowID = s.ActiveWindowID
+	persistedCwds := map[uint64]string{}
+	if persisted := s.persistenceRecord(); persisted != nil {
+		for _, window := range persisted.Plan.Windows {
+			for _, pane := range window.Panes {
+				if pane.Cwd != "" {
+					persistedCwds[pane.ID] = pane.Cwd
+				}
+			}
+		}
+	}
 	inputs = make([]paneCaptureInput, 0, len(s.Panes))
 	for _, pane := range s.Panes {
 		if pane == nil || pane.Root.PID <= 0 {
@@ -168,6 +178,9 @@ func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer P
 		}
 		launch := clonePaneLaunch(pane.Launch)
 		fallbackCwd := launch.Cwd
+		if persistedCwd := persistedCwds[pane.ID]; persistedCwd != "" {
+			fallbackCwd = persistedCwd
+		}
 		if pane.KnownCwd != "" {
 			fallbackCwd = pane.KnownCwd
 		}
@@ -1304,7 +1317,27 @@ func encodeKDLDocument(doc *document.Document) ([]byte, error) {
 	if err := kdl.GenerateWithOptions(deterministicKDLDocument(doc), &output, kdl.GenerateOptions{Indent: "    "}); err != nil {
 		return nil, fmt.Errorf("encode .meja file: %w", err)
 	}
-	return output.Bytes(), nil
+	return formatMejaDocument(output.Bytes()), nil
+}
+
+func formatMejaDocument(data []byte) []byte {
+	lines := bytes.Split(data, []byte{'\n'})
+	var output bytes.Buffer
+	for _, line := range lines {
+		trimmed := bytes.TrimSpace(line)
+		if (mejaStructuralNodeLine(trimmed, "window") || mejaStructuralNodeLine(trimmed, "pane")) &&
+			output.Len() > 0 && !bytes.HasSuffix(output.Bytes(), []byte("\n\n")) {
+			output.WriteByte('\n')
+		}
+		output.Write(line)
+		output.WriteByte('\n')
+	}
+	return bytes.TrimSuffix(output.Bytes(), []byte{'\n'})
+}
+
+func mejaStructuralNodeLine(line []byte, name string) bool {
+	prefix := []byte(name + " ")
+	return bytes.HasPrefix(line, prefix) && bytes.HasSuffix(line, []byte("{"))
 }
 
 // kdl-go's production document.Properties uses a map. Convert properties to
@@ -1522,12 +1555,16 @@ func normalizePlanPaths(plan *SessionPlan, fileDirectory string, userOwned bool)
 			windowCwd = sessionRoot
 		}
 		paneParent := windowCwd
-		if userOwned && !pathWithinRoot(sessionRoot, windowCwd) {
-			// A window retains the directory it was created with even after the
-			// session root changes. Do not let that stale machine-local value
-			// become the parent for portable pane paths.
-			window.Cwd = ""
-			paneParent = sessionRoot
+		if userOwned {
+			if !pathWithinRoot(sessionRoot, windowCwd) {
+				// A window retains the directory it was created with even after the
+				// session root changes. Do not let that stale machine-local value
+				// become the parent for portable pane paths.
+				window.Cwd = ""
+				paneParent = sessionRoot
+			} else {
+				window.Cwd = encodedUserPlanPath(sessionRoot, windowCwd, sessionRoot)
+			}
 		} else {
 			window.Cwd = encodedPlanPath(sessionRoot, windowCwd, sessionRoot)
 		}
@@ -1543,10 +1580,18 @@ func normalizePlanPaths(plan *SessionPlan, fileDirectory string, userOwned bool)
 				report.AbsolutePanePaths++
 				continue
 			}
-			pane.Cwd = encodedPlanPath(paneParent, paneCwd, sessionRoot)
+			pane.Cwd = encodedUserPlanPath(paneParent, paneCwd, sessionRoot)
 		}
 	}
 	return report, nil
+}
+
+func encodedUserPlanPath(parent, path, sessionRoot string) string {
+	encoded := encodedPlanPath(parent, path, sessionRoot)
+	if encoded == "" || encoded == "." || filepath.IsAbs(encoded) || strings.HasSuffix(encoded, "/") {
+		return encoded
+	}
+	return encoded + "/"
 }
 
 func encodedPlanPath(parent, path, sessionRoot string) string {

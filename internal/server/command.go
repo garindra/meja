@@ -2230,7 +2230,9 @@ func (d *Daemon) saveSessionOutput(session *SessionState, output string, force b
 		}
 		outputText.WriteString(verb + " an absolute path outside the session root.\nThis file may not restore portably on another machine.\n")
 	}
-	outputText.WriteString("Reminder: review captured pane commands and scrub any sensitive values before sharing or committing this file.\n")
+	outputText.WriteString("\nNote: command capture is best-effort.\n")
+	outputText.WriteString("  - Review commands before restoring.\n")
+	outputText.WriteString("  - Remove sensitive values before publishing.\n")
 	return []byte(outputText.String()), nil
 }
 

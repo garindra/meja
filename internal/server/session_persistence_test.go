@@ -126,6 +126,61 @@ func TestCaptureSessionMarksMissingObserverResultUnavailable(t *testing.T) {
 	}
 }
 
+func TestCaptureSessionUsesPersistedPaneCwdWhenObservationIsUnavailable(t *testing.T) {
+	session := NewSessionState(8)
+	t.Cleanup(func() { stopState(session) })
+	pane := &Pane{
+		ID:     1,
+		Root:   Identity{PID: 101, BirthToken: 1001},
+		Launch: PaneLaunch{Shell: "/bin/sh", Cwd: "/initial"},
+	}
+	if err := runStateOperation(session, func() error {
+		session.Panes[pane.ID] = pane
+		session.setPersistenceRecord(&SessionPersistence{Plan: SessionPlan{
+			Windows: []PlanWindow{{Panes: []PlanPane{{ID: pane.ID, Cwd: "/current"}}}},
+		}})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	capture, err := session.daemon.captureSession(session, context.Background(), emptyProcessObserver{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capture.Panes) != 1 || capture.Panes[0].CurrentCwd != "/current" {
+		t.Fatalf("capture=%#v", capture)
+	}
+}
+
+func TestCaptureSessionPrefersKnownPaneCwdOverPersistedFallback(t *testing.T) {
+	session := NewSessionState(8)
+	t.Cleanup(func() { stopState(session) })
+	pane := &Pane{
+		ID:       1,
+		Root:     Identity{PID: 101, BirthToken: 1001},
+		Launch:   PaneLaunch{Shell: "/bin/sh", Cwd: "/initial"},
+		KnownCwd: "/known",
+	}
+	if err := runStateOperation(session, func() error {
+		session.Panes[pane.ID] = pane
+		session.setPersistenceRecord(&SessionPersistence{Plan: SessionPlan{
+			Windows: []PlanWindow{{Panes: []PlanPane{{ID: pane.ID, Cwd: "/persisted"}}}},
+		}})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	capture, err := session.daemon.captureSession(session, context.Background(), emptyProcessObserver{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capture.Panes) != 1 || capture.Panes[0].CurrentCwd != "/known" {
+		t.Fatalf("capture=%#v", capture)
+	}
+}
+
 type emptyProcessObserver struct{}
 
 func (emptyProcessObserver) Observe(context.Context, []Anchor) map[PaneKey]ProcessObservation {
@@ -1019,7 +1074,7 @@ func TestMejaEncodingUsesSessionRootAndWindowCwds(t *testing.T) {
 	if report.AbsolutePanePaths != 0 {
 		t.Fatalf("portability report = %#v", report)
 	}
-	for _, fragment := range []string{`root ".."`, `window`, `cwd "frontend"`, `cwd "react"`, `cwd "server"`} {
+	for _, fragment := range []string{`root ".."`, `window`, `cwd "frontend/"`, `cwd "react/"`, `cwd "server/"`} {
 		if !strings.Contains(text, fragment) {
 			t.Fatalf("encoded .meja file is missing %q:\n%s", fragment, text)
 		}
@@ -1207,6 +1262,10 @@ func TestMejaFlatFormatUsesDocumentOrderAndImplicitDefaultFocus(t *testing.T) {
 	}
 	if strings.Count(text, "pane {") != 2 || strings.Contains(text, "pane 0") || strings.Contains(text, "window 0") {
 		t.Fatalf("numeric window or pane IDs were serialized:\n%s", text)
+	}
+	if !strings.Contains(text, "root \".\"\n\nwindow ") ||
+		strings.Count(text, "\n\n    pane {") != 2 {
+		t.Fatalf("windows and panes are not separated by blank lines:\n%s", text)
 	}
 	if strings.Contains(text, "layout ") || strings.Contains(text, "tile ") {
 		t.Fatalf("single-pane windows contain redundant layout data:\n%s", text)

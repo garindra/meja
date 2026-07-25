@@ -269,7 +269,7 @@ directory is mirrored on another machine.
 
 Existing files are refused unless `-f` is supplied. Parent directories are created. Files are atomically replaced with mode `0644`.
 
-Save normalizes inherited paths, preset layouts, custom geometry, commands, and non-default shells. Paths under the session root become relative where practical. Absolute pane paths outside the root are retained with a portability warning. Review captured pane commands and scrub any sensitive values before sharing or committing the file.
+Save normalizes inherited paths, preset layouts, custom geometry, commands, and non-default shells. Paths under the session root become relative where practical. Absolute pane paths outside the root are retained with a portability warning. Command capture is best-effort: review commands before restoring, and remove sensitive values before publishing the file.
 
 Save requires a running server and live session.
 
@@ -485,17 +485,18 @@ window name="editor" {
     layout "main-vertical"
 
     pane {
-        cwd "frontend"
+        cwd "frontend/"
         cmd "npm run dev"
     }
 
     pane {
-        cwd "backend"
+        cwd "backend/"
         cmd "go run ."
     }
 }
 
 window name="tests" {
+
     pane {
         cmd "go test ./..."
     }
@@ -514,8 +515,9 @@ Exactly one root is required. It may be absolute, `~`/`~/...`, or relative to th
 
 ```kdl
 window name="editor" {
-    cwd "services"
+    cwd "services/"
     layout "tiled"
+
     pane { /* ... */ }
 }
 ```
@@ -526,7 +528,7 @@ A file needs at least one window. `name` is optional. Each window accepts one op
 
 ```kdl
 pane {
-    cwd "api"
+    cwd "api/"
     shell "/bin/zsh"
     cmd "npm run dev"
     tile x=0 y=0 w=50 h=100

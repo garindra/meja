@@ -55,6 +55,46 @@ func TestParseCmdlinePreservesArgumentBoundaries(t *testing.T) {
 	}
 }
 
+func TestParseLsofProcessCwds(t *testing.T) {
+	data := []byte("p101\nfcwd\nn/Users/me/project/frontend\np202\nfcwd\nn/Users/me/project/backend\n")
+	got := parseLsofProcessCwds(data)
+	if got[101] != "/Users/me/project/frontend" || got[202] != "/Users/me/project/backend" {
+		t.Fatalf("parsed lsof cwd output = %#v", got)
+	}
+}
+
+func TestParseLsofProcessCwdsIgnoresMalformedRecords(t *testing.T) {
+	data := []byte("n/no-process\npbad\nn/bad-pid\np303\nfcwd\nn/valid\n")
+	got := parseLsofProcessCwds(data)
+	if len(got) != 1 || got[303] != "/valid" {
+		t.Fatalf("parsed malformed lsof cwd output = %#v", got)
+	}
+}
+
+func TestReadStructuredProcessCwdsOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("structured portable cwd capture uses macOS lsof")
+	}
+	want, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := readStructuredProcessCwds(context.Background(), []int{os.Getpid()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(want); resolveErr == nil {
+		want = resolved
+	}
+	actual := got[os.Getpid()]
+	if resolved, resolveErr := filepath.EvalSymlinks(actual); resolveErr == nil {
+		actual = resolved
+	}
+	if actual != want {
+		t.Fatalf("captured cwd = %q, want %q", actual, want)
+	}
+}
+
 func TestParseDarwinProcArgsPreservesArgumentBoundaries(t *testing.T) {
 	var data bytes.Buffer
 	if err := binary.Write(&data, binary.LittleEndian, int32(4)); err != nil {
@@ -178,6 +218,23 @@ func TestObserverClassifiesRealPTYJobs(t *testing.T) {
 					observation.Status, observation.ForegroundPGID, observation.Candidate, observation.Processes, observation.Issues)
 			}
 		})
+	}
+}
+
+func TestProcObserverCapturesRealShellCwd(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("procfs cwd capture is Linux-specific")
+	}
+	shell := startTestShell(t)
+	want := t.TempDir()
+	if _, err := shell.ptmx.Write([]byte(shellJoin([]string{"cd", want}) + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	observation := waitForObservation(t, shell.anchor, func(_ *testing.T, observation ProcessObservation) bool {
+		return observation.Status == StatusShellOwned && observation.Root != nil && observation.Root.Cwd == want
+	})
+	if observation.Root == nil || observation.Root.Cwd != want {
+		t.Fatalf("captured cwd = %#v, want %q", observation.Root, want)
 	}
 }
 
