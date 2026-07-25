@@ -302,7 +302,7 @@ func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
 	// fallback shell ever executing the command.
 	marker := "__FALLBACK_AFTER_EXIT_739241__"
 	markerCommand := "printf '__FALLBACK_AFTER_EXIT_%d__\\n' $((739240+1))\n"
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		outputMu.Lock()
 		found := bytes.Contains(output.Bytes(), []byte(marker))

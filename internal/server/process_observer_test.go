@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -330,9 +331,21 @@ func TestPSSessionMembersFiltersSessionAndDeadProcesses(t *testing.T) {
 		}
 		return 13, nil
 	}
-	members := psSessionMembers(processes, 10, getSession)
+	members, err := psSessionMembers(context.Background(), processes, 10, getSession)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(members) != 2 || members[0] != processes[0].Identity || members[1] != processes[1].Identity {
 		t.Fatalf("session members = %+v", members)
+	}
+}
+
+func TestPSSessionMembersStopsAtContextDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	getSession := func(int) (int, error) { return 10, nil }
+	if _, err := psSessionMembers(ctx, []ObservedProcess{{Identity: Identity{PID: 10}}}, 10, getSession); !errors.Is(err, context.Canceled) {
+		t.Fatalf("session member cancellation error = %v, want context cancellation", err)
 	}
 }
 

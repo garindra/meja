@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -989,16 +990,22 @@ func terminatePaneSession(pane *Pane, timeouts paneTerminationTimeouts) bool {
 	if pane == nil {
 		return false
 	}
-	_ = signalPaneSession(pane, syscall.SIGHUP)
+	if err := signalPaneSession(pane, syscall.SIGHUP); err != nil {
+		log.Printf("pane %d SIGHUP session scan: %v", pane.ID, err)
+	}
 	pane.stop()
 	if !waitForPaneSession(pane, timeouts.hangup) {
 		return false
 	}
-	_ = signalPaneSession(pane, syscall.SIGTERM)
+	if err := signalPaneSession(pane, syscall.SIGTERM); err != nil {
+		log.Printf("pane %d SIGTERM session scan: %v", pane.ID, err)
+	}
 	if !waitForPaneSession(pane, timeouts.terminate) {
 		return false
 	}
-	_ = signalPaneSession(pane, syscall.SIGKILL)
+	if err := signalPaneSession(pane, syscall.SIGKILL); err != nil {
+		log.Printf("pane %d SIGKILL session scan: %v", pane.ID, err)
+	}
 	return waitForPaneSession(pane, timeouts.kill)
 }
 
@@ -1009,7 +1016,7 @@ func signalPaneSession(pane *Pane, signal syscall.Signal) error {
 	members, err := processSessionMembers(context.Background(), pane.Root.PID)
 	if err != nil {
 		if pane.Process != nil && pane.Process.Process != nil {
-			return pane.Process.Process.Signal(signal)
+			return errors.Join(err, pane.Process.Process.Signal(signal))
 		}
 		return err
 	}

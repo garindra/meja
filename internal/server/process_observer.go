@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -113,8 +114,9 @@ func NewProcessObserver() ProcessObserver {
 }
 
 const (
-	maxCmdlineBytes    = 1 << 20
-	observationRetries = 3
+	maxCmdlineBytes            = 1 << 20
+	observationRetries         = 3
+	portableProcessScanTimeout = 250 * time.Millisecond
 )
 
 var errObservationChanged = errors.New("foreground process group changed during observation")
@@ -146,16 +148,25 @@ func processSessionMembers(ctx context.Context, sessionID int) ([]Identity, erro
 		return members, nil
 	}
 
-	processes, err := scanPS(ctx, "-ax")
+	scanCtx, cancel := context.WithTimeout(ctx, portableProcessScanTimeout)
+	defer cancel()
+	processes, err := scanPS(scanCtx, "-ax")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("scan portable process table for session %d: %w", sessionID, err)
 	}
-	return psSessionMembers(processes, sessionID, unix.Getsid), nil
+	members, err := psSessionMembers(scanCtx, processes, sessionID, unix.Getsid)
+	if err != nil {
+		return nil, fmt.Errorf("resolve portable process session %d: %w", sessionID, err)
+	}
+	return members, nil
 }
 
-func psSessionMembers(processes []ObservedProcess, sessionID int, getSession func(int) (int, error)) []Identity {
+func psSessionMembers(ctx context.Context, processes []ObservedProcess, sessionID int, getSession func(int) (int, error)) ([]Identity, error) {
 	members := make([]Identity, 0, len(processes))
 	for _, process := range processes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if process.State == 'Z' || process.State == 'X' || process.State == 'x' {
 			continue
 		}
@@ -164,7 +175,7 @@ func psSessionMembers(processes []ObservedProcess, sessionID int, getSession fun
 			members = append(members, process.Identity)
 		}
 	}
-	return members
+	return members, nil
 }
 
 func (systemObserver) Observe(ctx context.Context, anchors []Anchor) map[PaneKey]ProcessObservation {
