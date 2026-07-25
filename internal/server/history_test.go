@@ -60,6 +60,23 @@ func TestHistorySnapshotNeverSplitsClusterAcrossRows(t *testing.T) {
 	}
 }
 
+func TestHistoryCounterStyleCannotCollideWithLiveTerminalStyles(t *testing.T) {
+	term := newTerminal(5, 1)
+	term.Apply([]byte("\x1b[31mred"))
+	snapshot := captureTerminalHistorySnapshot(term)
+	defer snapshot.release()
+
+	term.Apply([]byte("\x1b[7mreverse"))
+	reverseID := term.currentStyleID()
+	if reverseID < firstLiveTerminalStyleID || reverseID == snapshot.CounterStyle || reverseID == historySelectionStyleID {
+		t.Fatalf("live style %d collided with reserved history styles", reverseID)
+	}
+	counter, ok := snapshot.LookupStyle(snapshot.CounterStyle)
+	if !ok || counter != historyCounterStyle {
+		t.Fatalf("history counter style = %#v, ok=%t", counter, ok)
+	}
+}
+
 func TestHistorySelectionExtractsUTF8AndJoinsSoftWrappedRows(t *testing.T) {
 	term := newTerminal(5, 3)
 	setTestRows(term, nil, []decodedTestRow{
@@ -152,7 +169,9 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 		t.Fatalf("history mode did not render the pane-owned frozen view: %#v", historyCommands)
 	}
 
-	sendPTYOutput("X")
+	// A new live style allocated while history is visible must not reuse the
+	// history counter's connection-local style ID.
+	sendPTYOutput("\x1b[7mX\x1b[0m")
 	syncPaneRenderer(t, pane)
 	historyBytes := wire.Len()
 	sendPTYOutput("Y")
@@ -172,8 +191,19 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	if wire.Len() <= historyBytes {
 		t.Fatal("exiting history did not repaint the pane's existing output stream")
 	}
-	if !displayCommandsContainText(decodePendingCommands(t, wire.Bytes()[historyBytes:]), "XYve") {
+	exitCommands := decodePendingCommands(t, wire.Bytes()[historyBytes:])
+	if !displayCommandsContainText(exitCommands, "X") || !displayCommandsContainText(exitCommands, "Yve") {
 		t.Fatal("exiting history did not render the pane's current terminal on the existing stream")
+	}
+	installed := make(map[uint32]protocol.Style)
+	for _, command := range decodePendingCommands(t, wire.Bytes()) {
+		if command.Opcode != protocol.DisplayOpcodeStyleInstall {
+			continue
+		}
+		if previous, ok := installed[command.StyleID]; ok && previous != command.Style {
+			t.Fatalf("style %d was redefined across history/live output: %#v then %#v", command.StyleID, previous, command.Style)
+		}
+		installed[command.StyleID] = command.Style
 	}
 }
 

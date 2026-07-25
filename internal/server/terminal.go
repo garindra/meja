@@ -13,9 +13,24 @@ import (
 )
 
 const (
-	maxCSISequenceBytes  = 256
-	maxTerminalStyles    = 4096
-	initialStyleCapacity = 32
+	maxCSISequenceBytes             = 256
+	maxTerminalStyles               = 4096
+	initialStyleCapacity            = 32
+	historyCounterStyleID    uint32 = 1
+	historySelectionStyleID  uint32 = 2
+	firstLiveTerminalStyleID uint32 = 3
+)
+
+var (
+	historyCounterStyle = Style{
+		Bold: true,
+		FG:   Color{Mode: "indexed", Index: 226},
+		BG:   Color{Mode: "default"},
+	}
+	historySelectionStyle = Style{
+		FG: Color{Mode: "indexed", Index: 0},
+		BG: Color{Mode: "indexed", Index: 226},
+	}
 )
 
 // maxGraphemeClusterBytes bounds the text retained by one terminal cell.
@@ -288,8 +303,10 @@ type reflowRow struct {
 }
 
 func newTerminal(cols, rows int) *TerminalState {
-	styles := make([]Style, 1, initialStyleCapacity)
+	styles := make([]Style, int(firstLiveTerminalStyleID), initialStyleCapacity)
 	styles[0] = DefaultStyle
+	styles[historyCounterStyleID] = historyCounterStyle
+	styles[historySelectionStyleID] = historySelectionStyle
 	t := &TerminalState{
 		Cols:          cols,
 		Rows:          rows,
@@ -298,7 +315,7 @@ func newTerminal(cols, rows int) *TerminalState {
 		CursorVisible: true,
 		styleByID:     styles,
 		styleToID:     make(map[Style]uint32, initialStyleCapacity),
-		nextStyleID:   1,
+		nextStyleID:   firstLiveTerminalStyleID,
 		ScrollBottom:  rows - 1,
 		AutoWrap:      true,
 		G0Charset:     'B',

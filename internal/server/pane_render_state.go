@@ -320,7 +320,7 @@ func (s *paneRenderState) tryCells(output *renderOutput, row, start, end int) (i
 			compiler.installStyles = true
 		} else if selected {
 			compiler.installStyles = true
-			compiler.styleMapper = func(id uint32) uint32 { return historySelectionStyleMask | id }
+			compiler.styleMapper = func(uint32) uint32 { return historySelectionStyleID }
 		} else {
 			compiler.installStyles = true
 		}
