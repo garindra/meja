@@ -302,7 +302,12 @@ func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
 	// fallback shell ever executing the command.
 	marker := "__FALLBACK_AFTER_EXIT_739241__"
 	markerCommand := "printf '__FALLBACK_AFTER_EXIT_%d__\\n' $((739240+1))\n"
-	deadline := time.Now().Add(10 * time.Second)
+	retry := time.NewTicker(25 * time.Millisecond)
+	defer retry.Stop()
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	writeDone := make(chan error, 1)
+	writePending := false
 	for {
 		outputMu.Lock()
 		found := bytes.Contains(output.Bytes(), []byte(marker))
@@ -310,13 +315,24 @@ func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
 		if found {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("surviving window did not accept input/render after shell exit; stderr: %s", stderr.String())
+		select {
+		case <-retry.C:
+			if writePending {
+				continue
+			}
+			writePending = true
+			go func() {
+				_, writeErr := terminal.Write([]byte(markerCommand))
+				writeDone <- writeErr
+			}()
+		case writeErr := <-writeDone:
+			writePending = false
+			if writeErr != nil {
+				t.Fatal(writeErr)
+			}
+		case <-deadline.C:
+			t.Fatalf("surviving window did not accept input/render after shell exit (PTY write blocked=%t); stderr: %s", writePending, stderr.String())
 		}
-		if _, err := terminal.Write([]byte(markerCommand)); err != nil {
-			t.Fatal(err)
-		}
-		time.Sleep(25 * time.Millisecond)
 	}
 	if _, err := terminal.Write([]byte{0x02, 'd'}); err != nil {
 		t.Fatal(err)
