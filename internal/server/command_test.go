@@ -1001,6 +1001,23 @@ func TestRestoreRequiresTargetAndRejectsFilesAndPositionalNames(t *testing.T) {
 	}
 }
 
+func TestRestoreRunShorthandAndCommandsConflict(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	setCommandTestPersistenceDir(t, d)
+
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "-t", "work", "--run"}})
+	if result.exitCode == 0 || !strings.Contains(string(result.stderr), "work.session.meja") {
+		t.Fatalf("restore --run was not accepted as a restore command mode: %#v", result)
+	}
+
+	result = d.executeCommand(protocol.CommandRequest{
+		Args: []string{"restore", "-t", "work", "--run", "--commands=skip"},
+	})
+	if result.exitCode == 0 || !strings.Contains(string(result.stderr), "--run cannot be combined with --commands") {
+		t.Fatalf("restore accepted conflicting command modes: %#v", result)
+	}
+}
+
 func TestNewFileRejectsRootAndInitialCommand(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	for _, args := range [][]string{
