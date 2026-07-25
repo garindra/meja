@@ -922,7 +922,9 @@ func TestSaveRelativeOutputUsesTargetSessionRoot(t *testing.T) {
 		"run `meja set-root .` here and save again",
 		"reconstructed pane paths relative to that project root",
 		"project directory is mirrored on another machine",
-		"Reminder: review captured pane commands and scrub any sensitive values",
+		"Note: command capture is best-effort.",
+		"  - Review commands before restoring.",
+		"  - Remove sensitive values before publishing.",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("save output omitted %q:\n%s", want, output)
