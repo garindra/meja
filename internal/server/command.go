@@ -667,7 +667,7 @@ func commandDefinitions() []commandDefinition {
 	return []commandDefinition{
 		{name: "help", aliases: []string{"--help"}, usage: "help [command]", description: "Show this reference or help for one server command.", run: runHelpCommand},
 		{name: "server-version", usage: "server-version", description: "Show the running daemon build and protocol versions.", run: runServerVersionCommand},
-		{name: "new-session", aliases: []string{"new"}, usage: "new-session [-d] [-P] [-F format] [-s name] [-r directory] [-t base] [-- command args...] | new-session -f file [-s name] [--commands=prepare|skip|run]", description: "Create a session, optionally from a .meja file, and attach unless -d is supplied.", run: runNewSessionCommand},
+		{name: "new-session", aliases: []string{"new"}, usage: "new-session [-d] [-P] [-F format] [-s name] [-r directory] [-t base] [-- command args...] | new-session -f file [-s name] [--run | --commands=prepare|skip|run]", description: "Create a session, optionally from a .meja file, and attach unless -d is supplied.", run: runNewSessionCommand},
 		{name: "attach-session", aliases: []string{"attach", "a"}, usage: "attach-session -t session-id-or-name", description: "Attach to an existing session.", run: runAttachSessionCommand},
 		{name: "restore-session", aliases: []string{"restore"}, usage: "restore-session -t name [-s new-name] [--run | --commands=prepare|skip|run]", description: "Restore a named session's automatic snapshot and attach.", run: runRestoreSessionCommand},
 		{name: "save-session", aliases: []string{"save"}, usage: "save-session [-t session-id-or-name] -o file [-f]", description: "Save a live session to a .meja file.", run: runSaveSessionCommand},
@@ -2002,6 +2002,7 @@ func (d *Daemon) commandNewSessionState(workingDirectory string, terminalCols, t
 	baseTarget := fs.String("t", "", "base session target for a mirror")
 	file := fs.String("f", "", ".meja file")
 	mode := fs.String("commands", "prepare", "restore command mode")
+	run := fs.Bool("run", false, "run restored commands")
 	var root string
 	fs.StringVar(&root, "r", "", "session root")
 	fs.StringVar(&root, "root", "", "session root")
@@ -2083,7 +2084,7 @@ func (d *Daemon) commandNewSessionState(workingDirectory string, terminalCols, t
 		if root != "" || len(fs.Args()) != 0 {
 			return sessionCommandResult{}, errors.New("new-session -f cannot be combined with a root or initial command")
 		}
-		restoreMode, err := parseRestoreCommandMode(*mode)
+		restoreMode, err := resolveRestoreCommandMode(fs, "new-session", *mode, *run)
 		if err != nil {
 			return sessionCommandResult{}, err
 		}
@@ -2101,6 +2102,9 @@ func (d *Daemon) commandNewSessionState(workingDirectory string, terminalCols, t
 			return sessionCommandResult{}, err
 		}
 		return sessionCommandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
+	}
+	if *run {
+		return sessionCommandResult{}, errors.New("new-session --run requires -f <file>")
 	}
 	if *mode != "prepare" {
 		return sessionCommandResult{}, errors.New("new-session --commands requires -f <file>")
@@ -2180,17 +2184,7 @@ func (d *Daemon) commandRestoreSession(args []string, issueBootstrap bool) (sess
 	if *target == "" || len(fs.Args()) != 0 {
 		return sessionCommandResult{}, errors.New("restore-session requires -t <session-name>")
 	}
-	if *run {
-		commandsSet := false
-		fs.Visit(func(f *flag.Flag) {
-			commandsSet = commandsSet || f.Name == "commands"
-		})
-		if commandsSet {
-			return sessionCommandResult{}, errors.New("restore-session --run cannot be combined with --commands")
-		}
-		*mode = string(restoreCommandsRun)
-	}
-	restoreMode, err := parseRestoreCommandMode(*mode)
+	restoreMode, err := resolveRestoreCommandMode(fs, "restore-session", *mode, *run)
 	if err != nil {
 		return sessionCommandResult{}, err
 	}
@@ -2209,6 +2203,20 @@ func (d *Daemon) commandRestoreSession(args []string, issueBootstrap bool) (sess
 		return sessionCommandResult{}, err
 	}
 	return sessionCommandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
+}
+
+func resolveRestoreCommandMode(fs *flag.FlagSet, commandName, raw string, run bool) (restoreCommandMode, error) {
+	if run {
+		commandsSet := false
+		fs.Visit(func(f *flag.Flag) {
+			commandsSet = commandsSet || f.Name == "commands"
+		})
+		if commandsSet {
+			return "", fmt.Errorf("%s --run cannot be combined with --commands", commandName)
+		}
+		raw = string(restoreCommandsRun)
+	}
+	return parseRestoreCommandMode(raw)
 }
 
 func parseRestoreCommandMode(raw string) (restoreCommandMode, error) {

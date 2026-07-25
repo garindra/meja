@@ -1021,6 +1021,28 @@ func TestRestoreRunShorthandAndCommandsConflict(t *testing.T) {
 	}
 }
 
+func TestNewFileRunShorthandAndCommandsConflict(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	path := filepath.Join(t.TempDir(), "missing.meja")
+
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"new", "-f", path, "--run"}})
+	if result.exitCode == 0 || !strings.Contains(string(result.stderr), "open .meja file") {
+		t.Fatalf("new -f --run was not accepted as a restore command mode: %#v", result)
+	}
+
+	result = d.executeCommand(protocol.CommandRequest{
+		Args: []string{"new", "-f", path, "--run", "--commands=skip"},
+	})
+	if result.exitCode == 0 || !strings.Contains(string(result.stderr), "--run cannot be combined with --commands") {
+		t.Fatalf("new -f accepted conflicting command modes: %#v", result)
+	}
+
+	result = d.executeCommand(protocol.CommandRequest{Args: []string{"new", "--run"}})
+	if result.exitCode == 0 || !strings.Contains(string(result.stderr), "--run requires -f <file>") {
+		t.Fatalf("new accepted --run without a restore file: %#v", result)
+	}
+}
+
 func TestNewFileRejectsRootAndInitialCommand(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	for _, args := range [][]string{
