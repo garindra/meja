@@ -14,7 +14,9 @@
 </p>
 
 <div align="center">
-  <img src="screenshot.png" alt="Meja screenshot" width="840">
+  <a href="demo.mp4">
+    <img src="demo.gif" alt="Meja screenshot" width="720">
+  </a>
   <p><em>"what is this, a blue tmux?"</em></p>
 </div>
 
