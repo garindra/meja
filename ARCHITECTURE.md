@@ -1,6 +1,6 @@
 # Meja Architecture
 
-Meja is a terminal multiplexer designed for both local and remote sessions. This document describes the system’s major components, the responsibilities they own, and the boundaries and data flows between the client, server, transport layer, terminal model, renderer, and persistence subsystem.
+Meja is a tmux-style multiplexer with native remote capability and restorable & shareable sessions. This document describes the system’s major components, the responsibilities they own, and the boundaries and data flows between the client, server, transport layer, terminal model, renderer, and persistence subsystem.
 
 > [!NOTE]
 > **About this document**
