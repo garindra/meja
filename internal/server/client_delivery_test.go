@@ -14,6 +14,12 @@ func newBlockedDeliveryConnection() (*clientConnection, chan struct{}) {
 	return connection, done
 }
 
+func newPausedDeliveryConnection() (*clientConnection, chan struct{}) {
+	connection, done := newBlockedDeliveryConnection()
+	connection.workerOnce.Do(func() {})
+	return connection, done
+}
+
 func TestRequiredClientDeliveriesPreserveFIFOOrder(t *testing.T) {
 	connection := newClientConnection()
 	done := make(chan struct{})
@@ -35,6 +41,272 @@ func TestRequiredClientDeliveriesPreserveFIFOOrder(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("timed out waiting for required delivery %d", sequence)
 		}
+	}
+}
+
+func TestRequiredDeliveryBacklogHasOneDocumentedBound(t *testing.T) {
+	connection := newClientConnection()
+	if got, want := cap(connection.required), clientRequiredDeliveryCapacity-1; got != want {
+		t.Fatalf("queued required capacity = %d, want %d", got, want)
+	}
+	if got := cap(connection.commands); got != 0 {
+		t.Fatalf("client actor handoff capacity = %d, want unbuffered", got)
+	}
+	if got := cap(connection.required) + 1; got != clientRequiredDeliveryCapacity {
+		t.Fatalf("total required backlog = %d, want %d", got, clientRequiredDeliveryCapacity)
+	}
+}
+
+func TestRequiredReservationsPreserveDaemonOrderAcrossReversedProducers(t *testing.T) {
+	connection := newClientConnection()
+	done := make(chan struct{})
+	connection.done = done
+	connection.startDeliveryWorker()
+	defer close(done)
+
+	first, ok := connection.reserveRequired()
+	if !ok {
+		t.Fatal("first daemon-turn reservation saturated")
+	}
+	second, ok := connection.reserveRequired()
+	if !ok {
+		t.Fatal("second daemon-turn reservation saturated")
+	}
+
+	results := make(chan uint64, 2)
+	attempt := func(delivery *clientRequiredDelivery, sequence uint64) {
+		commandDone := make(chan error, 1)
+		delivery.finish(clientInstanceCommand{
+			ClearStatusMessage: sequence,
+			Done:               commandDone,
+		}, false)
+		if err := <-commandDone; err != nil {
+			t.Errorf("delivery %d result: %v", sequence, err)
+		}
+		results <- sequence
+	}
+	go attempt(second, 2)
+	select {
+	case command := <-connection.commands:
+		t.Fatalf("second producer overtook first reservation: %#v", command)
+	case <-time.After(10 * time.Millisecond):
+	}
+	go attempt(first, 1)
+
+	for want := uint64(1); want <= 2; want++ {
+		select {
+		case command := <-connection.commands:
+			if command.ClearStatusMessage != want {
+				t.Fatalf("applied delivery = %d, want %d", command.ClearStatusMessage, want)
+			}
+			command.Done <- nil
+		case <-time.After(time.Second):
+			t.Fatalf("timed out applying delivery %d", want)
+		}
+		select {
+		case got := <-results:
+			if got != want {
+				t.Fatalf("command result order = %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for command result %d", want)
+		}
+	}
+}
+
+func TestRequiredReservationOrdersTransitionWithNonTransitionCommand(t *testing.T) {
+	connection := newClientConnection()
+	done := make(chan struct{})
+	connection.done = done
+	connection.startDeliveryWorker()
+	defer close(done)
+
+	transitionDelivery, ok := connection.reserveRequired()
+	if !ok {
+		t.Fatal("transition reservation saturated")
+	}
+	commandDelivery, ok := connection.reserveRequired()
+	if !ok {
+		t.Fatal("command reservation saturated")
+	}
+	commandDelivery.finish(clientInstanceCommand{EnterHistory: true}, false)
+	select {
+	case command := <-connection.commands:
+		t.Fatalf("non-transition command overtook transition: %#v", command)
+	case <-time.After(10 * time.Millisecond):
+	}
+	transition := ViewTransition{Reason: viewTransitionLayout}
+	transitionDelivery.finish(clientInstanceCommand{Transition: &transition}, false)
+
+	first := <-connection.commands
+	if first.Transition == nil {
+		t.Fatalf("first interleaved delivery = %#v, want transition", first)
+	}
+	second := <-connection.commands
+	if !second.EnterHistory {
+		t.Fatalf("second interleaved delivery = %#v, want history command", second)
+	}
+}
+
+func TestClientStatusSnapshotsRejectOldSessionAndRevision(t *testing.T) {
+	client := &ClientInstance{
+		sessionID: 2,
+		currentView: ClientView{
+			Status: clientStatusState{
+				Revision: 3, SessionID: 2, SessionName: "new",
+				Windows: []WindowStatus{{Title: "new-window"}},
+			},
+			StatusValid: true,
+		},
+	}
+	client.runClientCommand(clientInstanceCommand{
+		RefreshStatus: true, HasStatus: true,
+		Status: clientStatusState{Revision: 2, SessionID: 1, SessionName: "old"},
+	})
+	if got := client.currentView.Status.SessionName; got != "new" {
+		t.Fatalf("old-session status replaced transition status: %q", got)
+	}
+
+	client.runClientCommand(clientInstanceCommand{
+		RefreshStatus: true, HasStatus: true,
+		Status: clientStatusState{
+			Revision: 2, SessionID: 2,
+			Windows: []WindowStatus{{Title: "old-window"}},
+		},
+	})
+	if got := client.currentView.Status.Windows[0].Title; got != "new-window" {
+		t.Fatalf("old window status replaced newer layout status: %q", got)
+	}
+}
+
+func TestOldSessionStatusPendingBeforeSessionSwitchIsIgnored(t *testing.T) {
+	connection, done := newPausedDeliveryConnection()
+	defer close(done)
+	connection.enqueueStatusRefresh(clientStatusState{
+		Revision: 1, SessionID: 1, SessionName: "source",
+	}, true)
+	delivery, ok := connection.reserveRequired()
+	if !ok {
+		t.Fatal("session-switch reservation saturated")
+	}
+	transition := ViewTransition{
+		Reason: viewTransitionSession,
+		Projection: ClientProjectionPlan{
+			SessionID: 2,
+			View: ClientView{
+				Status: clientStatusState{
+					Revision: 2, SessionID: 2, SessionName: "target",
+				},
+				StatusValid: true,
+			},
+		},
+	}
+	delivery.finish(clientInstanceCommand{Transition: &transition}, false)
+	go connection.runDeliveryWorker()
+
+	required := <-connection.commands
+	client := &ClientInstance{sessionID: required.Transition.Projection.SessionID}
+	client.currentView = client.orderedViewStatus(
+		required.Transition.Projection.View,
+		required.Transition.Projection.SessionID,
+	)
+	client.runClientCommand(<-connection.commands)
+	if got := client.currentView.Status.SessionName; got != "target" {
+		t.Fatalf("pending source status replaced session-switch status: %q", got)
+	}
+}
+
+func TestOldWindowStatusPendingBeforeNewerLayoutTransitionIsIgnored(t *testing.T) {
+	connection, done := newPausedDeliveryConnection()
+	defer close(done)
+	connection.enqueueStatusRefresh(clientStatusState{
+		Revision: 4, SessionID: 7,
+		Windows: []WindowStatus{{Title: "old-window"}},
+	}, true)
+	delivery, ok := connection.reserveRequired()
+	if !ok {
+		t.Fatal("layout reservation saturated")
+	}
+	transition := ViewTransition{
+		Reason: viewTransitionLayout,
+		Projection: ClientProjectionPlan{
+			SessionID: 7,
+			View: ClientView{
+				Status: clientStatusState{
+					Revision: 5, SessionID: 7,
+					Windows: []WindowStatus{{Title: "new-window"}},
+				},
+				StatusValid: true,
+			},
+		},
+	}
+	delivery.finish(clientInstanceCommand{Transition: &transition}, false)
+	go connection.runDeliveryWorker()
+
+	required := <-connection.commands
+	client := &ClientInstance{sessionID: 7}
+	client.currentView = client.orderedViewStatus(
+		required.Transition.Projection.View,
+		required.Transition.Projection.SessionID,
+	)
+	client.runClientCommand(<-connection.commands)
+	if got := client.currentView.Status.Windows[0].Title; got != "new-window" {
+		t.Fatalf("pending old-window status replaced layout status: %q", got)
+	}
+}
+
+func TestDaemonAssignsMonotonicStatusRevisionAcrossSessions(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	client := &ClientIdentity{ID: 9}
+	firstSession := NewSessionState(1)
+	secondSession := NewSessionState(2)
+	var first, second clientStatusState
+	d.call(func() {
+		first = d.clientStatusSnapshotNow(client, firstSession)
+		second = d.clientStatusSnapshotNow(client, secondSession)
+	})
+	if first.Revision == 0 || second.Revision != first.Revision+1 {
+		t.Fatalf("status revisions = %d, %d; want consecutive nonzero revisions", first.Revision, second.Revision)
+	}
+	if first.SessionID != firstSession.ID || second.SessionID != secondSession.ID {
+		t.Fatalf("status sessions = %d, %d", first.SessionID, second.SessionID)
+	}
+}
+
+func TestCoalescedStatusAroundRequiredTransitionKeepsNewestRevision(t *testing.T) {
+	connection, done := newPausedDeliveryConnection()
+	defer close(done)
+
+	connection.enqueueStatusRefresh(clientStatusState{Revision: 1, SessionID: 7, SessionName: "old"}, true)
+	transitionDelivery, ok := connection.reserveRequired()
+	if !ok {
+		t.Fatal("transition reservation saturated")
+	}
+	connection.enqueueStatusRefresh(clientStatusState{Revision: 2, SessionID: 7, SessionName: "older"}, true)
+	connection.enqueueStatusRefresh(clientStatusState{Revision: 4, SessionID: 7, SessionName: "newest"}, true)
+	transition := ViewTransition{Reason: viewTransitionLayout}
+	transitionDelivery.finish(clientInstanceCommand{Transition: &transition}, false)
+	go connection.runDeliveryWorker()
+
+	required := <-connection.commands
+	if required.Transition == nil {
+		t.Fatalf("first delivery = %#v, want required transition", required)
+	}
+	refresh := <-connection.commands
+	if !refresh.RefreshStatus || refresh.Status.Revision != 4 {
+		t.Fatalf("coalesced status = %#v, want revision 4", refresh)
+	}
+
+	client := &ClientInstance{
+		sessionID: 7,
+		currentView: ClientView{
+			Status:      clientStatusState{Revision: 3, SessionID: 7, SessionName: "transition"},
+			StatusValid: true,
+		},
+	}
+	client.runClientCommand(refresh)
+	if got := client.currentView.Status.SessionName; got != "newest" {
+		t.Fatalf("coalesced status install = %q, want newest", got)
 	}
 }
 

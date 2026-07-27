@@ -112,17 +112,37 @@ func TestPaneActivityIsSourceCoalescedUntilMonitorProbe(t *testing.T) {
 	}
 }
 
-func TestTryUnwatchDoesNotBlockOnSaturatedMonitor(t *testing.T) {
+func TestTryUnwatchQueuesEventualCleanupOnSaturatedMonitor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	monitor := &ProcessMonitor{
-		commands: make(chan processMonitorCommand, 1),
-		done:     make(chan struct{}),
+		commands:         make(chan processMonitorCommand, 1),
+		done:             make(chan struct{}),
+		pendingUnwatches: make(map[PaneKey]struct{}),
+		unwatchWake:      make(chan struct{}, 1),
 	}
 	monitor.commands <- processMonitorCommand{dropSession: 1}
-	if monitor.TryUnwatch(PaneKey{PaneID: 2}) {
-		t.Fatal("saturated monitor unexpectedly accepted unwatch")
+	key := PaneKey{PaneID: 2}
+	if !monitor.TryUnwatch(key) {
+		t.Fatal("saturated monitor rejected eventual unwatch")
 	}
 	if got := len(monitor.commands); got != 1 {
 		t.Fatalf("saturated monitor queue length = %d, want 1", got)
+	}
+	go monitor.runUnwatchRetry(ctx)
+	<-monitor.commands
+	select {
+	case command := <-monitor.commands:
+		if command.unwatch == nil || *command.unwatch != key {
+			t.Fatalf("retried command = %#v, want unwatch for %#v", command, key)
+		}
+		watches := map[PaneKey]*processWatch{key: {sessionID: 1}}
+		monitor.applyCommand(watches, command)
+		if _, exists := watches[key]; exists {
+			t.Fatal("retried unwatch remained in monitor reconciliation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("saturated unwatch was not eventually retried")
 	}
 }
 

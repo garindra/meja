@@ -1422,6 +1422,7 @@ func TestPaneExitReclaimsRemovedPaneOutputBeforeBindingFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	plan.delivery.cancel()
 	if err := client.commitProjectionPlan(plan.Projection); err != nil {
 		t.Fatal(err)
 	}
@@ -1589,6 +1590,7 @@ func TestDaemonPostedVisiblePaneExitTransfersPhysicalOutputToFallback(t *testing
 		_ = terminatePane(exiting)
 		t.Fatal(err)
 	}
+	plan.delivery.cancel()
 	if err := client.commitProjectionPlan(plan.Projection); err != nil {
 		_ = terminatePane(exiting)
 		t.Fatal(err)
@@ -1665,6 +1667,7 @@ func TestPaneProcessExitResizesFallbackAndTransfersPhysicalOutput(t *testing.T) 
 		t.Fatal(err)
 	}
 	state.daemon.startPane(state.ID, exiting)
+	plan.delivery.cancel()
 	if err := client.commitProjectionPlan(plan.Projection); err != nil {
 		t.Fatal(err)
 	}

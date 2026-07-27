@@ -459,16 +459,26 @@ pane output handoff or stream I/O.
 ## Client delivery mailboxes
 
 A daemon transaction validates and mutates canonical state, allocates its
-projection revision, and prepares immutable delivery records. Delivery enqueue
-happens only after that transaction returns.
+projection revision, and reserves required delivery in the same daemon turn.
+The producer completes that reservation after the transaction returns. Because
+the connection worker consumes reservations in daemon order, concurrent command
+producers cannot reverse canonical effect order by racing their later delivery
+attempts or command results.
 
 Each connection has one delivery worker and two mailbox classes. Required
 commands, including view transitions and lifecycle fences, use a bounded FIFO.
+The total required backlog is 64 effects: 63 queued reservations plus at most
+one reservation held by the delivery worker. Its handoff to the client actor is
+unbuffered, so there is no second 64-entry command backlog.
 If that queue saturates, the transition is not silently dropped and the daemon
 does not block: the unhealthy exact connection is fenced with a reconnectable
 error while canonical state and unrelated work continue. Status refreshes use
 a capacity-one advisory edge; repeated refresh requests coalesce and the client
 actor reads the latest immutable status snapshot when it consumes the edge.
+Every daemon status snapshot has a client-identity monotonic revision, including
+the status embedded in `ClientView`. The client ignores an older revision and
+status for any session other than its installed session, so a delayed advisory
+refresh cannot overwrite a newer transition.
 Because mailbox identity belongs to one connection, an obsolete connection
 cannot deliver into its replacement.
 
@@ -627,6 +637,12 @@ nonblocking hints; periodic reconciliation covers missed or silent changes.
 A quick foreground-process-group probe avoids unnecessary process-table scans.
 Changed or uncertain watches receive a bounded, batched `/proc` observation,
 with a portable `ps` fallback.
+
+Pane exit attempts monitor unwatch without blocking the daemon. If the monitor
+command mailbox is saturated, the pane key enters a coalesced tombstone set
+owned by one persistent retry worker. That worker eventually appends the
+unwatch behind already queued monitor work; it never starts a goroutine per
+failed attempt, and pending entries are bounded by distinct watched pane keys.
 
 An explicit pane command identifies its root process. For an interactive shell,
 one stable foreground child is the command candidate; no child is

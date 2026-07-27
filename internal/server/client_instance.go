@@ -85,6 +85,38 @@ type clientInstanceCommand struct {
 	Snapshot           chan<- clientInstanceSnapshot
 }
 
+type clientStatusRefresh struct {
+	Status    clientStatusState
+	HasStatus bool
+}
+
+// clientRequiredDelivery is enqueued in daemon-turn order and completed by the
+// producer after its canonical turn returns. The persistent connection worker
+// waits on reservations in queue order, so concurrent producers cannot reverse
+// daemon effect order by racing their later delivery attempts.
+type clientRequiredDelivery struct {
+	completion chan clientRequiredCompletion
+}
+
+type clientRequiredCompletion struct {
+	command clientInstanceCommand
+	skip    bool
+}
+
+func (d *clientRequiredDelivery) finish(command clientInstanceCommand, skip bool) {
+	if d == nil {
+		return
+	}
+	select {
+	case d.completion <- clientRequiredCompletion{command: command, skip: skip}:
+	default:
+	}
+}
+
+func (d *clientRequiredDelivery) cancel() {
+	d.finish(clientInstanceCommand{}, true)
+}
+
 // clientInstanceSnapshot is an immutable observation copied by the client
 // actor. It exists so diagnostics and tests synchronize through the actor
 // rather than reaching into ordinary actor-owned fields.
@@ -175,6 +207,18 @@ func postClientCommand(connection *clientConnection, command clientInstanceComma
 	if connection == nil {
 		return
 	}
+	if command.Transition != nil {
+		if command.Transition.deliveryRejected {
+			return
+		}
+		if command.Transition.delivery != nil {
+			if command.Close {
+				connection.revoke()
+			}
+			command.Transition.delivery.finish(command, false)
+			return
+		}
+	}
 	if command.RefreshStatus && command.Transition == nil && !command.Close &&
 		command.FocusDirection == 0 && !command.EnterHistory &&
 		!command.RunSendKeys && !command.RunPasteBuffer {
@@ -248,8 +292,9 @@ func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
 		}
 	case command.RefreshStatus:
 		if command.HasStatus {
-			c.currentView.Status = command.Status
-			c.currentView.StatusValid = true
+			if !c.installStatusSnapshot(command.Status) {
+				break
+			}
 		}
 		err = c.publishStatusBar()
 	case command.FocusDirection != 0:
@@ -274,6 +319,39 @@ func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
 		c.Daemon.logf("meja server: client event failed client=%d session=%d: %v\n",
 			c.clientID, c.sessionID, err)
 	}
+}
+
+// installStatusSnapshot applies only an advisory snapshot for the currently
+// installed session and never lets it move the client actor's status revision
+// backward. Daemon-prepared ClientViews use the same rule below.
+func (c *ClientInstance) installStatusSnapshot(status clientStatusState) bool {
+	if c == nil || status.SessionID != c.sessionID {
+		return false
+	}
+	if c.currentView.StatusValid && status.Revision < c.currentView.Status.Revision {
+		return false
+	}
+	c.currentView.Status = status
+	c.currentView.StatusValid = true
+	return true
+}
+
+func (c *ClientInstance) orderedViewStatus(view ClientView, sessionID uint64) ClientView {
+	if !view.StatusValid || view.Status.SessionID != sessionID {
+		view.Status = clientStatusState{}
+		view.StatusValid = false
+		return view
+	}
+	if c.currentView.StatusValid && view.Status.Revision < c.currentView.Status.Revision {
+		if c.currentView.Status.SessionID == sessionID {
+			view.Status = c.currentView.Status
+			view.StatusValid = true
+		} else {
+			view.Status = clientStatusState{}
+			view.StatusValid = false
+		}
+	}
+	return view
 }
 
 type frontendPaneCapture struct {
@@ -309,8 +387,9 @@ const (
 // Channel identity distinguishes overlapping old and replacement connections.
 type clientConnection struct {
 	commands   chan clientInstanceCommand
-	required   chan clientInstanceCommand
-	refresh    chan clientStatusState
+	required   chan *clientRequiredDelivery
+	available  chan *clientRequiredDelivery
+	refresh    chan clientStatusRefresh
 	fence      chan clientInstanceCommand
 	done       <-chan struct{}
 	revoked    chan struct{}
@@ -324,15 +403,33 @@ type clientConnection struct {
 	workerStarted chan<- struct{}
 }
 
-const clientRequiredDeliveryCapacity = 64
+// The required path has a total bounded backlog of 64 effects: at most 63
+// queued reservations plus the one reservation held by the delivery worker.
+// The client actor handoff is unbuffered and therefore adds no second backlog.
+const (
+	clientRequiredDeliveryCapacity = 64
+	clientRequiredQueueCapacity    = clientRequiredDeliveryCapacity - 1
+)
 
 func newClientConnection() *clientConnection {
-	return &clientConnection{
-		commands: make(chan clientInstanceCommand, clientRequiredDeliveryCapacity),
-		required: make(chan clientInstanceCommand, clientRequiredDeliveryCapacity),
-		refresh:  make(chan clientStatusState, 1),
-		fence:    make(chan clientInstanceCommand, 1),
-		revoked:  make(chan struct{}),
+	connection := &clientConnection{
+		commands:  make(chan clientInstanceCommand),
+		required:  make(chan *clientRequiredDelivery, clientRequiredQueueCapacity),
+		available: make(chan *clientRequiredDelivery, clientRequiredDeliveryCapacity),
+		refresh:   make(chan clientStatusRefresh, 1),
+		fence:     make(chan clientInstanceCommand, 1),
+		revoked:   make(chan struct{}),
+	}
+	connection.initializeRequiredDeliveries()
+	return connection
+}
+
+func (c *clientConnection) initializeRequiredDeliveries() {
+	if c.available == nil {
+		c.available = make(chan *clientRequiredDelivery, clientRequiredDeliveryCapacity)
+	}
+	for len(c.available) < cap(c.available) {
+		c.available <- &clientRequiredDelivery{completion: make(chan clientRequiredCompletion, 1)}
 	}
 }
 
@@ -369,13 +466,14 @@ func (c *clientConnection) startDeliveryWorker() {
 	}
 	c.workerOnce.Do(func() {
 		if c.commands == nil {
-			c.commands = make(chan clientInstanceCommand, clientRequiredDeliveryCapacity)
+			c.commands = make(chan clientInstanceCommand)
 		}
 		if c.required == nil {
-			c.required = make(chan clientInstanceCommand, clientRequiredDeliveryCapacity)
+			c.required = make(chan *clientRequiredDelivery, clientRequiredQueueCapacity)
 		}
+		c.initializeRequiredDeliveries()
 		if c.refresh == nil {
-			c.refresh = make(chan clientStatusState, 1)
+			c.refresh = make(chan clientStatusRefresh, 1)
 		}
 		if c.fence == nil {
 			c.fence = make(chan clientInstanceCommand, 1)
@@ -388,33 +486,54 @@ func (c *clientConnection) startDeliveryWorker() {
 	})
 }
 
-func (c *clientConnection) enqueueRequired(command clientInstanceCommand) bool {
+func (c *clientConnection) reserveRequired() (*clientRequiredDelivery, bool) {
 	if c == nil {
-		return false
-	}
-	if command.Close {
-		c.revoke()
+		return nil, false
 	}
 	c.startDeliveryWorker()
+	var delivery *clientRequiredDelivery
 	select {
-	case c.required <- command:
-		return true
+	case delivery = <-c.available:
+	default:
+		c.fenceSaturatedDelivery()
+		return nil, false
+	}
+	select {
+	case c.required <- delivery:
+		return delivery, true
 	default:
 		// Required transitions are never discarded while leaving the transport
 		// live. Saturation fences this exact connection; canonical daemon state
 		// and unrelated clients continue independently.
-		fence := clientInstanceCommand{
-			Close:       true,
-			CloseCode:   protocol.RenderOutputErrorCode,
-			CloseReason: "client delivery mailbox saturated",
-		}
+		c.available <- delivery
+		c.fenceSaturatedDelivery()
+		return nil, false
+	}
+}
+
+func (c *clientConnection) fenceSaturatedDelivery() {
+	fence := clientInstanceCommand{
+		Close:       true,
+		CloseCode:   protocol.RenderOutputErrorCode,
+		CloseReason: "client delivery mailbox saturated",
+	}
+	c.revoke()
+	select {
+	case c.fence <- fence:
+	default:
+	}
+}
+
+func (c *clientConnection) enqueueRequired(command clientInstanceCommand) bool {
+	if command.Close {
 		c.revoke()
-		select {
-		case c.fence <- fence:
-		default:
-		}
+	}
+	delivery, ok := c.reserveRequired()
+	if !ok {
 		return false
 	}
+	delivery.finish(command, false)
+	return true
 }
 
 func (c *clientConnection) enqueueStatusRefresh(status clientStatusState, hasStatus bool) {
@@ -422,11 +541,9 @@ func (c *clientConnection) enqueueStatusRefresh(status clientStatusState, hasSta
 		return
 	}
 	c.startDeliveryWorker()
-	if !hasStatus {
-		status = clientStatusState{}
-	}
+	refresh := clientStatusRefresh{Status: status, HasStatus: hasStatus}
 	select {
-	case c.refresh <- status:
+	case c.refresh <- refresh:
 	default:
 		// Replace the pending advisory snapshot with the newest one. The
 		// connection worker remains the single consumer.
@@ -435,7 +552,7 @@ func (c *clientConnection) enqueueStatusRefresh(status clientStatusState, hasSta
 		default:
 		}
 		select {
-		case c.refresh <- status:
+		case c.refresh <- refresh:
 		default:
 		}
 	}
@@ -444,6 +561,7 @@ func (c *clientConnection) enqueueStatusRefresh(status clientStatusState, hasSta
 func (c *clientConnection) runDeliveryWorker() {
 	for {
 		var command clientInstanceCommand
+		var delivery *clientRequiredDelivery
 		// A saturation fence supersedes queued work for the unhealthy
 		// connection. Otherwise required FIFO work always gets the first chance;
 		// status is a capacity-one advisory edge.
@@ -452,16 +570,35 @@ func (c *clientConnection) runDeliveryWorker() {
 		default:
 			select {
 			case command = <-c.fence:
-			case command = <-c.required:
+			case delivery = <-c.required:
 			default:
 				select {
 				case command = <-c.fence:
-				case command = <-c.required:
-				case status := <-c.refresh:
-					command = clientInstanceCommand{RefreshStatus: true, Status: status, HasStatus: true}
+				case delivery = <-c.required:
+				case refresh := <-c.refresh:
+					command = clientInstanceCommand{
+						RefreshStatus: true, Status: refresh.Status, HasStatus: refresh.HasStatus,
+					}
 				case <-c.done:
 					return
 				}
+			}
+		}
+		if delivery != nil {
+			select {
+			case completion := <-delivery.completion:
+				command = completion.command
+				if command.Transition != nil {
+					command.Transition.delivery = nil
+				}
+				c.available <- delivery
+				if completion.skip {
+					continue
+				}
+			case fence := <-c.fence:
+				command = fence
+			case <-c.done:
+				return
 			}
 		}
 		select {
@@ -499,6 +636,7 @@ type ClientIdentity struct {
 	terminalCols       uint16
 	terminalRows       uint16
 	projectionRevision uint64
+	statusRevision     uint64
 	shell              string
 
 	// lastAllocatedClientLayoutRevision is the daemon's monotonic allocator
@@ -512,7 +650,7 @@ func newClientInstanceFromAdmission(d *Daemon, admission ClientAdmission) *Clien
 		connection = newClientConnection()
 	}
 	if connection.commands == nil {
-		connection.commands = make(chan clientInstanceCommand, clientRequiredDeliveryCapacity)
+		connection.commands = make(chan clientInstanceCommand)
 	}
 	instance := &ClientInstance{
 		clientID:       admission.ClientID,
@@ -557,7 +695,12 @@ func sendClientCommand(connection *clientConnection, command clientInstanceComma
 	}
 	result := make(chan error, 1)
 	command.Done = result
-	if !connection.enqueueRequired(command) {
+	if command.Transition != nil && command.Transition.deliveryRejected {
+		return errors.New("target client delivery mailbox saturated")
+	}
+	if command.Transition != nil && command.Transition.delivery != nil {
+		command.Transition.delivery.finish(command, false)
+	} else if !connection.enqueueRequired(command) {
 		return errors.New("target client delivery mailbox saturated")
 	}
 	select {
@@ -566,6 +709,48 @@ func sendClientCommand(connection *clientConnection, command clientInstanceComma
 	case <-connection.done:
 		return errors.New("target client disconnected")
 	}
+}
+
+func sendReservedClientCommand(delivery clientCommandDelivery, command clientInstanceCommand) error {
+	if delivery.Connection == nil {
+		return errors.New("target client delivery is unavailable")
+	}
+	if delivery.Rejected || delivery.Required == nil {
+		return errors.New("target client delivery mailbox saturated")
+	}
+	result := make(chan error, 1)
+	command.Done = result
+	if command.Close {
+		delivery.Connection.revoke()
+	}
+	delivery.Required.finish(command, false)
+	select {
+	case err := <-result:
+		return err
+	case <-delivery.Connection.done:
+		return errors.New("target client disconnected")
+	}
+}
+
+func postReservedClientCommand(delivery clientCommandDelivery, command clientInstanceCommand) bool {
+	if delivery.Connection == nil || delivery.Rejected || delivery.Required == nil {
+		return false
+	}
+	if command.Close {
+		delivery.Connection.revoke()
+	}
+	delivery.Required.finish(command, false)
+	return true
+}
+
+// reserveConnectionDeliveryNow is called only while the daemon actor owns the
+// canonical effect being prepared.
+func reserveConnectionDeliveryNow(connection *clientConnection) clientCommandDelivery {
+	if connection == nil {
+		return clientCommandDelivery{}
+	}
+	required, ok := connection.reserveRequired()
+	return clientCommandDelivery{Connection: connection, Required: required, Rejected: !ok}
 }
 
 func (c *ClientInstance) inputLayoutForRevision(revision protocol.ClientLayoutRevision) (protocol.ClientLayout, bool) {
@@ -870,6 +1055,7 @@ func (d *Daemon) admitSessionConnection(encodedToken string) (ClientAdmission, e
 	var admission ClientAdmission
 	var attachErr error
 	var displaced *clientConnection
+	var displacedDelivery clientCommandDelivery
 	d.call(func() {
 		now := time.Now()
 		grantIndex := -1
@@ -913,13 +1099,14 @@ func (d *Daemon) admitSessionConnection(encodedToken string) (ClientAdmission, e
 			previous.TerminalReason = "session was taken over by another client"
 			if previous.State.Active != nil {
 				displaced = previous.State.Active
+				displacedDelivery = reserveConnectionDeliveryNow(displaced)
 				identity.State.WaitFor = displaced.done
 				previous.State.Phase = clientClosing
 			}
 		}
 	})
 	if displaced != nil {
-		_ = sendClientCommand(displaced, clientInstanceCommand{
+		_ = sendReservedClientCommand(displacedDelivery, clientInstanceCommand{
 			Close: true, CloseCode: protocol.SessionReplacedErrorCode,
 			CloseReason: "session taken over by another client",
 		})
@@ -930,6 +1117,7 @@ func (d *Daemon) admitSessionConnection(encodedToken string) (ClientAdmission, e
 func (d *Daemon) admitResumedConnection(encodedToken string) (ClientAdmission, error) {
 	var admission ClientAdmission
 	var previous *clientConnection
+	var previousDelivery clientCommandDelivery
 	var resumeErr error
 	d.call(func() {
 		identity := d.clients[d.clientTokens[encodedToken]]
@@ -953,6 +1141,9 @@ func (d *Daemon) admitResumedConnection(encodedToken string) (ClientAdmission, e
 		}
 		connection := newClientConnection()
 		previous = identity.State.Active
+		if previous != nil {
+			previousDelivery = reserveConnectionDeliveryNow(previous)
+		}
 		identity.State = clientLifecycle{
 			Phase: clientPending, Pending: connection,
 		}
@@ -967,7 +1158,7 @@ func (d *Daemon) admitResumedConnection(encodedToken string) (ClientAdmission, e
 		}
 	})
 	if previous != nil {
-		_ = sendClientCommand(previous, clientInstanceCommand{
+		_ = sendReservedClientCommand(previousDelivery, clientInstanceCommand{
 			Close: true, CloseCode: protocol.SessionReplacedErrorCode,
 			CloseReason: "client reconnected elsewhere",
 		})
@@ -1098,6 +1289,7 @@ func (d *Daemon) transitionClientToSession(clientID ClientID, connection *client
 	var source *SessionState
 	var target *SessionState
 	var displaced *clientConnection
+	var displacedDelivery clientCommandDelivery
 	var transition ViewTransition
 	var switchErr error
 	if clientID == 0 || connection == nil {
@@ -1176,6 +1368,7 @@ func (d *Daemon) transitionClientToSession(clientID ClientID, connection *client
 		}
 		if displacedIdentity != nil {
 			displaced = displacedIdentity.State.Active
+			displacedDelivery = reserveConnectionDeliveryNow(displaced)
 			displacedIdentity.TerminalReason = "session taken over by another client"
 			displacedIdentity.State.Phase = clientClosing
 		}
@@ -1205,7 +1398,7 @@ func (d *Daemon) transitionClientToSession(clientID ClientID, connection *client
 		return transition, switchErr
 	}
 	if displaced != nil && displaced != connection {
-		postClientCommand(displaced, clientInstanceCommand{
+		postReservedClientCommand(displacedDelivery, clientInstanceCommand{
 			Close: true, CloseCode: protocol.SessionReplacedErrorCode,
 			CloseReason: "session taken over by another client",
 		})

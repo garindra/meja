@@ -13,6 +13,7 @@ import (
 // and ClientInstance.currentView.Layout without starting transport or pane actors.
 // Integration tests use ClientInstance.applyViewTransition instead.
 func commitTestProjection(client *ClientInstance, transition ViewTransition) error {
+	transition.delivery.cancel()
 	if err := client.commitProjectionPlan(transition.Projection); err != nil {
 		return err
 	}
@@ -248,7 +249,9 @@ func syncTestStatus(t *testing.T, state *SessionState) {
 		t.Fatal("test status refresh requires a client instance")
 	}
 	var status clientStatusState
-	state.daemon.call(func() { status = clientStatusSnapshotNow(state) })
+	state.daemon.call(func() {
+		status = state.daemon.clientStatusSnapshotNow(testClientIdentity(clientForState(state)), state)
+	})
 	result := make(chan error, 1)
 	client.postCommand(clientInstanceCommand{
 		RefreshStatus: true,

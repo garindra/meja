@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -76,6 +77,9 @@ type processFingerprint struct {
 type ProcessMonitor struct {
 	commands          chan processMonitorCommand
 	done              chan struct{}
+	unwatchMu         sync.Mutex
+	pendingUnwatches  map[PaneKey]struct{}
+	unwatchWake       chan struct{}
 	observer          ProcessObserver
 	foregroundProbe   func(Anchor) (int, error)
 	reconcileInterval time.Duration
@@ -88,10 +92,13 @@ func NewProcessMonitor(ctx context.Context, observer ProcessObserver) *ProcessMo
 	monitor := &ProcessMonitor{
 		commands:          make(chan processMonitorCommand, 256),
 		done:              make(chan struct{}),
+		pendingUnwatches:  make(map[PaneKey]struct{}),
+		unwatchWake:       make(chan struct{}, 1),
 		observer:          observer,
 		foregroundProbe:   foregroundGroupForAnchor,
 		reconcileInterval: processReconcileInterval,
 	}
+	go monitor.runUnwatchRetry(ctx)
 	go monitor.run(ctx)
 	return monitor
 }
@@ -107,10 +114,10 @@ func (m *ProcessMonitor) Watch(sessionID uint64, deliver func(monitoredProcessBa
 	}
 }
 
-// TryUnwatch is the daemon-after-turn variant. Pane-exit reconciliation has
-// already removed the authoritative pane, so a saturated advisory monitor may
-// retain a stale watch until later cleanup, but it must never block the daemon
-// request loop.
+// TryUnwatch is the daemon-after-turn variant. It first attempts the monitor
+// mailbox directly. Saturation records a coalesced tombstone for the one
+// persistent retry worker, so pane exit never blocks the daemon and every
+// accepted unwatch is eventually ordered behind already queued monitor work.
 func (m *ProcessMonitor) TryUnwatch(key PaneKey) bool {
 	if m == nil {
 		return false
@@ -121,8 +128,56 @@ func (m *ProcessMonitor) TryUnwatch(key PaneKey) bool {
 	case <-m.done:
 		return false
 	default:
+	}
+	if m.unwatchWake == nil {
 		return false
 	}
+	m.unwatchMu.Lock()
+	if m.pendingUnwatches == nil {
+		m.pendingUnwatches = make(map[PaneKey]struct{})
+	}
+	m.pendingUnwatches[key] = struct{}{}
+	m.unwatchMu.Unlock()
+	select {
+	case m.unwatchWake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func (m *ProcessMonitor) runUnwatchRetry(ctx context.Context) {
+	for {
+		select {
+		case <-m.unwatchWake:
+		case <-ctx.Done():
+			return
+		case <-m.done:
+			return
+		}
+		for {
+			key, ok := m.takePendingUnwatch()
+			if !ok {
+				break
+			}
+			select {
+			case m.commands <- processMonitorCommand{unwatch: &key}:
+			case <-ctx.Done():
+				return
+			case <-m.done:
+				return
+			}
+		}
+	}
+}
+
+func (m *ProcessMonitor) takePendingUnwatch() (PaneKey, bool) {
+	m.unwatchMu.Lock()
+	defer m.unwatchMu.Unlock()
+	for key := range m.pendingUnwatches {
+		delete(m.pendingUnwatches, key)
+		return key, true
+	}
+	return PaneKey{}, false
 }
 
 func (m *ProcessMonitor) DropSession(sessionID uint64) {

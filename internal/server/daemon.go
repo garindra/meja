@@ -99,6 +99,7 @@ type daemonRequest struct {
 }
 
 type clientStatusState struct {
+	Revision    uint64
 	SessionID   uint64
 	SessionName string
 	Root        string
@@ -129,14 +130,19 @@ func (d *Daemon) call(run func()) {
 	<-done
 }
 
-// clientStatusSnapshotNow runs only on the daemon actor and transfers an
-// immutable status model to the client actor.
-func clientStatusSnapshotNow(state *SessionState) clientStatusState {
-	if state == nil {
+// clientStatusSnapshotNow runs only on the daemon actor. The revision belongs
+// to the stable client identity so snapshots remain ordered across session and
+// window transitions as live transports are replaced.
+func (d *Daemon) clientStatusSnapshotNow(client *ClientIdentity, state *SessionState) clientStatusState {
+	if d == nil || client == nil || state == nil {
 		return clientStatusState{}
 	}
+	if client.statusRevision != ^uint64(0) {
+		client.statusRevision++
+	}
 	return clientStatusState{
-		SessionID: state.ID, SessionName: state.Name, Root: state.rootDir,
+		Revision: client.statusRevision, SessionID: state.ID,
+		SessionName: state.Name, Root: state.rootDir,
 		Windows: state.WindowStatuses(),
 	}
 }
@@ -195,7 +201,7 @@ func (d *Daemon) processObservationDelivery(sessionID uint64) func(monitoredProc
 							if client := d.clients[member.ClientID]; client != nil {
 								deliveries = append(deliveries, clientStatusDelivery{
 									Connection: client.State.Active,
-									Status:     clientStatusSnapshotNow(member),
+									Status:     d.clientStatusSnapshotNow(client, member),
 								})
 							}
 						}
@@ -235,7 +241,7 @@ func (d *Daemon) postPaneProcessExit(paneID uint64) {
 	}, func() {
 		if unwatch && d.processMonitor != nil {
 			if !d.processMonitor.TryUnwatch(PaneKey{PaneID: paneID}) {
-				d.logf("meja pane-exit: process monitor mailbox saturated; stale pane=%d watch remains advisory\n", paneID)
+				d.logf("meja pane-exit: process monitor stopped before pane=%d unwatch\n", paneID)
 			}
 		}
 		for index, client := range clients {
@@ -556,6 +562,7 @@ func (d *Daemon) runPersistence(ctx context.Context, sessionPersistenceDir strin
 type sessionShutdownPlan struct {
 	panes           []*Pane
 	connection      *clientConnection
+	delivery        clientCommandDelivery
 	monitorFrom     uint64
 	monitorTo       uint64
 	monitorDelivery func(monitoredProcessBatch)
@@ -608,6 +615,7 @@ func (d *Daemon) shutdownSessionInActor(state *SessionState) sessionShutdownPlan
 		client.TerminalReason = "session is no longer available"
 		client.State.Phase = clientClosing
 		plan.connection = client.State.Active
+		plan.delivery = reserveConnectionDeliveryNow(plan.connection)
 	}
 	state.ClientID = 0
 	d.removeSession(state)
@@ -626,7 +634,7 @@ func (d *Daemon) applySessionShutdownPlan(plan sessionShutdownPlan) {
 		}
 	}
 	if plan.connection != nil {
-		postClientCommand(plan.connection, clientInstanceCommand{Close: true, CloseReason: "[exited]"})
+		postReservedClientCommand(plan.delivery, clientInstanceCommand{Close: true, CloseReason: "[exited]"})
 	}
 }
 
@@ -672,6 +680,7 @@ func (d *Daemon) resizeClientView(clientID ClientID, connection *clientConnectio
 func (d *Daemon) prepareViewTransitionNow(reason ViewTransitionReason, client *ClientIdentity, state *SessionState, _ ...*Pane) ViewTransition {
 	plan := d.projectionPlanNow(client, state)
 	transition := ViewTransition{Reason: reason, Projection: plan}
+	d.reserveViewTransitionDeliveryNow(client, &transition)
 	if plan.Close {
 		return transition
 	}
@@ -684,7 +693,17 @@ func (d *Daemon) prepareViewTransitionNow(reason ViewTransitionReason, client *C
 func (d *Daemon) prepareFocusTransitionNow(client *ClientIdentity, state *SessionState) ViewTransition {
 	plan := d.projectionPlanNow(client, state)
 	plan.View.Layout.LayoutRevision = d.clientLayoutRevisionNow(client)
-	return ViewTransition{Reason: viewTransitionFocus, Projection: plan}
+	transition := ViewTransition{Reason: viewTransitionFocus, Projection: plan}
+	d.reserveViewTransitionDeliveryNow(client, &transition)
+	return transition
+}
+
+func (d *Daemon) reserveViewTransitionDeliveryNow(client *ClientIdentity, transition *ViewTransition) {
+	if d == nil || client == nil || transition == nil || client.State.Active == nil {
+		return
+	}
+	transition.delivery, _ = client.State.Active.reserveRequired()
+	transition.deliveryRejected = transition.delivery == nil
 }
 
 func (d *Daemon) clientLayoutRevisionNow(client *ClientIdentity) protocol.ClientLayoutRevision {
@@ -739,7 +758,7 @@ func prepareClientWindowGeometryNow(client *ClientIdentity, state *SessionState,
 
 func (d *Daemon) projectionPlanNow(client *ClientIdentity, state *SessionState) ClientProjectionPlan {
 	plan := ClientProjectionPlan{ClientID: client.ID, SessionID: state.ID}
-	plan.View.Status = clientStatusSnapshotNow(state)
+	plan.View.Status = d.clientStatusSnapshotNow(client, state)
 	plan.View.StatusValid = true
 	plan.View.Layout.WindowID = state.ActiveWindowID
 	if plan.View.Layout.WindowID == 0 && len(state.Windows) > 0 {

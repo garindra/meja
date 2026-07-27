@@ -49,10 +49,15 @@ func runSendKeysCommand(d *Daemon, ctx CommandContext, args []string) (commandOu
 	if client == nil {
 		return commandOutcome{}, errors.New("command requires an attached client")
 	}
+	delivery, err := reserveCommandActionDelivery(d, ctx, client)
+	if err != nil {
+		return commandOutcome{}, err
+	}
 	return commandOutcome{Action: sendClientKeysAction{
 		ClientID:  client.ID,
 		SessionID: client.SessionID,
 		Args:      append([]string(nil), remaining...),
+		Delivery:  delivery,
 	}}, nil
 }
 

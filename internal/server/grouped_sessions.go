@@ -523,7 +523,7 @@ func (d *Daemon) renameSessionWindow(sessionID, windowID uint64, name string) (*
 						if client := member.attachedClient(); client != nil {
 							refresh = append(refresh, clientStatusDelivery{
 								Connection: client.State.Active,
-								Status:     clientStatusSnapshotNow(member),
+								Status:     d.clientStatusSnapshotNow(client, member),
 							})
 						}
 					}
@@ -1209,6 +1209,7 @@ func (d *Daemon) removeClientPane(clientID ClientID, paneID uint64) (clientPaneR
 		result.FinalPane = state.ActiveWindowID == 0 || len(state.Windows) == 0
 		if result.FinalPane {
 			result.Transition = ViewTransition{Reason: viewTransitionClosePane, Projection: ClientProjectionPlan{ClientID: client.ID, SessionID: state.ID, Close: true, CloseReason: "no viewable fallback window"}}
+			d.reserveViewTransitionDeliveryNow(client, &result.Transition)
 			return
 		}
 		result.Window = cloneWindow(state.Windows[state.ActiveWindowID])

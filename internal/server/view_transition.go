@@ -107,12 +107,20 @@ type ClientProjectionPlan struct {
 type ViewTransition struct {
 	Reason     ViewTransitionReason
 	Projection ClientProjectionPlan
+
+	delivery         *clientRequiredDelivery
+	deliveryRejected bool
 }
 
 func (c *ClientInstance) applyViewTransition(transition ViewTransition) error {
 	if c == nil {
 		return errors.New("nil client view transition")
 	}
+	// Direct client-actor application consumes its daemon-order reservation as
+	// a no-op. Mailbox-delivered transitions have already completed the same
+	// reservation, so this is idempotent.
+	transition.delivery.cancel()
+	transition.delivery = nil
 	if err := c.adoptTransitionSession(transition.Projection); err != nil {
 		return err
 	}
@@ -188,6 +196,8 @@ func (c *ClientInstance) validateClientView(transition ViewTransition) error {
 }
 
 func (c *ClientInstance) installClientView(transition ViewTransition, handoff *outputHandoff) error {
+	transition.delivery.cancel()
+	transition.delivery = nil
 	if err := c.validateClientView(transition); err != nil {
 		return fmt.Errorf("%s projection: %w", transition.Reason, err)
 	}
@@ -201,20 +211,23 @@ func (c *ClientInstance) installClientView(transition ViewTransition, handoff *o
 	if err := c.finishOutputHandoff(handoff, plan); err != nil {
 		return fmt.Errorf("%s bind outputs: %w", transition.Reason, err)
 	}
-	c.currentView.Status = plan.View.Status
-	c.currentView.StatusValid = plan.View.StatusValid
+	nextView := c.orderedViewStatus(plan.View, plan.SessionID)
+	c.currentView.Status = nextView.Status
+	c.currentView.StatusValid = nextView.StatusValid
 	if err := c.publishStatusBar(); err != nil {
 		return fmt.Errorf("%s publish status: %w", transition.Reason, err)
 	}
-	if err := c.sendClientLayout(plan.View.Layout); err != nil {
+	if err := c.sendClientLayout(nextView.Layout); err != nil {
 		return fmt.Errorf("%s publish layout: %w", transition.Reason, err)
 	}
-	c.currentView = plan.View
+	c.currentView = nextView
 	c.appliedProjectionRevision = plan.ProjectionRevision
 	return nil
 }
 
 func (c *ClientInstance) applyFocusTransition(transition ViewTransition) error {
+	transition.delivery.cancel()
+	transition.delivery = nil
 	if transition.Projection.FullSnapshot {
 		return errors.New("focus transition unexpectedly requires a full snapshot")
 	}
@@ -224,11 +237,12 @@ func (c *ClientInstance) applyFocusTransition(transition ViewTransition) error {
 	if err := c.cancelFrontendPointerCapture(); err != nil {
 		return fmt.Errorf("%s cancel pointer capture: %w", transition.Reason, err)
 	}
-	layout := transition.Projection.View.Layout
+	nextView := c.orderedViewStatus(transition.Projection.View, transition.Projection.SessionID)
+	layout := nextView.Layout
 	if err := c.sendClientLayout(layout); err != nil {
 		return err
 	}
-	c.currentView = transition.Projection.View
+	c.currentView = nextView
 	c.appliedProjectionRevision = transition.Projection.ProjectionRevision
 	return nil
 }

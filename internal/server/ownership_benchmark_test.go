@@ -116,7 +116,9 @@ func BenchmarkRequiredMailboxEnqueueDequeue(b *testing.B) {
 		if !connection.enqueueRequired(command) {
 			b.Fatal("required mailbox saturated")
 		}
-		<-connection.required
+		delivery := <-connection.required
+		<-delivery.completion
+		connection.available <- delivery
 	}
 }
 
