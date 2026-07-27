@@ -36,6 +36,18 @@ type usageError struct{ text string }
 
 func (e usageError) Error() string { return e.text }
 
+const quicDisableReceiveBufferWarning = "QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING"
+
+func configureQUICStartup() {
+	if _, ok := os.LookupEnv(quicDisableReceiveBufferWarning); ok {
+		return
+	}
+	if debugEnvironmentEnabled("MEJA_DEBUG") {
+		return
+	}
+	_ = os.Setenv(quicDisableReceiveBufferWarning, "true")
+}
+
 const usage = `usage:
   meja version
   meja [transport-options] [command [command-args...]]
@@ -52,6 +64,8 @@ Transport options must appear before the command. With no command, Meja runs
 new-session. Use --help for the server-backed command reference.`
 
 func run(ctx context.Context, args []string, stdin *os.File, stdout, stderr io.Writer) error {
+	configureQUICStartup()
+
 	cfg, err := parseInvocation(args, stdin, stdout, stderr)
 	if err != nil {
 		return usageError{err.Error()}
