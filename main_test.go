@@ -32,6 +32,59 @@ func parseTestInvocation(t *testing.T, args ...string) client.Config {
 	return cfg
 }
 
+func TestConfigureQUICStartupSetsDefault(t *testing.T) {
+	t.Setenv("MEJA_DEBUG", "")
+	t.Setenv(quicDisableReceiveBufferWarning, "")
+	if err := os.Unsetenv(quicDisableReceiveBufferWarning); err != nil {
+		t.Fatal(err)
+	}
+
+	configureQUICStartup()
+
+	if got := os.Getenv(quicDisableReceiveBufferWarning); got != "true" {
+		t.Fatalf("QUIC warning setting = %q, want %q", got, "true")
+	}
+}
+
+func TestConfigureQUICStartupPreservesExplicitSetting(t *testing.T) {
+	t.Setenv(quicDisableReceiveBufferWarning, "false")
+
+	configureQUICStartup()
+
+	if got := os.Getenv(quicDisableReceiveBufferWarning); got != "false" {
+		t.Fatalf("QUIC warning setting = %q, want %q", got, "false")
+	}
+}
+
+func TestConfigureQUICStartupIsIdempotent(t *testing.T) {
+	t.Setenv("MEJA_DEBUG", "")
+	t.Setenv(quicDisableReceiveBufferWarning, "")
+	if err := os.Unsetenv(quicDisableReceiveBufferWarning); err != nil {
+		t.Fatal(err)
+	}
+
+	configureQUICStartup()
+	configureQUICStartup()
+
+	if got := os.Getenv(quicDisableReceiveBufferWarning); got != "true" {
+		t.Fatalf("QUIC warning setting = %q after repeated calls, want %q", got, "true")
+	}
+}
+
+func TestConfigureQUICStartupPreservesWarningInDebugMode(t *testing.T) {
+	t.Setenv("MEJA_DEBUG", "true")
+	t.Setenv(quicDisableReceiveBufferWarning, "")
+	if err := os.Unsetenv(quicDisableReceiveBufferWarning); err != nil {
+		t.Fatal(err)
+	}
+
+	configureQUICStartup()
+
+	if _, ok := os.LookupEnv(quicDisableReceiveBufferWarning); ok {
+		t.Fatal("QUIC warning setting was added in debug mode")
+	}
+}
+
 func shortUnixSocketPath(t *testing.T) string {
 	t.Helper()
 	directory, err := os.MkdirTemp("", "meja-test-")
