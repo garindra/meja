@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"sync/atomic"
 )
 
 // GroupState is the daemon-owned execution graph shared by one or more
@@ -15,7 +14,7 @@ type GroupState struct {
 	SessionIDs map[uint64]struct{}
 	Windows    map[uint64]*Window
 	Panes      map[uint64]*Pane
-	members    atomic.Value // []uint64; immutable membership snapshots for callbacks
+	memberIDs  []uint64
 }
 
 // WindowLink is a session-local display link to a canonical Window. The
@@ -95,9 +94,7 @@ type WindowViewLease struct {
 }
 
 func newGroup(id uint64) *GroupState {
-	g := &GroupState{ID: id, SessionIDs: make(map[uint64]struct{}), Windows: make(map[uint64]*Window), Panes: make(map[uint64]*Pane)}
-	g.members.Store([]uint64(nil))
-	return g
+	return &GroupState{ID: id, SessionIDs: make(map[uint64]struct{}), Windows: make(map[uint64]*Window), Panes: make(map[uint64]*Pane)}
 }
 
 func (g *GroupState) publishMembers() {
@@ -106,15 +103,14 @@ func (g *GroupState) publishMembers() {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	g.members.Store(ids)
+	g.memberIDs = ids
 }
 
 func (g *GroupState) memberIDsSnapshot() []uint64 {
 	if g == nil {
 		return nil
 	}
-	ids, _ := g.members.Load().([]uint64)
-	return ids
+	return append([]uint64(nil), g.memberIDs...)
 }
 
 func (g *GroupState) addSession(s *SessionState) {
@@ -247,7 +243,7 @@ func (s *SessionState) groupMembersNow() []*SessionState {
 }
 
 func (s *SessionState) isGrouped() bool {
-	return s != nil && s.grouped.Load()
+	return s != nil && s.grouped
 }
 
 // removeGroupWindowNow runs inside the daemon transaction above. It repairs
@@ -268,11 +264,10 @@ func (s *SessionState) removeGroupWindowNow(windowID uint64) ([]*Pane, bool) {
 			panes = append(panes, pane)
 			delete(s.group.Panes, paneID)
 			delete(s.daemon.panes, paneID)
-			s.daemon.paneIndex.Delete(paneID)
 		}
 	}
 	delete(s.group.Windows, windowID)
-	s.daemon.windowIndex.Delete(windowID)
+	delete(s.daemon.windows, windowID)
 	members := s.groupMembersNow()
 	for _, member := range members {
 		delete(member.Windows, windowID)
@@ -361,7 +356,6 @@ func (s *SessionState) removeGroupPaneNow(paneID uint64) (*Pane, *Window, bool, 
 	}
 	delete(s.group.Panes, paneID)
 	delete(s.daemon.panes, paneID)
-	s.daemon.paneIndex.Delete(paneID)
 	for _, member := range s.groupMembersNow() {
 		delete(member.Panes, paneID)
 	}
@@ -403,7 +397,6 @@ func (d *Daemon) ensureSessionGroupInActor(s *SessionState) *GroupState {
 				d.groups = make(map[uint64]*GroupState)
 			}
 			d.groups[s.group.ID] = s.group
-			d.groupIndex.Store(s.group.ID, s.group)
 		}
 		return s.group
 	}
@@ -417,13 +410,12 @@ func (d *Daemon) ensureSessionGroupInActor(s *SessionState) *GroupState {
 	}
 	g := newGroup(id)
 	g.addSession(s)
-	s.grouped.Store(false)
+	s.grouped = false
 	if d != nil {
 		if d.groups == nil {
 			d.groups = make(map[uint64]*GroupState)
 		}
 		d.groups[id] = g
-		d.groupIndex.Store(id, g)
 	}
 	return g
 }
@@ -432,6 +424,9 @@ func (d *Daemon) addWindowToGroupNow(session *SessionState, window *Window, pane
 	var err error
 	if d.panes == nil {
 		d.panes = make(map[uint64]*Pane)
+	}
+	if d.windows == nil {
+		d.windows = make(map[uint64]*Window)
 	}
 	if session == nil || session.group == nil {
 		err = errSessionUnavailable
@@ -442,8 +437,7 @@ func (d *Daemon) addWindowToGroupNow(session *SessionState, window *Window, pane
 		return err
 	}
 	d.panes[pane.ID] = pane
-	d.paneIndex.Store(pane.ID, pane)
-	d.windowIndex.Store(window.ID, window)
+	d.windows[window.ID] = window
 	for memberID := range g.SessionIDs {
 		member := d.sessions[memberID]
 		if member == nil && memberID == session.ID {
@@ -465,6 +459,9 @@ func (d *Daemon) addPaneToWindowGroupNow(session *SessionState, window *Window, 
 	if d.panes == nil {
 		d.panes = make(map[uint64]*Pane)
 	}
+	if d.windows == nil {
+		d.windows = make(map[uint64]*Window)
+	}
 	if session == nil || session.group == nil || window == nil || pane == nil {
 		err = errSessionUnavailable
 		return err
@@ -483,8 +480,7 @@ func (d *Daemon) addPaneToWindowGroupNow(session *SessionState, window *Window, 
 	}
 	pane.WindowID = window.ID
 	d.panes[pane.ID] = pane
-	d.paneIndex.Store(pane.ID, pane)
-	d.windowIndex.Store(window.ID, window)
+	d.windows[window.ID] = window
 	window.Layout = layout
 	window.LayoutRevision = session.nextWindowLayoutRevisionNow()
 	window.ActivePaneID = pane.ID
@@ -501,31 +497,47 @@ func (d *Daemon) addPaneToWindowGroupNow(session *SessionState, window *Window, 
 	return err
 }
 
-func (d *Daemon) renameWindow(window *Window, name string) error {
+func (d *Daemon) renameSessionWindow(sessionID, windowID uint64, name string) (*Window, error) {
 	var err error
+	var snapshot *Window
+	var refresh []clientStatusDelivery
 	d.call(func() {
-		if window == nil {
+		state := d.sessions[sessionID]
+		if state == nil {
 			err = errSessionUnavailable
 			return
 		}
+		window := state.Windows[windowID]
+		if window == nil {
+			err = fmt.Errorf("unknown window %d", windowID)
+			return
+		}
+		changed := window.Name != name || window.AutomaticName
 		window.Name = name
 		window.AutomaticName = false
+		if changed {
+			state.markWindowChangedForPersistence(windowID)
+			if state.isGrouped() {
+				for _, member := range state.groupMembersNow() {
+					if member != state {
+						if client := member.attachedClient(); client != nil {
+							refresh = append(refresh, clientStatusDelivery{
+								Connection: client.State.Active,
+								Status:     d.clientStatusSnapshotNow(client, member),
+							})
+						}
+					}
+				}
+			}
+		}
+		snapshot = cloneWindow(window)
 	})
-	return err
-}
-
-// groupSession promotes base's singleton graph (or joins its existing graph)
-// and adds mirror without creating any runtime resources.
-func (d *Daemon) groupSession(base *SessionState, mirror *SessionState) error {
-	if base == nil || mirror == nil {
-		return errors.New("grouping requires two sessions")
+	for _, delivery := range refresh {
+		postClientCommand(delivery.Connection, clientInstanceCommand{
+			RefreshStatus: true, Status: delivery.Status, HasStatus: true,
+		})
 	}
-	if d != nil {
-		var err error
-		d.call(func() { err = d.groupSessionInActor(base, mirror) })
-		return err
-	}
-	return groupSessionsNow(base, mirror)
+	return snapshot, err
 }
 
 func (d *Daemon) groupSessionInActor(base, mirror *SessionState) error {
@@ -567,7 +579,7 @@ func groupSessionsNow(base, mirror *SessionState) error {
 	if base.daemon != nil {
 		for memberID := range g.SessionIDs {
 			if member := base.daemon.sessions[memberID]; member != nil {
-				member.grouped.Store(true)
+				member.grouped = true
 			}
 		}
 	}
@@ -588,7 +600,6 @@ func groupSessionsNow(base, mirror *SessionState) error {
 			d.groups = make(map[uint64]*GroupState)
 		}
 		d.groups[g.ID] = g
-		d.groupIndex.Store(g.ID, g)
 		for memberID := range g.SessionIDs {
 			if member := d.sessions[memberID]; member != nil {
 				member.syncGroupLinksNow()
@@ -731,7 +742,7 @@ func clientViewportSize(client *ClientIdentity, fallback *Window) (uint16, uint1
 		}
 		return fallback.Cols, fallback.Rows
 	}
-	cols, rows := uint16(client.terminalCols.Load()), uint16(client.terminalRows.Load())
+	cols, rows := client.terminalCols, client.terminalRows
 	if (cols == 0 || rows == 0) && fallback != nil {
 		cols, rows = fallback.Cols, fallback.Rows
 	}
@@ -780,29 +791,23 @@ func (d *Daemon) releaseWindowView(clientID ClientID, windowID, generation uint6
 	return released
 }
 
-func (d *Daemon) validateWindowView(clientID ClientID, windowID, generation uint64) error {
-	var err error
-	d.call(func() {
-		lease := d.windowLeases[windowID]
-		if lease == nil || lease.ClientID != clientID || lease.Generation != generation {
-			err = errors.New("stale or invalid window view lease")
-		}
-	})
-	return err
-}
-
 // mutateClientView serializes a session-view graph mutation and captures the
 // immutable projection which the ClientInstance actor installs afterward.
 // ClientInstance.currentView.Layout never crosses into the daemon transaction.
-func (d *Daemon) mutateClientView(reason ViewTransitionReason, client *ClientIdentity, mutate func(*SessionState) (*Window, bool, error)) (*Window, ViewTransition, bool, error) {
+func (d *Daemon) mutateClientView(reason ViewTransitionReason, clientID ClientID, mutate func(*SessionState) (*Window, bool, error)) (*Window, ViewTransition, bool, error) {
 	var window *Window
 	var transition ViewTransition
 	var changed bool
 	var err error
-	if d == nil || client == nil {
+	if d == nil || clientID == 0 {
 		return nil, transition, false, errSessionUnavailable
 	}
 	d.call(func() {
+		client := d.clients[clientID]
+		if client == nil {
+			err = errSessionUnavailable
+			return
+		}
 		state := d.sessions[client.SessionID]
 		if state == nil || d.clients[state.ClientID] != client {
 			err = errSessionUnavailable
@@ -816,11 +821,16 @@ func (d *Daemon) mutateClientView(reason ViewTransitionReason, client *ClientIde
 	return window, transition, changed, err
 }
 
-func (d *Daemon) focusClientPane(client *ClientIdentity, paneID uint64) (*Window, ViewTransition, error) {
+func (d *Daemon) focusClientPane(clientID ClientID, paneID uint64) (*Window, ViewTransition, error) {
 	var window *Window
 	var transition ViewTransition
 	var err error
 	d.call(func() {
+		client := d.clients[clientID]
+		if client == nil {
+			err = errSessionUnavailable
+			return
+		}
 		state := d.sessions[client.SessionID]
 		if state == nil || d.clients[state.ClientID] != client {
 			err = errSessionUnavailable
@@ -843,60 +853,66 @@ func (d *Daemon) focusClientPane(client *ClientIdentity, paneID uint64) (*Window
 	return window, transition, err
 }
 
-func (d *Daemon) toggleClientZoom(client *ClientIdentity) (*Window, ViewTransition, bool, error) {
-	return d.mutateClientView(viewTransitionLayout, client, func(state *SessionState) (*Window, bool, error) {
+func (d *Daemon) toggleClientZoom(clientID ClientID) (*Window, ViewTransition, bool, error) {
+	return d.mutateClientView(viewTransitionLayout, clientID, func(state *SessionState) (*Window, bool, error) {
 		window, changed, err := state.toggleZoomNow()
 		return window, changed, err
 	})
 }
 
-func (d *Daemon) splitClientPane(client *ClientIdentity, pane *Pane, direction SplitDirection) (*Window, ViewTransition, error) {
+func (d *Daemon) splitClientPane(clientID ClientID, pane *Pane, direction SplitDirection) (*Window, ViewTransition, error) {
 	if pane == nil {
 		return nil, ViewTransition{}, errors.New("split pane is unavailable")
 	}
-	window, transition, _, err := d.mutateClientView(viewTransitionSplitPane, client, func(state *SessionState) (*Window, bool, error) {
+	window, transition, _, err := d.mutateClientView(viewTransitionSplitPane, clientID, func(state *SessionState) (*Window, bool, error) {
 		window, err := state.splitFocusedPaneNow(pane, direction)
 		return window, err == nil, err
 	})
 	return window, transition, err
 }
 
-func (d *Daemon) cycleWindowLayout(client *ClientIdentity) (*Window, ViewTransition, bool, error) {
-	return d.mutateClientView(viewTransitionLayout, client, func(state *SessionState) (*Window, bool, error) {
+func (d *Daemon) cycleWindowLayout(clientID ClientID) (*Window, ViewTransition, bool, error) {
+	return d.mutateClientView(viewTransitionLayout, clientID, func(state *SessionState) (*Window, bool, error) {
 		return state.cycleWindowLayoutNow()
 	})
 }
 
-func (d *Daemon) resizeClientPane(client *ClientIdentity, direction PaneResizeDirection, amount int) (*Window, ViewTransition, bool, error) {
-	return d.mutateClientView(viewTransitionLayout, client, func(state *SessionState) (*Window, bool, error) {
+func (d *Daemon) resizeClientPane(clientID ClientID, direction PaneResizeDirection, amount int) (*Window, ViewTransition, bool, error) {
+	return d.mutateClientView(viewTransitionLayout, clientID, func(state *SessionState) (*Window, bool, error) {
 		return state.resizeFocusedPaneNow(direction, amount)
 	})
 }
 
-func (d *Daemon) swapClientPane(client *ClientIdentity, direction PaneSwapDirection) (*Window, ViewTransition, bool, error) {
-	return d.mutateClientView(viewTransitionLayout, client, func(state *SessionState) (*Window, bool, error) {
+func (d *Daemon) swapClientPane(clientID ClientID, direction PaneSwapDirection) (*Window, ViewTransition, bool, error) {
+	return d.mutateClientView(viewTransitionLayout, clientID, func(state *SessionState) (*Window, bool, error) {
 		return state.swapFocusedPaneNow(direction)
 	})
 }
 
-func (d *Daemon) createClientWindow(client *ClientIdentity, pane *Pane, cols, rows uint16) (*Window, ViewTransition, error) {
+func (d *Daemon) createClientWindow(clientID ClientID, pane *Pane, cols, rows uint16) (*Window, ViewTransition, error) {
 	var window *Window
 	var transition ViewTransition
 	var err error
-	if d == nil || client == nil {
+	if d == nil || clientID == 0 {
 		return nil, transition, errSessionUnavailable
 	}
 	d.call(func() {
+		client := d.clients[clientID]
+		if client == nil {
+			err = errSessionUnavailable
+			return
+		}
 		state := d.sessions[client.SessionID]
 		if state == nil || (d.clients[state.ClientID] != nil && d.clients[state.ClientID] != client) {
 			err = errSessionUnavailable
 			return
 		}
-		window, err = state.createWindowNow(pane, cols, rows)
+		var canonical *Window
+		canonical, err = state.createWindowNow(pane, cols, rows)
 		if err != nil {
 			return
 		}
-		if err = d.activateCreatedWindowNow(state, window.ID); err != nil {
+		if err = d.activateCreatedWindowNow(state, canonical.ID); err != nil {
 			return
 		}
 		if _, prepareErr := prepareClientWindowGeometryNow(client, state, state.ActiveWindowID); prepareErr != nil {
@@ -904,110 +920,153 @@ func (d *Daemon) createClientWindow(client *ClientIdentity, pane *Pane, cols, ro
 			return
 		}
 		transition = d.prepareViewTransitionNow(viewTransitionCreateWindow, client, state)
+		window = cloneWindow(canonical)
 	})
 	return window, transition, err
 }
 
-func (d *Daemon) startClientWindow(client *ClientIdentity, cwd string, argv []string, cols, rows uint16, shell string) (*Window, ViewTransition, error) {
-	if d == nil || client == nil {
+func (d *Daemon) startClientWindow(clientID ClientID, cwd string, argv []string, cols, rows uint16, shell string) (*Window, ViewTransition, error) {
+	if d == nil || clientID == 0 {
 		return nil, ViewTransition{}, errSessionUnavailable
 	}
-	state := d.sessions[client.SessionID]
-	if state == nil {
+	var sessionID uint64
+	var request paneRequest
+	d.call(func() {
+		if client := d.clients[clientID]; client != nil {
+			if state := d.sessions[client.SessionID]; state != nil {
+				sessionID = state.ID
+				request = state.contextualPaneRequest(paneRequest{Cwd: cwd, Command: argv, Cols: cols, Rows: rows, Shell: shell})
+			}
+		}
+	})
+	if sessionID == 0 {
 		return nil, ViewTransition{}, errSessionUnavailable
 	}
 	paneID, err := d.allocatePaneID()
 	if err != nil {
 		return nil, ViewTransition{}, err
 	}
-	pane, err := startPaneProcess(paneID, state.contextualPaneRequest(paneRequest{Cwd: cwd, Command: argv, Cols: cols, Rows: rows, Shell: shell}))
+	pane, err := startPaneProcess(paneID, request)
 	if err != nil {
 		return nil, ViewTransition{}, fmt.Errorf("start pane: %w", err)
 	}
-	window, transition, err := d.createClientWindow(client, pane, cols, rows)
+	window, transition, err := d.createClientWindow(clientID, pane, cols, rows)
 	if err != nil {
 		_ = terminatePane(pane)
 		return nil, ViewTransition{}, err
 	}
-	d.startPane(state, pane)
+	d.startPane(sessionID, pane)
 	return window, transition, nil
 }
 
-func (d *Daemon) startSessionWindow(state *SessionState, cwd string, argv []string, cols, rows uint16, shell string) (*Pane, *Window, error) {
-	if d == nil || state == nil {
+func (d *Daemon) startSessionWindowID(sessionID uint64, cwd string, argv []string, cols, rows uint16, shell string) (*Pane, *Window, error) {
+	if d == nil || sessionID == 0 {
+		return nil, nil, errSessionUnavailable
+	}
+	var request paneRequest
+	d.call(func() {
+		if state := d.sessions[sessionID]; state != nil {
+			request = state.contextualPaneRequest(paneRequest{Cwd: cwd, Command: argv, Cols: cols, Rows: rows, Shell: shell})
+		}
+	})
+	if request.Cwd == "" {
 		return nil, nil, errSessionUnavailable
 	}
 	paneID, err := d.allocatePaneID()
 	if err != nil {
 		return nil, nil, err
 	}
-	pane, err := startPaneProcess(paneID, state.contextualPaneRequest(paneRequest{Cwd: cwd, Command: argv, Cols: cols, Rows: rows, Shell: shell}))
+	pane, err := startPaneProcess(paneID, request)
 	if err != nil {
 		return nil, nil, fmt.Errorf("start pane: %w", err)
 	}
 	var window *Window
 	d.call(func() {
-		if d.sessions[state.ID] != state {
+		state := d.sessions[sessionID]
+		if state == nil {
 			err = errSessionUnavailable
 			return
 		}
-		window, err = state.createWindowNow(pane, cols, rows)
+		var created *Window
+		created, err = state.createWindowNow(pane, cols, rows)
 		if err == nil {
-			err = d.activateCreatedWindowNow(state, window.ID)
+			err = d.activateCreatedWindowNow(state, created.ID)
+			window = cloneWindow(created)
 		}
 	})
 	if err != nil {
 		_ = terminatePane(pane)
 		return nil, nil, err
 	}
-	d.startPane(state, pane)
+	d.startPane(sessionID, pane)
 	return pane, window, nil
 }
 
-func (d *Daemon) startClientSplit(client *ClientIdentity, cwd string, cols, rows uint16, shell string, direction SplitDirection) (ViewTransition, error) {
-	if d == nil || client == nil {
+func (d *Daemon) startClientSplit(clientID ClientID, cwd string, cols, rows uint16, shell string, direction SplitDirection) (ViewTransition, error) {
+	if d == nil || clientID == 0 {
 		return ViewTransition{}, errSessionUnavailable
 	}
-	state := d.sessions[client.SessionID]
-	if state == nil {
+	var sessionID uint64
+	var request paneRequest
+	d.call(func() {
+		if client := d.clients[clientID]; client != nil {
+			if state := d.sessions[client.SessionID]; state != nil {
+				sessionID = state.ID
+				request = state.contextualPaneRequest(paneRequest{Cwd: cwd, Cols: cols, Rows: rows, Shell: shell})
+			}
+		}
+	})
+	if sessionID == 0 {
 		return ViewTransition{}, errSessionUnavailable
 	}
 	paneID, err := d.allocatePaneID()
 	if err != nil {
 		return ViewTransition{}, err
 	}
-	pane, err := startPaneProcess(paneID, state.contextualPaneRequest(paneRequest{Cwd: cwd, Cols: cols, Rows: rows, Shell: shell}))
+	pane, err := startPaneProcess(paneID, request)
 	if err != nil {
 		return ViewTransition{}, fmt.Errorf("start split pane: %w", err)
 	}
-	_, transition, err := d.splitClientPane(client, pane, direction)
+	_, transition, err := d.splitClientPane(clientID, pane, direction)
 	if err != nil {
 		_ = terminatePane(pane)
 		return ViewTransition{}, err
 	}
-	d.startPane(state, pane)
+	d.startPane(sessionID, pane)
 	return transition, nil
 }
 
-func (d *Daemon) startSessionSplit(state *SessionState, cwd string, shell string, direction SplitDirection) error {
-	if d == nil || state == nil {
+func (d *Daemon) startSessionSplitID(sessionID uint64, cwd string, shell string, direction SplitDirection) error {
+	if d == nil || sessionID == 0 {
 		return errSessionUnavailable
 	}
-	active := state.activePane()
-	if active == nil {
+	var request paneRequest
+	d.call(func() {
+		state := d.sessions[sessionID]
+		if state == nil {
+			return
+		}
+		active := state.activePane()
+		if active == nil {
+			return
+		}
+		cols, rows := active.TerminalSize()
+		request = state.contextualPaneRequest(paneRequest{Cwd: cwd, Cols: uint16(cols), Rows: uint16(rows), Shell: shell})
+	})
+	if request.Cwd == "" {
 		return errors.New("split-window requires an active pane")
 	}
-	cols, rows := active.TerminalSize()
 	paneID, err := d.allocatePaneID()
 	if err != nil {
 		return err
 	}
-	pane, err := startPaneProcess(paneID, state.contextualPaneRequest(paneRequest{Cwd: cwd, Cols: uint16(cols), Rows: uint16(rows), Shell: shell}))
+	pane, err := startPaneProcess(paneID, request)
 	if err != nil {
 		return fmt.Errorf("start split pane: %w", err)
 	}
 	d.call(func() {
-		if d.sessions[state.ID] != state {
+		state := d.sessions[sessionID]
+		if state == nil {
 			err = errSessionUnavailable
 			return
 		}
@@ -1017,48 +1076,64 @@ func (d *Daemon) startSessionSplit(state *SessionState, cwd string, shell string
 		_ = terminatePane(pane)
 		return err
 	}
-	d.startPane(state, pane)
+	d.startPane(sessionID, pane)
 	return nil
 }
 
-func (d *Daemon) commandSessionAndClient(clientID ClientID, sessionID uint64) (*SessionState, *ClientIdentity) {
-	var state *SessionState
-	var client *ClientIdentity
+type commandSessionClientSnapshot struct {
+	SessionID  uint64
+	RootDir    string
+	WindowCols uint16
+	WindowRows uint16
+	ActivePane *Pane
+	CanSplit   error
+	Client     *commandClientSnapshot
+}
+
+func (d *Daemon) commandSessionAndClient(clientID ClientID, sessionID uint64) *commandSessionClientSnapshot {
+	var snapshot *commandSessionClientSnapshot
 	d.call(func() {
-		state = d.sessions[sessionID]
+		state := d.sessions[sessionID]
 		if state == nil {
 			return
 		}
+		snapshot = &commandSessionClientSnapshot{SessionID: state.ID, RootDir: state.rootDir}
+		if window := state.Windows[state.ActiveWindowID]; window != nil {
+			snapshot.WindowCols, snapshot.WindowRows = window.Cols, window.Rows
+			paneID := state.groupWindowViewNow(window.ID).FocusedPaneID
+			if paneID == 0 {
+				paneID = window.ActivePaneID
+			}
+			snapshot.ActivePane = state.Panes[paneID]
+		}
+		snapshot.CanSplit = state.CanSplitFocusedPane()
 		candidate := d.clients[state.ClientID]
 		if candidate != nil && (clientID == 0 || candidate.ID == clientID) {
-			client = candidate
+			snapshot.Client = commandClientSnapshotNow(candidate)
 		}
 	})
-	return state, client
+	return snapshot
 }
 
 func (d *Daemon) createCommandWindow(clientID ClientID, sessionID uint64, cols, rows uint16) (*ViewTransition, error) {
-	state, client := d.commandSessionAndClient(clientID, sessionID)
+	state := d.commandSessionAndClient(clientID, sessionID)
 	if state == nil {
 		return nil, errSessionUnavailable
 	}
+	client := state.Client
 	if client != nil {
-		clientCols, clientRows := uint16(client.terminalCols.Load()), uint16(client.terminalRows.Load())
+		clientCols, clientRows := client.TerminalCols, client.TerminalRows
 		if clientCols == 0 || clientRows == 0 {
-			if window := state.Windows[state.ActiveWindowID]; window != nil {
-				clientCols, clientRows = window.Cols, window.Rows
-			}
+			clientCols, clientRows = state.WindowCols, state.WindowRows
 		}
-		window, transition, err := d.startClientWindow(client, state.rootDir, nil, clientCols, clientRows, client.shell)
+		window, transition, err := d.startClientWindow(client.ID, state.RootDir, nil, clientCols, clientRows, client.Shell)
 		if err == nil && window == nil {
 			err = errors.New("create window: daemon rejected graph insertion")
 		}
 		return &transition, err
 	}
 	if cols == 0 || rows == 0 {
-		if window := state.Windows[state.ActiveWindowID]; window != nil {
-			cols, rows = window.Cols, window.Rows
-		}
+		cols, rows = state.WindowCols, state.WindowRows
 	}
 	if cols == 0 {
 		cols = 80
@@ -1066,35 +1141,28 @@ func (d *Daemon) createCommandWindow(clientID ClientID, sessionID uint64, cols, 
 	if rows == 0 {
 		rows = 23
 	}
-	_, _, err := d.startSessionWindow(state, state.rootDir, nil, cols, rows, defaultShell())
+	_, _, err := d.startSessionWindowID(state.SessionID, state.RootDir, nil, cols, rows, defaultShell())
 	return nil, err
 }
 
 func (d *Daemon) splitCommandWindow(clientID ClientID, sessionID uint64, direction SplitDirection) (*ViewTransition, error) {
-	state, client := d.commandSessionAndClient(clientID, sessionID)
+	state := d.commandSessionAndClient(clientID, sessionID)
 	if state == nil {
 		return nil, errSessionUnavailable
 	}
+	client := state.Client
 	if client != nil {
-		var activePane *Pane
-		if window := state.Windows[state.ActiveWindowID]; window != nil {
-			paneID := state.groupWindowViewNow(window.ID).FocusedPaneID
-			if paneID == 0 {
-				paneID = window.ActivePaneID
-			}
-			activePane = state.Panes[paneID]
-		}
-		if activePane == nil {
+		if state.ActivePane == nil {
 			return nil, nil
 		}
-		if err := state.CanSplitFocusedPane(); err != nil {
-			return nil, err
+		if state.CanSplit != nil {
+			return nil, state.CanSplit
 		}
-		cols, rows := activePane.TerminalSize()
-		transition, err := d.startClientSplit(client, state.rootDir, uint16(cols), uint16(rows), client.shell, direction)
+		cols, rows := state.ActivePane.TerminalSize()
+		transition, err := d.startClientSplit(client.ID, state.RootDir, uint16(cols), uint16(rows), client.Shell, direction)
 		return &transition, err
 	}
-	return nil, d.startSessionSplit(state, state.rootDir, defaultShell(), direction)
+	return nil, d.startSessionSplitID(state.SessionID, state.RootDir, defaultShell(), direction)
 }
 
 type clientPaneRemoval struct {
@@ -1108,13 +1176,18 @@ type clientPaneRemoval struct {
 	Removed        bool
 }
 
-func (d *Daemon) removeClientPane(client *ClientIdentity, paneID uint64) (clientPaneRemoval, error) {
+func (d *Daemon) removeClientPane(clientID ClientID, paneID uint64) (clientPaneRemoval, error) {
 	var result clientPaneRemoval
 	var err error
-	if d == nil || client == nil {
+	if d == nil || clientID == 0 {
 		return result, errSessionUnavailable
 	}
 	d.call(func() {
+		client := d.clients[clientID]
+		if client == nil {
+			err = errSessionUnavailable
+			return
+		}
 		state := d.sessions[client.SessionID]
 		if state == nil || d.clients[state.ClientID] != client {
 			err = errSessionUnavailable
@@ -1136,6 +1209,7 @@ func (d *Daemon) removeClientPane(client *ClientIdentity, paneID uint64) (client
 		result.FinalPane = state.ActiveWindowID == 0 || len(state.Windows) == 0
 		if result.FinalPane {
 			result.Transition = ViewTransition{Reason: viewTransitionClosePane, Projection: ClientProjectionPlan{ClientID: client.ID, SessionID: state.ID, Close: true, CloseReason: "no viewable fallback window"}}
+			d.reserveViewTransitionDeliveryNow(client, &result.Transition)
 			return
 		}
 		result.Window = cloneWindow(state.Windows[state.ActiveWindowID])
@@ -1154,7 +1228,7 @@ func (d *Daemon) closeCommandPane(clientID ClientID, sessionID, paneID uint64) (
 	if d == nil || sessionID == 0 || paneID == 0 {
 		return nil, errSessionUnavailable
 	}
-	var client *ClientIdentity
+	var resolvedClientID ClientID
 	d.call(func() {
 		state := d.sessions[sessionID]
 		if state == nil {
@@ -1164,18 +1238,18 @@ func (d *Daemon) closeCommandPane(clientID ClientID, sessionID, paneID uint64) (
 		if candidate == nil || (clientID != 0 && candidate.ID != clientID) {
 			return
 		}
-		client = candidate
+		resolvedClientID = candidate.ID
 	})
-	if client == nil {
+	if resolvedClientID == 0 {
 		return nil, errors.New("kill-pane client is no longer attached")
 	}
-	result, err := d.removeClientPane(client, paneID)
+	result, err := d.removeClientPane(resolvedClientID, paneID)
 	if err != nil {
 		return nil, err
 	}
 	_ = terminatePane(result.Pane)
 	if result.FinalPane {
-		_ = d.shutdownSession(d.sessions[client.SessionID])
+		_ = d.shutdownSessionID(sessionID, defaultPaneTerminationTimeouts)
 	}
 	if !result.FinalPane && result.Window == nil {
 		return nil, errors.New("pane removal produced no fallback window")
@@ -1187,24 +1261,32 @@ func (d *Daemon) killCommandPaneNow(sessionID, paneID uint64) (*ViewTransition, 
 	if d == nil || sessionID == 0 || paneID == 0 {
 		return nil, errSessionUnavailable
 	}
-	var state *SessionState
-	var client *ClientIdentity
+	var exists bool
+	var attachedClientID ClientID
 	d.call(func() {
-		state = d.sessions[sessionID]
+		state := d.sessions[sessionID]
 		if state != nil {
-			client = d.clients[state.ClientID]
+			exists = true
+			if client := d.clients[state.ClientID]; client != nil {
+				attachedClientID = client.ID
+			}
 		}
 	})
-	if state == nil {
+	if !exists {
 		return nil, errSessionUnavailable
 	}
-	if client != nil {
-		return d.closeCommandPane(client.ID, sessionID, paneID)
+	if attachedClientID != 0 {
+		return d.closeCommandPane(attachedClientID, sessionID, paneID)
 	}
 	var pane *Pane
 	var final bool
 	var err error
 	d.call(func() {
+		state := d.sessions[sessionID]
+		if state == nil {
+			err = errSessionUnavailable
+			return
+		}
 		var removed bool
 		pane, _, removed, err = state.removeGroupPaneNow(paneID)
 		if err == nil && !removed {
@@ -1220,7 +1302,7 @@ func (d *Daemon) killCommandPaneNow(sessionID, paneID uint64) (*ViewTransition, 
 	}
 	_ = terminatePane(pane)
 	if final {
-		return nil, d.shutdownSession(state)
+		return nil, d.shutdownSessionID(sessionID, defaultPaneTerminationTimeouts)
 	}
 	return nil, nil
 }

@@ -255,12 +255,12 @@ func statusLocation(hostname, root, home string) string {
 }
 
 func (c *ClientInstance) publishStatusBar() error {
-	width := int(c.terminalCols.Load())
+	width := int(c.terminalCols)
 	if width == 0 {
 		return nil
 	}
-	status, ok := c.Daemon.clientStatusSnapshot(c.sessionID)
-	if !ok {
+	status := c.currentView.Status
+	if !c.currentView.StatusValid {
 		return nil
 	}
 	styleID := statusNormalStyleID
@@ -268,7 +268,7 @@ func (c *ClientInstance) publishStatusBar() error {
 	if prompt := c.ActivePrompt(); prompt != nil {
 		styleID = statusPromptStyleID
 		text = prompt.Label + string(prompt.Text)
-	} else if statusMessage, _ := c.statusMessage.Load().(string); statusMessage != "" {
+	} else if statusMessage := c.statusMessage; statusMessage != "" {
 		styleID = statusPromptStyleID
 		text = statusMessage
 	} else {
@@ -337,7 +337,7 @@ func (c *ClientInstance) finishOutputHandoff(handoff *outputHandoff, plan Client
 			return fmt.Errorf("pane %d has no resolved actor", placement.PaneID)
 		}
 		c.Daemon.logf("meja projection: bind client=%d session=%d window=%d pane=%d slot=%d revision=%d grid=%dx%d\n",
-			c.identity.ID, plan.SessionID, plan.View.Layout.WindowID, resolved.Pane.ID, placement.Slot,
+			c.clientID, plan.SessionID, plan.View.Layout.WindowID, resolved.Pane.ID, placement.Slot,
 			plan.View.Layout.LayoutRevision, placement.Rect.Width, placement.Rect.Height)
 		return resolved.Pane.installOutputLease(
 			lease,

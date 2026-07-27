@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/garindra/meja/internal/protocol"
@@ -35,7 +34,7 @@ type SessionState struct {
 	ActiveWindowID   uint64
 	PreviousWindowID uint64
 	group            *GroupState
-	grouped          atomic.Bool
+	grouped          bool
 
 	lastWindowLayoutRevision WindowLayoutRevision
 
@@ -260,34 +259,19 @@ func (s *SessionState) lowestAvailableWindowDisplayIndex() int {
 }
 
 func (s *SessionState) RenameWindow(windowID uint64, name string) (*Window, error) {
+	if s.daemon != nil {
+		return s.daemon.renameSessionWindow(s.ID, windowID, name)
+	}
 	window := s.Windows[windowID]
 	if window == nil {
 		return nil, fmt.Errorf("unknown window %d", windowID)
 	}
 	// Empty names are valid; normal status projection remains well-formed.
 	changed := window.Name != name || window.AutomaticName
-	if s.daemon != nil {
-		if err := s.daemon.renameWindow(window, name); err != nil {
-			return nil, err
-		}
-	} else {
-		window.Name = name
-		window.AutomaticName = false
-	}
+	window.Name = name
+	window.AutomaticName = false
 	if changed {
 		s.markWindowChangedForPersistence(windowID)
-		if s.isGrouped() && s.daemon != nil {
-			var members []*SessionState
-			s.daemon.call(func() { members = s.groupMembersNow() })
-			for _, member := range members {
-				if member == s {
-					continue
-				}
-				if member.attachedClient() != nil {
-					postClientCommand(member.attachedClient().State.Active, clientInstanceCommand{RefreshStatus: true})
-				}
-			}
-		}
 	}
 	return cloneWindow(window), nil
 }

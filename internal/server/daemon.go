@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -40,10 +39,8 @@ type Config struct {
 // canonical registry access is serialized by requests.
 type Daemon struct {
 	logMu                    sync.Mutex
-	shutdownMu               sync.Mutex
 	requests                 chan daemonRequest
 	requestLoopOnce          sync.Once
-	requestLoopReady         atomic.Bool
 	commandEngineOnce        sync.Once
 	commands                 *CommandEngine
 	nextID                   uint64
@@ -52,12 +49,9 @@ type Daemon struct {
 	nextGroupID              uint64
 	nextClientID             ClientID
 	sessions                 map[uint64]*SessionState
-	sessionIndex             sync.Map // uint64 -> *SessionState; lock-free client lookup
 	groups                   map[uint64]*GroupState
-	groupIndex               sync.Map // uint64 -> *GroupState
 	panes                    map[uint64]*Pane
-	paneIndex                sync.Map // uint64 -> *Pane; process exits resolve directly
-	windowIndex              sync.Map // uint64 -> *Window
+	windows                  map[uint64]*Window
 	windowLeases             map[uint64]*WindowViewLease
 	names                    map[string]*SessionState
 	clientTokens             map[string]ClientID
@@ -84,7 +78,7 @@ type Daemon struct {
 	persistenceStop          chan struct{}
 	persistenceStopOnce      sync.Once
 	persistenceDone          chan struct{}
-	persistenceStarted       atomic.Bool
+	persistenceStarted       chan struct{}
 	persistenceUpdates       chan persistenceSnapshot
 	pasteBuffers             pasteBufferStore
 	stderr                   io.Writer
@@ -99,11 +93,13 @@ type sessionShutdown struct {
 }
 
 type daemonRequest struct {
-	run  func()
-	done chan struct{}
+	run   func()
+	after func()
+	done  chan struct{}
 }
 
 type clientStatusState struct {
+	Revision    uint64
 	SessionID   uint64
 	SessionName string
 	Root        string
@@ -118,6 +114,9 @@ func (d *Daemon) runRequests(ctx context.Context) {
 			if request.done != nil {
 				close(request.done)
 			}
+			if request.after != nil {
+				request.after()
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -131,26 +130,39 @@ func (d *Daemon) call(run func()) {
 	<-done
 }
 
-// clientStatusSnapshot copies every daemon-owned value needed by status
-// rendering in one transaction. Client actors must not walk SessionState maps.
-func (d *Daemon) clientStatusSnapshot(sessionID uint64) (clientStatusState, bool) {
-	var snapshot clientStatusState
-	var ok bool
-	if d == nil {
-		return snapshot, false
+// clientStatusSnapshotNow runs only on the daemon actor. The revision belongs
+// to the stable client identity so snapshots remain ordered across session and
+// window transitions as live transports are replaced.
+func (d *Daemon) clientStatusSnapshotNow(client *ClientIdentity, state *SessionState) clientStatusState {
+	if d == nil || client == nil || state == nil {
+		return clientStatusState{}
 	}
+	if client.statusRevision != ^uint64(0) {
+		client.statusRevision++
+	}
+	return clientStatusState{
+		Revision: client.statusRevision, SessionID: state.ID,
+		SessionName: state.Name, Root: state.rootDir,
+		Windows: state.WindowStatuses(),
+	}
+}
+
+func (d *Daemon) clientWindowIDByIndex(sessionID uint64, displayIndex int) (uint64, bool) {
+	if d == nil || displayIndex < 0 {
+		return 0, false
+	}
+	var windowID uint64
 	d.call(func() {
-		state := d.sessions[sessionID]
-		if state == nil {
-			return
+		if state := d.sessions[sessionID]; state != nil {
+			for id, window := range state.Windows {
+				if window != nil && window.DisplayIndex == displayIndex {
+					windowID = id
+					break
+				}
+			}
 		}
-		snapshot = clientStatusState{
-			SessionID: state.ID, SessionName: state.Name, Root: state.rootDir,
-			Windows: state.WindowStatuses(),
-		}
-		ok = true
 	})
-	return snapshot, ok
+	return windowID, windowID != 0
 }
 
 func (d *Daemon) ensureRequestLoop() {
@@ -162,7 +174,6 @@ func (d *Daemon) ensureRequestLoop() {
 			d.requests = make(chan daemonRequest, 64)
 			go d.runRequests(context.Background())
 		}
-		d.requestLoopReady.Store(true)
 	})
 }
 
@@ -171,70 +182,104 @@ func (d *Daemon) post(run func()) {
 	d.requests <- daemonRequest{run: run}
 }
 
+// postAfter separates canonical mutation from outbound delivery. The after
+// callback must contain only bounded, nonblocking mailbox enqueues.
+func (d *Daemon) postAfter(run, after func()) {
+	d.ensureRequestLoop()
+	d.requests <- daemonRequest{run: run, after: after}
+}
+
 func (d *Daemon) processObservationDelivery(sessionID uint64) func(monitoredProcessBatch) {
 	return func(batch monitoredProcessBatch) {
-		d.post(func() {
+		var deliveries []clientStatusDelivery
+		d.postAfter(func() {
 			if state := d.sessions[sessionID]; state != nil {
 				_ = d.applyMonitoredProcessObservations(state, batch)
 				if state.group != nil {
 					for _, memberID := range state.group.memberIDsSnapshot() {
 						if member := d.sessions[memberID]; member != nil {
 							if client := d.clients[member.ClientID]; client != nil {
-								postClientCommand(client.State.Active, clientInstanceCommand{RefreshStatus: true})
+								deliveries = append(deliveries, clientStatusDelivery{
+									Connection: client.State.Active,
+									Status:     d.clientStatusSnapshotNow(client, member),
+								})
 							}
 						}
 					}
 				}
 			}
+		}, func() {
+			for _, delivery := range deliveries {
+				postClientCommand(delivery.Connection, clientInstanceCommand{
+					RefreshStatus: true, Status: delivery.Status, HasStatus: true,
+				})
+			}
 		})
 	}
+}
+
+type clientStatusDelivery struct {
+	Connection *clientConnection
+	Status     clientStatusState
+}
+
+type clientDeliveryTarget struct {
+	ClientID   ClientID
+	Connection *clientConnection
 }
 
 func (d *Daemon) postPaneProcessExit(paneID uint64) {
 	if d == nil || paneID == 0 {
 		return
 	}
-	d.post(func() {
-		transitions, clients, terminalStates := d.applyPaneExit(paneID)
-		go func() {
-			for index, client := range clients {
-				transition := transitions[index]
-				plan := transition.Projection
-				d.logf("meja pane-exit: deliver pane=%d client=%d session=%d window=%d projection=%d layout=%d close=%t\n",
-					paneID, client.ID, plan.SessionID, plan.View.Layout.WindowID, plan.ProjectionRevision, plan.View.Layout.LayoutRevision, plan.Close)
-				postClientCommand(client.State.Active, clientInstanceCommand{Transition: &transition})
+	var transitions []ViewTransition
+	var clients []clientDeliveryTarget
+	var terminalSessionIDs []uint64
+	var unwatch bool
+	d.postAfter(func() {
+		transitions, clients, terminalSessionIDs, unwatch = d.applyPaneExit(paneID)
+	}, func() {
+		if unwatch && d.processMonitor != nil {
+			if !d.processMonitor.TryUnwatch(PaneKey{PaneID: paneID}) {
+				d.logf("meja pane-exit: process monitor stopped before pane=%d unwatch\n", paneID)
 			}
-			if len(terminalStates) > 0 {
-				for _, state := range terminalStates {
-					_ = d.shutdownSession(state)
+		}
+		for index, client := range clients {
+			transition := transitions[index]
+			plan := transition.Projection
+			d.logf("meja pane-exit: deliver pane=%d client=%d session=%d window=%d projection=%d layout=%d close=%t\n",
+				paneID, client.ClientID, plan.SessionID, plan.View.Layout.WindowID, plan.ProjectionRevision, plan.View.Layout.LayoutRevision, plan.Close)
+			postClientCommand(client.Connection, clientInstanceCommand{Transition: &transition})
+		}
+		if len(terminalSessionIDs) > 0 {
+			go func() {
+				for _, sessionID := range terminalSessionIDs {
+					_ = d.shutdownSessionID(sessionID, defaultPaneTerminationTimeouts)
 				}
-			}
-		}()
+			}()
+		}
 	})
 }
 
 // applyPaneExit reconciles a pane exactly once from its daemon-global identity.
 // It returns immutable client plans; all transport work is performed after the
 // transaction has returned.
-func (d *Daemon) applyPaneExit(paneID uint64) ([]ViewTransition, []*ClientIdentity, []*SessionState) {
+func (d *Daemon) applyPaneExit(paneID uint64) ([]ViewTransition, []clientDeliveryTarget, []uint64, bool) {
 	var transitions []ViewTransition
-	var clients []*ClientIdentity
-	var terminalStates []*SessionState
-	value, ok := d.paneIndex.Load(paneID)
-	if !ok || value == nil {
-		return nil, nil, nil
+	var clients []clientDeliveryTarget
+	var terminalSessionIDs []uint64
+	pane := d.panes[paneID]
+	if pane == nil {
+		return nil, nil, nil, false
 	}
-	pane := value.(*Pane)
-	windowValue, ok := d.windowIndex.Load(pane.WindowID)
-	if !ok || windowValue == nil {
-		return nil, nil, nil
+	window := d.windows[pane.WindowID]
+	if window == nil {
+		return nil, nil, nil, false
 	}
-	window := windowValue.(*Window)
-	groupValue, ok := d.groupIndex.Load(window.GroupID)
-	if !ok || groupValue == nil {
-		return nil, nil, nil
+	group := d.groups[window.GroupID]
+	if group == nil {
+		return nil, nil, nil, false
 	}
-	group := groupValue.(*GroupState)
 	var owner *SessionState
 	for _, memberID := range group.memberIDsSnapshot() {
 		if state := d.sessions[memberID]; state != nil {
@@ -243,21 +288,22 @@ func (d *Daemon) applyPaneExit(paneID uint64) ([]ViewTransition, []*ClientIdenti
 		}
 	}
 	if owner == nil {
-		return nil, nil, nil
+		return nil, nil, nil, false
 	}
 	removedPane, affectedWindow, removed, err := owner.removeGroupPaneNow(paneID)
 	if err != nil || !removed || removedPane == nil || affectedWindow == nil {
-		return nil, nil, nil
+		return nil, nil, nil, false
 	}
 	pane = removedPane
-	d.unwatchPaneProcesses(paneID)
+	delete(d.processObservations, paneID)
+	delete(d.processSaveCandidates, paneID)
 	for _, memberID := range group.memberIDsSnapshot() {
 		state := d.sessions[memberID]
 		if state == nil {
 			continue
 		}
 		if len(state.Windows) == 0 {
-			terminalStates = append(terminalStates, state)
+			terminalSessionIDs = append(terminalSessionIDs, state.ID)
 		}
 		client := d.clients[state.ClientID]
 		if client == nil {
@@ -272,9 +318,9 @@ func (d *Daemon) applyPaneExit(paneID uint64) ([]ViewTransition, []*ClientIdenti
 			transition.Projection.CloseReason = "no viewable fallback window"
 		}
 		transitions = append(transitions, transition)
-		clients = append(clients, client)
+		clients = append(clients, clientDeliveryTarget{ClientID: client.ID, Connection: client.State.Active})
 	}
-	return transitions, clients, terminalStates
+	return transitions, clients, terminalSessionIDs, true
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -308,6 +354,7 @@ func Run(ctx context.Context, cfg Config) error {
 		sessions:              make(map[uint64]*SessionState),
 		groups:                make(map[uint64]*GroupState),
 		panes:                 make(map[uint64]*Pane),
+		windows:               make(map[uint64]*Window),
 		windowLeases:          make(map[uint64]*WindowViewLease),
 		names:                 make(map[string]*SessionState),
 		clientTokens:          make(map[string]ClientID),
@@ -332,13 +379,14 @@ func Run(ctx context.Context, cfg Config) error {
 	d.persistenceNow = make(chan struct{}, 1)
 	d.persistenceStop = make(chan struct{})
 	d.persistenceDone = make(chan struct{})
+	d.persistenceStarted = make(chan struct{})
 	d.persistenceUpdates = make(chan persistenceSnapshot, 1)
 	actorCtx, stopActor := context.WithCancel(context.Background())
 	go d.runRequests(actorCtx)
 	defer func() {
 		d.disconnectActiveClients()
 		d.stopPersistence()
-		if d.persistenceStarted.Load() {
+		if d.persistenceHasStarted() {
 			<-d.persistenceDone
 		}
 		d.closeQUIC()
@@ -404,65 +452,50 @@ func daemonCertificate() (tls.Certificate, string, error) {
 // retains one global grace period instead of multiplying it by session count.
 // Clients receive the same clean QUIC close used by an explicit detach.
 func (d *Daemon) disconnectActiveClients() {
-	var sessions []*SessionState
+	var sessionIDs []uint64
 	d.call(func() {
-		sessions = make([]*SessionState, 0, len(d.sessions))
-		for _, session := range d.sessions {
-			sessions = append(sessions, session)
+		sessionIDs = make([]uint64, 0, len(d.sessions))
+		for sessionID := range d.sessions {
+			sessionIDs = append(sessionIDs, sessionID)
 		}
 	})
 	var wait sync.WaitGroup
-	wait.Add(len(sessions))
-	for _, session := range sessions {
+	wait.Add(len(sessionIDs))
+	for _, sessionID := range sessionIDs {
 		go func() {
 			defer wait.Done()
-			_ = d.shutdownSession(session)
+			_ = d.shutdownSessionID(sessionID, defaultPaneTerminationTimeouts)
 		}()
 	}
 	wait.Wait()
 }
 
 func (d *Daemon) sessionShutdownState(id uint64) *sessionShutdown {
-	d.shutdownMu.Lock()
-	defer d.shutdownMu.Unlock()
-	if d.shutdowns == nil {
-		d.shutdowns = make(map[uint64]*sessionShutdown)
-	}
-	state := d.shutdowns[id]
-	if state == nil {
-		state = &sessionShutdown{}
-		d.shutdowns[id] = state
-	}
-	return state
+	var lifecycle *sessionShutdown
+	d.call(func() {
+		if d.shutdowns == nil {
+			d.shutdowns = make(map[uint64]*sessionShutdown)
+		}
+		lifecycle = d.shutdowns[id]
+		if lifecycle == nil {
+			lifecycle = &sessionShutdown{}
+			d.shutdowns[id] = lifecycle
+		}
+		lifecycle.stopping = true
+	})
+	return lifecycle
 }
 
-func (d *Daemon) isSessionStopping(state *SessionState) bool {
-	if d == nil || state == nil {
-		return false
-	}
-	d.shutdownMu.Lock()
-	defer d.shutdownMu.Unlock()
-	return d.shutdowns[state.ID] != nil && d.shutdowns[state.ID].stopping
-}
-
-func (d *Daemon) shutdownSession(state *SessionState) error {
-	return d.shutdownSessionWithTimeouts(state, defaultPaneTerminationTimeouts)
-}
-
-func (d *Daemon) shutdownSessionWithTimeouts(state *SessionState, timeouts paneTerminationTimeouts) error {
-	if d == nil || state == nil {
+func (d *Daemon) shutdownSessionID(sessionID uint64, timeouts paneTerminationTimeouts) error {
+	if d == nil || sessionID == 0 {
 		return nil
 	}
-	lifecycle := d.sessionShutdownState(state.ID)
+	lifecycle := d.sessionShutdownState(sessionID)
 	lifecycle.once.Do(func() {
-		d.shutdownMu.Lock()
-		lifecycle.stopping = true
-		d.shutdownMu.Unlock()
-
-		panes := d.shutdownSessionNow(state)
+		panes := d.shutdownSessionNow(sessionID)
 		if remaining := terminatePanesAndWait(panes, timeouts); len(remaining) > 0 {
 			cleanupErr := fmt.Errorf("%d pane process(es) did not exit before the shutdown deadline", len(remaining))
-			d.logf("meja server: shut down session %d: %v\n", state.ID, cleanupErr)
+			d.logf("meja server: shut down session %d: %v\n", sessionID, cleanupErr)
 			lifecycle.err = errors.Join(lifecycle.err, cleanupErr)
 		}
 	})
@@ -474,7 +507,10 @@ func (d *Daemon) startPersistence(sessionPersistenceDir string) {
 		return
 	}
 	d.persistenceOnce.Do(func() {
-		d.persistenceStarted.Store(true)
+		if d.persistenceStarted == nil {
+			d.persistenceStarted = make(chan struct{})
+		}
+		close(d.persistenceStarted)
 		go func() {
 			defer close(d.persistenceDone)
 			d.runPersistence(context.Background(), sessionPersistenceDir)
@@ -483,10 +519,22 @@ func (d *Daemon) startPersistence(sessionPersistenceDir string) {
 }
 
 func (d *Daemon) stopPersistence() {
-	if d == nil || !d.persistenceStarted.Load() {
+	if d == nil || !d.persistenceHasStarted() {
 		return
 	}
 	d.persistenceStopOnce.Do(func() { close(d.persistenceStop) })
+}
+
+func (d *Daemon) persistenceHasStarted() bool {
+	if d == nil || d.persistenceStarted == nil {
+		return false
+	}
+	select {
+	case <-d.persistenceStarted:
+		return true
+	default:
+		return false
+	}
 }
 
 func (d *Daemon) runPersistence(ctx context.Context, sessionPersistenceDir string) {
@@ -511,62 +559,83 @@ func (d *Daemon) runPersistence(ctx context.Context, sessionPersistenceDir strin
 	}
 }
 
-func (d *Daemon) shutdownSessionNow(state *SessionState) []*Pane {
-	if d == nil || state == nil {
+type sessionShutdownPlan struct {
+	panes           []*Pane
+	connection      *clientConnection
+	delivery        clientCommandDelivery
+	monitorFrom     uint64
+	monitorTo       uint64
+	monitorDelivery func(monitoredProcessBatch)
+}
+
+func (d *Daemon) shutdownSessionNow(sessionID uint64) []*Pane {
+	if d == nil || sessionID == 0 {
 		return nil
 	}
-	var panes []*Pane
-	var connection *clientConnection
+	var plan sessionShutdownPlan
 	d.call(func() {
-		if d.sessions[state.ID] != state {
+		state := d.sessions[sessionID]
+		if state == nil {
 			return
 		}
-		lastGroupMember := state.group == nil || len(state.group.SessionIDs) <= 1
-		if lastGroupMember {
-			panes = make([]*Pane, 0, len(state.Panes))
-			for _, pane := range state.Panes {
-				panes = append(panes, pane)
-			}
-		}
-		connection = d.shutdownSessionInActor(state)
+		plan = d.shutdownSessionInActor(state)
 	})
-	if connection != nil {
-		postClientCommand(connection, clientInstanceCommand{Close: true, CloseReason: "[exited]"})
-	}
-	return panes
+	d.applySessionShutdownPlan(plan)
+	return plan.panes
 }
 
 // shutdownSessionInActor performs registry mutation in the daemon actor.
 // Waiting for pane processes and persistence happens after this transaction.
-func (d *Daemon) shutdownSessionInActor(state *SessionState) *clientConnection {
+func (d *Daemon) shutdownSessionInActor(state *SessionState) sessionShutdownPlan {
+	var plan sessionShutdownPlan
+	lastGroupMember := state.group == nil || len(state.group.SessionIDs) <= 1
+	if lastGroupMember {
+		plan.panes = make([]*Pane, 0, len(state.Panes))
+		for _, pane := range state.Panes {
+			plan.panes = append(plan.panes, pane)
+		}
+	}
 	if d.processMonitor != nil {
-		var transferred bool
+		plan.monitorFrom = state.ID
 		if state.isGrouped() {
 			for memberID := range state.group.SessionIDs {
 				if memberID == state.ID {
 					continue
 				}
 				if member := d.sessions[memberID]; member != nil {
-					d.processMonitor.TransferSession(state.ID, member.ID, d.processObservationDelivery(member.ID))
-					transferred = true
+					plan.monitorTo = member.ID
+					plan.monitorDelivery = d.processObservationDelivery(member.ID)
 					break
 				}
 			}
 		}
-		if !transferred {
-			d.processMonitor.DropSession(state.ID)
-		}
 	}
 	client := d.clients[state.ClientID]
-	var connection *clientConnection
 	if client != nil {
 		client.TerminalReason = "session is no longer available"
 		client.State.Phase = clientClosing
-		connection = client.State.Active
+		plan.connection = client.State.Active
+		plan.delivery = reserveConnectionDeliveryNow(plan.connection)
 	}
 	state.ClientID = 0
 	d.removeSession(state)
-	return connection
+	return plan
+}
+
+func (d *Daemon) applySessionShutdownPlan(plan sessionShutdownPlan) {
+	if d == nil {
+		return
+	}
+	if d.processMonitor != nil && plan.monitorFrom != 0 {
+		if plan.monitorTo != 0 {
+			d.processMonitor.TransferSession(plan.monitorFrom, plan.monitorTo, plan.monitorDelivery)
+		} else {
+			d.processMonitor.DropSession(plan.monitorFrom)
+		}
+	}
+	if plan.connection != nil {
+		postReservedClientCommand(plan.delivery, clientInstanceCommand{Close: true, CloseReason: "[exited]"})
+	}
 }
 
 func newSession(id uint64, name string) *SessionState {
@@ -584,11 +653,12 @@ func (d *Daemon) allocatePaneID() (uint64, error) {
 	return id, err
 }
 
-func (d *Daemon) resizeClientView(client *ClientIdentity, cols, rows uint16) (ViewTransition, error) {
+func (d *Daemon) resizeClientView(clientID ClientID, connection *clientConnection, cols, rows uint16) (ViewTransition, error) {
 	var transition ViewTransition
 	var err error
 	d.call(func() {
-		if client == nil {
+		client := d.clients[clientID]
+		if client == nil || client.State.Active != connection {
 			err = errSessionUnavailable
 			return
 		}
@@ -597,8 +667,8 @@ func (d *Daemon) resizeClientView(client *ClientIdentity, cols, rows uint16) (Vi
 			err = errSessionUnavailable
 			return
 		}
-		client.terminalCols.Store(uint32(cols))
-		client.terminalRows.Store(uint32(rows))
+		client.terminalCols = cols
+		client.terminalRows = rows
 		err = resizeSessionWindowModelNow(state, state.ActiveWindowID, cols, rows)
 		if err == nil {
 			transition = d.prepareViewTransitionNow(viewTransitionResize, client, state)
@@ -610,6 +680,7 @@ func (d *Daemon) resizeClientView(client *ClientIdentity, cols, rows uint16) (Vi
 func (d *Daemon) prepareViewTransitionNow(reason ViewTransitionReason, client *ClientIdentity, state *SessionState, _ ...*Pane) ViewTransition {
 	plan := d.projectionPlanNow(client, state)
 	transition := ViewTransition{Reason: reason, Projection: plan}
+	d.reserveViewTransitionDeliveryNow(client, &transition)
 	if plan.Close {
 		return transition
 	}
@@ -622,7 +693,17 @@ func (d *Daemon) prepareViewTransitionNow(reason ViewTransitionReason, client *C
 func (d *Daemon) prepareFocusTransitionNow(client *ClientIdentity, state *SessionState) ViewTransition {
 	plan := d.projectionPlanNow(client, state)
 	plan.View.Layout.LayoutRevision = d.clientLayoutRevisionNow(client)
-	return ViewTransition{Reason: viewTransitionFocus, Projection: plan}
+	transition := ViewTransition{Reason: viewTransitionFocus, Projection: plan}
+	d.reserveViewTransitionDeliveryNow(client, &transition)
+	return transition
+}
+
+func (d *Daemon) reserveViewTransitionDeliveryNow(client *ClientIdentity, transition *ViewTransition) {
+	if d == nil || client == nil || transition == nil || client.State.Active == nil {
+		return
+	}
+	transition.delivery, _ = client.State.Active.reserveRequired()
+	transition.deliveryRejected = transition.delivery == nil
 }
 
 func (d *Daemon) clientLayoutRevisionNow(client *ClientIdentity) protocol.ClientLayoutRevision {
@@ -677,6 +758,8 @@ func prepareClientWindowGeometryNow(client *ClientIdentity, state *SessionState,
 
 func (d *Daemon) projectionPlanNow(client *ClientIdentity, state *SessionState) ClientProjectionPlan {
 	plan := ClientProjectionPlan{ClientID: client.ID, SessionID: state.ID}
+	plan.View.Status = d.clientStatusSnapshotNow(client, state)
+	plan.View.StatusValid = true
 	plan.View.Layout.WindowID = state.ActiveWindowID
 	if plan.View.Layout.WindowID == 0 && len(state.Windows) > 0 {
 		ids := state.orderedWindowIDs()
@@ -685,7 +768,7 @@ func (d *Daemon) projectionPlanNow(client *ClientIdentity, state *SessionState) 
 	if lease := d.windowLeases[plan.View.Layout.WindowID]; lease != nil && lease.ClientID == client.ID {
 		plan.ViewLeaseGeneration = lease.Generation
 	}
-	cols, rows := uint16(client.terminalCols.Load()), uint16(client.terminalRows.Load())
+	cols, rows := client.terminalCols, client.terminalRows
 	if cols == 0 || rows == 0 {
 		if window := state.Windows[plan.View.Layout.WindowID]; window != nil {
 			cols, rows = window.Cols, window.Rows
@@ -693,9 +776,20 @@ func (d *Daemon) projectionPlanNow(client *ClientIdentity, state *SessionState) 
 	}
 	window := state.Windows[plan.View.Layout.WindowID]
 	if window != nil {
+		navigation := window.Layout.Compute(Rect{Width: int(cols), Height: int(rows)})
+		plan.View.NavigationPanes = make([]protocol.PanePlacement, 0, len(navigation))
+		for _, placement := range navigation {
+			plan.View.NavigationPanes = append(plan.View.NavigationPanes, protocol.PanePlacement{
+				PaneID: placement.PaneID,
+				Rect: protocol.Rect{
+					X: placement.Rect.X, Y: placement.Rect.Y, Width: placement.Rect.Width, Height: placement.Rect.Height,
+				},
+			})
+		}
 		placements := visibleWindowPlacementsForSession(state, window, Rect{Width: int(cols), Height: int(rows)})
 		plan.View.Layout.Panes = make([]protocol.PanePlacement, 0, len(placements))
 		plan.View.Panes = make([]ClientPanePlacement, 0, len(placements))
+		plan.View.paneByID = make(map[uint64]*Pane, len(placements))
 		for slot, placement := range placements {
 			published := protocol.PanePlacement{
 				PaneID: placement.PaneID,
@@ -705,10 +799,11 @@ func (d *Daemon) projectionPlanNow(client *ClientIdentity, state *SessionState) 
 				},
 			}
 			plan.View.Layout.Panes = append(plan.View.Layout.Panes, published)
-			if value, ok := d.paneIndex.Load(placement.PaneID); ok && value != nil {
+			if pane := d.panes[placement.PaneID]; pane != nil {
 				plan.View.Panes = append(plan.View.Panes, ClientPanePlacement{
-					Pane: value.(*Pane), Placement: published,
+					Pane: pane, Placement: published,
 				})
+				plan.View.paneByID[pane.ID] = pane
 			}
 		}
 		view := state.groupWindowViewNow(plan.View.Layout.WindowID)
@@ -735,8 +830,8 @@ func (d *Daemon) prepareAttachedClientViewNow(client *ClientIdentity, state *Ses
 	if client == nil || state == nil {
 		return ViewTransition{}, errSessionUnavailable
 	}
-	client.terminalCols.Store(uint32(cols))
-	client.terminalRows.Store(uint32(rows))
+	client.terminalCols = cols
+	client.terminalRows = rows
 	return d.prepareAttachedClientViewInActor(client, state)
 }
 
@@ -817,9 +912,14 @@ func (d *Daemon) sessionByName(name string) *SessionState {
 	return nil
 }
 
-func (d *Daemon) renameSession(state *SessionState, name string) error {
+func (d *Daemon) renameSessionID(sessionID uint64, name string) error {
 	var renameErr error
 	d.call(func() {
+		state := d.sessions[sessionID]
+		if state == nil {
+			renameErr = errSessionUnavailable
+			return
+		}
 		renameErr = d.validateSessionRename(state, name)
 		if renameErr == nil {
 			d.reserveSessionName(state, name)
@@ -887,7 +987,6 @@ func (d *Daemon) removeSession(state *SessionState) {
 		identity.TerminalReason = "session is no longer available"
 	}
 	delete(d.sessions, state.ID)
-	d.sessionIndex.Delete(state.ID)
 	d.reserveSessionName(state, "")
 	for windowID, lease := range d.windowLeases {
 		if lease.SessionID == state.ID {
@@ -900,12 +999,11 @@ func (d *Daemon) removeSession(state *SessionState) {
 		group.publishMembers()
 		if len(group.SessionIDs) == 0 {
 			delete(d.groups, group.ID)
-			d.groupIndex.Delete(group.ID)
 		} else {
 			for memberID := range group.SessionIDs {
 				if member := d.sessions[memberID]; member != nil {
 					member.syncGroupLinksNow()
-					member.grouped.Store(len(group.SessionIDs) > 1)
+					member.grouped = len(group.SessionIDs) > 1
 					member.persistSessionForPersistence()
 				}
 			}

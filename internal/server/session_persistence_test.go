@@ -76,7 +76,7 @@ func TestCaptureSessionBuildsProcessAnchorsOutsideDurableTypes(t *testing.T) {
 	}
 
 	observer := &recordingProcessObserver{}
-	capture, err := session.daemon.captureSession(session, context.Background(), observer)
+	capture, err := captureTestSession(session, context.Background(), observer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestCaptureSessionMarksMissingObserverResultUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	capture, err := session.daemon.captureSession(session, context.Background(), emptyProcessObserver{})
+	capture, err := captureTestSession(session, context.Background(), emptyProcessObserver{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestCaptureSessionUsesPersistedPaneCwdWhenObservationIsUnavailable(t *testi
 		t.Fatal(err)
 	}
 
-	capture, err := session.daemon.captureSession(session, context.Background(), emptyProcessObserver{})
+	capture, err := captureTestSession(session, context.Background(), emptyProcessObserver{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestCaptureSessionPrefersKnownPaneCwdOverPersistedFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	capture, err := session.daemon.captureSession(session, context.Background(), emptyProcessObserver{})
+	capture, err := captureTestSession(session, context.Background(), emptyProcessObserver{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -598,7 +598,7 @@ func TestDaemonRestoresPersistenceWindowsLayoutsAndPanes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := bootstrap.session
+	session := testOperationSession(d, bootstrap)
 	var panes []*Pane
 	if err := runStateOperation(session, func() error {
 		if session.Name != "work" || session.rootDir != base || len(session.Windows) != 1 || len(session.Panes) != 2 {
@@ -655,7 +655,7 @@ func TestDaemonRestoresPositionalWindowMetadataWithSafePaneFallback(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := bootstrap.session
+	session := testOperationSession(d, bootstrap)
 	var panes []*Pane
 	if err := runStateOperation(session, func() error {
 		if session.ActiveWindowID != 3 || session.PreviousWindowID != 2 {
@@ -749,7 +749,7 @@ func TestAcceptedSessionRenameRequestsImmediatePersistence(t *testing.T) {
 	session.setSessionName("before")
 	addPersistenceTestWindow(session, 0)
 	<-session.daemon.persistenceNow
-	if err := session.daemon.renameSession(session, "after"); err != nil {
+	if err := session.daemon.renameSessionID(session.ID, "after"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -757,7 +757,7 @@ func TestAcceptedSessionRenameRequestsImmediatePersistence(t *testing.T) {
 	default:
 		t.Fatal("accepted session rename did not request an immediate persistence")
 	}
-	if err := session.daemon.renameSession(session, "after"); err != nil {
+	if err := session.daemon.renameSessionID(session.ID, "after"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -982,7 +982,7 @@ func TestSessionRenameImmediatelyWritesPersistence(t *testing.T) {
 		stopState(session)
 	})
 
-	if err := session.daemon.renameSession(session, "after"); err != nil {
+	if err := session.daemon.renameSessionID(session.ID, "after"); err != nil {
 		t.Fatal(err)
 	}
 

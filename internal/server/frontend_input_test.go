@@ -812,7 +812,7 @@ func TestMouseSelectionWithoutReleaseCancelsOnFocusLossAndRelayout(t *testing.T)
 			if err != nil {
 				return err
 			}
-			cols, rows := uint16(frontend.terminalCols.Load()), uint16(frontend.terminalRows.Load())
+			cols, rows := frontend.terminalCols, frontend.terminalRows
 			if err := resizeTestSessionActiveWindow(s, cols, rows); err != nil {
 				return err
 			}

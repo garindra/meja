@@ -290,9 +290,12 @@ history therefore survive transport replacement.
 The identity owns its session assignment, latest terminal dimensions,
 rejection state, projection/layout revision allocators, and connection
 lifecycle. That lifecycle may name one active and one pending
-`clientConnection`, each consisting of an instance command channel and a
-`done` signal. This lets an old and replacement transport overlap during
-setup while the daemon serializes which one may control the session.
+`clientConnection`. The identity is daemon-owned and is never retained by a
+client actor: admission copies scalar values, the instance stores only
+`ClientID`, and every later mutation asks the daemon to resolve that ID and
+validate the exact connection. This lets an old and replacement transport
+overlap during setup while the daemon serializes which one may control the
+session.
 
 ## Client instance
 
@@ -304,8 +307,8 @@ exact pane actors resolved by the daemon, so the instance does not rediscover
 bindings from mutable graph state.
 
 The daemon sees the instance only through a passive `clientConnection`: its
-`clientInstanceCommand` mailbox and `done` signal. QUIC streams and
-transport-local state never enter the daemon registry.
+bounded delivery mailboxes, actor command channel, and `done` signal. QUIC
+streams and transport-local state never enter the daemon registry.
 
 Initial attach uses two daemon calls. `AdmitConnectionRequest` consumes the
 short-lived token and creates the stable identity plus pending connection.
@@ -398,7 +401,14 @@ transactions. ClientInstance actors own connection-scoped behavior, and Pane
 actors own PTYs and terminal state. Other goroutines communicate through
 bounded channels and immutable or copied messages.
 
-We use “lock-free architecture” here in the ownership sense, not as a formal non-blocking progress guarantee. Core mutable domain state is not shared behind a large graph of mutexes. There are still narrow mutexes and atomics for infrastructure concerns such as logging, listener lifecycle, shutdown flags, and read-mostly pane metadata. Those do not replace actor ownership of sessions, layouts, terminal grids, or render leases.
+We use “lock-free architecture” here in the ownership sense, not as a formal
+non-blocking progress guarantee. Core mutable domain state is not shared behind
+a large graph of mutexes. The daemon has only the logging and QUIC-listener
+mutexes. The remaining atomics are an exact, mechanically checked allowlist for
+immutable pane metadata, pane/process teardown edges, frontend reconnect
+fences, the installed frontend layout revision, and connection liveness. They
+do not replace actor ownership of sessions, layouts, terminal grids, or render
+leases.
 
 ## Daemon actor
 
@@ -415,6 +425,12 @@ Requests contain a closure and, when needed, a completion channel. Code that
 needs a result submits one short daemon transaction. Code that only needs to
 continue a protocol submits a one-way post. The daemon never waits for client
 output, pane termination, process observation, prompts, or filesystem I/O.
+
+Canonical `SessionState`, `Window`, `GroupState`, and `ClientIdentity` objects
+are never published for traversal by client or worker goroutines. Daemon APIs
+return scalar decisions, deliberately opaque actor handles, or deeply copied
+snapshots. Recursive layout trees are cloned rather than copied only at their
+interface header.
 
 The QUIC accept loop and command-socket handlers can run concurrently because they do not mutate the registries directly. They ask the daemon actor to perform the mutation.
 
@@ -439,6 +455,32 @@ Commands and pane-exit events mutate this state in short daemon transactions.
 When presentation must change, the daemon returns an immutable
 `ViewTransition` for the relevant ClientInstance. The daemon never waits for
 pane output handoff or stream I/O.
+
+## Client delivery mailboxes
+
+A daemon transaction validates and mutates canonical state, allocates its
+projection revision, and reserves required delivery in the same daemon turn.
+The producer completes that reservation after the transaction returns. Because
+the connection worker consumes reservations in daemon order, concurrent command
+producers cannot reverse canonical effect order by racing their later delivery
+attempts or command results.
+
+Each connection has one delivery worker and two mailbox classes. Required
+commands, including view transitions and lifecycle fences, use a bounded FIFO.
+The total required backlog is 64 effects: 63 queued reservations plus at most
+one reservation held by the delivery worker. Its handoff to the client actor is
+unbuffered, so there is no second 64-entry command backlog.
+If that queue saturates, the transition is not silently dropped and the daemon
+does not block: the unhealthy exact connection is fenced with a reconnectable
+error while canonical state and unrelated work continue. Status refreshes use
+a capacity-one advisory edge; repeated refresh requests coalesce and the client
+actor reads the latest immutable status snapshot when it consumes the edge.
+Every daemon status snapshot has a client-identity monotonic revision, including
+the status embedded in `ClientView`. The client ignores an older revision and
+status for any session other than its installed session, so a delayed advisory
+refresh cannot overwrite a newer transition.
+Because mailbox identity belongs to one connection, an obsolete connection
+cannot deliver into its replacement.
 
 ### Projection plans
 
@@ -595,6 +637,12 @@ nonblocking hints; periodic reconciliation covers missed or silent changes.
 A quick foreground-process-group probe avoids unnecessary process-table scans.
 Changed or uncertain watches receive a bounded, batched `/proc` observation,
 with a portable `ps` fallback.
+
+Pane exit attempts monitor unwatch without blocking the daemon. If the monitor
+command mailbox is saturated, the pane key enters a coalesced tombstone set
+owned by one persistent retry worker. That worker eventually appends the
+unwatch behind already queued monitor work; it never starts a goroutine per
+failed attempt, and pending entries are bounded by distinct watched pane keys.
 
 An explicit pane command identifies its root process. For an interactive shell,
 one stable foreground child is the command candidate; no child is
@@ -1419,7 +1467,7 @@ The following statements summarize the contracts contributors should preserve:
 12. Server-provided frontend setup has paired cleanup, and terminal writes are serialized by the client UI loop.
 13. Every full visible replacement is installed from one daemon-resolved `ViewTransition`; application uses its `ClientView` and does not rebuild pane placements or layout from live graph state.
 14. Every prepared pane grid matches its published rectangle, and `START_RENDER` and `CLIENT_LAYOUT` carry the same daemon-allocated `ClientLayoutRevision`.
-15. Pane terminal modes are learned from authoritative PTY output; frontend events are encoded for the pane's current modes on the server.
+15. Pane terminal modes are learned from authoritative PTY output and published as immutable pane metadata, including history mode; frontend events are encoded for the pane's current published modes on the server.
 16. Pointer hit testing uses the layout revision the frontend reported, not an unrelated current geometry.
 17. An output lease is owned by at most one pane actor, and its render buffer is owned by exactly one of that actor or the lease worker at a time. Pane resize, lease replacement, renderer attachment, and full-snapshot start occur in one pane-actor installation turn.
 18. Blocking PTY reads, PTY writes, and pane-stream writes occur outside the pane actor and do not mutate its terminal state.
@@ -1440,5 +1488,8 @@ The following statements summarize the contracts contributors should preserve:
 33. Recovery snapshots and `.meja` project files are restart recipes, not process images.
 34. `restore` consumes daemon-managed named-session snapshots; `new -f` consumes explicit project files.
 35. Initial remote attachment authority is transferred through SSH; the direct QUIC connection must match that bootstrap.
+36. ClientInstance local state is ordinary actor-owned state; status/output workers receive immutable messages and timers post only copied generation IDs.
+37. Daemon transactions prepare client deliveries but never block delivering them; required FIFO and coalescible status traffic use distinct bounded mailbox semantics.
+38. The synchronization allowlist is exact and enforced by a production-source AST/type test.
 
 These invariants are more stable than individual files, constants, or goroutine counts. When an implementation change preserves them—or deliberately revises them along with this document—the architecture remains understandable even as its internals evolve.

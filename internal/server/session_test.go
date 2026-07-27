@@ -505,14 +505,14 @@ func TestResizePreservesVisualClientPaneOrder(t *testing.T) {
 	}
 	clientInstance := clientForState(s)
 	clientInstance.currentView.Layout.Panes = []protocol.PanePlacement{{PaneID: first.ID, Slot: 0}, {PaneID: second.ID, Slot: 1}}
-	if got := clientInstance.currentPanePlacements()[0].PaneID; got != first.ID {
+	if got := clientInstance.currentView.Placements()[0].PaneID; got != first.ID {
 		t.Fatalf("initial slot 0 pane = %d, want %d", got, first.ID)
 	}
 
 	if err := resizeTestSessionActiveWindow(s, 16, 1); err != nil {
 		t.Fatal(err)
 	}
-	if got := clientInstance.currentPanePlacements()[0].PaneID; got != first.ID {
+	if got := clientInstance.currentView.Placements()[0].PaneID; got != first.ID {
 		t.Fatalf("resized slot 0 pane = %d, want %d", got, first.ID)
 	}
 }
@@ -958,7 +958,7 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	}
 
 	client := clientForState(s)
-	result, err := s.daemon.removeClientPane(client.identity, second.ActivePaneID)
+	result, err := s.daemon.removeClientPane(client.clientID, second.ActivePaneID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -969,10 +969,10 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	if len(statuses) != 3 || statuses[0].Index != 0 || statuses[1].Index != 2 || statuses[2].Index != 3 {
 		t.Fatalf("statuses after deleting display index 1 = %#v", statuses)
 	}
-	if got, ok := clientForState(s).WindowIDByIndex(1); ok || got != 0 {
+	if got, ok := s.daemon.clientWindowIDByIndex(s.ID, 1); ok || got != 0 {
 		t.Fatalf("deleted display index lookup = %d, %v", got, ok)
 	}
-	if got, ok := clientForState(s).WindowIDByIndex(3); !ok || got != fourth.ID {
+	if got, ok := s.daemon.clientWindowIDByIndex(s.ID, 3); !ok || got != fourth.ID {
 		t.Fatalf("display index 3 lookup = %d, %v; want %d, true", got, ok, fourth.ID)
 	}
 	clientForState(s).ConsumeInputByte(0x02)
@@ -985,7 +985,7 @@ func TestWindowDisplayIndicesSurviveDeletionAndNewCreation(t *testing.T) {
 	if fifth.DisplayIndex != 1 {
 		t.Fatalf("new window display index = %d, want 1", fifth.DisplayIndex)
 	}
-	if got, ok := clientForState(s).WindowIDByIndex(1); !ok || got != fifth.ID {
+	if got, ok := s.daemon.clientWindowIDByIndex(s.ID, 1); !ok || got != fifth.ID {
 		t.Fatalf("display index 1 lookup = %d, %v; want %d, true", got, ok, fifth.ID)
 	}
 	if _, _, err := selectTestSessionWindow(s, third.ID); err != nil {
@@ -1009,14 +1009,16 @@ func TestSessionShutdownRequestsGracefulClientClose(t *testing.T) {
 	client := &ClientInstance{QUIC: connection}
 	setTestClient(s, client)
 
-	if err := d.shutdownSession(s); err != nil {
+	if err := d.shutdownSessionID(s.ID, defaultPaneTerminationTimeouts); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)
-	for !client.ended.Load() && time.Now().Before(deadline) {
+	clientSnapshot := snapshotTestClientActor(client)
+	for !clientSnapshot.Ended && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
+		clientSnapshot = snapshotTestClientActor(client)
 	}
-	if !client.ended.Load() {
+	if !clientSnapshot.Ended {
 		t.Fatal("client was not marked for graceful close")
 	}
 	if closed {
@@ -1044,7 +1046,7 @@ func TestSessionShutdownEscalatesAndReapsPaneProcess(t *testing.T) {
 	if err := runStateOperation(s, func() error {
 		setTestClientSize(s, 80, 24)
 		var createErr error
-		pane, _, createErr = s.daemon.startSessionWindow(s, directory, []string{
+		pane, _, createErr = s.daemon.startSessionWindowID(s.ID, directory, []string{
 			shell,
 			"-c",
 			`trap '' HUP TERM; : > "$1"; while :; do sleep 1; done`,
@@ -1055,7 +1057,7 @@ func TestSessionShutdownEscalatesAndReapsPaneProcess(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = d.shutdownSessionWithTimeouts(s, timeouts) }()
+	defer func() { _ = d.shutdownSessionID(s.ID, timeouts) }()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -1071,7 +1073,7 @@ func TestSessionShutdownEscalatesAndReapsPaneProcess(t *testing.T) {
 	}
 
 	started := time.Now()
-	if err := d.shutdownSessionWithTimeouts(s, timeouts); err != nil {
+	if err := d.shutdownSessionID(s.ID, timeouts); err != nil {
 		t.Fatal(err)
 	}
 	elapsed := time.Since(started)
@@ -1115,7 +1117,7 @@ func TestTerminatePaneReturnsBeforeSignalEscalationCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var daemon *Daemon
-	daemon.startPane(nil, pane)
+	daemon.startPane(0, pane)
 	t.Cleanup(func() {
 		_ = terminatePaneAndWait(pane, defaultPaneTerminationTimeouts)
 	})
@@ -1178,7 +1180,7 @@ while [ ! -s "$1" ]; do :; done`,
 		t.Fatal(err)
 	}
 	var daemon *Daemon
-	daemon.startPane(nil, pane)
+	daemon.startPane(0, pane)
 
 	select {
 	case <-pane.processDone:
@@ -1211,7 +1213,7 @@ func TestInitializeAttachedViewDoesNotReplaceDaemonClient(t *testing.T) {
 	setTestClient(s, existing)
 	replacement := newClientInstance(s.daemon, &ClientIdentity{SessionID: s.ID, ID: 999})
 
-	if _, err := s.daemon.initializeClient(ClientInitialized{ClientID: replacement.identity.ID, Cols: 80, Rows: 24}); err == nil {
+	if _, err := s.daemon.initializeClient(ClientInitialized{ClientID: replacement.clientID, Cols: 80, Rows: 24}); err == nil {
 		t.Fatal("unregistered replacement initialized a view")
 	}
 	if testClientOf(s) != existing {
@@ -1222,7 +1224,6 @@ func TestInitializeAttachedViewDoesNotReplaceDaemonClient(t *testing.T) {
 func TestStaleTransportCleanupDoesNotDetachReconnectedClientInstance(t *testing.T) {
 	s := NewSessionState(1)
 	stale := newClientInstance(s.daemon, nil)
-	stale.detaching.Store(true)
 	current := newClientInstance(s.daemon, nil)
 	setTestClient(s, current)
 

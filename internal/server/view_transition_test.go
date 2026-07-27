@@ -10,17 +10,17 @@ import (
 
 func TestDaemonPreparesFinalClientLayoutRevision(t *testing.T) {
 	state, client, _, _ := preparedTransitionFixture(t, 12, 4)
-	client.identity.lastAllocatedClientLayoutRevision = 17
+	testClientIdentity(client).lastAllocatedClientLayoutRevision = 17
 	client.currentView.Layout.LayoutRevision = 17
 
 	var transition ViewTransition
 	state.daemon.call(func() {
-		transition = state.daemon.prepareViewTransitionNow(viewTransitionLayout, client.identity, state)
+		transition = state.daemon.prepareViewTransitionNow(viewTransitionLayout, testClientIdentity(client), state)
 	})
 	if got := transition.Projection.View.Layout.LayoutRevision; got != 18 {
 		t.Fatalf("prepared client layout revision = %d, want 18", got)
 	}
-	if got := client.identity.lastAllocatedClientLayoutRevision; got != 18 {
+	if got := testClientIdentity(client).lastAllocatedClientLayoutRevision; got != 18 {
 		t.Fatalf("identity client layout revision = %d, want 18", got)
 	}
 
@@ -45,7 +45,7 @@ func preparedTransitionFixture(t *testing.T, cols, rows int) (*SessionState, *Cl
 	attachDisplayTestClient(t, state, client)
 	var plan ClientProjectionPlan
 	state.daemon.call(func() {
-		plan = state.daemon.prepareViewTransitionNow(viewTransitionLayout, client.identity, state).Projection
+		plan = state.daemon.prepareViewTransitionNow(viewTransitionLayout, testClientIdentity(client), state).Projection
 	})
 	return state, client, pane, plan
 }
@@ -71,7 +71,7 @@ func TestClientViewAllowsPaneGridToDifferBeforeAtomicInstall(t *testing.T) {
 	if err := client.validateClientView(ViewTransition{Reason: viewTransitionResize, Projection: plan}); err != nil {
 		t.Fatalf("validate view before pane resize: %v", err)
 	}
-	if got := client.appliedProjectionRevision.Load(); got >= plan.ProjectionRevision {
+	if got := client.appliedProjectionRevision; got >= plan.ProjectionRevision {
 		t.Fatalf("unapplied projection revision %d was installed; client revision=%d", plan.ProjectionRevision, got)
 	}
 }
@@ -83,10 +83,10 @@ func TestClientViewBindsResolvedPaneWithoutGraphReread(t *testing.T) {
 	transition := ViewTransition{Reason: viewTransitionSelectWindow, Projection: plan}
 
 	// Once prepared, application must use the resolved pane carried in the
-	// transition. Removing the concurrent lookup entry simulates graph progress
+	// transition. Removing the canonical entry simulates graph progress
 	// after the daemon transaction without invalidating the immutable result.
-	state.daemon.paneIndex.Delete(pane.ID)
-	defer state.daemon.paneIndex.Store(pane.ID, pane)
+	state.daemon.call(func() { delete(state.daemon.panes, pane.ID) })
+	defer state.daemon.call(func() { state.daemon.panes[pane.ID] = pane })
 	if err := client.installClientView(transition, client.beginOutputHandoff()); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestRejectedTargetTransitionDoesNotReleaseInstalledOutput(t *testing.T) {
 	syncPaneRenderer(t, pane)
 	wire.Reset()
 
-	_, err := client.Daemon.selectWindow(client.identity.ID, client.sessionID, 999)
+	_, err := client.Daemon.selectWindow(client.clientID, client.sessionID, 999)
 	if err == nil || !strings.Contains(err.Error(), "unknown window 999") {
 		t.Fatalf("transition error = %v, want unknown target", err)
 	}
@@ -143,9 +143,9 @@ func TestDaemonPreparesResizeAndClientAppliesPhysicalGrid(t *testing.T) {
 	}
 	syncPaneRenderer(t, pane)
 
-	client.terminalCols.Store(80)
-	client.terminalRows.Store(20)
-	transition, err := state.daemon.resizeClientView(client.identity, 80, 20)
+	client.terminalCols = 80
+	client.terminalRows = 20
+	transition, err := state.daemon.resizeClientView(client.clientID, client.connection, 80, 20)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -46,7 +46,7 @@ type Pane struct {
 	processMonitor         *ProcessMonitor
 	processKey             PaneKey
 	startupInput           []byte
-	viewMode               atomic.Uint32
+	viewMode               paneViewMode
 	historyView            *paneHistoryView
 
 	// Held exclusively by the pane main goroutine. A lease contains the actual
@@ -161,6 +161,7 @@ type paneTerminalMetadata struct {
 	mouseTracking         MouseTrackingMode
 	mouseEncoding         MouseEncoding
 	kittyFlags            uint32
+	historyMode           bool
 }
 
 type paneOutputRelease struct {
@@ -226,6 +227,7 @@ func (p *Pane) publishTerminalMetadata() {
 		mouseTracking:         p.terminal.MouseTracking,
 		mouseEncoding:         p.terminal.MouseEncoding,
 		kittyFlags:            p.terminal.KittyFlags,
+		historyMode:           p.viewMode == paneViewHistory,
 	}
 	if current := p.metadata.Load(); current != nil && *current == next {
 		return

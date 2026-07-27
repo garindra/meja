@@ -1503,6 +1503,38 @@ func TestDisplayFrameCompilerTreatsClusterAsOneDisplayUnit(t *testing.T) {
 	}
 }
 
+func BenchmarkDisplayDecodeAndRenderCompilation(b *testing.B) {
+	encoder := protocol.NewDisplayEncoder(nil)
+	commands := []protocol.DisplayCommand{
+		{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 80, GridRows: 24},
+		{Opcode: protocol.DisplayOpcodeSetWritePosition},
+		{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: bytes.Repeat([]byte("x"), 80)},
+		{Opcode: protocol.DisplayOpcodePresent},
+	}
+	for _, command := range commands {
+		if err := encoder.AppendCommand(command); err != nil {
+			b.Fatal(err)
+		}
+	}
+	wire := append([]byte(nil), encoder.Bytes()...)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(wire)))
+	b.ResetTimer()
+	for range b.N {
+		decoder := protocol.NewDisplayDecoder(bytes.NewReader(wire))
+		compiler := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
+		for {
+			command, _, err := decoder.ReadCommand()
+			if err != nil {
+				break
+			}
+			if _, err := compiler.apply(command); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
 func TestClusterCacheMirrorsAnchorContinuationAndAtomicOverwrite(t *testing.T) {
 	cache := newPaneScanoutCache(4, 1)
 	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange)}

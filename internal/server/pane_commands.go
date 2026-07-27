@@ -49,10 +49,15 @@ func runSendKeysCommand(d *Daemon, ctx CommandContext, args []string) (commandOu
 	if client == nil {
 		return commandOutcome{}, errors.New("command requires an attached client")
 	}
+	delivery, err := reserveCommandActionDelivery(d, ctx, client)
+	if err != nil {
+		return commandOutcome{}, err
+	}
 	return commandOutcome{Action: sendClientKeysAction{
 		ClientID:  client.ID,
 		SessionID: client.SessionID,
 		Args:      append([]string(nil), remaining...),
+		Delivery:  delivery,
 	}}, nil
 }
 
@@ -364,7 +369,7 @@ func capturePaneCommand() commandHandler {
 			return commandOutcome{}, err
 		}
 		var data []byte
-		pane := session.activePane()
+		pane := session.ActivePane
 		if pane == nil {
 			return commandOutcome{}, errors.New("capture-pane requires an active pane")
 		}

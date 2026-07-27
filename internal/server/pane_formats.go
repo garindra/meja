@@ -220,26 +220,25 @@ func listPanesCommand() commandHandler {
 			if d == nil {
 				return commandOutcome{}, errors.New("list-panes -a requires the daemon command interface")
 			}
-			var sessions []*SessionState
+			var sessions []formatSessionSnapshot
 			d.call(func() {
-				sessions = make([]*SessionState, 0, len(d.sessions))
+				sessions = make([]formatSessionSnapshot, 0, len(d.sessions))
 				for _, session := range d.sessions {
 					if session != nil {
-						sessions = append(sessions, session)
+						sessions = append(sessions, session.formatSnapshot())
 					}
 				}
 			})
 			sort.Slice(sessions, func(i, j int) bool { return sessions[i].ID < sessions[j].ID })
 			var output strings.Builder
-			for _, session := range sessions {
-				snapshot := session.formatSnapshot()
+			for _, snapshot := range sessions {
 				writePaneFormatLines(&output, *format, snapshot)
 			}
 			data := []byte(output.String())
 			return commandOutcome{Stdout: data}, nil
 		}
 
-		var session *SessionState
+		var session *commandSessionSnapshot
 		var err error
 		if *target != "" {
 			session, err = resolveCommandSessionValue(d, ctx, *target)
@@ -252,9 +251,8 @@ func listPanesCommand() commandHandler {
 		if err != nil {
 			return commandOutcome{}, err
 		}
-		snapshot := session.formatSnapshot()
 		var output strings.Builder
-		writePaneFormatLines(&output, *format, snapshot)
+		writePaneFormatLines(&output, *format, session.Format)
 		data := []byte(output.String())
 		return commandOutcome{Stdout: data}, nil
 	}

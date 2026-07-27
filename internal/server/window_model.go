@@ -111,6 +111,30 @@ func windowActivePaneID(window *Window) uint64 {
 	return windowPrimaryPaneID(window)
 }
 
+func cloneLayoutNode(layout LayoutNode) LayoutNode {
+	switch node := layout.(type) {
+	case nil:
+		return nil
+	case *PaneLayout:
+		if node == nil {
+			return (*PaneLayout)(nil)
+		}
+		return &PaneLayout{PaneID: node.PaneID}
+	case *SplitLayout:
+		if node == nil {
+			return (*SplitLayout)(nil)
+		}
+		return &SplitLayout{
+			Direction: node.Direction,
+			Ratio:     node.Ratio,
+			First:     cloneLayoutNode(node.First),
+			Second:    cloneLayoutNode(node.Second),
+		}
+	default:
+		panic("unknown layout node type")
+	}
+}
+
 func cloneWindow(window *Window) *Window {
 	if window == nil {
 		return nil
@@ -119,7 +143,7 @@ func cloneWindow(window *Window) *Window {
 		ID: window.ID, GroupID: window.GroupID, DisplayIndex: window.DisplayIndex,
 		Name: window.Name, AutomaticName: window.AutomaticName,
 		ActivePaneID: window.ActivePaneID, Zoomed: window.Zoomed, ZoomedPaneID: window.ZoomedPaneID,
-		Layout: window.Layout, LayoutRevision: window.LayoutRevision, Cols: window.Cols, Rows: window.Rows,
+		Layout: cloneLayoutNode(window.Layout), LayoutRevision: window.LayoutRevision, Cols: window.Cols, Rows: window.Rows,
 		layoutCycleIndex: window.layoutCycleIndex,
 	}
 }
