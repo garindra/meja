@@ -112,6 +112,20 @@ func TestPaneActivityIsSourceCoalescedUntilMonitorProbe(t *testing.T) {
 	}
 }
 
+func TestTryUnwatchDoesNotBlockOnSaturatedMonitor(t *testing.T) {
+	monitor := &ProcessMonitor{
+		commands: make(chan processMonitorCommand, 1),
+		done:     make(chan struct{}),
+	}
+	monitor.commands <- processMonitorCommand{dropSession: 1}
+	if monitor.TryUnwatch(PaneKey{PaneID: 2}) {
+		t.Fatal("saturated monitor unexpectedly accepted unwatch")
+	}
+	if got := len(monitor.commands); got != 1 {
+		t.Fatalf("saturated monitor queue length = %d, want 1", got)
+	}
+}
+
 func TestForegroundProcessInputHints(t *testing.T) {
 	for _, input := range [][]byte{{'\r'}, {'\n'}, {0x03}, {0x04}, {0x1a}, {0x1c}, []byte("echo ok\r")} {
 		if !inputMayChangeForegroundProcess(input) {

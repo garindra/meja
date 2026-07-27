@@ -10,14 +10,11 @@ import (
 )
 
 func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) {
-	state := c.sessionState()
-	if state == nil {
+	if c == nil || c.Daemon == nil {
 		return false, errors.New("client instance has no session")
 	}
-	if c.Daemon != nil && c.ViewLeaseWindowID != 0 && c.ViewLeaseGeneration != 0 {
-		if err := c.Daemon.validateWindowView(c.identity.ID, c.ViewLeaseWindowID, c.ViewLeaseGeneration); err != nil {
-			return false, err
-		}
+	if c.connection != nil && c.connection.isRevoked() {
+		return true, nil
 	}
 	switch frame.Type {
 	case protocol.MsgFrontendInputBytes:
@@ -28,10 +25,7 @@ func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) 
 		if msg.SourceIdle && !bytes.Equal(msg.Data, []byte{0x1b}) {
 			return false, errors.New("source-idle frontend input must contain one Escape byte")
 		}
-		var detach, stopped bool
-		if !c.Daemon.clientConnectionIsActive(c.identity, c.connection, state.ID) {
-			return false, nil
-		}
+		var detach bool
 		var processErr error
 		detach, processErr = c.handleInputBytes(msg.LayoutRevision, msg.Data)
 		if processErr == nil && !detach && msg.SourceIdle {
@@ -39,7 +33,6 @@ func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) 
 				detach, processErr = c.handleFrontendInputEvent(event)
 			}
 		}
-		stopped = c.Daemon != nil && c.Daemon.isSessionStopping(state)
 		if errors.Is(processErr, io.ErrClosedPipe) {
 			// Pane exit and the replacement view transition are delivered
 			// asynchronously. Input can therefore briefly target a pane whose
@@ -50,16 +43,13 @@ func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) 
 		if processErr != nil {
 			return false, processErr
 		}
-		if detach || stopped {
+		if detach || (c.connection != nil && c.connection.isRevoked()) {
 			return true, nil
 		}
 	case protocol.MsgFrontendResize:
 		msg, err := protocol.DecodeFrontendResize(frame.Payload)
 		if err != nil {
 			return false, err
-		}
-		if !c.Daemon.clientConnectionIsActive(c.identity, c.connection, state.ID) {
-			return false, nil
 		}
 		if err := c.resizeClient(msg.Cols, msg.Rows); err != nil {
 			return false, err
@@ -70,13 +60,13 @@ func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) 
 	return false, nil
 }
 
-func (d *Daemon) startPane(state *SessionState, pane *Pane) {
+func (d *Daemon) startPane(sessionID uint64, pane *Pane) {
 	if pane == nil {
 		return
 	}
 	pane.initializeRuntime()
 	if d != nil {
-		d.watchPaneProcesses(state, pane)
+		d.watchPaneProcesses(sessionID, pane)
 	}
 	go pane.run()
 	go relayPTYOutput(pane)
@@ -104,7 +94,7 @@ func (d *Daemon) startPane(state *SessionState, pane *Pane) {
 }
 
 func (c *ClientInstance) createWindowSize() (uint16, uint16, error) {
-	if cols, rows := uint16(c.terminalCols.Load()), uint16(c.terminalRows.Load()); cols > 0 && rows > 0 {
+	if cols, rows := c.terminalCols, c.terminalRows; cols > 0 && rows > 0 {
 		return cols, rows, nil
 	}
 	activePane := c.activePane()
@@ -227,15 +217,17 @@ func (c *ClientInstance) resizeClient(cols, rows uint16) error {
 	// new-grid paint through the old barrier and make the frontend reject the
 	// display stream. Pane command FIFO ordering guarantees each release is
 	// processed before the prepared transition applies the corresponding resize.
-	if err := c.sessionState().exitAllPaneHistoryModes(); err != nil {
-		return err
+	for _, pane := range c.currentView.PaneActors() {
+		if _, err := pane.exitHistoryMode(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			return err
+		}
 	}
 	// The dimensions belong to this client actor. Publish them before asking
 	// the daemon for its immutable projection so that the plan describes the
 	// resize being applied, rather than the previous scanout.
-	c.terminalCols.Store(uint32(cols))
-	c.terminalRows.Store(uint32(rows))
-	transition, err := c.Daemon.resizeClientView(c.identity, cols, rows)
+	c.terminalCols = cols
+	c.terminalRows = rows
+	transition, err := c.Daemon.resizeClientView(c.clientID, c.connection, cols, rows)
 	if err != nil {
 		return err
 	}

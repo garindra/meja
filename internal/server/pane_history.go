@@ -104,19 +104,20 @@ func (p *Pane) installHistoryView(snapshot *paneHistorySnapshot) error {
 		CursorRow: snapshot.InitialTop + snapshot.InitialCursor.Y,
 		CursorCol: snapshot.InitialCursor.X,
 	}
-	p.viewMode.Store(uint32(paneViewHistory))
+	p.viewMode = paneViewHistory
+	p.publishTerminalMetadata()
 	return nil
 }
 
 func (p *Pane) isHistoryMode() bool {
-	return p != nil && p.currentViewMode() == paneViewHistory
+	return p != nil && p.InputMode().historyMode
 }
 
 func (p *Pane) currentViewMode() paneViewMode {
 	if p == nil {
 		return paneViewLive
 	}
-	return paneViewMode(p.viewMode.Load())
+	return p.viewMode
 }
 
 func (s *SessionState) exitAllPaneHistoryModes() error {
@@ -180,12 +181,13 @@ func (p *Pane) jumpHistory(oldest bool) bool {
 }
 
 func (p *Pane) exitHistoryModeNow() bool {
-	if !p.isHistoryMode() {
+	if p.currentViewMode() != paneViewHistory {
 		return false
 	}
 	p.historyView.Snapshot.release()
 	p.historyView = nil
-	p.viewMode.Store(uint32(paneViewLive))
+	p.viewMode = paneViewLive
+	p.publishTerminalMetadata()
 	return true
 }
 

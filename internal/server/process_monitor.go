@@ -107,13 +107,21 @@ func (m *ProcessMonitor) Watch(sessionID uint64, deliver func(monitoredProcessBa
 	}
 }
 
-func (m *ProcessMonitor) Unwatch(key PaneKey) {
+// TryUnwatch is the daemon-after-turn variant. Pane-exit reconciliation has
+// already removed the authoritative pane, so a saturated advisory monitor may
+// retain a stale watch until later cleanup, but it must never block the daemon
+// request loop.
+func (m *ProcessMonitor) TryUnwatch(key PaneKey) bool {
 	if m == nil {
-		return
+		return false
 	}
 	select {
 	case m.commands <- processMonitorCommand{unwatch: &key}:
+		return true
 	case <-m.done:
+		return false
+	default:
+		return false
 	}
 }
 

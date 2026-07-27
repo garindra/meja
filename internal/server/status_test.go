@@ -13,8 +13,8 @@ import (
 func attachStatusTestClient(t *testing.T, s *SessionState, client *ClientInstance) {
 	t.Helper()
 	previous := clientForState(s)
-	client.terminalCols.Store(previous.terminalCols.Load())
-	client.terminalRows.Store(previous.terminalRows.Load())
+	client.terminalCols = previous.terminalCols
+	client.terminalRows = previous.terminalRows
 	setLeasedTestClient(t, s, client, 1)
 	if err := client.attachStatusOutput(client.StatusOutput); err != nil {
 		t.Fatal(err)
@@ -134,6 +134,7 @@ func TestRenameSessionPromptUpdatesStatusName(t *testing.T) {
 	d := &Daemon{sessions: map[uint64]*SessionState{7: state}}
 	state.daemon = d
 	attachStatusTestClient(t, state, testClientInstance(nil, nil, &statusClient.wire))
+	syncTestProjection(t, state)
 
 	clientForState(s).ConsumeInputByte(0x02)
 	if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte('$')); err != nil {
@@ -200,7 +201,7 @@ func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 	if err := runStatusEvent(t, s, events[len(events)-1]); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := clientForState(s).statusMessage.Load().(string); got == "" {
+	if got := snapshotTestClientActor(clientForState(s)).StatusMessage; got == "" {
 		t.Fatal("command error did not install a status message")
 	}
 	errorStatus := statusClient.read(t)
@@ -213,14 +214,7 @@ func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 
 	deadline := time.Now().Add(time.Second)
 	for {
-		cleared := false
-		if err := runStateOperation(s, func() error {
-			message, _ := clientForState(s).statusMessage.Load().(string)
-			cleared = message == ""
-			return nil
-		}); err != nil {
-			t.Fatal(err)
-		}
+		cleared := snapshotTestClientActor(clientForState(s)).StatusMessage == ""
 		if cleared {
 			break
 		}
@@ -486,11 +480,8 @@ func TestStatusOutputReconnectGetsBarrierlessFullRefresh(t *testing.T) {
 		t.Fatal("reconnected status stream did not reinstall prompt style")
 	}
 
-	firstConnection.detaching.Store(true)
 	firstConnection.releaseFrontendResources()
 	s.Name = "live"
-	if err := clientForState(s).publishStatusBar(); err != nil {
-		t.Fatal(err)
-	}
+	syncTestStatus(t, s)
 	assertStatusText(t, second.read(t), "[live] 0:bash* ")
 }

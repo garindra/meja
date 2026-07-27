@@ -615,12 +615,12 @@ func TestKillSessionCommandTargetsByNameAndID(t *testing.T) {
 		t.Fatalf("kill-session by name = %#v", killedByName)
 	}
 
-	killedByID := d.executeCommand(protocol.CommandRequest{Args: []string{"kill-session", "-t", strconv.FormatUint(second.session.ID, 10)}})
-	if killedByID.exitCode != 0 || testDaemonSession(d, second.session.ID) != nil {
+	killedByID := d.executeCommand(protocol.CommandRequest{Args: []string{"kill-session", "-t", strconv.FormatUint(second.sessionID, 10)}})
+	if killedByID.exitCode != 0 || testDaemonSession(d, second.sessionID) != nil {
 		t.Fatalf("kill-session by ID = %#v", killedByID)
 	}
 
-	if first.session == second.session {
+	if first.sessionID == second.sessionID {
 		t.Fatal("test sessions unexpectedly share state")
 	}
 	missingTarget := d.executeCommand(protocol.CommandRequest{Args: []string{"kill-session"}})
@@ -638,12 +638,12 @@ func TestPaneCLIKillSessionInfersInjectedSession(t *testing.T) {
 
 	result := d.executeCommand(protocol.CommandRequest{
 		Args:                []string{"kill-session"},
-		CallerSessionTarget: strconv.FormatUint(created.session.ID, 10),
+		CallerSessionTarget: strconv.FormatUint(created.sessionID, 10),
 	})
 	if result.exitCode != 0 {
 		t.Fatalf("contextual kill-session = %#v", result)
 	}
-	if testDaemonSession(d, created.session.ID) != nil {
+	if testDaemonSession(d, created.sessionID) != nil {
 		t.Fatal("contextual kill-session did not remove the injected session")
 	}
 }
@@ -802,14 +802,15 @@ func TestSaveUnnamedSessionUsesOutputFilenameAsRestoreName(t *testing.T) {
 		TerminalCols: 80, TerminalRows: 23,
 	})
 	defer d.disconnectActiveClients()
-	if created.exitCode != 0 || created.session == nil || created.session.SessionName() != "" {
+	createdSession := testDaemonSession(d, created.sessionID)
+	if created.exitCode != 0 || createdSession == nil || createdSession.SessionName() != "" {
 		t.Fatalf("unnamed session creation = %#v", created)
 	}
 
 	path := filepath.Join(t.TempDir(), "dev7.meja")
 	saved := d.executeCommand(protocol.CommandRequest{
 		Args:                []string{"save-session", "-o", path},
-		CallerSessionTarget: strconv.FormatUint(created.session.ID, 10),
+		CallerSessionTarget: strconv.FormatUint(created.sessionID, 10),
 	})
 	if saved.exitCode != 0 {
 		t.Fatalf("unnamed session save = %#v", saved)
@@ -842,7 +843,7 @@ func TestPaneCLISelectWindowUsesInjectedSessionWithWindowOnlyTarget(t *testing.T
 	d.sessions[s.ID] = s
 	d.names[s.Name] = s
 	d.windowLeases[second.ID] = &WindowViewLease{
-		WindowID: second.ID, SessionID: s.ID, ClientID: client.identity.ID, Generation: 1,
+		WindowID: second.ID, SessionID: s.ID, ClientID: client.clientID, Generation: 1,
 	}
 	s.ActiveWindowID = second.ID
 
@@ -1276,7 +1277,7 @@ func TestCommandPromptReportsCommandErrorsWithoutClosingInput(t *testing.T) {
 		}
 	}
 	state := snapshotTestClient(s)
-	message, _ := clientForState(s).statusMessage.Load().(string)
+	message := clientForState(s).statusMessage
 	if state.Prompt != nil || message != `unknown command "not-a-command"` {
 		t.Fatalf("client after command error = %#v", state)
 	}
@@ -1318,15 +1319,15 @@ func TestSwitchSessionCommandAppliesPreparedTransition(t *testing.T) {
 	fixtureClient := newTestClient(source)
 	fixtureClient.setTestTerminalSize(101, 37)
 	client := clientForState(source)
-	identity := client.identity
+	identity := testClientIdentity(client)
 	identity.ResumeToken = "switch-command"
 	identity.lastAllocatedClientLayoutRevision = client.currentView.Layout.LayoutRevision
-	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: client.identity.ID, Generation: 1}
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: client.clientID, Generation: 1}
 	if _, err := client.executeAttachedCommand([]string{"switch-session", "-t", "target"}); err != nil {
 		t.Fatal(err)
 	}
-	if client.sessionState() != target || testClientOf(source) != nil || testClientOf(target) != client {
-		t.Fatalf("switch did not install target: source=%#v target=%#v client-session=%#v", testClientOf(source), testClientOf(target), client.sessionState())
+	if testClientSession(client) != target || testClientOf(source) != nil || testClientOf(target) != client {
+		t.Fatalf("switch did not install target: source=%#v target=%#v client-session=%#v", testClientOf(source), testClientOf(target), testClientSession(client))
 	}
 
 	if _, err := client.executeAttachedCommand([]string{"switch-session", "target"}); err == nil || err.Error() != "switch-session requires -t <session-target>" {
@@ -1352,14 +1353,14 @@ func TestSwitchSessionHandlerPreparesButDoesNotApplyClientView(t *testing.T) {
 	d.names[target.Name] = target
 
 	client := clientForState(source)
-	client.terminalCols.Store(80)
-	client.terminalRows.Store(23)
-	identity := client.identity
+	client.terminalCols = 80
+	client.terminalRows = 23
+	identity := testClientIdentity(client)
 	identity.ResumeToken = "prepare-only"
 	identity.lastAllocatedClientLayoutRevision = client.currentView.Layout.LayoutRevision
 	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{
 		WindowID: source.ActiveWindowID, SessionID: source.ID,
-		ClientID: client.identity.ID, Generation: 1,
+		ClientID: client.clientID, Generation: 1,
 	}
 
 	outcome, err := d.commandEngine().run(client.commandContext(), []string{"switch-session", "-t", "target"})
@@ -1373,7 +1374,7 @@ func TestSwitchSessionHandlerPreparesButDoesNotApplyClientView(t *testing.T) {
 	if action.Transition.Projection.SessionID != target.ID {
 		t.Fatalf("prepared target session = %d, want %d", action.Transition.Projection.SessionID, target.ID)
 	}
-	if d.clients[target.ClientID] != client.identity || source.ClientID != 0 {
+	if d.clients[target.ClientID] != testClientIdentity(client) || source.ClientID != 0 {
 		t.Fatalf("daemon assignment was not committed during preparation: source=%d target=%p", source.ClientID, d.clients[target.ClientID])
 	}
 	if client.sessionID != source.ID {
@@ -1387,8 +1388,8 @@ func TestSwitchSessionHandlerPreparesButDoesNotApplyClientView(t *testing.T) {
 	if _, err := client.applyAttachedCommandOutcome(outcome); err != nil {
 		t.Fatal(err)
 	}
-	if client.sessionID != target.ID || client.sessionState() != target {
-		t.Fatalf("applied session = %d/%p, want %d/%p", client.sessionID, client.sessionState(), target.ID, target)
+	if client.sessionID != target.ID || testClientSession(client) != target {
+		t.Fatalf("applied session = %d/%p, want %d/%p", client.sessionID, testClientSession(client), target.ID, target)
 	}
 }
 
@@ -1419,16 +1420,16 @@ func TestAttachedRestoreCreatesSessionAndAppliesPreparedTransition(t *testing.T)
 	createTestWindow(source, &Pane{
 		ID: testAddPaneID(source), Launch: PaneLaunch{Cwd: project}, terminal: newTerminal(101, 37),
 	})
-	clientForState(source).terminalCols.Store(101)
-	clientForState(source).terminalRows.Store(37)
+	clientForState(source).terminalCols = 101
+	clientForState(source).terminalRows = 37
 
 	d.sessions[source.ID] = source
 	d.names[source.Name] = source
 	client := clientForState(source)
-	identity := client.identity
+	identity := testClientIdentity(client)
 	identity.ResumeToken = "restore-command"
 	identity.lastAllocatedClientLayoutRevision = client.currentView.Layout.LayoutRevision
-	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: client.identity.ID, Generation: 1}
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: client.clientID, Generation: 1}
 
 	_, err := client.executeAttachedCommand([]string{
 		"restore", "-t", "persisted", "-s", "mynewsession", "--commands=skip",
@@ -1440,8 +1441,8 @@ func TestAttachedRestoreCreatesSessionAndAppliesPreparedTransition(t *testing.T)
 	if restored == nil {
 		t.Fatal("attached restore did not create mynewsession")
 	}
-	if client.sessionState() != restored || testClientOf(restored) != client {
-		t.Fatalf("restore did not install restored session: client=%#v restored-client=%#v", client.sessionState(), testClientOf(restored))
+	if testClientSession(client) != restored || testClientOf(restored) != client {
+		t.Fatalf("restore did not install restored session: client=%#v restored-client=%#v", testClientSession(client), testClientOf(restored))
 	}
 	if restored.rootDir != project {
 		t.Fatalf("restored root = %q, want %q", restored.rootDir, project)
@@ -1532,7 +1533,7 @@ func TestPaneCLISetRootMakesUnnamedSessionPanePortable(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	capture, err := d.captureSession(s, context.Background(), emptyProcessObserver{})
+	capture, err := captureTestSession(s, context.Background(), emptyProcessObserver{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1587,7 +1588,7 @@ func TestPaneCLIGroupTargetResolvesToThePaneWindowLeaseSession(t *testing.T) {
 	pane := &Pane{ID: testAddPaneID(base), terminal: newTerminal(80, 23)}
 	window, _ := createTestWindow(base, pane)
 	mirror := groupedTestSession(d, 2, "mirror")
-	if err := d.groupSession(base, mirror); err != nil {
+	if err := groupTestSessions(d, base, mirror); err != nil {
 		t.Fatal(err)
 	}
 	d.windowLeases[window.ID] = &WindowViewLease{

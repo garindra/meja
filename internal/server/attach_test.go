@@ -27,11 +27,11 @@ func admitTestClient(d *Daemon, token string) (*ClientInstance, *SessionState, e
 	if err != nil {
 		return nil, nil, err
 	}
-	state, _ := d.sessionIndex.Load(admission.SessionID)
-	client := newClientInstance(d, admission.identity, admission.connection)
-	testClientByIdentity.Store(client.identity, client)
+	state := testDaemonSession(d, admission.SessionID)
+	client := newClientInstanceFromAdmission(d, admission)
+	testClientByIdentity.Store(testClientIdentity(client), client)
 	startTestClientCommandLoop(client)
-	return client, state.(*SessionState), nil
+	return client, state, nil
 }
 
 func resumeTestClient(d *Daemon, token string) (*ClientInstance, *SessionState, error) {
@@ -39,11 +39,11 @@ func resumeTestClient(d *Daemon, token string) (*ClientInstance, *SessionState, 
 	if err != nil {
 		return nil, nil, err
 	}
-	state, _ := d.sessionIndex.Load(admission.SessionID)
-	client := newClientInstance(d, admission.identity, admission.connection)
-	testClientByIdentity.Store(client.identity, client)
+	state := testDaemonSession(d, admission.SessionID)
+	client := newClientInstanceFromAdmission(d, admission)
+	testClientByIdentity.Store(testClientIdentity(client), client)
 	startTestClientCommandLoop(client)
-	return client, state.(*SessionState), nil
+	return client, state, nil
 }
 
 func TestQUICRejectsMismatchedALPN(t *testing.T) {
@@ -73,7 +73,7 @@ func setCommandTestPersistenceDir(t *testing.T, d *Daemon) string {
 	// provide that ordering on its own.
 	t.Cleanup(func() {
 		d.stopPersistence()
-		if d.persistenceStarted.Load() {
+		if d.persistenceHasStarted() {
 			<-d.persistenceDone
 		}
 	})
@@ -95,6 +95,7 @@ func newCommandTestDaemonMode(t *testing.T, withActor bool) *Daemon {
 		nextID:       1,
 		sessions:     map[uint64]*SessionState{},
 		panes:        map[uint64]*Pane{},
+		windows:      map[uint64]*Window{},
 		names:        map[string]*SessionState{},
 		windowLeases: map[uint64]*WindowViewLease{},
 		clientTokens: map[string]ClientID{},
@@ -111,6 +112,7 @@ func newCommandTestDaemonMode(t *testing.T, withActor bool) *Daemon {
 	d.persistenceNow = make(chan struct{}, 1)
 	d.persistenceStop = make(chan struct{})
 	d.persistenceDone = make(chan struct{})
+	d.persistenceStarted = make(chan struct{})
 	d.persistenceUpdates = make(chan persistenceSnapshot, 1)
 	var stopActor context.CancelFunc
 	if withActor {
@@ -122,7 +124,7 @@ func newCommandTestDaemonMode(t *testing.T, withActor bool) *Daemon {
 	t.Cleanup(func() {
 		d.disconnectActiveClients()
 		d.stopPersistence()
-		if d.persistenceStarted.Load() {
+		if d.persistenceHasStarted() {
 			<-d.persistenceDone
 		}
 		cancel()
@@ -137,7 +139,6 @@ func newCommandTestDaemonMode(t *testing.T, withActor bool) *Daemon {
 func prepareTestDaemonSession(d *Daemon, session *SessionState, cols, rows uint16) {
 	session.daemon = d
 	d.sessions[session.ID] = session
-	d.sessionIndex.Store(session.ID, session)
 	d.ensureSessionGroupInActor(session)
 	client := newTestClient(session)
 	client.setTestTerminalSize(cols, rows)
@@ -155,8 +156,8 @@ func TestDaemonAllocatesMonotonicSessionIDsAndSingleUseAttach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b1.session.ID != 1 || b2.session.ID != 2 {
-		t.Fatalf("IDs = %d, %d", b1.session.ID, b2.session.ID)
+	if b1.sessionID != 1 || b2.sessionID != 2 {
+		t.Fatalf("IDs = %d, %d", b1.sessionID, b2.sessionID)
 	}
 	if _, _, err := admitTestClient(d, b1.bootstrap.AttachToken); err != nil {
 		t.Fatal(err)
@@ -228,13 +229,13 @@ func TestReconnectRebuildsInstanceForStableClientIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token := instance.identity.ResumeToken
+	token := testClientIdentity(instance).ResumeToken
 	for i := 0; i < 2; i++ {
 		resumed, _, err := resumeTestClient(d, token)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if resumed == instance || resumed.identity != instance.identity {
+		if resumed == instance || testClientIdentity(resumed) != testClientIdentity(instance) {
 			t.Fatal("resume did not rebuild the same logical client instance")
 		}
 		instance = resumed
@@ -252,9 +253,9 @@ func TestReconnectIdentityPreservesClientLayoutRevisionAllocator(t *testing.T) {
 		t.Fatal(err)
 	}
 	const lastAllocatedRevision = 17
-	instance.identity.lastAllocatedClientLayoutRevision = lastAllocatedRevision
+	testClientIdentity(instance).lastAllocatedClientLayoutRevision = lastAllocatedRevision
 
-	resumed, _, err := resumeTestClient(d, instance.identity.ResumeToken)
+	resumed, _, err := resumeTestClient(d, testClientIdentity(instance).ResumeToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +263,7 @@ func TestReconnectIdentityPreservesClientLayoutRevisionAllocator(t *testing.T) {
 		t.Fatalf("fresh resumed instance already has layout revision %d", got)
 	}
 	var nextRevision protocol.ClientLayoutRevision
-	d.call(func() { nextRevision = d.allocateClientLayoutRevisionNow(resumed.identity) })
+	d.call(func() { nextRevision = d.allocateClientLayoutRevisionNow(testClientIdentity(resumed)) })
 	plan := ClientProjectionPlan{
 		SessionID: resumed.sessionID, ProjectionRevision: 1, FullSnapshot: true,
 	}
@@ -281,14 +282,14 @@ func TestReconnectIdentityPreservesClientLayoutRevisionAllocator(t *testing.T) {
 	// The logical identity must retain its allocator for the next attempt even
 	// though the unattached replacement ClientInstance is discarded.
 	d.discardPendingClientInstance(resumed)
-	again, _, err := resumeTestClient(d, instance.identity.ResumeToken)
+	again, _, err := resumeTestClient(d, testClientIdentity(instance).ResumeToken)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := again.currentView.Layout.LayoutRevision; got != 0 {
 		t.Fatalf("second fresh resumed instance already has layout revision %d", got)
 	}
-	if got := again.identity.lastAllocatedClientLayoutRevision; got != nextRevision {
+	if got := testClientIdentity(again).lastAllocatedClientLayoutRevision; got != nextRevision {
 		t.Fatalf("identity last allocated layout revision = %d, want %d", got, nextRevision)
 	}
 }
@@ -303,7 +304,8 @@ func TestFreshSSHAttachCreatesNewClientInstanceAndSupersedesPrevious(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	setTestClient(firstBootstrap.session, first)
+	session := testOperationSession(d, firstBootstrap)
+	setTestClient(session, first)
 	var closeCode quic.ApplicationErrorCode
 	var closeMessage string
 	first.QUIC = &recordingQUICConnection{closeWithError: func(code quic.ApplicationErrorCode, message string) error {
@@ -311,7 +313,7 @@ func TestFreshSSHAttachCreatesNewClientInstanceAndSupersedesPrevious(t *testing.
 		return nil
 	}}
 
-	secondBootstrap, err := d.executeSessionOperation("connect-session", commandSessionTarget{id: firstBootstrap.session.ID})
+	secondBootstrap, err := d.executeSessionOperation("connect-session", commandSessionTarget{id: firstBootstrap.sessionID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,17 +321,17 @@ func TestFreshSSHAttachCreatesNewClientInstanceAndSupersedesPrevious(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	setTestClient(firstBootstrap.session, second)
-	if first == second || first.identity.TerminalReason != "session was taken over by another client" {
+	setTestClient(session, second)
+	if first == second || testClientIdentity(first).TerminalReason != "session was taken over by another client" {
 		t.Fatalf("client instances = %#v and %#v", first, second)
 	}
-	if got := d.clients[firstBootstrap.session.ClientID]; got != second.identity {
-		t.Fatalf("session owner = %#v, want %#v", got, second.identity)
+	if got := d.clients[session.ClientID]; got != testClientIdentity(second) {
+		t.Fatalf("session owner = %#v, want %#v", got, testClientIdentity(second))
 	}
 	if closeCode != protocol.SessionReplacedErrorCode || closeMessage != "session taken over by another client" {
 		t.Fatalf("replacement close = (%d, %q)", closeCode, closeMessage)
 	}
-	if _, _, err := resumeTestClient(d, first.identity.ResumeToken); err == nil || err.Error() != "session was taken over by another client" {
+	if _, _, err := resumeTestClient(d, testClientIdentity(first).ResumeToken); err == nil || err.Error() != "session was taken over by another client" {
 		t.Fatalf("superseded resume error = %v", err)
 	}
 }
@@ -346,17 +348,17 @@ func TestClosedClientInstanceIsDiscardedButClientIdentityPersists(t *testing.T) 
 	}
 	conn := &recordingQUICConnection{}
 	instance.QUIC = conn
-	session := bootstrap.session
+	session := testOperationSession(d, bootstrap)
 	setTestClient(session, instance)
 	d.detachClientInstance(instance)
-	if instance.identity.State.Phase != clientDetached {
+	if testClientIdentity(instance).State.Phase != clientDetached {
 		t.Fatal("closed client identity did not become detached")
 	}
-	if d.clients[d.clientTokens[instance.identity.ResumeToken]] != instance.identity ||
-		instance.identity.SessionID != bootstrap.session.ID {
+	if d.clients[d.clientTokens[testClientIdentity(instance).ResumeToken]] != testClientIdentity(instance) ||
+		testClientIdentity(instance).SessionID != bootstrap.sessionID {
 		t.Fatal("stable reconnect identity or session assignment was discarded")
 	}
-	resumed, resumedSession, err := resumeTestClient(d, instance.identity.ResumeToken)
+	resumed, resumedSession, err := resumeTestClient(d, testClientIdentity(instance).ResumeToken)
 	if err != nil || resumed == instance || resumedSession != session {
 		t.Fatalf("resume after close = (%#v, %#v, %v)", resumed, resumedSession, err)
 	}
@@ -374,7 +376,7 @@ func TestFailedReplacementAllowsObsoleteInstanceToDetachSession(t *testing.T) {
 	}
 	setTestClient(session, old)
 
-	replacement, _, err := resumeTestClient(d, old.identity.ResumeToken)
+	replacement, _, err := resumeTestClient(d, testClientIdentity(old).ResumeToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +386,7 @@ func TestFailedReplacementAllowsObsoleteInstanceToDetachSession(t *testing.T) {
 	if session.ClientID != 0 {
 		t.Fatal("obsolete instance remained attached after its replacement failed")
 	}
-	if old.identity.State.Phase != clientDetached {
+	if testClientIdentity(old).State.Phase != clientDetached {
 		t.Fatal("failed replacement did not leave the identity detached")
 	}
 }
@@ -403,16 +405,18 @@ func TestClientInstanceAssignmentMovesAtomicallyBetweenSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setTestClient(firstBootstrap.session, instance)
+	firstSession := testOperationSession(d, firstBootstrap)
+	secondSession := testOperationSession(d, secondBootstrap)
+	setTestClient(firstSession, instance)
 	d.call(func() {
-		firstBootstrap.session.ClientID = 0
-		instance.identity.SessionID = secondBootstrap.session.ID
-		secondBootstrap.session.ClientID = instance.identity.ID
+		firstSession.ClientID = 0
+		testClientIdentity(instance).SessionID = secondBootstrap.sessionID
+		secondSession.ClientID = instance.clientID
 	})
-	if instance.identity.SessionID != secondBootstrap.session.ID ||
-		firstBootstrap.session.ClientID != 0 ||
-		secondBootstrap.session.ClientID != instance.identity.ID {
-		t.Fatalf("moved client identity = %#v", instance.identity)
+	if testClientIdentity(instance).SessionID != secondBootstrap.sessionID ||
+		firstSession.ClientID != 0 ||
+		secondSession.ClientID != instance.clientID {
+		t.Fatalf("moved client identity = %#v", testClientIdentity(instance))
 	}
 }
 
@@ -435,11 +439,11 @@ func TestLiveSwitchMovesClientAssignmentWithoutChangingReconnectToken(t *testing
 	instance.Output[0] = testOutputLease(0, &paneOutput)
 	setTestClient(source, instance)
 	d.clientTokens[identity.ResumeToken] = identity.ID
-	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: instance.identity.ID, Generation: 1}
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: instance.clientID, Generation: 1}
 	instance.ViewLeaseWindowID = source.ActiveWindowID
 	instance.ViewLeaseGeneration = 1
 
-	transition, err := d.transitionClientToSession(instance.identity, target.ID, 80, 23)
+	transition, err := d.transitionClientToSession(instance.clientID, instance.connection, target.ID, 80, 23)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,8 +452,8 @@ func TestLiveSwitchMovesClientAssignmentWithoutChangingReconnectToken(t *testing
 	}
 	testClientByState.Delete(source)
 	testClientByState.Store(target, instance)
-	if instance.sessionState() != target {
-		t.Fatalf("switched session = %#v, want target", instance.sessionState())
+	if testClientSession(instance) != target {
+		t.Fatalf("switched session = %#v, want target", testClientSession(instance))
 	}
 	if d.clients[d.clientTokens["stable-token"]] != identity || identity.ResumeToken != "stable-token" {
 		t.Fatal("switch changed the reconnect-token association")
@@ -477,11 +481,11 @@ func TestLiveSwitchMovesClientAssignmentWithoutChangingReconnectToken(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resumed == instance || resumedSession != target || resumed.identity != identity {
+	if resumed == instance || resumedSession != target || testClientIdentity(resumed) != identity {
 		t.Fatalf("resume after switch = (%#v, %#v), want rebuilt client targeting %#v", resumed, resumedSession, target)
 	}
-	if resumed.identity.ID == 0 || resumed.identity.ID != instance.identity.ID {
-		t.Fatalf("resumed client ID = %d, want stable ID %d", resumed.identity.ID, instance.identity.ID)
+	if resumed.clientID == 0 || resumed.clientID != instance.clientID {
+		t.Fatalf("resumed client ID = %d, want stable ID %d", resumed.clientID, instance.clientID)
 	}
 	if identity.State.Phase != clientReplacing ||
 		identity.State.Active != instance.connection ||
@@ -502,8 +506,8 @@ func TestPaneCLINewReconcilesNestedPTYSizeToLiveViewport(t *testing.T) {
 
 	identity := &ClientIdentity{ResumeToken: "contextual-new"}
 	instance := newClientInstance(d, identity)
-	instance.terminalCols.Store(80)
-	instance.terminalRows.Store(23)
+	instance.terminalCols = 80
+	instance.terminalRows = 23
 	instance.controlOut = make(chan protocol.Frame, 8)
 	var paneOutput synchronizedBuffer
 	instance.Output[0] = testOutputLease(0, &paneOutput)
@@ -511,7 +515,7 @@ func TestPaneCLINewReconcilesNestedPTYSizeToLiveViewport(t *testing.T) {
 	d.clientTokens[identity.ResumeToken] = identity.ID
 	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{
 		WindowID: source.ActiveWindowID, SessionID: source.ID,
-		ClientID: instance.identity.ID, Generation: 1,
+		ClientID: instance.clientID, Generation: 1,
 	}
 	instance.ViewLeaseWindowID = source.ActiveWindowID
 	instance.ViewLeaseGeneration = 1
@@ -602,7 +606,7 @@ window {
 	instance.controlOut = make(chan protocol.Frame, 8)
 	setTestClient(source, instance)
 	d.clientTokens[identity.ResumeToken] = identity.ID
-	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: instance.identity.ID, Generation: 1}
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: instance.clientID, Generation: 1}
 	instance.ViewLeaseWindowID = source.ActiveWindowID
 	instance.ViewLeaseGeneration = 1
 	result := d.executeCommand(protocol.CommandRequest{
@@ -649,7 +653,7 @@ func TestPaneCLIAttachUsesPreparedTransitionToCallingClient(t *testing.T) {
 	instance := newClientInstance(d, identity)
 	instance.controlOut = make(chan protocol.Frame, 8)
 	setTestClient(source, instance)
-	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: instance.identity.ID, Generation: 1}
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: instance.clientID, Generation: 1}
 	instance.ViewLeaseWindowID = source.ActiveWindowID
 	instance.ViewLeaseGeneration = 1
 	result := d.executeCommand(protocol.CommandRequest{
@@ -681,7 +685,7 @@ func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 	}
 	first := decodeTestClientLayout(t, <-instance.controlOut)
 
-	transition, err := d.transitionClientToSession(instance.identity, target.ID, 80, 23)
+	transition, err := d.transitionClientToSession(instance.clientID, instance.connection, target.ID, 80, 23)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -692,7 +696,7 @@ func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 	if second.LayoutRevision <= first.LayoutRevision {
 		t.Fatalf("first switch revision = %d, want greater than %d", second.LayoutRevision, first.LayoutRevision)
 	}
-	transition, err = d.transitionClientToSession(instance.identity, source.ID, 80, 23)
+	transition, err = d.transitionClientToSession(instance.clientID, instance.connection, source.ID, 80, 23)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,7 +771,9 @@ func TestDaemonQUICListenerResumesByClientInstance(t *testing.T) {
 	var firstInstance *ClientIdentity
 	var firstClientID ClientID
 	d.call(func() {
-		firstInstance = d.clients[result.session.ClientID]
+		if session := d.sessions[result.sessionID]; session != nil {
+			firstInstance = d.clients[session.ClientID]
+		}
 		if firstInstance != nil {
 			firstClientID = firstInstance.ID
 		}
@@ -801,7 +807,9 @@ func TestDaemonQUICListenerResumesByClientInstance(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for secondInstance == nil && time.Now().Before(deadline) {
 		d.call(func() {
-			secondInstance = d.clients[result.session.ClientID]
+			if session := d.sessions[result.sessionID]; session != nil {
+				secondInstance = d.clients[session.ClientID]
+			}
 			if secondInstance != nil {
 				secondClientID = secondInstance.ID
 			}
@@ -852,7 +860,7 @@ func TestNormalDetachWaitsForFrontendTerminalExitCompletion(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		wantMessage := fmt.Sprintf("[detached (from session %d)]", result.session.ID)
+		wantMessage := fmt.Sprintf("[detached (from session %d)]", result.sessionID)
 		if request.Message != wantMessage {
 			t.Fatalf("terminal exit message = %q, want %q", request.Message, wantMessage)
 		}
@@ -977,12 +985,14 @@ func TestResizeBurstPreservesDetachInput(t *testing.T) {
 
 	var client *ClientIdentity
 	d.call(func() {
-		client = d.clients[result.session.ClientID]
+		if session := d.sessions[result.sessionID]; session != nil {
+			client = d.clients[session.ClientID]
+		}
 	})
 	if client == nil {
 		t.Fatal("attached client disappeared before detach completed")
 	}
-	if gotCols, gotRows := client.terminalCols.Load(), client.terminalRows.Load(); gotCols != 47 || gotRows != 18 {
+	if gotCols, gotRows := client.terminalCols, client.terminalRows; gotCols != 47 || gotRows != 18 {
 		t.Fatalf("terminal size before detach = %dx%d, want latest queued size 47x18", gotCols, gotRows)
 	}
 }
@@ -1236,7 +1246,7 @@ func TestDaemonCreatesListsAndConnectsNamedSession(t *testing.T) {
 		t.Fatalf("sessions = %#v, err = %v", listed.sessions, err)
 	}
 	connected, err := d.executeSessionOperation("connect-session", commandSessionTarget{name: "work"})
-	if err != nil || connected.session != created.session {
+	if err != nil || connected.sessionID != created.sessionID {
 		t.Fatalf("named connect = %#v, err = %v", connected, err)
 	}
 	if _, err := d.executeSessionOperation("create-session", commandSessionTarget{name: "work"}); err == nil {
@@ -1248,14 +1258,14 @@ func TestDaemonRenamesSessionUniquely(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	first, _ := d.executeSessionOperation("create-session", commandSessionTarget{name: "one"})
 	_, _ = d.executeSessionOperation("create-session", commandSessionTarget{name: "two"})
-	state := first.session
-	if err := d.renameSession(state, "renamed"); err != nil {
+	state := testOperationSession(d, first)
+	if err := d.renameSessionID(state.ID, "renamed"); err != nil {
 		t.Fatal(err)
 	}
 	if got := state.SessionName(); got != "renamed" {
 		t.Fatalf("session name = %q", got)
 	}
-	if err := d.renameSession(state, "two"); err == nil {
+	if err := d.renameSessionID(state.ID, "two"); err == nil {
 		t.Fatal("rename to an existing name was accepted")
 	}
 }
@@ -1273,7 +1283,7 @@ func TestSessionsShareDaemonQUICPort(t *testing.T) {
 	if first.bootstrap.Port != second.bootstrap.Port {
 		t.Fatalf("session ports = %d and %d, want one daemon port", first.bootstrap.Port, second.bootstrap.Port)
 	}
-	reconnect, err := d.executeSessionOperation("connect-session", commandSessionTarget{id: first.session.ID})
+	reconnect, err := d.executeSessionOperation("connect-session", commandSessionTarget{id: first.sessionID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1284,7 +1294,7 @@ func TestSessionsShareDaemonQUICPort(t *testing.T) {
 		t.Fatal("reconnect reused the initial attach token")
 	}
 
-	if err := d.shutdownSession(first.session); err != nil {
+	if err := d.shutdownSessionID(first.sessionID, defaultPaneTerminationTimeouts); err != nil {
 		t.Fatal(err)
 	}
 	if rebound, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: int(first.bootstrap.Port)}); err == nil {

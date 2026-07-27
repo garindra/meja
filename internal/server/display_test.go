@@ -377,7 +377,7 @@ func attachDisplayTestClient(t *testing.T, s *SessionState, client *ClientInstan
 func (c *ClientInstance) applyCurrentTestViewWithHandoff(handoff *outputHandoff) error {
 	var transition ViewTransition
 	c.Daemon.call(func() {
-		transition = c.Daemon.prepareViewTransitionNow(viewTransitionLayout, c.identity, c.sessionState())
+		transition = c.Daemon.prepareViewTransitionNow(viewTransitionLayout, testClientIdentity(c), c.Daemon.sessions[c.sessionID])
 	})
 	if handoff == nil {
 		return c.applyViewTransition(transition)
@@ -393,11 +393,11 @@ func (c *ClientInstance) finishTestHandoff(handoff *outputHandoff, placements []
 	plan.View.Layout.WindowID = c.currentView.Layout.WindowID
 	plan.View.Layout.LayoutRevision = c.currentView.Layout.LayoutRevision
 	for _, placement := range placements {
-		value, ok := c.Daemon.paneIndex.Load(placement.PaneID)
-		if !ok || value == nil {
+		var pane *Pane
+		c.Daemon.call(func() { pane = c.Daemon.panes[placement.PaneID] })
+		if pane == nil {
 			continue
 		}
-		pane := value.(*Pane)
 		cols, rows := pane.TerminalSize()
 		placement.Rect = protocol.Rect{Width: cols, Height: rows}
 		plan.View.Panes = append(plan.View.Panes, ClientPanePlacement{Placement: placement, Pane: pane})
@@ -1018,8 +1018,8 @@ func TestPrefixWindowNavigationMovesTheLiveProjectionAndInputTarget(t *testing.T
 	client := testClientInstance(frames, map[int]*OutputLease{0: testOutputLease(0, &output)})
 	client.shell = "/bin/sh"
 	attachDisplayTestClient(t, session, client)
-	client.terminalCols.Store(80)
-	client.terminalRows.Store(24)
+	client.terminalCols = 80
+	client.terminalRows = 24
 	if err := client.applyCurrentTestViewWithHandoff(nil); err != nil {
 		t.Fatal(err)
 	}
@@ -1134,7 +1134,7 @@ func TestPrefixWindowNavigationMovesTheLiveProjectionAndInputTarget(t *testing.T
 	if client.ViewLeaseWindowID != firstWindow.ID || client.ViewLeaseGeneration == 0 {
 		t.Fatalf("installed lease window=%d generation=%d; want window %d", client.ViewLeaseWindowID, client.ViewLeaseGeneration, firstWindow.ID)
 	}
-	if panes := client.currentPanePlacements(); len(panes) != 1 || panes[0].PaneID != first.ID {
+	if panes := client.currentView.Placements(); len(panes) != 1 || panes[0].PaneID != first.ID {
 		t.Fatalf("installed client layout panes = %#v; want pane %d", panes, first.ID)
 	}
 	if detach, err = client.handleInputBytes(returned.LayoutRevision, []byte("input-target")); err != nil || detach {
@@ -1289,7 +1289,7 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 	syncPaneRenderer(t, second)
 
 	instance := clientForState(session)
-	removal, err := session.daemon.removeClientPane(instance.identity, instance.activePane().ID)
+	removal, err := session.daemon.removeClientPane(instance.clientID, instance.activePane().ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1342,8 +1342,9 @@ func TestDaemonPostedExitOfOnlyPaneDestroysSession(t *testing.T) {
 	if testDaemonSession(state.daemon, state.ID) != nil {
 		t.Fatal("daemon-posted final pane exit left an empty session registered")
 	}
-	if !client.ended.Load() || state.HasWindows() {
-		t.Fatalf("ended=%v windows=%v", client.ended.Load(), state.HasWindows())
+	clientSnapshot := snapshotTestClientActor(client)
+	if !clientSnapshot.Ended || state.HasWindows() {
+		t.Fatalf("ended=%v windows=%v", clientSnapshot.Ended, state.HasWindows())
 	}
 }
 
@@ -1366,8 +1367,8 @@ func TestExitedShellProcessRemovesWindowAndSelectsFallback(t *testing.T) {
 		_ = terminatePane(exiting)
 		t.Fatal("failed to insert exiting shell window")
 	}
-	previousProjection := client.appliedProjectionRevision.Load()
-	client.Daemon.startPane(client.sessionState(), exiting)
+	previousProjection := snapshotTestClientActor(client).AppliedProjectionRevision
+	client.Daemon.startPane(client.sessionID, exiting)
 
 	deadline := time.Now().Add(2 * time.Second)
 	var exitingPresent bool
@@ -1377,7 +1378,8 @@ func TestExitedShellProcessRemovesWindowAndSelectsFallback(t *testing.T) {
 			exitingPresent = state.Windows[exitingWindow.ID] != nil
 			activeWindowID = state.ActiveWindowID
 		})
-		if (!exitingPresent && client.appliedProjectionRevision.Load() > previousProjection) || !time.Now().Before(deadline) {
+		clientSnapshot := snapshotTestClientActor(client)
+		if (!exitingPresent && clientSnapshot.AppliedProjectionRevision > previousProjection) || !time.Now().Before(deadline) {
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -1385,11 +1387,12 @@ func TestExitedShellProcessRemovesWindowAndSelectsFallback(t *testing.T) {
 	if exitingPresent || activeWindowID != firstWindow.ID {
 		t.Fatalf("shell exit left exiting-window=%v active=%d, want fallback %d", exitingPresent, activeWindowID, firstWindow.ID)
 	}
-	if testDaemonSession(state.daemon, state.ID) != state || client.ended.Load() {
+	clientSnapshot := snapshotTestClientActor(client)
+	if testDaemonSession(state.daemon, state.ID) != state || clientSnapshot.Ended {
 		t.Fatal("shell exit destroyed the session despite a surviving fallback window")
 	}
-	if client.currentView.Layout.WindowID != firstWindow.ID || client.currentView.Layout.FocusedPaneID != first.ID {
-		t.Fatalf("installed fallback window=%d pane=%d, want window=%d pane=%d", client.currentView.Layout.WindowID, client.currentView.Layout.FocusedPaneID, firstWindow.ID, first.ID)
+	if clientSnapshot.View.Layout.WindowID != firstWindow.ID || clientSnapshot.View.Layout.FocusedPaneID != first.ID {
+		t.Fatalf("installed fallback window=%d pane=%d, want window=%d pane=%d", clientSnapshot.View.Layout.WindowID, clientSnapshot.View.Layout.FocusedPaneID, firstWindow.ID, first.ID)
 	}
 }
 
@@ -1405,8 +1408,8 @@ func TestPaneExitReclaimsRemovedPaneOutputBeforeBindingFallback(t *testing.T) {
 	lease := testOutputLease(0, &synchronizedBuffer{})
 	client := testClientInstance(frames, map[int]*OutputLease{0: lease})
 	attachDisplayTestClient(t, state, client)
-	client.terminalCols.Store(16)
-	client.terminalRows.Store(4)
+	client.terminalCols = 16
+	client.terminalRows = 4
 	if err := client.applyCurrentTestViewWithHandoff(nil); err != nil {
 		t.Fatal(err)
 	}
@@ -1415,7 +1418,7 @@ func TestPaneExitReclaimsRemovedPaneOutputBeforeBindingFallback(t *testing.T) {
 	second, secondUpdates := startTestPaneRenderer(testAddPaneID(state), 16, 4)
 	defer close(secondUpdates)
 	handoff := client.beginOutputHandoff()
-	secondWindow, plan, err := state.daemon.createClientWindow(client.identity, second, 16, 4)
+	secondWindow, plan, err := state.daemon.createClientWindow(client.clientID, second, 16, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1468,8 +1471,8 @@ func TestSplitPaneExitRelayoutsSurvivorBeforePublishingProjection(t *testing.T) 
 		1: testOutputLease(1, &synchronizedBuffer{}),
 	})
 	attachDisplayTestClient(t, state, client)
-	client.terminalCols.Store(16)
-	client.terminalRows.Store(4)
+	client.terminalCols = 16
+	client.terminalRows = 4
 	if err := client.applyCurrentTestViewWithHandoff(nil); err != nil {
 		t.Fatal(err)
 	}
@@ -1531,7 +1534,7 @@ func TestLoginShellLogoutRemovesWindowAndSelectsFallback(t *testing.T) {
 		_ = terminatePane(exiting)
 		t.Fatal("failed to insert login-shell window")
 	}
-	client.Daemon.startPane(client.sessionState(), exiting)
+	client.Daemon.startPane(client.sessionID, exiting)
 	if err := exiting.sendInput([]byte("logout\n")); err != nil {
 		t.Fatalf("send logout: %v", err)
 	}
@@ -1567,8 +1570,8 @@ func TestDaemonPostedVisiblePaneExitTransfersPhysicalOutputToFallback(t *testing
 	var output synchronizedBuffer
 	client := testClientInstance(frames, map[int]*OutputLease{0: testOutputLease(0, &output)})
 	attachDisplayTestClient(t, state, client)
-	client.terminalCols.Store(16)
-	client.terminalRows.Store(4)
+	client.terminalCols = 16
+	client.terminalRows = 4
 	if err := client.applyCurrentTestViewWithHandoff(nil); err != nil {
 		t.Fatal(err)
 	}
@@ -1581,7 +1584,7 @@ func TestDaemonPostedVisiblePaneExitTransfersPhysicalOutputToFallback(t *testing
 	exiting, exitingUpdates := startTestPaneRenderer(testAddPaneID(state), 16, 4)
 	defer close(exitingUpdates)
 	handoff := client.beginOutputHandoff()
-	exitingWindow, plan, err := state.daemon.createClientWindow(client.identity, exiting, 16, 4)
+	exitingWindow, plan, err := state.daemon.createClientWindow(client.clientID, exiting, 16, 4)
 	if err != nil {
 		_ = terminatePane(exiting)
 		t.Fatal(err)
@@ -1638,8 +1641,8 @@ func TestPaneProcessExitResizesFallbackAndTransfersPhysicalOutput(t *testing.T) 
 	var output synchronizedBuffer
 	client := testClientInstance(frames, map[int]*OutputLease{0: testOutputLease(0, &output)})
 	attachDisplayTestClient(t, state, client)
-	client.terminalCols.Store(16)
-	client.terminalRows.Store(4)
+	client.terminalCols = 16
+	client.terminalRows = 4
 	if err := client.applyCurrentTestViewWithHandoff(nil); err != nil {
 		t.Fatal(err)
 	}
@@ -1656,12 +1659,12 @@ func TestPaneProcessExitResizesFallbackAndTransfersPhysicalOutput(t *testing.T) 
 		t.Fatal(err)
 	}
 	handoff := client.beginOutputHandoff()
-	exitingWindow, plan, err := state.daemon.createClientWindow(client.identity, exiting, 16, 4)
+	exitingWindow, plan, err := state.daemon.createClientWindow(client.clientID, exiting, 16, 4)
 	if err != nil {
 		_ = terminatePane(exiting)
 		t.Fatal(err)
 	}
-	state.daemon.startPane(state, exiting)
+	state.daemon.startPane(state.ID, exiting)
 	if err := client.commitProjectionPlan(plan.Projection); err != nil {
 		t.Fatal(err)
 	}
@@ -1683,7 +1686,7 @@ func TestPaneProcessExitResizesFallbackAndTransfersPhysicalOutput(t *testing.T) 
 	output.mu.Lock()
 	outputOffset := output.data.Len()
 	output.mu.Unlock()
-	previousProjection := client.appliedProjectionRevision.Load()
+	previousProjection := snapshotTestClientActor(client).AppliedProjectionRevision
 	if err := terminatePane(exiting); err != nil {
 		t.Fatalf("terminate exiting pane: %v", err)
 	}
@@ -1702,13 +1705,15 @@ func TestPaneProcessExitResizesFallbackAndTransfersPhysicalOutput(t *testing.T) 
 		t.Fatalf("exited shell remained in graph: window=%v pane=%v", state.Windows[exitingWindow.ID] != nil, state.Panes[exiting.ID] != nil)
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for client.appliedProjectionRevision.Load() <= previousProjection && time.Now().Before(deadline) {
+	clientSnapshot := snapshotTestClientActor(client)
+	for clientSnapshot.AppliedProjectionRevision <= previousProjection && time.Now().Before(deadline) {
 		runtime.Gosched()
+		clientSnapshot = snapshotTestClientActor(client)
 	}
-	if client.appliedProjectionRevision.Load() <= previousProjection {
+	if clientSnapshot.AppliedProjectionRevision <= previousProjection {
 		t.Fatal("fallback projection was published but not installed")
 	}
-	installed := client.currentView.Layout
+	installed := clientSnapshot.View.Layout
 	if installed.WindowID != firstWindow.ID || installed.FocusedPaneID != first.ID {
 		t.Fatalf("installed fallback window=%d pane=%d, want window=%d pane=%d",
 			installed.WindowID, installed.FocusedPaneID, firstWindow.ID, first.ID)
@@ -1747,7 +1752,7 @@ func TestMissingPrefixWindowShowsStatusWithoutDetaching(t *testing.T) {
 	if err != nil || detach {
 		t.Fatalf("missing prefix window detach=%v err=%v", detach, err)
 	}
-	message, _ := client.statusMessage.Load().(string)
+	message := client.statusMessage
 	if message != "unknown window 2" {
 		t.Fatalf("status message = %q, want unknown window 2", message)
 	}
@@ -1778,23 +1783,24 @@ func TestDaemonPostedPaneExitCannotDetachNewerFallbackProjection(t *testing.T) {
 	firstPlacement := protocol.PanePlacement{PaneID: first.ID, Slot: 0}
 	client.currentView.Layout.Panes = []protocol.PanePlacement{firstPlacement}
 	client.currentView.Panes = []ClientPanePlacement{{Pane: first, Placement: firstPlacement}}
-	client.eventLoopStarted.Store(true)
-	defer client.eventLoopStarted.Store(false)
 
 	state.daemon.postPaneProcessExit(second.ID)
 	// Barrier: the graph removal has completed. Client delivery starts only
 	// after the daemon transaction returns and may not be queued yet.
 	state.daemon.call(func() {})
 	if state.Windows[secondWindow.ID] != nil || state.ActiveWindowID != firstWindow.ID {
-		_, paneIndexed := state.daemon.paneIndex.Load(second.ID)
-		_, windowIndexed := state.daemon.windowIndex.Load(secondWindow.ID)
-		_, groupIndexed := state.daemon.groupIndex.Load(secondWindow.GroupID)
+		var paneIndexed, windowIndexed, groupIndexed bool
+		state.daemon.call(func() {
+			paneIndexed = state.daemon.panes[second.ID] != nil
+			windowIndexed = state.daemon.windows[secondWindow.ID] != nil
+			groupIndexed = state.daemon.groups[secondWindow.GroupID] != nil
+		})
 		t.Fatalf("pane exit left windows=%v active=%d, want fallback %d (pane=%v window=%v group=%v members=%v)", state.orderedWindowIDs(), state.ActiveWindowID, firstWindow.ID, paneIndexed, windowIndexed, groupIndexed, state.group.memberIDsSnapshot())
 	}
 
 	var newer ViewTransition
 	state.daemon.call(func() {
-		newer = state.daemon.prepareViewTransitionNow(viewTransitionSelectWindow, client.identity, state)
+		newer = state.daemon.prepareViewTransitionNow(viewTransitionSelectWindow, testClientIdentity(client), state)
 	})
 	if err := sendClientCommand(client.connection, clientInstanceCommand{Transition: &newer}); err != nil {
 		t.Fatal(err)

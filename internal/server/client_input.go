@@ -14,16 +14,12 @@ import (
 const paneResizeRepeatWindow = 500 * time.Millisecond
 
 func (c *ClientInstance) BeginPrompt(mode PromptMode, label, initial string) (*PromptState, error) {
-	state := c.sessionState()
 	if c == nil {
 		return nil, errors.New("client is unavailable")
 	}
 	client := &c.inputState
 	windowID := c.currentView.Layout.WindowID
 	if windowID == 0 {
-		windowID = state.ActiveWindowID
-	}
-	if state.Windows[windowID] == nil {
 		return nil, errors.New("client has no active window")
 	}
 	text := []rune(initial)
@@ -44,11 +40,12 @@ func (c *ClientInstance) BeginCommandPrompt() (*PromptState, error) {
 }
 
 func (c *ClientInstance) showStatusMessage(message string) {
-	if c == nil || c.sessionState() == nil {
+	if c == nil || c.currentView.Layout.WindowID == 0 {
 		return
 	}
-	messageID := c.statusMessageID.Add(1)
-	c.statusMessage.Store(message)
+	c.statusMessageID++
+	messageID := c.statusMessageID
+	c.statusMessage = message
 	duration := c.statusMessageDuration
 	if duration <= 0 {
 		duration = time.Second
@@ -505,18 +502,6 @@ func translateApplicationCursor(data []byte, enabled bool) ([]byte, int, bool) {
 	return []byte{0x1b, 'O', data[2]}, 3, true
 }
 
-func (c *ClientInstance) WindowIDByIndex(index int) (uint64, bool) {
-	if index < 0 {
-		return 0, false
-	}
-	for _, window := range c.sessionState().Windows {
-		if window.DisplayIndex == index {
-			return window.ID, true
-		}
-	}
-	return 0, false
-}
-
 func appendPromptByte(prompt *PromptState, b byte) bool {
 	prompt.pendingUTF8 = append(prompt.pendingUTF8, b)
 	changed := false
@@ -571,13 +556,14 @@ func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, protocol.C
 	}
 	client := &c.inputState
 	windowID := c.currentView.Layout.WindowID
-	window := c.sessionState().Windows[windowID]
-	if window == nil {
+	placements := c.currentView.NavigationPanes
+	if len(placements) == 0 {
+		placements = c.currentView.Layout.Panes
+	}
+	if windowID == 0 || len(placements) == 0 {
 		return nil, protocol.ClientLayout{}, fmt.Errorf("unknown window %d", windowID)
 	}
-	cols, rows := clientViewportSize(c.identity, window)
-	placements := window.Layout.Compute(Rect{Width: int(cols), Height: int(rows)})
-	var current *PanePlacement
+	var current *protocol.PanePlacement
 	for i := range placements {
 		if placements[i].PaneID == c.currentView.Layout.FocusedPaneID {
 			current = &placements[i]
@@ -585,7 +571,7 @@ func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, protocol.C
 		}
 	}
 	if current == nil {
-		return cloneWindow(window), c.currentView.Layout, nil
+		return nil, c.currentView.Layout, nil
 	}
 	if !client.HasFocusPoint {
 		client.FocusX2 = rectCenterX2(current.Rect)
@@ -596,11 +582,12 @@ func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, protocol.C
 		client.FocusY2 = clampToRectAxis(client.FocusY2, current.Rect.Y, current.Rect.Height)
 	}
 	type candidate struct {
-		placement    PanePlacement
+		placement    protocol.PanePlacement
 		primaryGap   int
 		secondaryGap int
 	}
-	var best *candidate
+	var best candidate
+	hasBest := false
 	for _, placement := range placements {
 		if placement.PaneID == current.PaneID {
 			continue
@@ -638,14 +625,14 @@ func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, protocol.C
 		default:
 			continue
 		}
-		if best == nil || candidate.secondaryGap < best.secondaryGap ||
+		if !hasBest || candidate.secondaryGap < best.secondaryGap ||
 			(candidate.secondaryGap == best.secondaryGap && candidate.primaryGap < best.primaryGap) ||
 			(candidate.secondaryGap == best.secondaryGap && candidate.primaryGap == best.primaryGap && candidate.placement.PaneID < best.placement.PaneID) {
-			copy := candidate
-			best = &copy
+			best = candidate
+			hasBest = true
 		}
 	}
-	if best != nil {
+	if hasBest {
 		if direction == 'A' || direction == 'B' {
 			client.FocusX2 = clampToRectAxis(client.FocusX2, best.placement.Rect.X, best.placement.Rect.Width)
 			client.FocusY2 = rectCenterY2(best.placement.Rect)
@@ -659,14 +646,14 @@ func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, protocol.C
 		}
 		return focusedWindow, c.currentView.Layout, nil
 	}
-	return cloneWindow(window), c.currentView.Layout, nil
+	return nil, c.currentView.Layout, nil
 }
 
-func rectCenterX2(rect Rect) int {
+func rectCenterX2(rect protocol.Rect) int {
 	return rect.X*2 + rect.Width
 }
 
-func rectCenterY2(rect Rect) int {
+func rectCenterY2(rect protocol.Rect) int {
 	return rect.Y*2 + rect.Height
 }
 

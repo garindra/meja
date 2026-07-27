@@ -3,10 +3,50 @@ package server
 import (
 	"bytes"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/garindra/meja/internal/protocol"
 )
+
+func TestPaneHistoryModePublishesImmutableMetadataConcurrently(t *testing.T) {
+	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
+	ptyOutput := startTestPaneLoop(pane)
+	defer func() {
+		close(ptyOutput)
+		<-pane.mainDone
+		pane.stop()
+	}()
+
+	stopReaders := make(chan struct{})
+	var readers sync.WaitGroup
+	for range 4 {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stopReaders:
+					return
+				default:
+					_ = pane.InputMode().historyMode
+				}
+			}
+		}()
+	}
+	for range 100 {
+		changed, err := pane.enterHistoryMode()
+		if err != nil || !changed || !pane.InputMode().historyMode {
+			t.Fatalf("enter history changed=%t metadata=%t err=%v", changed, pane.InputMode().historyMode, err)
+		}
+		changed, err = pane.exitHistoryMode()
+		if err != nil || !changed || pane.InputMode().historyMode {
+			t.Fatalf("exit history changed=%t metadata=%t err=%v", changed, pane.InputMode().historyMode, err)
+		}
+	}
+	close(stopReaders)
+	readers.Wait()
+}
 
 func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {
 	pane := &Pane{ID: 0, terminal: newTerminal(4, 3)}

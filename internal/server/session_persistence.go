@@ -133,7 +133,6 @@ type paneCaptureInput struct {
 }
 
 type windowCaptureInput struct {
-	window         *Window
 	windowID       uint64
 	displayIndex   int
 	layoutRevision WindowLayoutRevision
@@ -143,7 +142,7 @@ type windowCaptureInput struct {
 	layout         PlanLayout
 }
 
-func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer ProcessObserver) (SessionCapture, error) {
+func (d *Daemon) captureSessionID(sessionID uint64, ctx context.Context, observer ProcessObserver) (SessionCapture, error) {
 	if observer == nil {
 		observer = NewProcessObserver()
 	}
@@ -157,61 +156,75 @@ func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer P
 	var sessionName string
 	var sessionRoot string
 	var activeWindowID uint64
-	paneCount = len(s.Panes)
-	sessionName = s.Name
-	sessionRoot = s.rootDir
-	activeWindowID = s.ActiveWindowID
-	persistedCwds := map[uint64]string{}
-	if persisted := s.persistenceRecord(); persisted != nil {
-		for _, window := range persisted.Plan.Windows {
-			for _, pane := range window.Panes {
-				if pane.Cwd != "" {
-					persistedCwds[pane.ID] = pane.Cwd
+	var snapshotErr error
+	var windowCount int
+	d.call(func() {
+		s := d.sessions[sessionID]
+		if s == nil {
+			snapshotErr = errSessionUnavailable
+			return
+		}
+		paneCount = len(s.Panes)
+		windowCount = len(s.Windows)
+		sessionName = s.Name
+		sessionRoot = s.rootDir
+		activeWindowID = s.ActiveWindowID
+		persistedCwds := map[uint64]string{}
+		if persisted := s.persistenceRecord(); persisted != nil {
+			for _, window := range persisted.Plan.Windows {
+				for _, pane := range window.Panes {
+					if pane.Cwd != "" {
+						persistedCwds[pane.ID] = pane.Cwd
+					}
 				}
 			}
 		}
-	}
-	inputs = make([]paneCaptureInput, 0, len(s.Panes))
-	for _, pane := range s.Panes {
-		if pane == nil || pane.Root.PID <= 0 {
-			continue
+
+		inputs = make([]paneCaptureInput, 0, len(s.Panes))
+		for _, pane := range s.Panes {
+			if pane == nil || pane.Root.PID <= 0 {
+				continue
+			}
+			launch := clonePaneLaunch(pane.Launch)
+			fallbackCwd := launch.Cwd
+			if persistedCwd := persistedCwds[pane.ID]; persistedCwd != "" {
+				fallbackCwd = persistedCwd
+			}
+			if pane.KnownCwd != "" {
+				fallbackCwd = pane.KnownCwd
+			}
+			inputs = append(inputs, paneCaptureInput{
+				pane:        pane,
+				launch:      launch,
+				fallbackCwd: fallbackCwd,
+				anchor: Anchor{
+					Key:         PaneKey{PaneID: pane.ID},
+					Root:        pane.Root,
+					PTY:         pane.PTY,
+					RootIsShell: len(launch.RequestedArgv) == 0,
+				},
+			})
 		}
-		launch := clonePaneLaunch(pane.Launch)
-		fallbackCwd := launch.Cwd
-		if persistedCwd := persistedCwds[pane.ID]; persistedCwd != "" {
-			fallbackCwd = persistedCwd
+		windowInputs = make([]windowCaptureInput, 0, len(s.Windows))
+		for _, window := range s.Windows {
+			layout, err := planLayout(window.Layout)
+			if err != nil {
+				snapshotErr = err
+				return
+			}
+			windowInputs = append(windowInputs, windowCaptureInput{
+				windowID:       window.ID,
+				displayIndex:   window.DisplayIndex,
+				layoutRevision: window.LayoutRevision,
+				name:           window.Name,
+				automaticName:  window.AutomaticName,
+				activePaneID:   windowActivePaneID(window),
+				layout:         layout,
+			})
 		}
-		if pane.KnownCwd != "" {
-			fallbackCwd = pane.KnownCwd
-		}
-		inputs = append(inputs, paneCaptureInput{
-			pane:        pane,
-			launch:      launch,
-			fallbackCwd: fallbackCwd,
-			anchor: Anchor{
-				Key:         PaneKey{PaneID: pane.ID},
-				Root:        pane.Root,
-				PTY:         pane.PTY,
-				RootIsShell: len(launch.RequestedArgv) == 0,
-			},
-		})
-	}
-	windowInputs = make([]windowCaptureInput, 0, len(s.Windows))
-	for _, window := range s.Windows {
-		layout, err := planLayout(window.Layout)
-		if err != nil {
-			return SessionCapture{}, err
-		}
-		windowInputs = append(windowInputs, windowCaptureInput{
-			window:         window,
-			windowID:       window.ID,
-			displayIndex:   window.DisplayIndex,
-			layoutRevision: window.LayoutRevision,
-			name:           window.Name,
-			automaticName:  window.AutomaticName,
-			activePaneID:   windowActivePaneID(window),
-			layout:         layout,
-		})
+	})
+	if snapshotErr != nil {
+		return SessionCapture{}, snapshotErr
 	}
 	sort.Slice(inputs, func(i, j int) bool { return inputs[i].anchor.Key.PaneID < inputs[j].anchor.Key.PaneID })
 	sort.Slice(windowInputs, func(i, j int) bool { return windowInputs[i].displayIndex < windowInputs[j].displayIndex })
@@ -225,34 +238,37 @@ func (d *Daemon) captureSession(s *SessionState, ctx context.Context, observer P
 		return SessionCapture{}, err
 	}
 
-	valid := false
-	valid = len(s.Panes) == paneCount && len(s.Windows) == len(windowInputs) && s.Name == sessionName && s.rootDir == sessionRoot
-	currentActiveWindowID := s.ActiveWindowID
-	if currentActiveWindowID != activeWindowID {
-		valid = false
-	}
-	for _, input := range inputs {
-		current := s.Panes[input.anchor.Key.PaneID]
-		if current != input.pane || current.Root != input.anchor.Root {
-			valid = false
-			break
+	valid := true
+	d.call(func() {
+		s := d.sessions[sessionID]
+		valid = s != nil && len(s.Panes) == paneCount && len(s.Windows) == windowCount &&
+			s.Name == sessionName && s.rootDir == sessionRoot && s.ActiveWindowID == activeWindowID
+		if !valid {
+			return
 		}
-	}
-	for _, input := range windowInputs {
-		current := s.Windows[input.windowID]
-		if current != input.window || current.LayoutRevision != input.layoutRevision || current.Name != input.name ||
-			current.AutomaticName != input.automaticName || windowActivePaneID(current) != input.activePaneID {
-			valid = false
-			break
+		for _, input := range inputs {
+			current := s.Panes[input.anchor.Key.PaneID]
+			if current != input.pane || current.Root != input.anchor.Root {
+				valid = false
+				return
+			}
 		}
-	}
+		for _, input := range windowInputs {
+			current := s.Windows[input.windowID]
+			if current == nil || current.LayoutRevision != input.layoutRevision || current.Name != input.name ||
+				current.AutomaticName != input.automaticName || windowActivePaneID(current) != input.activePaneID {
+				valid = false
+				return
+			}
+		}
+	})
 	if !valid {
 		return SessionCapture{}, errSessionChangedDuringCapture
 	}
 
 	capture := SessionCapture{
 		CapturedAt:     time.Now().UTC(),
-		SessionID:      s.ID,
+		SessionID:      sessionID,
 		SessionName:    sessionName,
 		SessionRoot:    sessionRoot,
 		ActiveWindowID: activeWindowID,
@@ -958,7 +974,6 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 				s.daemon.panes = make(map[uint64]*Pane)
 			}
 			s.daemon.panes[restored.pane.ID] = restored.pane
-			s.daemon.paneIndex.Store(restored.pane.ID, restored.pane)
 		}
 	}
 	windowsByDisplay := make(map[int]uint64, len(plan.Windows))
@@ -986,7 +1001,10 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 		}
 		s.Windows[windowID] = window
 		if s.daemon != nil {
-			s.daemon.windowIndex.Store(windowID, window)
+			if s.daemon.windows == nil {
+				s.daemon.windows = make(map[uint64]*Window)
+			}
+			s.daemon.windows[windowID] = window
 		}
 		for _, paneID := range window.Layout.PaneIDs() {
 			if pane := s.Panes[paneID]; pane != nil {
@@ -1041,7 +1059,7 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 	for _, restored := range panes {
 		input := restoredCommandInput(restored.command, mode)
 		restored.pane.startupInput = input
-		d.startPane(s, restored.pane)
+		d.startPane(s.ID, restored.pane)
 	}
 	return nil
 }
@@ -1099,10 +1117,10 @@ func (d *Daemon) restoreSessionView(s *SessionState, persisted SessionPersistenc
 	if d.sessions[s.ID] != s {
 		return errSessionUnavailable
 	}
-	s.grouped.Store(len(group.SessionIDs) > 1)
+	s.grouped = len(group.SessionIDs) > 1
 	for memberID := range group.SessionIDs {
 		if member := d.sessions[memberID]; member != nil {
-			member.grouped.Store(len(group.SessionIDs) > 1)
+			member.grouped = len(group.SessionIDs) > 1
 		}
 	}
 	return nil

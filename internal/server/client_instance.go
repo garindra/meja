@@ -9,7 +9,6 @@ import (
 	"net"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -22,24 +21,22 @@ import (
 // object is discarded when QUIC closes; only its ClientIdentity survives
 // so a later reconnect can rebuild it.
 type ClientInstance struct {
-	identity   *ClientIdentity
+	clientID   ClientID
 	connection *clientConnection
 
 	sessionID    uint64
-	detaching    atomic.Bool
-	terminalCols atomic.Uint32
-	terminalRows atomic.Uint32
+	terminalCols uint16
+	terminalRows uint16
 	shell        string
 	commands     chan clientInstanceCommand
 
 	ViewLeaseWindowID   uint64
 	ViewLeaseGeneration uint64
-	ended               atomic.Bool
-	statusStarted       atomic.Bool
+	ended               bool
 	// appliedProjectionRevision orders every daemon decision applied by this
 	// transport, including focus-only updates that reuse currentView.Layout's
 	// client-view revision.
-	appliedProjectionRevision atomic.Uint64
+	appliedProjectionRevision uint64
 	Daemon                    *Daemon
 	// inputState is the client actor's prefix, prompt, and directional-focus
 	// parser state. It contains no session, viewport, or installed-view data.
@@ -52,11 +49,14 @@ type ClientInstance struct {
 	Output       [protocol.MaxRenderSlots]*OutputLease
 	StatusOutput io.Writer
 
-	controlOut            chan protocol.Frame
-	statusCommands        chan statusCommand
-	eventLoopStarted      atomic.Bool
-	statusMessage         atomic.Value // string
-	statusMessageID       atomic.Uint64
+	controlOut     chan protocol.Frame
+	statusCommands chan statusCommand
+	// statusWorkerStarted is set during construction, before publication. Test
+	// fixtures assembled incrementally use it only for initialization; it is not
+	// cross-goroutine synchronization.
+	statusWorkerStarted   bool
+	statusMessage         string
+	statusMessageID       uint64
 	statusMessageDuration time.Duration
 	lifetimeDone          chan struct{}
 	frontendInput         frontendInputParser
@@ -70,6 +70,8 @@ type clientInstanceCommand struct {
 	Transition         *ViewTransition
 	RefreshStatus      bool
 	ClearStatusMessage uint64
+	Status             clientStatusState
+	HasStatus          bool
 	FocusDirection     byte
 	EnterHistory       bool
 	RunSendKeys        bool
@@ -80,6 +82,18 @@ type clientInstanceCommand struct {
 	CloseCode          quic.ApplicationErrorCode
 	CloseReason        string
 	Done               chan<- error
+	Snapshot           chan<- clientInstanceSnapshot
+}
+
+// clientInstanceSnapshot is an immutable observation copied by the client
+// actor. It exists so diagnostics and tests synchronize through the actor
+// rather than reaching into ordinary actor-owned fields.
+type clientInstanceSnapshot struct {
+	Ended                      bool
+	AppliedProjectionRevision  uint64
+	StatusMessage              string
+	TerminalCols, TerminalRows uint16
+	View                       ClientView
 }
 
 type clientInputState struct {
@@ -113,7 +127,7 @@ func (c *ClientInstance) validateProjectionPlan(plan ClientProjectionPlan) error
 	if c == nil {
 		return errors.New("nil client projection")
 	}
-	if plan.ClientID != 0 && plan.ClientID != c.identity.ID {
+	if plan.ClientID != 0 && plan.ClientID != c.clientID {
 		return errors.New("stale client projection")
 	}
 	// Lease generations are monotonic per window, not across windows. A newly
@@ -126,7 +140,7 @@ func (c *ClientInstance) validateProjectionPlan(plan ClientProjectionPlan) error
 	if plan.ProjectionRevision == 0 {
 		return errors.New("client projection has no ordering revision")
 	}
-	if plan.ProjectionRevision <= c.appliedProjectionRevision.Load() {
+	if plan.ProjectionRevision <= c.appliedProjectionRevision {
 		return errors.New("stale client projection revision")
 	}
 	if plan.SessionID != 0 && c.sessionID != 0 && plan.SessionID != c.sessionID {
@@ -136,7 +150,7 @@ func (c *ClientInstance) validateProjectionPlan(plan ClientProjectionPlan) error
 }
 
 func (c *ClientInstance) focusPane(paneID uint64) (*Window, error) {
-	window, transition, err := c.Daemon.focusClientPane(c.identity, paneID)
+	window, transition, err := c.Daemon.focusClientPane(c.clientID, paneID)
 	if err != nil {
 		return nil, err
 	}
@@ -146,43 +160,11 @@ func (c *ClientInstance) focusPane(paneID uint64) (*Window, error) {
 	return window, c.applyFocusTransition(transition)
 }
 
-func (c *ClientInstance) sessionState() *SessionState {
-	if c == nil || c.Daemon == nil {
-		return nil
-	}
-	if state, ok := c.Daemon.sessionIndex.Load(c.sessionID); ok {
-		return state.(*SessionState)
-	}
-	return nil
-}
-
 func (c *ClientInstance) activePane() *Pane {
-	if c == nil || c.Daemon == nil {
-		return nil
-	}
-	value, ok := c.Daemon.paneIndex.Load(c.currentView.Layout.FocusedPaneID)
-	if !ok || value == nil {
-		return nil
-	}
-	return value.(*Pane)
-}
-
-func (c *ClientInstance) activeWindow() *Window {
 	if c == nil {
 		return nil
 	}
-	state := c.sessionState()
-	if state == nil {
-		return nil
-	}
-	return cloneWindow(state.Windows[c.currentView.Layout.WindowID])
-}
-
-func (c *ClientInstance) currentPanePlacements() []protocol.PanePlacement {
-	if c == nil {
-		return nil
-	}
-	return append([]protocol.PanePlacement(nil), c.currentView.Layout.Panes...)
+	return c.currentView.FocusedPane()
 }
 
 func (c *ClientInstance) isFocusedPane(paneID uint64) bool {
@@ -190,32 +172,26 @@ func (c *ClientInstance) isFocusedPane(paneID uint64) bool {
 }
 
 func postClientCommand(connection *clientConnection, command clientInstanceCommand) {
-	if connection == nil || connection.commands == nil {
+	if connection == nil {
 		return
 	}
-	connection.commands <- command
-}
-
-func (d *Daemon) clientConnectionIsActive(identity *ClientIdentity, connection *clientConnection, sessionID uint64) bool {
-	if d == nil || identity == nil || connection == nil {
-		return false
+	if command.RefreshStatus && command.Transition == nil && !command.Close &&
+		command.FocusDirection == 0 && !command.EnterHistory &&
+		!command.RunSendKeys && !command.RunPasteBuffer {
+		connection.enqueueStatusRefresh(command.Status, command.HasStatus)
+		return
 	}
-	active := false
-	d.call(func() {
-		session := d.sessions[sessionID]
-		active = session != nil && session.ClientID == identity.ID &&
-			d.clients[identity.ID] == identity && identity.State.Active == connection
-	})
-	return active
+	connection.enqueueRequired(command)
 }
 
-func (d *Daemon) clientConnectionIsCurrent(identity *ClientIdentity, connection *clientConnection) bool {
-	if d == nil || identity == nil || connection == nil {
+func (d *Daemon) clientConnectionIsCurrent(clientID ClientID, connection *clientConnection) bool {
+	if d == nil || clientID == 0 || connection == nil {
 		return false
 	}
 	current := false
 	d.call(func() {
-		current = d.clients[identity.ID] == identity && identity.State.Active == connection
+		identity := d.clients[clientID]
+		current = identity != nil && identity.State.Active == connection
 	})
 	return current
 }
@@ -224,7 +200,10 @@ func (c *ClientInstance) postCommand(command clientInstanceCommand) {
 	if c == nil || c.connection == nil {
 		return
 	}
-	if !c.eventLoopStarted.Load() {
+	// A nil mailbox is possible only for an unpublished test fixture. Published
+	// production instances always have their actor mailbox before callbacks can
+	// retain the instance.
+	if c.commands == nil {
 		c.runClientCommand(command)
 		return
 	}
@@ -240,14 +219,38 @@ func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
 	}
 	var err error
 	switch {
+	case command.Snapshot != nil:
+		view := c.currentView
+		view.Layout.Panes = append([]protocol.PanePlacement(nil), c.currentView.Layout.Panes...)
+		view.Panes = append([]ClientPanePlacement(nil), c.currentView.Panes...)
+		view.NavigationPanes = append([]protocol.PanePlacement(nil), c.currentView.NavigationPanes...)
+		view.Status.Windows = append([]WindowStatus(nil), c.currentView.Status.Windows...)
+		if c.currentView.paneByID != nil {
+			view.paneByID = make(map[uint64]*Pane, len(c.currentView.paneByID))
+			for id, pane := range c.currentView.paneByID {
+				view.paneByID[id] = pane
+			}
+		}
+		command.Snapshot <- clientInstanceSnapshot{
+			Ended:                     c.ended,
+			AppliedProjectionRevision: c.appliedProjectionRevision,
+			StatusMessage:             c.statusMessage,
+			TerminalCols:              c.terminalCols,
+			TerminalRows:              c.terminalRows,
+			View:                      view,
+		}
 	case command.Transition != nil:
 		err = c.applyViewTransition(*command.Transition)
 	case command.ClearStatusMessage != 0:
-		if c.sessionState() != nil && c.statusMessageID.Load() == command.ClearStatusMessage {
-			c.statusMessage.Store("")
+		if c.sessionID != 0 && c.statusMessageID == command.ClearStatusMessage {
+			c.statusMessage = ""
 			err = c.publishStatusBar()
 		}
 	case command.RefreshStatus:
+		if command.HasStatus {
+			c.currentView.Status = command.Status
+			c.currentView.StatusValid = true
+		}
 		err = c.publishStatusBar()
 	case command.FocusDirection != 0:
 		_, _, err = c.FocusPaneDirection(command.FocusDirection)
@@ -259,7 +262,7 @@ func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
 		err = pasteBufferToClient(c, command.PasteBuffer)
 	case command.Close:
 		if command.CloseCode == 0 {
-			c.ended.Store(true)
+			c.ended = true
 		} else if c.QUIC != nil {
 			err = c.QUIC.CloseWithError(command.CloseCode, command.CloseReason)
 		}
@@ -269,12 +272,13 @@ func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
 	}
 	if err != nil && command.Done == nil && c.Daemon != nil {
 		c.Daemon.logf("meja server: client event failed client=%d session=%d: %v\n",
-			c.identity.ID, c.sessionID, err)
+			c.clientID, c.sessionID, err)
 	}
 }
 
 type frontendPaneCapture struct {
 	paneID uint64
+	pane   *Pane
 	active bool
 	button uint8
 	// mejaSelection distinguishes a pending or active server-owned history
@@ -304,8 +308,174 @@ const (
 // clientConnection is a passive address for one ClientInstance goroutine.
 // Channel identity distinguishes overlapping old and replacement connections.
 type clientConnection struct {
-	commands chan clientInstanceCommand
-	done     <-chan struct{}
+	commands   chan clientInstanceCommand
+	required   chan clientInstanceCommand
+	refresh    chan clientStatusState
+	fence      chan clientInstanceCommand
+	done       <-chan struct{}
+	revoked    chan struct{}
+	revokeOnce sync.Once
+	workerOnce sync.Once
+	// deliveryConfigured is set before the worker is published and is used only
+	// to keep incremental test construction from rewriting live channel fields.
+	deliveryConfigured bool
+	// workerStarted is an optional construction probe used by deterministic
+	// mailbox tests. Production connections leave it nil.
+	workerStarted chan<- struct{}
+}
+
+const clientRequiredDeliveryCapacity = 64
+
+func newClientConnection() *clientConnection {
+	return &clientConnection{
+		commands: make(chan clientInstanceCommand, clientRequiredDeliveryCapacity),
+		required: make(chan clientInstanceCommand, clientRequiredDeliveryCapacity),
+		refresh:  make(chan clientStatusState, 1),
+		fence:    make(chan clientInstanceCommand, 1),
+		revoked:  make(chan struct{}),
+	}
+}
+
+func (c *clientConnection) revoke() {
+	if c == nil {
+		return
+	}
+	c.revokeOnce.Do(func() {
+		if c.revoked == nil {
+			c.revoked = make(chan struct{})
+		}
+		close(c.revoked)
+	})
+}
+
+func (c *clientConnection) isRevoked() bool {
+	if c == nil {
+		return true
+	}
+	if c.revoked == nil {
+		return false
+	}
+	select {
+	case <-c.revoked:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *clientConnection) startDeliveryWorker() {
+	if c == nil {
+		return
+	}
+	c.workerOnce.Do(func() {
+		if c.commands == nil {
+			c.commands = make(chan clientInstanceCommand, clientRequiredDeliveryCapacity)
+		}
+		if c.required == nil {
+			c.required = make(chan clientInstanceCommand, clientRequiredDeliveryCapacity)
+		}
+		if c.refresh == nil {
+			c.refresh = make(chan clientStatusState, 1)
+		}
+		if c.fence == nil {
+			c.fence = make(chan clientInstanceCommand, 1)
+		}
+		c.deliveryConfigured = true
+		if c.workerStarted != nil {
+			c.workerStarted <- struct{}{}
+		}
+		go c.runDeliveryWorker()
+	})
+}
+
+func (c *clientConnection) enqueueRequired(command clientInstanceCommand) bool {
+	if c == nil {
+		return false
+	}
+	if command.Close {
+		c.revoke()
+	}
+	c.startDeliveryWorker()
+	select {
+	case c.required <- command:
+		return true
+	default:
+		// Required transitions are never discarded while leaving the transport
+		// live. Saturation fences this exact connection; canonical daemon state
+		// and unrelated clients continue independently.
+		fence := clientInstanceCommand{
+			Close:       true,
+			CloseCode:   protocol.RenderOutputErrorCode,
+			CloseReason: "client delivery mailbox saturated",
+		}
+		c.revoke()
+		select {
+		case c.fence <- fence:
+		default:
+		}
+		return false
+	}
+}
+
+func (c *clientConnection) enqueueStatusRefresh(status clientStatusState, hasStatus bool) {
+	if c == nil {
+		return
+	}
+	c.startDeliveryWorker()
+	if !hasStatus {
+		status = clientStatusState{}
+	}
+	select {
+	case c.refresh <- status:
+	default:
+		// Replace the pending advisory snapshot with the newest one. The
+		// connection worker remains the single consumer.
+		select {
+		case <-c.refresh:
+		default:
+		}
+		select {
+		case c.refresh <- status:
+		default:
+		}
+	}
+}
+
+func (c *clientConnection) runDeliveryWorker() {
+	for {
+		var command clientInstanceCommand
+		// A saturation fence supersedes queued work for the unhealthy
+		// connection. Otherwise required FIFO work always gets the first chance;
+		// status is a capacity-one advisory edge.
+		select {
+		case command = <-c.fence:
+		default:
+			select {
+			case command = <-c.fence:
+			case command = <-c.required:
+			default:
+				select {
+				case command = <-c.fence:
+				case command = <-c.required:
+				case status := <-c.refresh:
+					command = clientInstanceCommand{RefreshStatus: true, Status: status, HasStatus: true}
+				case <-c.done:
+					return
+				}
+			}
+		}
+		select {
+		case c.commands <- command:
+		case fence := <-c.fence:
+			select {
+			case c.commands <- fence:
+			case <-c.done:
+				return
+			}
+		case <-c.done:
+			return
+		}
+	}
 }
 
 type clientLifecycle struct {
@@ -326,8 +496,8 @@ type ClientIdentity struct {
 	State       clientLifecycle
 
 	TerminalReason     string
-	terminalCols       atomic.Uint32
-	terminalRows       atomic.Uint32
+	terminalCols       uint16
+	terminalRows       uint16
 	projectionRevision uint64
 	shell              string
 
@@ -336,19 +506,16 @@ type ClientIdentity struct {
 	lastAllocatedClientLayoutRevision protocol.ClientLayoutRevision
 }
 
-func newClientInstance(d *Daemon, identity *ClientIdentity, connections ...*clientConnection) *ClientInstance {
-	var connection *clientConnection
-	if len(connections) > 0 {
-		connection = connections[0]
-	}
+func newClientInstanceFromAdmission(d *Daemon, admission ClientAdmission) *ClientInstance {
+	connection := admission.connection
 	if connection == nil {
-		connection = &clientConnection{commands: make(chan clientInstanceCommand, 64)}
+		connection = newClientConnection()
 	}
 	if connection.commands == nil {
-		connection.commands = make(chan clientInstanceCommand, 64)
+		connection.commands = make(chan clientInstanceCommand, clientRequiredDeliveryCapacity)
 	}
 	instance := &ClientInstance{
-		identity:       identity,
+		clientID:       admission.ClientID,
 		connection:     connection,
 		Daemon:         d,
 		shell:          defaultShell(),
@@ -357,41 +524,41 @@ func newClientInstance(d *Daemon, identity *ClientIdentity, connections ...*clie
 		statusCommands: make(chan statusCommand, 64),
 		heldKeys:       make(map[frontendHeldKey]uint64),
 	}
-	if identity != nil {
-		instance.sessionID = identity.SessionID
-		if identity.shell != "" {
-			instance.shell = identity.shell
-		}
-		instance.terminalCols.Store(identity.terminalCols.Load())
-		instance.terminalRows.Store(identity.terminalRows.Load())
+	instance.sessionID = admission.SessionID
+	if admission.Shell != "" {
+		instance.shell = admission.Shell
 	}
+	instance.terminalCols = admission.Cols
+	instance.terminalRows = admission.Rows
 	connection.done = instance.lifetimeDone
-	instance.startStatusOutput()
+	connection.startDeliveryWorker()
+	instance.statusWorkerStarted = true
+	go instance.runStatusOutput()
 	return instance
 }
 
 func (c *ClientInstance) adoptIdentityTerminalSize() {
-	if c == nil || c.identity == nil {
+	if c == nil || c.Daemon == nil || c.clientID == 0 {
 		return
 	}
-	c.terminalCols.Store(c.identity.terminalCols.Load())
-	c.terminalRows.Store(c.identity.terminalRows.Load())
+	var cols, rows uint16
+	c.Daemon.call(func() {
+		if identity := c.Daemon.clients[c.clientID]; identity != nil && identity.State.Active == c.connection {
+			cols, rows = identity.terminalCols, identity.terminalRows
+		}
+	})
+	c.terminalCols = cols
+	c.terminalRows = rows
 }
 
 func sendClientCommand(connection *clientConnection, command clientInstanceCommand) error {
-	if connection == nil || connection.commands == nil {
+	if connection == nil {
 		return errors.New("client connection is unavailable")
-	}
-	if connection.done == nil {
-		connection.commands <- command
-		return nil
 	}
 	result := make(chan error, 1)
 	command.Done = result
-	select {
-	case connection.commands <- command:
-	case <-connection.done:
-		return errors.New("target client disconnected")
+	if !connection.enqueueRequired(command) {
+		return errors.New("target client delivery mailbox saturated")
 	}
 	select {
 	case err := <-result:
@@ -399,13 +566,6 @@ func sendClientCommand(connection *clientConnection, command clientInstanceComma
 	case <-connection.done:
 		return errors.New("target client disconnected")
 	}
-}
-
-func (c *ClientInstance) startStatusOutput() {
-	if c == nil || c.statusCommands == nil || !c.statusStarted.CompareAndSwap(false, true) {
-		return
-	}
-	go c.runStatusOutput()
 }
 
 func (c *ClientInstance) inputLayoutForRevision(revision protocol.ClientLayoutRevision) (protocol.ClientLayout, bool) {
@@ -498,7 +658,7 @@ func isSessionReplacedClose(err error) bool {
 // releaseFrontendResources tears down transport-local status and pane output
 // resources after the daemon has fenced and unregistered this instance.
 func (c *ClientInstance) releaseFrontendResources() {
-	if c == nil || !c.detaching.Load() {
+	if c == nil {
 		return
 	}
 	var detachErr error
@@ -612,7 +772,7 @@ func (d *Daemon) runQUIC(ctx context.Context, listener *quic.Listener) {
 	}
 }
 
-func (d *Daemon) issueAttachGrant(session *SessionState) (uint16, string, time.Time, error) {
+func (d *Daemon) issueAttachGrant(sessionID uint64) (uint16, string, time.Time, error) {
 	port, err := d.ensureQUIC()
 	if err != nil {
 		return 0, "", time.Time{}, err
@@ -624,12 +784,12 @@ func (d *Daemon) issueAttachGrant(session *SessionState) (uint16, string, time.T
 	expiresAt := time.Now().Add(attachTTL)
 	var issueErr error
 	d.call(func() {
-		if d.sessions[session.ID] != session {
+		if d.sessions[sessionID] == nil {
 			issueErr = errSessionUnavailable
 			return
 		}
 		d.removeExpiredAttachGrants(time.Now())
-		d.attachGrants = append(d.attachGrants, attachGrant{Token: token, SessionID: session.ID, ExpiresAt: expiresAt})
+		d.attachGrants = append(d.attachGrants, attachGrant{Token: token, SessionID: sessionID, ExpiresAt: expiresAt})
 	})
 	if issueErr != nil {
 		return 0, "", time.Time{}, issueErr
@@ -677,9 +837,10 @@ type ClientAdmission struct {
 	ClientID    ClientID
 	SessionID   uint64
 	ResumeToken string
-
-	identity   *ClientIdentity
-	connection *clientConnection
+	Shell       string
+	Cols        uint16
+	Rows        uint16
+	connection  *clientConnection
 }
 
 type ClientInitialized struct {
@@ -707,7 +868,6 @@ func (d *Daemon) admitSessionConnection(encodedToken string) (ClientAdmission, e
 		return ClientAdmission{}, err
 	}
 	var admission ClientAdmission
-	var session *SessionState
 	var attachErr error
 	var displaced *clientConnection
 	d.call(func() {
@@ -726,7 +886,7 @@ func (d *Daemon) admitSessionConnection(encodedToken string) (ClientAdmission, e
 		}
 		sessionID := d.attachGrants[grantIndex].SessionID
 		d.attachGrants = append(d.attachGrants[:grantIndex], d.attachGrants[grantIndex+1:]...)
-		session = d.sessions[sessionID]
+		session := d.sessions[sessionID]
 		if session == nil {
 			attachErr = &clientHandshakeError{reason: "session attachment rejected"}
 			return
@@ -735,7 +895,7 @@ func (d *Daemon) admitSessionConnection(encodedToken string) (ClientAdmission, e
 		if d.nextClientID == 0 {
 			d.nextClientID = 1
 		}
-		connection := &clientConnection{commands: make(chan clientInstanceCommand, 64)}
+		connection := newClientConnection()
 		identity := &ClientIdentity{
 			ID: d.nextClientID, ResumeToken: encodedReconnectToken, SessionID: session.ID,
 			State: clientLifecycle{Phase: clientPending, Pending: connection},
@@ -744,7 +904,8 @@ func (d *Daemon) admitSessionConnection(encodedToken string) (ClientAdmission, e
 		d.nextClientID++
 		admission = ClientAdmission{
 			ClientID: identity.ID, SessionID: session.ID,
-			ResumeToken: identity.ResumeToken, identity: identity, connection: connection,
+			ResumeToken: identity.ResumeToken, Shell: identity.shell,
+			Cols: identity.terminalCols, Rows: identity.terminalRows, connection: connection,
 		}
 		d.clients[identity.ID] = identity
 		d.clientTokens[encodedReconnectToken] = identity.ID
@@ -768,7 +929,6 @@ func (d *Daemon) admitSessionConnection(encodedToken string) (ClientAdmission, e
 
 func (d *Daemon) admitResumedConnection(encodedToken string) (ClientAdmission, error) {
 	var admission ClientAdmission
-	var session *SessionState
 	var previous *clientConnection
 	var resumeErr error
 	d.call(func() {
@@ -786,12 +946,12 @@ func (d *Daemon) admitResumedConnection(encodedToken string) (ClientAdmission, e
 			resumeErr = &clientHandshakeError{reason: "client instance is not assigned to a session"}
 			return
 		}
-		session = d.sessions[sessionID]
+		session := d.sessions[sessionID]
 		if session == nil {
 			resumeErr = &clientHandshakeError{reason: "session is no longer available"}
 			return
 		}
-		connection := &clientConnection{commands: make(chan clientInstanceCommand, 64)}
+		connection := newClientConnection()
 		previous = identity.State.Active
 		identity.State = clientLifecycle{
 			Phase: clientPending, Pending: connection,
@@ -802,7 +962,8 @@ func (d *Daemon) admitResumedConnection(encodedToken string) (ClientAdmission, e
 		}
 		admission = ClientAdmission{
 			ClientID: identity.ID, SessionID: session.ID, ResumeToken: identity.ResumeToken,
-			identity: identity, connection: connection,
+			Shell: identity.shell, Cols: identity.terminalCols, Rows: identity.terminalRows,
+			connection: connection,
 		}
 	})
 	if previous != nil {
@@ -816,7 +977,7 @@ func (d *Daemon) admitResumedConnection(encodedToken string) (ClientAdmission, e
 
 func (d *Daemon) initializeClient(request ClientInitialized) (ViewTransition, error) {
 	var transition ViewTransition
-	var session *SessionState
+	var sessionID uint64
 	var previousDone <-chan struct{}
 	var activateErr error
 	d.call(func() {
@@ -830,11 +991,12 @@ func (d *Daemon) initializeClient(request ClientInitialized) (ViewTransition, er
 			activateErr = &clientHandshakeError{reason: identity.TerminalReason}
 			return
 		}
-		session = d.sessions[identity.SessionID]
+		session := d.sessions[identity.SessionID]
 		if session == nil {
 			activateErr = &clientHandshakeError{reason: "session is no longer available"}
 			return
 		}
+		sessionID = session.ID
 		if request.Cols == 0 || request.Rows == 0 {
 			if window := session.Windows[session.ActiveWindowID]; window != nil {
 				request.Cols, request.Rows = window.Cols, window.Rows
@@ -860,7 +1022,8 @@ func (d *Daemon) initializeClient(request ClientInitialized) (ViewTransition, er
 			activateErr = &clientHandshakeError{reason: "client admission is no longer active"}
 			return
 		}
-		if identity.TerminalReason != "" || d.sessions[identity.SessionID] != session {
+		session := d.sessions[identity.SessionID]
+		if identity.TerminalReason != "" || session == nil || identity.SessionID != sessionID {
 			reason := identity.TerminalReason
 			if reason == "" {
 				reason = "session is no longer available"
@@ -876,8 +1039,8 @@ func (d *Daemon) initializeClient(request ClientInitialized) (ViewTransition, er
 			return
 		}
 		identity.State = clientLifecycle{Phase: clientActive, Active: pending}
-		identity.terminalCols.Store(uint32(cols))
-		identity.terminalRows.Store(uint32(rows))
+		identity.terminalCols = cols
+		identity.terminalRows = rows
 		session.ClientID = identity.ID
 		transition, activateErr = d.prepareAttachedClientViewNow(identity, session, cols, rows)
 	})
@@ -887,13 +1050,12 @@ func (d *Daemon) initializeClient(request ClientInitialized) (ViewTransition, er
 func (d *Daemon) detachClientInstance(instance *ClientInstance) {
 	deactivate := false
 	d.call(func() {
-		identity := instance.identity
+		identity := d.clients[instance.clientID]
 		if identity == nil {
 			return
 		}
 		switch {
 		case identity.State.Active == instance.connection:
-			instance.detaching.Store(true)
 			identity.State.Active = nil
 			if identity.State.Pending != nil {
 				identity.State.Phase = clientPending
@@ -909,8 +1071,6 @@ func (d *Daemon) detachClientInstance(instance *ClientInstance) {
 				identity.State.Phase = clientDetached
 			}
 			deactivate = true
-		case instance.detaching.Load():
-			deactivate = true
 		}
 		if !deactivate {
 			return
@@ -922,7 +1082,7 @@ func (d *Daemon) detachClientInstance(instance *ClientInstance) {
 	})
 	if deactivate {
 		if instance.ViewLeaseWindowID != 0 {
-			_ = d.releaseWindowView(instance.identity.ID, instance.ViewLeaseWindowID, instance.ViewLeaseGeneration)
+			_ = d.releaseWindowView(instance.clientID, instance.ViewLeaseWindowID, instance.ViewLeaseGeneration)
 			instance.ViewLeaseWindowID = 0
 			instance.ViewLeaseGeneration = 0
 		}
@@ -934,24 +1094,26 @@ func (d *Daemon) detachClientInstance(instance *ClientInstance) {
 // target session while retaining its transport, streams, output leases, and
 // reconnect token. It commits daemon ownership and returns the exact view for
 // the ClientInstance actor to apply; it never installs that view itself.
-func (d *Daemon) transitionClientToSession(instance *ClientIdentity, targetSessionID uint64, cols, rows uint16) (ViewTransition, error) {
+func (d *Daemon) transitionClientToSession(clientID ClientID, connection *clientConnection, targetSessionID uint64, cols, rows uint16) (ViewTransition, error) {
 	var source *SessionState
 	var target *SessionState
 	var displaced *clientConnection
 	var transition ViewTransition
 	var switchErr error
-	if instance == nil {
+	if clientID == 0 || connection == nil {
 		return transition, errors.New("nil client instance")
 	}
 	if targetSessionID == 0 {
 		return transition, errors.New("target session is unavailable")
 	}
-	// The terminal dimensions are client-owned input to the daemon plan. They
-	// are not part of the assignment transaction and may be refreshed before
-	// the next projection is installed.
-	instance.terminalCols.Store(uint32(cols))
-	instance.terminalRows.Store(uint32(rows))
 	d.call(func() {
+		instance := d.clients[clientID]
+		if instance == nil || instance.State.Active != connection {
+			switchErr = errors.New("client instance can no longer switch sessions")
+			return
+		}
+		instance.terminalCols = cols
+		instance.terminalRows = rows
 		source = d.sessions[instance.SessionID]
 		if source == nil {
 			switchErr = errors.New("client instance is not attached to a session")
@@ -969,8 +1131,7 @@ func (d *Daemon) transitionClientToSession(instance *ClientIdentity, targetSessi
 			transition = d.prepareViewTransitionNow(viewTransitionSession, instance, target)
 			return
 		}
-		if d.clients[instance.ID] != instance || instance.State.Active == nil ||
-			instance.TerminalReason != "" || source.ClientID != instance.ID ||
+		if instance.TerminalReason != "" || source.ClientID != instance.ID ||
 			d.sessions[target.ID] != target {
 			switchErr = errors.New("client instance can no longer switch sessions")
 			return
@@ -1043,7 +1204,7 @@ func (d *Daemon) transitionClientToSession(instance *ClientIdentity, targetSessi
 	if switchErr != nil {
 		return transition, switchErr
 	}
-	if displaced != nil && displaced != instance.State.Active {
+	if displaced != nil && displaced != connection {
 		postClientCommand(displaced, clientInstanceCommand{
 			Close: true, CloseCode: protocol.SessionReplacedErrorCode,
 			CloseReason: "session taken over by another client",
@@ -1054,7 +1215,7 @@ func (d *Daemon) transitionClientToSession(instance *ClientIdentity, targetSessi
 
 func (d *Daemon) discardPendingClientInstance(instance *ClientInstance) {
 	d.call(func() {
-		identity := instance.identity
+		identity := d.clients[instance.clientID]
 		if identity == nil {
 			return
 		}
@@ -1142,7 +1303,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		_ = sendEncodedDirect(controlStream, protocol.MsgSessionAttachFailed, protocol.SessionAttachFailed{Reason: reason}, protocol.EncodeSessionAttachFailed)
 		return err
 	}
-	clientInstance := newClientInstance(d, admission.identity, admission.connection)
+	clientInstance := newClientInstanceFromAdmission(d, admission)
 	defer close(clientInstance.lifetimeDone)
 	attached := false
 	defer func() {
@@ -1238,7 +1399,6 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 	// recent dimensions before doing the expensive projection transaction.
 	controlEvents := make(chan clientControlEvent, 256)
 	go readClientControl(controlDecoder, controlEvents)
-	clientInstance.eventLoopStarted.Store(true)
 	exitRequested := false
 	requestTerminalExit := func(message string) error {
 		if exitRequested {
@@ -1280,7 +1440,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		stopped, err := clientInstance.handleControlFrame(event.frame)
 		if stopped {
 			message := fmt.Sprintf("[detached (from session %d)]", clientInstance.sessionID)
-			if clientInstance.ended.Load() {
+			if clientInstance.ended {
 				message = "[exited]"
 			}
 			if err := requestTerminalExit(message); err != nil {
@@ -1314,7 +1474,7 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 				if err := requestTerminalExit(message); err != nil {
 					return err
 				}
-			} else if clientInstance.ended.Load() {
+			} else if clientInstance.ended {
 				if err := requestTerminalExit("[exited]"); err != nil {
 					return err
 				}

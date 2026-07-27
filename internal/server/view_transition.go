@@ -32,8 +32,62 @@ type ClientPanePlacement struct {
 // ClientView is the exact daemon-resolved view carried by a transition and,
 // after successful application, retained by the ClientInstance.
 type ClientView struct {
-	Layout protocol.ClientLayout
-	Panes  []ClientPanePlacement
+	Layout          protocol.ClientLayout
+	Panes           []ClientPanePlacement
+	NavigationPanes []protocol.PanePlacement
+	Status          clientStatusState
+	StatusValid     bool
+	paneByID        map[uint64]*Pane
+}
+
+// Pane resolves an actor handle from the exact immutable view installed by the
+// client actor. It never consults daemon-owned session maps.
+func (v *ClientView) Pane(id uint64) *Pane {
+	if v == nil {
+		return nil
+	}
+	if v.paneByID != nil {
+		return v.paneByID[id]
+	}
+	for _, resolved := range v.Panes {
+		if resolved.Pane != nil && resolved.Pane.ID == id {
+			return resolved.Pane
+		}
+	}
+	return nil
+}
+
+func (v *ClientView) FocusedPane() *Pane {
+	if v == nil {
+		return nil
+	}
+	return v.Pane(v.Layout.FocusedPaneID)
+}
+
+func (v *ClientView) PaneActors() []*Pane {
+	if v == nil {
+		return nil
+	}
+	panes := make([]*Pane, 0, len(v.Panes))
+	seen := make(map[uint64]struct{}, len(v.Panes))
+	for _, resolved := range v.Panes {
+		if resolved.Pane == nil {
+			continue
+		}
+		if _, ok := seen[resolved.Pane.ID]; ok {
+			continue
+		}
+		seen[resolved.Pane.ID] = struct{}{}
+		panes = append(panes, resolved.Pane)
+	}
+	return panes
+}
+
+func (v *ClientView) Placements() []protocol.PanePlacement {
+	if v == nil {
+		return nil
+	}
+	return append([]protocol.PanePlacement(nil), v.Layout.Panes...)
 }
 
 // ClientProjectionPlan is the immutable daemon-to-client transition contract.
@@ -63,7 +117,7 @@ func (c *ClientInstance) applyViewTransition(transition ViewTransition) error {
 		return err
 	}
 	if transition.Projection.Close {
-		c.ended.Store(true)
+		c.ended = true
 		return nil
 	}
 	if err := c.validateProjectionPlan(transition.Projection); err != nil {
@@ -87,8 +141,9 @@ func (c *ClientInstance) adoptTransitionSession(plan ClientProjectionPlan) error
 	authorized := false
 	c.Daemon.call(func() {
 		state := c.Daemon.sessions[plan.SessionID]
-		authorized = state != nil && c.Daemon.clients[state.ClientID] == c.identity &&
-			c.identity.State.Active == c.connection
+		identity := c.Daemon.clients[c.clientID]
+		authorized = state != nil && state.ClientID == c.clientID &&
+			identity != nil && identity.State.Active == c.connection
 	})
 	if !authorized {
 		return errors.New("view transition session assignment is not authorized")
@@ -146,6 +201,8 @@ func (c *ClientInstance) installClientView(transition ViewTransition, handoff *o
 	if err := c.finishOutputHandoff(handoff, plan); err != nil {
 		return fmt.Errorf("%s bind outputs: %w", transition.Reason, err)
 	}
+	c.currentView.Status = plan.View.Status
+	c.currentView.StatusValid = plan.View.StatusValid
 	if err := c.publishStatusBar(); err != nil {
 		return fmt.Errorf("%s publish status: %w", transition.Reason, err)
 	}
@@ -153,7 +210,7 @@ func (c *ClientInstance) installClientView(transition ViewTransition, handoff *o
 		return fmt.Errorf("%s publish layout: %w", transition.Reason, err)
 	}
 	c.currentView = plan.View
-	c.appliedProjectionRevision.Store(plan.ProjectionRevision)
+	c.appliedProjectionRevision = plan.ProjectionRevision
 	return nil
 }
 
@@ -172,6 +229,6 @@ func (c *ClientInstance) applyFocusTransition(transition ViewTransition) error {
 		return err
 	}
 	c.currentView = transition.Projection.View
-	c.appliedProjectionRevision.Store(transition.Projection.ProjectionRevision)
+	c.appliedProjectionRevision = transition.Projection.ProjectionRevision
 	return nil
 }

@@ -188,7 +188,7 @@ type commandSessionInfo struct {
 
 type commandOperationResult struct {
 	bootstrap protocol.CommandBootstrap
-	session   *SessionState
+	sessionID uint64
 	sessions  []commandSessionInfo
 }
 
@@ -196,7 +196,7 @@ type commandResult struct {
 	stdout     []byte
 	stderr     []byte
 	bootstrap  *protocol.CommandBootstrap
-	session    *SessionState
+	sessionID  uint64
 	exitCode   int
 	stopServer bool
 }
@@ -207,7 +207,7 @@ type commandResult struct {
 type sessionCommandResult struct {
 	stdout    []byte
 	bootstrap *protocol.CommandBootstrap
-	session   *SessionState
+	sessionID uint64
 }
 
 func (d *Daemon) executeCommand(request protocol.CommandRequest) commandResult {
@@ -227,7 +227,7 @@ func (d *Daemon) executeCommandNow(request protocol.CommandRequest) (commandResu
 	if err := d.applyExternalCommandAction(outcome.Action); err != nil {
 		return commandResult{}, err
 	}
-	result := commandResult{stdout: outcome.Stdout, stderr: outcome.Stderr, bootstrap: outcome.Bootstrap, session: outcome.session}
+	result := commandResult{stdout: outcome.Stdout, stderr: outcome.Stderr, bootstrap: outcome.Bootstrap, sessionID: outcome.sessionID}
 	if _, stop := outcome.Action.(stopServerAction); stop {
 		result.stopServer = true
 	}
@@ -240,7 +240,7 @@ func (d *Daemon) applyExternalCommandAction(action commandAction) error {
 		return nil
 	case applyViewTransitionAction:
 		plan := action.Transition.Projection
-		var client *ClientIdentity
+		var connection *clientConnection
 		d.call(func() {
 			session := d.sessions[plan.SessionID]
 			if session == nil {
@@ -248,51 +248,53 @@ func (d *Daemon) applyExternalCommandAction(action commandAction) error {
 			}
 			candidate := d.clients[session.ClientID]
 			if candidate != nil && candidate.ID == plan.ClientID {
-				client = candidate
+				connection = candidate.State.Active
 			}
 		})
-		if client == nil {
+		if connection == nil {
 			return errors.New("view transition target client is no longer attached")
 		}
-		return sendClientCommand(client.State.Active, clientInstanceCommand{Transition: &action.Transition})
+		return sendClientCommand(connection, clientInstanceCommand{Transition: &action.Transition})
 	case publishClientStatusAction:
-		var client *ClientIdentity
+		var connection *clientConnection
 		d.call(func() {
 			for _, candidate := range d.clients {
 				if candidate != nil && candidate.ID == action.ClientID {
-					client = candidate
+					connection = candidate.State.Active
 					break
 				}
 			}
 		})
-		if client == nil {
+		if connection == nil {
 			return errors.New("status update target client is no longer attached")
 		}
-		return sendClientCommand(client.State.Active, clientInstanceCommand{RefreshStatus: true})
+		return sendClientCommand(connection, clientInstanceCommand{
+			RefreshStatus: true, Status: action.Status, HasStatus: true,
+		})
 	case focusClientDirectionAction:
 		client := commandClientValue(d, CommandContext{Caller: CommandCaller{Origin: CommandOriginStandaloneCLI}}, action.SessionID)
 		if client == nil || client.ID != action.ClientID {
 			return errors.New("focus target client is no longer attached")
 		}
-		return sendClientCommand(client.State.Active, clientInstanceCommand{FocusDirection: action.Direction})
+		return sendClientCommand(client.Connection, clientInstanceCommand{FocusDirection: action.Direction})
 	case enterClientHistoryAction:
 		client := commandClientValue(d, CommandContext{Caller: CommandCaller{Origin: CommandOriginStandaloneCLI}}, action.SessionID)
 		if client == nil || client.ID != action.ClientID {
 			return errors.New("history target client is no longer attached")
 		}
-		return sendClientCommand(client.State.Active, clientInstanceCommand{EnterHistory: true})
+		return sendClientCommand(client.Connection, clientInstanceCommand{EnterHistory: true})
 	case sendClientKeysAction:
 		client := commandClientValue(d, CommandContext{Caller: CommandCaller{Origin: CommandOriginStandaloneCLI}}, action.SessionID)
 		if client == nil || client.ID != action.ClientID {
 			return errors.New("send-keys target client is no longer attached")
 		}
-		return sendClientCommand(client.State.Active, clientInstanceCommand{RunSendKeys: true, SendKeys: action.Args})
+		return sendClientCommand(client.Connection, clientInstanceCommand{RunSendKeys: true, SendKeys: action.Args})
 	case pasteClientBufferAction:
 		client := commandClientValue(d, CommandContext{Caller: CommandCaller{Origin: CommandOriginStandaloneCLI}}, action.SessionID)
 		if client == nil || client.ID != action.ClientID {
 			return errors.New("paste-buffer target client is no longer attached")
 		}
-		return sendClientCommand(client.State.Active, clientInstanceCommand{RunPasteBuffer: true, PasteBuffer: action.Args})
+		return sendClientCommand(client.Connection, clientInstanceCommand{RunPasteBuffer: true, PasteBuffer: action.Args})
 	case detachClientAction:
 		return errors.New("external detach action is not implemented")
 	case promptAction:
@@ -381,7 +383,10 @@ type applyViewTransitionAction struct{ Transition ViewTransition }
 
 func (applyViewTransitionAction) commandAction() {}
 
-type publishClientStatusAction struct{ ClientID ClientID }
+type publishClientStatusAction struct {
+	ClientID ClientID
+	Status   clientStatusState
+}
 
 func (publishClientStatusAction) commandAction() {}
 
@@ -433,18 +438,71 @@ type commandOutcome struct {
 	Stderr    []byte
 	Bootstrap *protocol.CommandBootstrap
 	Action    commandAction
-	session   *SessionState
+	sessionID uint64
 }
 
 type commandHandler func(*Daemon, CommandContext, []string) (commandOutcome, error)
 
-func resolveCommandSessionValue(d *Daemon, ctx CommandContext, raw string) (*SessionState, error) {
+type commandClientSnapshot struct {
+	ID           ClientID
+	SessionID    uint64
+	Connection   *clientConnection
+	TerminalCols uint16
+	TerminalRows uint16
+	Shell        string
+	Status       clientStatusState
+}
+
+type commandSessionSnapshot struct {
+	ID              uint64
+	ActivePane      *Pane
+	CallerPane      *Pane
+	HasActiveWindow bool
+	Client          *commandClientSnapshot
+	Format          formatSessionSnapshot
+}
+
+func commandClientSnapshotNow(client *ClientIdentity) *commandClientSnapshot {
+	if client == nil {
+		return nil
+	}
+	return &commandClientSnapshot{
+		ID:           client.ID,
+		SessionID:    client.SessionID,
+		Connection:   client.State.Active,
+		TerminalCols: client.terminalCols,
+		TerminalRows: client.terminalRows,
+		Shell:        client.shell,
+	}
+}
+
+func commandSessionSnapshotNow(d *Daemon, state *SessionState, callerPaneID uint64) *commandSessionSnapshot {
+	if state == nil {
+		return nil
+	}
+	snapshot := &commandSessionSnapshot{
+		ID:              state.ID,
+		ActivePane:      state.activePane(),
+		CallerPane:      state.Panes[callerPaneID],
+		HasActiveWindow: state.Windows[state.ActiveWindowID] != nil,
+		Format:          state.formatSnapshot(),
+	}
+	if d != nil {
+		snapshot.Client = commandClientSnapshotNow(d.clients[state.ClientID])
+		if snapshot.Client != nil {
+			snapshot.Client.Status = clientStatusSnapshotNow(state)
+		}
+	}
+	return snapshot
+}
+
+func resolveCommandSessionValue(d *Daemon, ctx CommandContext, raw string) (*commandSessionSnapshot, error) {
 	if strings.HasPrefix(raw, "@") {
 		groupID, err := strconv.ParseUint(strings.TrimPrefix(raw, "@"), 10, 64)
 		if err != nil || groupID == 0 || d == nil {
 			return nil, fmt.Errorf("unknown session %q", raw)
 		}
-		var session *SessionState
+		var session *commandSessionSnapshot
 		d.call(func() {
 			group := d.groups[groupID]
 			if group == nil {
@@ -458,7 +516,7 @@ func resolveCommandSessionValue(d *Daemon, ctx CommandContext, raw string) (*Ses
 				if lease := d.windowLeases[pane.WindowID]; lease != nil {
 					candidate := d.sessions[lease.SessionID]
 					if candidate != nil && candidate.group == group {
-						session = candidate
+						session = commandSessionSnapshotNow(d, candidate, ctx.Caller.PaneID)
 						return
 					}
 				}
@@ -470,7 +528,7 @@ func resolveCommandSessionValue(d *Daemon, ctx CommandContext, raw string) (*Ses
 			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 			for _, id := range ids {
 				if candidate := d.sessions[id]; candidate != nil {
-					session = candidate
+					session = commandSessionSnapshotNow(d, candidate, ctx.Caller.PaneID)
 					break
 				}
 			}
@@ -485,19 +543,19 @@ func resolveCommandSessionValue(d *Daemon, ctx CommandContext, raw string) (*Ses
 		return nil, err
 	}
 	if ctx.Caller.SessionID != 0 && target.id == ctx.Caller.SessionID {
-		var session *SessionState
-		d.call(func() { session = d.sessions[ctx.Caller.SessionID] })
+		var session *commandSessionSnapshot
+		d.call(func() { session = commandSessionSnapshotNow(d, d.sessions[ctx.Caller.SessionID], ctx.Caller.PaneID) })
 		if session != nil {
 			return session, nil
 		}
 	}
-	var session *SessionState
+	var session *commandSessionSnapshot
 	if d != nil {
 		d.call(func() {
 			if target.id != 0 {
-				session = d.sessions[target.id]
+				session = commandSessionSnapshotNow(d, d.sessions[target.id], ctx.Caller.PaneID)
 			} else {
-				session = d.sessionByName(target.name)
+				session = commandSessionSnapshotNow(d, d.sessionByName(target.name), ctx.Caller.PaneID)
 			}
 		})
 	}
@@ -511,14 +569,16 @@ var errNoImplicitCommandSession = errors.New("caller has no current Meja session
 
 // resolveCommandCallerSession is the single definition of "the session this
 // command was invoked from". Explicit command targets do not pass through it.
-func resolveCommandCallerSession(d *Daemon, ctx CommandContext) (*SessionState, error) {
+func resolveCommandCallerSession(d *Daemon, ctx CommandContext) (*commandSessionSnapshot, error) {
 	// AttachedUI always carries the daemon session-map key. Production keys
 	// are nonzero; accepting zero here keeps the resolver faithful to daemon
 	// ownership and permits synthetic actor fixtures that use session zero.
 	if ctx.Caller.Origin == CommandOriginAttachedUI || ctx.Caller.SessionID != 0 {
-		var session *SessionState
+		var session *commandSessionSnapshot
 		if d != nil {
-			d.call(func() { session = d.sessions[ctx.Caller.SessionID] })
+			d.call(func() {
+				session = commandSessionSnapshotNow(d, d.sessions[ctx.Caller.SessionID], ctx.Caller.PaneID)
+			})
 		}
 		if session == nil {
 			return nil, errSessionUnavailable
@@ -531,11 +591,11 @@ func resolveCommandCallerSession(d *Daemon, ctx CommandContext) (*SessionState, 
 	return nil, errNoImplicitCommandSession
 }
 
-func commandClientValue(d *Daemon, ctx CommandContext, sessionID uint64) *ClientIdentity {
+func commandClientValue(d *Daemon, ctx CommandContext, sessionID uint64) *commandClientSnapshot {
 	if d == nil {
 		return nil
 	}
-	var client *ClientIdentity
+	var client *commandClientSnapshot
 	d.call(func() {
 		session := d.sessions[sessionID]
 		if session == nil {
@@ -543,7 +603,8 @@ func commandClientValue(d *Daemon, ctx CommandContext, sessionID uint64) *Client
 		}
 		candidate := d.clients[session.ClientID]
 		if candidate != nil && (ctx.Caller.Origin != CommandOriginAttachedUI || candidate.ID == ctx.Caller.ClientID) {
-			client = candidate
+			client = commandClientSnapshotNow(candidate)
+			client.Status = clientStatusSnapshotNow(session)
 		}
 	})
 	return client
@@ -629,10 +690,10 @@ func (c *ClientInstance) commandContext() CommandContext {
 	if c == nil {
 		return CommandContext{Caller: caller}
 	}
-	caller.ClientID = c.identity.ID
+	caller.ClientID = c.clientID
 	caller.SessionID = c.sessionID
-	caller.TerminalCols = uint16(c.terminalCols.Load())
-	caller.TerminalRows = uint16(c.terminalRows.Load())
+	caller.TerminalCols = c.terminalCols
+	caller.TerminalRows = c.terminalRows
 	paneID := c.currentView.Layout.FocusedPaneID
 	cwd, paneFound := c.observedPaneCwd(paneID)
 	caller.WorkingDirectory = cwd
@@ -816,7 +877,7 @@ func (c *ClientInstance) applyAttachedCommandOutcome(outcome commandOutcome) (bo
 		return false, errors.New("command output is only available through the CLI")
 	}
 	if outcome.Action != nil && c.Daemon != nil &&
-		!c.Daemon.clientConnectionIsCurrent(c.identity, c.connection) {
+		!c.Daemon.clientConnectionIsCurrent(c.clientID, c.connection) {
 		return false, errors.New("command client connection is no longer active")
 	}
 	switch action := outcome.Action.(type) {
@@ -851,6 +912,9 @@ func (c *ClientInstance) applyAttachedCommandOutcome(outcome commandOutcome) (bo
 			if detach {
 				return true, nil
 			}
+			if result.Submitted {
+				c.refreshCommandStatusSnapshot()
+			}
 			return false, c.publishStatusBar()
 		})
 		if err != nil {
@@ -858,38 +922,61 @@ func (c *ClientInstance) applyAttachedCommandOutcome(outcome commandOutcome) (bo
 		}
 		return false, c.publishStatusBar()
 	case applyViewTransitionAction:
-		if action.Transition.Projection.ClientID != c.identity.ID {
+		if action.Transition.Projection.ClientID != c.clientID {
 			return false, errors.New("view transition belongs to another client")
 		}
 		return false, c.applyViewTransition(action.Transition)
 	case publishClientStatusAction:
-		if action.ClientID != c.identity.ID {
+		if action.ClientID != c.clientID {
 			return false, errors.New("status update belongs to another client")
 		}
+		c.currentView.Status = action.Status
+		c.currentView.StatusValid = true
 		return false, c.publishStatusBar()
 	case focusClientDirectionAction:
-		if action.ClientID != c.identity.ID {
+		if action.ClientID != c.clientID {
 			return false, errors.New("focus action belongs to another client")
 		}
 		_, _, err := c.FocusPaneDirection(action.Direction)
 		return false, err
 	case enterClientHistoryAction:
-		if action.ClientID != c.identity.ID {
+		if action.ClientID != c.clientID {
 			return false, errors.New("history action belongs to another client")
 		}
 		return false, c.commandEnterHistory()
 	case sendClientKeysAction:
-		if action.ClientID != c.identity.ID {
+		if action.ClientID != c.clientID {
 			return false, errors.New("send-keys action belongs to another client")
 		}
 		return false, sendKeysToClient(c, action.Args)
 	case pasteClientBufferAction:
-		if action.ClientID != c.identity.ID {
+		if action.ClientID != c.clientID {
 			return false, errors.New("paste-buffer action belongs to another client")
 		}
 		return false, pasteBufferToClient(c, action.Args)
 	default:
 		return false, fmt.Errorf("command returned unsupported attached action %T", action)
+	}
+}
+
+// refreshCommandStatusSnapshot is used only after an interactive command has
+// submitted a canonical mutation. Ordinary status paints remain entirely
+// connection-local.
+func (c *ClientInstance) refreshCommandStatusSnapshot() {
+	if c == nil || c.Daemon == nil {
+		return
+	}
+	var status clientStatusState
+	var ok bool
+	c.Daemon.call(func() {
+		if state := c.Daemon.sessions[c.sessionID]; state != nil {
+			status = clientStatusSnapshotNow(state)
+			ok = true
+		}
+	})
+	if ok {
+		c.currentView.Status = status
+		c.currentView.StatusValid = true
 	}
 }
 
@@ -902,7 +989,7 @@ func runKillPaneCommand(d *Daemon, ctx CommandContext, args []string) (commandOu
 		if len(remaining) != 0 {
 			return commandOutcome{}, errors.New("kill-pane accepts only -t <session-target>")
 		}
-		var session *SessionState
+		var session *commandSessionSnapshot
 		if hasTarget {
 			session, err = resolveCommandSessionValue(d, ctx, rawTarget)
 		} else {
@@ -915,11 +1002,11 @@ func runKillPaneCommand(d *Daemon, ctx CommandContext, args []string) (commandOu
 			return commandOutcome{}, err
 		}
 		paneID := uint64(0)
-		if !hasTarget && ctx.Caller.PaneID != 0 && session.Pane(ctx.Caller.PaneID) != nil {
+		if !hasTarget && ctx.Caller.PaneID != 0 && session.CallerPane != nil {
 			paneID = ctx.Caller.PaneID
 		}
 		if paneID == 0 {
-			pane := session.activePane()
+			pane := session.ActivePane
 			if pane == nil {
 				return commandOutcome{}, errors.New("kill-pane requires an active pane")
 			}
@@ -962,7 +1049,7 @@ func resolveCommandSessionID(d *Daemon, ctx CommandContext, args []string) (uint
 	if err != nil {
 		return 0, nil, err
 	}
-	var session *SessionState
+	var session *commandSessionSnapshot
 	if hasTarget {
 		session, err = resolveCommandSessionValue(d, ctx, rawTarget)
 	} else {
@@ -1044,17 +1131,16 @@ func runRenameSessionCommand(d *Daemon, ctx CommandContext, args []string) (comm
 		return commandOutcome{}, err
 	}
 	if client := commandClientValue(d, ctx, sessionID); client != nil {
-		return commandOutcome{Action: publishClientStatusAction{ClientID: client.ID}}, nil
+		return commandOutcome{Action: publishClientStatusAction{ClientID: client.ID, Status: client.Status}}, nil
 	}
 	return commandOutcome{}, nil
 }
 
 func renameSessionAnswer(d *Daemon, sessionID uint64, name string) (commandOutcome, error) {
-	var state *SessionState
 	var currentName string
 	var validationErr error
 	d.call(func() {
-		state = d.sessions[sessionID]
+		state := d.sessions[sessionID]
 		if state == nil {
 			validationErr = errSessionUnavailable
 			return
@@ -1155,7 +1241,7 @@ func runRenameWindowCommand(d *Daemon, ctx CommandContext, args []string) (comma
 		return commandOutcome{}, err
 	}
 	if client := commandClientValue(d, ctx, sessionID); client != nil {
-		return commandOutcome{Action: publishClientStatusAction{ClientID: client.ID}}, nil
+		return commandOutcome{Action: publishClientStatusAction{ClientID: client.ID, Status: client.Status}}, nil
 	}
 	return commandOutcome{}, nil
 }
@@ -1189,15 +1275,8 @@ func (d *Daemon) commandWindowByIndex(sessionID uint64, index int) (uint64, stri
 }
 
 func (d *Daemon) renameCommandWindow(sessionID, windowID uint64, name string) error {
-	var state *SessionState
-	d.call(func() { state = d.sessions[sessionID] })
-	if state == nil {
-		return errSessionUnavailable
-	}
-	if _, err := state.RenameWindow(windowID, name); err != nil {
-		return err
-	}
-	return nil
+	_, err := d.renameSessionWindow(sessionID, windowID, name)
+	return err
 }
 
 func runSetRootCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
@@ -1217,7 +1296,7 @@ func runSetRootCommand(d *Daemon, ctx CommandContext, args []string) (commandOut
 		return commandOutcome{}, err
 	}
 	if client := commandClientValue(d, ctx, sessionID); client != nil {
-		return commandOutcome{Action: publishClientStatusAction{ClientID: client.ID}}, nil
+		return commandOutcome{Action: publishClientStatusAction{ClientID: client.ID, Status: client.Status}}, nil
 	}
 	return commandOutcome{}, nil
 }
@@ -1282,22 +1361,28 @@ func viewTransitionOutcome(transition *ViewTransition) commandOutcome {
 }
 
 func (d *Daemon) resizeCommandPane(clientID ClientID, sessionID uint64, direction PaneResizeDirection, amount int, zoom bool) (*ViewTransition, error) {
-	state, client := d.commandSessionAndClient(clientID, sessionID)
+	state := d.commandSessionAndClient(clientID, sessionID)
 	if state == nil {
 		return nil, errSessionUnavailable
 	}
+	client := state.Client
 	if client != nil {
 		var transition ViewTransition
 		var err error
 		if zoom {
-			_, transition, _, err = d.toggleClientZoom(client)
+			_, transition, _, err = d.toggleClientZoom(client.ID)
 		} else {
-			_, transition, _, err = d.resizeClientPane(client, direction, amount)
+			_, transition, _, err = d.resizeClientPane(client.ID, direction, amount)
 		}
 		return &transition, err
 	}
 	var err error
 	d.call(func() {
+		state := d.sessions[sessionID]
+		if state == nil {
+			err = errSessionUnavailable
+			return
+		}
 		if zoom {
 			_, _, err = state.toggleZoomNow()
 		} else {
@@ -1329,7 +1414,7 @@ func runSwitchSessionCommand(d *Daemon, ctx CommandContext, args []string) (comm
 	if client == nil {
 		return commandOutcome{}, errors.New("switch-session requires an existing client")
 	}
-	transition, err := d.transitionClientToSession(client, target.ID, uint16(client.terminalCols.Load()), uint16(client.terminalRows.Load()))
+	transition, err := d.transitionClientToSession(client.ID, client.Connection, target.ID, client.TerminalCols, client.TerminalRows)
 	if err != nil {
 		return commandOutcome{}, err
 	}
@@ -1337,28 +1422,24 @@ func runSwitchSessionCommand(d *Daemon, ctx CommandContext, args []string) (comm
 }
 
 func (d *Daemon) renameCommandSession(sessionID uint64, name string) error {
-	var state *SessionState
-	d.call(func() { state = d.sessions[sessionID] })
-	if state == nil {
-		return errSessionUnavailable
-	}
-	return d.renameSession(state, name)
+	return d.renameSessionID(sessionID, name)
 }
 
 func (d *Daemon) setCommandRoot(sessionID uint64, raw, callerWorkingDirectory string, callerPaneID uint64, callerIsPane bool) error {
-	var state *SessionState
+	var exists bool
 	var current string
 	d.call(func() {
-		state = d.sessions[sessionID]
+		state := d.sessions[sessionID]
 		if state == nil {
 			return
 		}
+		exists = true
 		current = state.rootDir
 		if pane := state.activePane(); pane != nil && pane.Launch.Cwd != "" {
 			current = pane.Launch.Cwd
 		}
 	})
-	if state == nil {
+	if !exists {
 		return errSessionUnavailable
 	}
 	if callerWorkingDirectory != "" {
@@ -1372,7 +1453,8 @@ func (d *Daemon) setCommandRoot(sessionID uint64, raw, callerWorkingDirectory st
 		return err
 	}
 	d.call(func() {
-		if d.sessions[sessionID] != state {
+		state := d.sessions[sessionID]
+		if state == nil {
 			err = errSessionUnavailable
 			return
 		}
@@ -1398,7 +1480,7 @@ const (
 	windowTarget
 )
 
-func commandOriginClient(d *Daemon, ctx CommandContext) (*ClientIdentity, error) {
+func commandOriginClient(d *Daemon, ctx CommandContext) (*commandClientSnapshot, error) {
 	switch ctx.Caller.Origin {
 	case CommandOriginAttachedUI:
 		client := commandClientValue(d, ctx, ctx.Caller.SessionID)
@@ -1411,7 +1493,7 @@ func commandOriginClient(d *Daemon, ctx CommandContext) (*ClientIdentity, error)
 		if err != nil {
 			return nil, err
 		}
-		client := source.attachedClient()
+		client := source.Client
 		if client == nil {
 			return nil, errors.New("the invoking Meja session is no longer attached")
 		}
@@ -1423,11 +1505,11 @@ func commandOriginClient(d *Daemon, ctx CommandContext) (*ClientIdentity, error)
 	}
 }
 
-func commandViewport(ctx CommandContext, client *ClientIdentity) (string, uint16, uint16) {
+func commandViewport(ctx CommandContext, client *commandClientSnapshot) (string, uint16, uint16) {
 	cols, rows := ctx.Caller.TerminalCols, ctx.Caller.TerminalRows
 	if client != nil {
-		cols = uint16(client.terminalCols.Load())
-		rows = uint16(client.terminalRows.Load())
+		cols = client.TerminalCols
+		rows = client.TerminalRows
 	}
 	return ctx.Caller.WorkingDirectory, cols, rows
 }
@@ -1435,14 +1517,14 @@ func commandViewport(ctx CommandContext, client *ClientIdentity) (string, uint16
 // sessionActivationOutcome assigns an existing client to the resulting
 // session and returns the transition that installs that session's active view.
 // Without an existing client, it preserves the bootstrap for a new attachment.
-func sessionActivationOutcome(d *Daemon, client *ClientIdentity, result sessionCommandResult) (commandOutcome, error) {
-	if client == nil || result.session == nil {
-		return commandOutcome{Stdout: result.stdout, Bootstrap: result.bootstrap, session: result.session}, nil
+func sessionActivationOutcome(d *Daemon, client *commandClientSnapshot, result sessionCommandResult) (commandOutcome, error) {
+	if client == nil || result.sessionID == 0 {
+		return commandOutcome{Stdout: result.stdout, Bootstrap: result.bootstrap, sessionID: result.sessionID}, nil
 	}
 	if result.bootstrap != nil {
 		d.discardAttachGrant(result.bootstrap.AttachToken)
 	}
-	transition, err := d.transitionClientToSession(client, result.session.ID, uint16(client.terminalCols.Load()), uint16(client.terminalRows.Load()))
+	transition, err := d.transitionClientToSession(client.ID, client.Connection, result.sessionID, client.TerminalCols, client.TerminalRows)
 	if err != nil {
 		return commandOutcome{}, err
 	}
@@ -1451,7 +1533,7 @@ func sessionActivationOutcome(d *Daemon, client *ClientIdentity, result sessionC
 }
 
 func runNewSessionCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
-	var client *ClientIdentity
+	var client *commandClientSnapshot
 	var err error
 	if !newSessionRequestsDetached(args) {
 		client, err = commandOriginClient(d, ctx)
@@ -1491,12 +1573,12 @@ func runRestoreSessionCommand(d *Daemon, ctx CommandContext, args []string) (com
 	return sessionActivationOutcome(d, client, result)
 }
 
-func resolveSessionCommandContextValue(d *Daemon, ctx CommandContext, kind commandTargetKind, args []string) (*SessionState, *ClientIdentity, []string, error) {
+func resolveSessionCommandContextValue(d *Daemon, ctx CommandContext, kind commandTargetKind, args []string) (*commandSessionSnapshot, *commandClientSnapshot, []string, error) {
 	rawTarget, remaining, hasTarget, err := extractCommandTarget(args)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	var targetSession *SessionState
+	var targetSession *commandSessionSnapshot
 	normalized := remaining
 	if hasTarget {
 		switch kind {
@@ -1602,7 +1684,7 @@ func runSaveSessionCommand(d *Daemon, ctx CommandContext, args []string) (comman
 	if err != nil {
 		return commandOutcome{}, err
 	}
-	output, err := d.saveSessionOutput(session, *outputPath, *force, ctx.Caller.WorkingDirectory)
+	output, err := d.saveSessionOutput(session.ID, *outputPath, *force, ctx.Caller.WorkingDirectory)
 	return commandOutcome{Stdout: output}, err
 }
 
@@ -1637,13 +1719,13 @@ func runKillSessionCommand(d *Daemon, ctx CommandContext, args []string) (comman
 	if err != nil {
 		return commandOutcome{}, err
 	}
-	if err := d.shutdownSession(session); err != nil {
+	if err := d.shutdownSessionID(session.ID, defaultPaneTerminationTimeouts); err != nil {
 		return commandOutcome{}, fmt.Errorf("kill-session: %w", err)
 	}
 	return commandOutcome{}, nil
 }
 
-func resolveCommandSessionTarget(d *Daemon, ctx CommandContext, explicitTarget, commandName string) (*SessionState, error) {
+func resolveCommandSessionTarget(d *Daemon, ctx CommandContext, explicitTarget, commandName string) (*commandSessionSnapshot, error) {
 	if explicitTarget != "" {
 		return resolveCommandSessionValue(d, ctx, explicitTarget)
 	}
@@ -1671,7 +1753,7 @@ func requireNoCommandArgs(name string, args []string) error {
 	return nil
 }
 
-func transitionCommandTarget(d *Daemon, ctx CommandContext, kind commandTargetKind, args []string) (*SessionState, *ClientIdentity, []string, error) {
+func transitionCommandTarget(d *Daemon, ctx CommandContext, kind commandTargetKind, args []string) (*commandSessionSnapshot, *commandClientSnapshot, []string, error) {
 	session, client, normalized, err := resolveSessionCommandContextValue(d, ctx, kind, args)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1690,7 +1772,7 @@ func runNextLayoutCommand(d *Daemon, ctx CommandContext, args []string) (command
 	if err := requireNoCommandArgs("next-layout", remaining); err != nil {
 		return commandOutcome{}, err
 	}
-	_, transition, _, err := d.cycleWindowLayout(client)
+	_, transition, _, err := d.cycleWindowLayout(client.ID)
 	if err != nil {
 		return commandOutcome{}, err
 	}
@@ -1735,16 +1817,8 @@ func runSelectWindowCommand(d *Daemon, ctx CommandContext, args []string) (comma
 	if err != nil || index < 0 {
 		return commandOutcome{}, fmt.Errorf("invalid window target %q", *target)
 	}
-	var windowID uint64
-	d.call(func() {
-		for _, window := range session.Windows {
-			if window.DisplayIndex == index {
-				windowID = window.ID
-				break
-			}
-		}
-	})
-	if windowID == 0 {
+	windowID, ok := d.clientWindowIDByIndex(session.ID, index)
+	if !ok {
 		return commandOutcome{}, fmt.Errorf("unknown window %d", index)
 	}
 	transition, err := d.selectWindow(client.ID, session.ID, windowID)
@@ -1770,7 +1844,7 @@ func runSwapPaneCommand(d *Daemon, ctx CommandContext, args []string) (commandOu
 	if direction == 'B' {
 		swap = SwapPaneNext
 	}
-	_, transition, _, err := d.swapClientPane(client, swap)
+	_, transition, _, err := d.swapClientPane(client.ID, swap)
 	if err != nil {
 		return commandOutcome{}, err
 	}
@@ -1789,7 +1863,7 @@ func runSelectPaneCommand(d *Daemon, ctx CommandContext, args []string) (command
 	if len(rest) != 0 {
 		return commandOutcome{}, errors.New("select-pane accepts no positional arguments")
 	}
-	if session.Windows[session.ActiveWindowID] == nil {
+	if !session.HasActiveWindow {
 		return commandOutcome{}, nil
 	}
 	return commandOutcome{Action: focusClientDirectionAction{
@@ -1809,7 +1883,7 @@ func runDetachClientCommand(d *Daemon, ctx CommandContext, args []string) (comma
 		return commandOutcome{}, errors.New("command requires an attached client")
 	}
 	if ctx.Caller.SessionID != session.ID {
-		postClientCommand(client.State.Active, clientInstanceCommand{
+		postClientCommand(client.Connection, clientInstanceCommand{
 			Close:       true,
 			CloseReason: fmt.Sprintf("[detached (from session %d)]", session.ID),
 		})
@@ -2023,48 +2097,54 @@ func (d *Daemon) commandNewSessionState(workingDirectory string, terminalCols, t
 		if err != nil {
 			return sessionCommandResult{}, err
 		}
-		var base *SessionState
+		if err := validateSessionName(*name); err != nil {
+			return sessionCommandResult{}, err
+		}
+		var mirrorID uint64
+		var createErr error
 		d.call(func() {
+			var base *SessionState
 			if parsed.id != 0 {
 				base = d.sessions[parsed.id]
 			} else {
 				base = d.sessionByName(parsed.name)
 			}
-		})
-		if base == nil {
-			return sessionCommandResult{}, fmt.Errorf("unknown session %q", *baseTarget)
-		}
-		if err := validateSessionName(*name); err != nil {
-			return sessionCommandResult{}, err
-		}
-		var mirror *SessionState
-		d.call(func() {
+			if base == nil {
+				createErr = fmt.Errorf("unknown session %q", *baseTarget)
+				return
+			}
 			if d.sessionByName(*name) != nil {
+				createErr = fmt.Errorf("session %q already exists", *name)
 				return
 			}
 			if d.nextID == 0 {
+				createErr = errors.New("session ID exhausted")
 				return
 			}
-			mirror = newSession(d.nextID, *name)
+			mirror := newSession(d.nextID, *name)
 			mirror.daemon = d
 			d.sessions[d.nextID] = mirror
-			d.sessionIndex.Store(d.nextID, mirror)
 			d.reserveSessionName(mirror, *name)
+			if createErr = d.groupSessionInActor(base, mirror); createErr != nil {
+				d.removeSession(mirror)
+				return
+			}
+			mirrorID = mirror.ID
 			d.nextID++
 		})
-		if mirror == nil {
-			return sessionCommandResult{}, fmt.Errorf("session %q already exists or session ID is exhausted", *name)
-		}
-		if err := d.groupSession(base, mirror); err != nil {
-			_ = d.shutdownSession(mirror)
-			d.call(func() { d.removeSession(mirror) })
-			return sessionCommandResult{}, err
+		if createErr != nil {
+			return sessionCommandResult{}, createErr
 		}
 		d.startPersistence(d.sessionPersistenceDir)
 		// Mirror creation copies only view metadata. The linked Window and Pane
 		// objects, including their process identities, remain canonical in base.
 		if *printOutput {
-			snapshot := mirror.formatSnapshot()
+			var snapshot formatSessionSnapshot
+			d.call(func() {
+				if mirror := d.sessions[mirrorID]; mirror != nil {
+					snapshot = mirror.formatSnapshot()
+				}
+			})
 			if len(snapshot.Panes) == 0 {
 				return sessionCommandResult{}, errors.New("created mirror has no active pane")
 			}
@@ -2101,7 +2181,7 @@ func (d *Daemon) commandNewSessionState(workingDirectory string, terminalCols, t
 		if err != nil {
 			return sessionCommandResult{}, err
 		}
-		return sessionCommandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
+		return sessionCommandResult{bootstrap: &operation.bootstrap, sessionID: operation.sessionID}, nil
 	}
 	if *run {
 		return sessionCommandResult{}, errors.New("new-session --run requires -f <file>")
@@ -2123,23 +2203,35 @@ func (d *Daemon) commandNewSessionState(workingDirectory string, terminalCols, t
 	if err != nil {
 		return sessionCommandResult{}, err
 	}
-	s := operation.session
-	if s == nil {
+	sessionID := operation.sessionID
+	if sessionID == 0 {
 		return sessionCommandResult{}, errors.New("created session is unavailable")
 	}
 	resolved, err := resolveRootDirectory(root, workingDirectory)
 	if err == nil {
-		s.rootDir = resolved
-		_, _, err = d.startSessionWindow(s, resolved, fs.Args(), cols, rows, defaultShell())
+		d.call(func() {
+			if state := d.sessions[sessionID]; state != nil {
+				state.rootDir = resolved
+			} else {
+				err = errSessionUnavailable
+			}
+		})
+	}
+	if err == nil {
+		_, _, err = d.startSessionWindowID(sessionID, resolved, fs.Args(), cols, rows, defaultShell())
 	}
 	if err != nil {
-		_ = d.shutdownSession(s)
-		d.call(func() { d.removeSession(s) })
+		_ = d.shutdownSessionID(sessionID, defaultPaneTerminationTimeouts)
 		return sessionCommandResult{}, err
 	}
-	result := sessionCommandResult{session: operation.session}
+	result := sessionCommandResult{sessionID: sessionID}
 	if *printOutput {
-		snapshot := s.formatSnapshot()
+		var snapshot formatSessionSnapshot
+		d.call(func() {
+			if state := d.sessions[sessionID]; state != nil {
+				snapshot = state.formatSnapshot()
+			}
+		})
 		if len(snapshot.Panes) == 0 {
 			return sessionCommandResult{}, errors.New("created session has no initial pane")
 		}
@@ -2169,7 +2261,7 @@ func (d *Daemon) commandAttachSession(args []string, issueBootstrap bool) (sessi
 	if err != nil {
 		return sessionCommandResult{}, err
 	}
-	return sessionCommandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
+	return sessionCommandResult{bootstrap: &operation.bootstrap, sessionID: operation.sessionID}, nil
 }
 
 func (d *Daemon) commandRestoreSession(args []string, issueBootstrap bool) (sessionCommandResult, error) {
@@ -2202,7 +2294,7 @@ func (d *Daemon) commandRestoreSession(args []string, issueBootstrap bool) (sess
 	if err != nil {
 		return sessionCommandResult{}, err
 	}
-	return sessionCommandResult{bootstrap: &operation.bootstrap, session: operation.session}, nil
+	return sessionCommandResult{bootstrap: &operation.bootstrap, sessionID: operation.sessionID}, nil
 }
 
 func resolveRestoreCommandMode(fs *flag.FlagSet, commandName, raw string, run bool) (restoreCommandMode, error) {
@@ -2229,8 +2321,8 @@ func parseRestoreCommandMode(raw string) (restoreCommandMode, error) {
 	}
 }
 
-func (d *Daemon) saveSessionOutput(session *SessionState, output string, force bool, callerWorkingDirectory string) ([]byte, error) {
-	if session == nil {
+func (d *Daemon) saveSessionOutput(sessionID uint64, output string, force bool, callerWorkingDirectory string) ([]byte, error) {
+	if sessionID == 0 {
 		return nil, errSessionUnavailable
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sessionPersistenceTimeout)
@@ -2239,7 +2331,7 @@ func (d *Daemon) saveSessionOutput(session *SessionState, output string, force b
 	if observer == nil {
 		observer = NewProcessObserver()
 	}
-	captured, err := d.captureSession(session, ctx, observer)
+	captured, err := d.captureSessionID(sessionID, ctx, observer)
 	if err != nil {
 		return nil, fmt.Errorf("capture session: %w", err)
 	}
@@ -2516,9 +2608,11 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 		target.name = restored.Name
 	}
 
-	var session *SessionState
+	var sessionID uint64
 	var operationErr error
+	var cleanupPlan sessionShutdownPlan
 	d.call(func() {
+		var session *SessionState
 		switch operation {
 		case "create-session":
 			if target.name != "" {
@@ -2540,7 +2634,6 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 			d.ensureSessionGroupInActor(session)
 			d.startPersistence(d.sessionPersistenceDir)
 			d.sessions[d.nextID] = session
-			d.sessionIndex.Store(d.nextID, session)
 			d.reserveSessionName(session, target.name)
 			d.nextID++
 		case "connect-session":
@@ -2573,7 +2666,6 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 			// Register the passive state before restoration starts panes. Live
 			// ClientInstances resolve their state through this daemon registry.
 			d.sessions[d.nextID] = session
-			d.sessionIndex.Store(d.nextID, session)
 			if existingGroup != nil {
 				operationErr = d.restoreSessionView(session, *restoredPersistence)
 			} else {
@@ -2589,7 +2681,7 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 				// We are already inside the daemon transaction. Remove the
 				// registry entry now; process termination is handled after the
 				// transaction returns.
-				d.shutdownSessionInActor(session)
+				cleanupPlan = d.shutdownSessionInActor(session)
 				return
 			}
 			d.startPersistence(d.sessionPersistenceDir)
@@ -2598,17 +2690,20 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 		default:
 			operationErr = fmt.Errorf("unsupported session operation %q", operation)
 		}
+		if operationErr == nil && session != nil {
+			sessionID = session.ID
+		}
 	})
+	d.applySessionShutdownPlan(cleanupPlan)
 	if operationErr != nil {
 		return commandOperationResult{}, operationErr
 	}
 	if target.detached {
-		return commandOperationResult{session: session}, nil
+		return commandOperationResult{sessionID: sessionID}, nil
 	}
-	port, encodedToken, expires, err := d.issueAttachGrant(session)
+	port, encodedToken, expires, err := d.issueAttachGrant(sessionID)
 	if err != nil {
-		_ = d.shutdownSession(session)
-		d.call(func() { d.removeSession(session) })
+		_ = d.shutdownSessionID(sessionID, defaultPaneTerminationTimeouts)
 		return commandOperationResult{}, err
 	}
 	return commandOperationResult{bootstrap: protocol.CommandBootstrap{
@@ -2617,5 +2712,5 @@ func (d *Daemon) executeSessionOperation(operation string, target commandSession
 		AttachToken:    encodedToken,
 		ExpiresAt:      expires,
 		CertSPKISHA256: d.certHash,
-	}, session: session}, nil
+	}, sessionID: sessionID}, nil
 }

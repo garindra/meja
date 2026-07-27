@@ -18,8 +18,8 @@ type processSaveCandidate struct {
 
 const processSaveStableSamples = 2
 
-func (d *Daemon) watchPaneProcesses(s *SessionState, pane *Pane) {
-	if d == nil || pane == nil || s == nil || d.processMonitor == nil {
+func (d *Daemon) watchPaneProcesses(sessionID uint64, pane *Pane) {
+	if d == nil || pane == nil || sessionID == 0 || d.processMonitor == nil {
 		return
 	}
 	anchor := Anchor{
@@ -30,17 +30,7 @@ func (d *Daemon) watchPaneProcesses(s *SessionState, pane *Pane) {
 	}
 	pane.processMonitor = d.processMonitor
 	pane.processKey = anchor.Key
-	d.processMonitor.Watch(s.ID, d.processObservationDelivery(s.ID), anchor)
-}
-
-func (d *Daemon) unwatchPaneProcesses(paneID uint64) {
-	if d != nil && d.processMonitor != nil {
-		d.processMonitor.Unwatch(PaneKey{PaneID: paneID})
-	}
-	if d != nil {
-		delete(d.processObservations, paneID)
-		delete(d.processSaveCandidates, paneID)
-	}
+	d.processMonitor.Watch(sessionID, d.processObservationDelivery(sessionID), anchor)
 }
 
 // applyMonitoredProcessObservations runs in a daemon transaction. Monitor

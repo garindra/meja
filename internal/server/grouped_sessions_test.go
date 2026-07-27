@@ -17,6 +17,7 @@ func groupedTestDaemon() *Daemon {
 		names:                    make(map[string]*SessionState),
 		groups:                   make(map[uint64]*GroupState),
 		panes:                    make(map[uint64]*Pane),
+		windows:                  make(map[uint64]*Window),
 		windowLeases:             make(map[uint64]*WindowViewLease),
 		processObserver:          NewProcessObserver(),
 		processObservations:      make(map[uint64]ProcessObservation),
@@ -27,6 +28,7 @@ func groupedTestDaemon() *Daemon {
 		persistenceNow:           make(chan struct{}, 1),
 		persistenceStop:          make(chan struct{}),
 		persistenceDone:          make(chan struct{}),
+		persistenceStarted:       make(chan struct{}),
 		persistenceUpdates:       make(chan persistenceSnapshot, 1),
 	}
 }
@@ -52,7 +54,7 @@ func TestGroupedSessionsShareExecutionGraphAndLinks(t *testing.T) {
 	createTestWindow(base, pane)
 
 	mirror := groupedTestSession(d, 2, "mirror")
-	if err := d.groupSession(base, mirror); err != nil {
+	if err := groupTestSessions(d, base, mirror); err != nil {
 		t.Fatal(err)
 	}
 	if base.GroupID != mirror.GroupID || len(base.group.SessionIDs) != 2 {
@@ -99,17 +101,17 @@ func TestGroupedSessionsCanViewDifferentWindowsButLeaseConflictsAreAtomic(t *tes
 	createTestWindow(base, &Pane{ID: 1, terminal: newTerminal(80, 23)})
 	createTestWindow(base, &Pane{ID: 2, terminal: newTerminal(80, 23)})
 	mirror := groupedTestSession(d, 2, "mirror")
-	if err := d.groupSession(base, mirror); err != nil {
+	if err := groupTestSessions(d, base, mirror); err != nil {
 		t.Fatal(err)
 	}
 	first := &WindowViewLease{WindowID: 1, SessionID: base.ID, ClientID: 10, Generation: 1}
 	second := &WindowViewLease{WindowID: 2, SessionID: mirror.ID, ClientID: 11, Generation: 1}
 	d.windowLeases[1] = first
 	d.windowLeases[2] = second
-	if err := d.validateWindowView(10, first.WindowID, first.Generation); err != nil {
+	if err := validateTestWindowView(d, 10, first.WindowID, first.Generation); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.validateWindowView(11, 1, first.Generation); err == nil {
+	if err := validateTestWindowView(d, 11, 1, first.Generation); err == nil {
 		t.Fatal("stale generation was accepted")
 	}
 	base.ActiveWindowID = first.WindowID
@@ -145,7 +147,7 @@ func TestGroupedWindowLeaseConflictReportsDisplayIndexForEveryCommandOrigin(t *t
 	first, _ := createTestWindow(base, &Pane{ID: 1, terminal: newTerminal(80, 23)})
 	second, _ := createTestWindow(base, &Pane{ID: 2, terminal: newTerminal(80, 23)})
 	mirror := groupedTestSession(d, 2, "mirror")
-	if err := d.groupSession(base, mirror); err != nil {
+	if err := groupTestSessions(d, base, mirror); err != nil {
 		t.Fatal(err)
 	}
 
@@ -156,10 +158,10 @@ func TestGroupedWindowLeaseConflictReportsDisplayIndexForEveryCommandOrigin(t *t
 	base.ActiveWindowID = second.ID
 	mirror.ActiveWindowID = first.ID
 	d.windowLeases[second.ID] = &WindowViewLease{
-		WindowID: second.ID, SessionID: base.ID, ClientID: baseClient.identity.ID, Generation: 1,
+		WindowID: second.ID, SessionID: base.ID, ClientID: baseClient.clientID, Generation: 1,
 	}
 	d.windowLeases[first.ID] = &WindowViewLease{
-		WindowID: first.ID, SessionID: mirror.ID, ClientID: mirrorClient.identity.ID, Generation: 1,
+		WindowID: first.ID, SessionID: mirror.ID, ClientID: mirrorClient.clientID, Generation: 1,
 	}
 
 	if second.ID == uint64(second.DisplayIndex) {
@@ -189,7 +191,7 @@ func TestGroupedSessionViewsKeepFocusIndependent(t *testing.T) {
 	createTestWindow(base, &Pane{ID: 1, terminal: newTerminal(80, 23)})
 	splitTestFocusedPane(base, &Pane{ID: 2, terminal: newTerminal(80, 23)}, SplitVertical)
 	mirror := groupedTestSession(d, 2, "mirror")
-	if err := d.groupSession(base, mirror); err != nil {
+	if err := groupTestSessions(d, base, mirror); err != nil {
 		t.Fatal(err)
 	}
 	focusTestSessionPane(base, 2)
@@ -208,7 +210,7 @@ func TestGroupedNewWindowLinksEverySessionButActivatesOnlyInvoker(t *testing.T) 
 	setTestClientSize(base, 80, 23)
 	createTestWindow(base, &Pane{ID: 1, terminal: newTerminal(80, 23)})
 	mirror := groupedTestSession(d, 2, "mirror")
-	if err := d.groupSession(base, mirror); err != nil {
+	if err := groupTestSessions(d, base, mirror); err != nil {
 		t.Fatal(err)
 	}
 	oldMirrorWindow := mirror.ActiveWindowID
@@ -254,10 +256,10 @@ func TestKillingOneGroupedSessionPreservesExecutionGraph(t *testing.T) {
 	setTestClientSize(base, 80, 23)
 	createTestWindow(base, &Pane{ID: 1, terminal: newTerminal(80, 23)})
 	mirror := groupedTestSession(d, 2, "mirror")
-	if err := d.groupSession(base, mirror); err != nil {
+	if err := groupTestSessions(d, base, mirror); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.shutdownSession(mirror); err != nil {
+	if err := d.shutdownSessionID(mirror.ID, defaultPaneTerminationTimeouts); err != nil {
 		t.Fatal(err)
 	}
 	if d.sessionByName("mirror") != nil || d.sessionByName("base") == nil {
@@ -275,13 +277,13 @@ func TestProjectionPlanCarriesPlacementsAndRejectsStaleRevision(t *testing.T) {
 	createTestWindow(session, &Pane{ID: 1, terminal: newTerminal(80, 23)})
 	client := newClientInstance(d, &ClientIdentity{SessionID: session.ID, ID: 7})
 	setTestClient(session, client)
-	d.windowLeases[1] = &WindowViewLease{WindowID: 1, SessionID: session.ID, ClientID: client.identity.ID, Generation: 4}
+	d.windowLeases[1] = &WindowViewLease{WindowID: 1, SessionID: session.ID, ClientID: client.clientID, Generation: 4}
 	client.ViewLeaseWindowID = 1
 	client.ViewLeaseGeneration = 4
 	session.ActiveWindowID = 1
 	var transition ViewTransition
 	d.call(func() {
-		transition = d.prepareViewTransitionNow(viewTransitionAttach, client.identity, session)
+		transition = d.prepareViewTransitionNow(viewTransitionAttach, testClientIdentity(client), session)
 	})
 	plan := transition.Projection
 	if plan.SessionID != session.ID || plan.View.Layout.WindowID != 1 || len(plan.View.Layout.Panes) != 1 || plan.ViewLeaseGeneration != 4 {
@@ -290,7 +292,7 @@ func TestProjectionPlanCarriesPlacementsAndRejectsStaleRevision(t *testing.T) {
 	if err := commitTestProjection(client, transition); err != nil {
 		t.Fatal(err)
 	}
-	if panes := client.currentPanePlacements(); len(panes) != 1 || panes[0].PaneID != 1 {
+	if panes := client.currentView.Placements(); len(panes) != 1 || panes[0].PaneID != 1 {
 		t.Fatalf("client layout panes = %#v", panes)
 	}
 	if err := commitTestProjection(client, ViewTransition{Reason: viewTransitionAttach, Projection: plan}); err == nil {
@@ -305,7 +307,7 @@ func TestProjectionPlanCarriesPlacementsAndRejectsStaleRevision(t *testing.T) {
 func TestFocusOnlyProjectionPreservesRenderedLayoutRevision(t *testing.T) {
 	client := newClientInstance(nil, nil)
 	client.currentView.Layout.LayoutRevision = 7
-	client.appliedProjectionRevision.Store(10)
+	client.appliedProjectionRevision = 10
 
 	plan := ClientProjectionPlan{
 		ProjectionRevision: 11,

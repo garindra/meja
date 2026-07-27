@@ -232,10 +232,10 @@ func TestSwitchSessionPromptAppliesPreparedTransition(t *testing.T) {
 	createTestWindow(source, &Pane{ID: testAddPaneID(source), terminal: newTerminal(90, 28)})
 	createTestWindow(target, &Pane{ID: testAddPaneID(target), terminal: newTerminal(90, 28)})
 	client := clientForState(source)
-	identity := client.identity
+	identity := testClientIdentity(client)
 	identity.ResumeToken = "input-switch"
 	identity.lastAllocatedClientLayoutRevision = client.currentView.Layout.LayoutRevision
-	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: client.identity.ID, Generation: 1}
+	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: client.clientID, Generation: 1}
 
 	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: append([]byte{0x02, ':'}, []byte("switch-session -t logs\r")...)})
 	if err != nil {
@@ -248,8 +248,8 @@ func TestSwitchSessionPromptAppliesPreparedTransition(t *testing.T) {
 	if err := handleTestControlFrames(source, client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize)); err != nil {
 		t.Fatal(err)
 	}
-	if client.sessionState() != target {
-		t.Fatalf("command prompt left client in session %#v, want %#v", client.sessionState(), target)
+	if testClientSession(client) != target {
+		t.Fatalf("command prompt left client in session %#v, want %#v", testClientSession(client), target)
 	}
 }
 
@@ -585,9 +585,10 @@ func TestStaleTransportInputIsIgnoredAfterReconnect(t *testing.T) {
 	client.Daemon = s.daemon
 	client.sessionID = s.ID
 	currentClient := newClientInstance(nil, nil)
-	currentClient.terminalCols.Store(80)
-	currentClient.terminalRows.Store(24)
+	currentClient.terminalCols = 80
+	currentClient.terminalRows = 24
 	setTestClient(s, currentClient)
+	client.connection.revoke()
 
 	payload, err := protocol.EncodeFrontendResize(nil, protocol.FrontendResize{Cols: 40, Rows: 12})
 	if err != nil {
@@ -601,7 +602,7 @@ func TestStaleTransportInputIsIgnoredAfterReconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	current := clientForState(s)
-	if cols, rows := current.terminalCols.Load(), current.terminalRows.Load(); cols != 80 || rows != 24 {
+	if cols, rows := current.terminalCols, current.terminalRows; cols != 80 || rows != 24 {
 		t.Fatalf("stale resize changed client size to %dx%d", cols, rows)
 	}
 }

@@ -68,7 +68,7 @@ func (c *ClientInstance) mejaOwnedWheelTarget(event frontendInputEvent) (uint64,
 	if !found {
 		return 0, false
 	}
-	pane := c.sessionState().Pane(paneID)
+	pane := c.currentView.Pane(paneID)
 	return paneID, pane != nil && (pane.isHistoryMode() || pane.InputMode().mouseTracking == MouseTrackingNone)
 }
 
@@ -94,7 +94,7 @@ func (c *ClientInstance) handleFrontendInputEvent(event frontendInputEvent) (boo
 		if event.PasteDiscarded {
 			return false, nil
 		}
-		pane := c.sessionState().Pane(capture.paneID)
+		pane := c.currentView.Pane(capture.paneID)
 		if pane == nil {
 			return false, nil
 		}
@@ -139,17 +139,17 @@ func (c *ClientInstance) handleFrontendKey(key frontendKeyEvent) (bool, error) {
 		c.heldKeys[held] = pane.ID
 	} else if key.Action == frontendKeyRepeat || key.Action == frontendKeyRelease {
 		if paneID, ok := c.heldKeys[held]; ok {
-			pane = c.sessionState().Pane(paneID)
+			pane = c.currentView.Pane(paneID)
 		}
 		if key.Action == frontendKeyRelease {
 			delete(c.heldKeys, held)
 		}
 	}
 
-	commandBytes := encodeLegacyKey(key, paneTerminalMetadata{})
 	commandPath := c.ActivePrompt() != nil || !c.InputIsNormal() ||
 		(pane != nil && pane.isHistoryMode()) || isMejaPrefixKey(key)
 	if commandPath {
+		commandBytes := encodeLegacyKey(key, paneTerminalMetadata{})
 		if key.Action == frontendKeyRelease || len(commandBytes) == 0 {
 			return false, nil
 		}
@@ -177,7 +177,10 @@ func (c *ClientInstance) cancelFrontendPointerCapture() error {
 	if !capture.active || !capture.mejaSelection || !capture.selecting {
 		return nil
 	}
-	pane := c.sessionState().Pane(capture.paneID)
+	pane := capture.pane
+	if pane == nil {
+		pane = c.currentView.Pane(capture.paneID)
+	}
 	if pane == nil {
 		return nil
 	}
@@ -497,7 +500,7 @@ func (c *ClientInstance) handleFrontendPointer(revision protocol.ClientLayoutRev
 	if !found {
 		return nil
 	}
-	pane := c.sessionState().Pane(paneID)
+	pane := c.currentView.Pane(paneID)
 	if pane == nil {
 		c.pointerCapture = frontendPaneCapture{}
 		return nil
@@ -513,6 +516,7 @@ func (c *ClientInstance) handleFrontendPointer(revision protocol.ClientLayoutRev
 			row, column := pointer.Y-rect.Y, pointer.X-rect.X
 			c.pointerCapture = frontendPaneCapture{
 				paneID:        paneID,
+				pane:          pane,
 				active:        true,
 				button:        pointer.Button,
 				mejaSelection: true,
@@ -523,7 +527,7 @@ func (c *ClientInstance) handleFrontendPointer(revision protocol.ClientLayoutRev
 			}
 			return nil
 		}
-		c.pointerCapture = frontendPaneCapture{paneID: paneID, active: true, button: pointer.Button, rect: rect}
+		c.pointerCapture = frontendPaneCapture{paneID: paneID, pane: pane, active: true, button: pointer.Button, rect: rect}
 	}
 	if pointer.Action == frontendPointerRelease {
 		defer func() { c.pointerCapture = frontendPaneCapture{} }()
