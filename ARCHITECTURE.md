@@ -107,7 +107,7 @@ flowchart LR
 
 The command plane is request/response oriented. It handles operations such as creating a session, listing sessions, saving, restoring, requesting help, and requesting attachment. An attach-capable command returns a short-lived authorization bundle rather than opening the interactive terminal itself.
 
-The interactive data plane is a QUIC connection. It has one framed bidirectional control stream for attachment, reconnection, frontend input, terminal-size changes, layout publication, and server-directed frontend terminal control. A separate status display stream and a bounded pool of pane display streams carry the compact display protocol. SSH is no longer in the path after a remote bootstrap succeeds.
+The interactive data plane is a QUIC connection. It has one framed bidirectional control stream for attachment, reconnection, frontend input, terminal-size changes, layout and structured status publication, and server-directed frontend terminal control. Eight server-initiated unidirectional pane streams carry the compact display protocol. SSH is no longer in the path after a remote bootstrap succeeds.
 
 The server is per user and per profile. Each profile has its own command socket, daemon process, session registry, QUIC listener and certificate, session-ID sequence, and private snapshot directory. The default profile is rooted at `~/.meja/default/`; another profile is an independent instance rather than a label inside one global daemon.
 
@@ -126,7 +126,7 @@ The most important architectural question is not which package contains an objec
 | Window | Session lifetime | Owns a layout tree, pane membership, active pane, name, zoom state, and layout revision |
 | Pane | Child-process lifetime | Actor-owns a PTY, packed terminal store, parser modes, history, process recipe, pending render damage, and at most one output lease |
 | Client identity | Logical-client lifetime | Is keyed by stable `ClientID`; retains the resume token, session assignment, active/pending connection lifecycle, terminal dimensions, and projection/layout revision allocators |
-| Client instance | One live QUIC transport | Owns control/status streams, connection-local pane output leases, frontend parser and prompt state, the installed `ClientView`, render/status workers, and transport teardown |
+| Client instance | One live QUIC transport | Owns the control stream, connection-local pane output leases, frontend parser and prompt state, the installed `ClientView`, structured status publication, and transport teardown |
 | Output lease | One client transport | Owns one render-slot stream, its fixed-capacity render buffer, and the worker that performs blocking stream writes |
 | Client pane cache | Current layout lifetime | Stores the last decoded authoritative scanout cells for one visible render slot |
 
@@ -234,19 +234,18 @@ The attach token authorizes one initial attachment. It is not reused as the long
 
 ## QUIC stream topology
 
-Each client connection has three classes of streams:
+Each client connection has two classes of streams:
 
 | Stream | Direction | Purpose |
 |---|---|---|
-| Control | Bidirectional | Attach/resume handshake, frontend input, terminal-size changes, layouts, session switching, and server-directed frontend terminal writes |
-| Status output | Server to client | Status bar, prompts, and session/window state |
+| Control | Bidirectional | Attach/resume handshake, frontend input, terminal-size changes, layouts, structured status snapshots, session switching, and server-directed frontend terminal writes |
 | Pane render slots | Server to client | Custom display commands for visible panes |
 
-The server pre-establishes one status stream and a bounded set of unidirectional pane render streams. A visible pane receives exclusive use of one pane stream through an output lease. The stream is identified by its connection-local render slot; layout messages on the control stream map that slot to a pane ID and rectangle.
+The server pre-establishes exactly eight unidirectional pane render streams. A visible pane receives exclusive use of one pane stream through an output lease. The stream is identified by its connection-local render slot, numbered 0 through 7; layout messages on the control stream map that slot to a pane ID and rectangle.
 
 Using an independent QUIC stream for each visible pane matters under load. Ordering and stream-level flow control are isolated, so a pane producing a large or awkward output sequence is less likely to hold up the ordered bytes for another pane. QUIC congestion control and total connection capacity are still shared, so a noisy pane can consume bandwidth; the design reduces cross-pane interference rather than pretending it cannot occur.
 
-The status surface has its own stream because it is not part of any pane's terminal state or geometry. It can update independently and survives pane-slot rebinding.
+Status is semantic client UI rather than pane terminal content. The server publishes a complete `CLIENT_STATUS` snapshot on the control stream, including a monotonic publication revision, session identity, server location data, stable window IDs and presentation indexes, titles, active/zoom state, and structured prompt or temporary-message state. Frontends ignore stale revisions and choose their own status placement, styling, and truncation.
 
 The control stream is the authoritative lifecycle signal. Output streams carry display data but do not independently decide whether the session was detached, replaced, switched, or terminated.
 
@@ -256,7 +255,7 @@ Meja uses separate encodings for different traffic shapes:
 
 1. The command protocol uses length-delimited structured frames because it is low-frequency, extensible request/response traffic.
 2. The interactive control stream uses typed binary frames with bounded payloads.
-3. Status and pane display output use a compact opcode grammar with no generic frame wrapper around every operation.
+3. Pane display output uses a compact opcode grammar with no generic frame wrapper around every operation.
 
 Treating display output separately keeps the hot path small without forcing commands, attachment, or frontend events into a rendering-oriented format.
 
@@ -300,7 +299,7 @@ session.
 ## Client instance
 
 A `ClientInstance` is the disposable server-side actor for one QUIC
-connection. It owns that connection's control and display streams, output
+connection. It owns that connection's control and pane render streams, output
 leases and workers, frontend input and prompt state, terminal dimensions, and
 installed `ClientView`. `ClientView` contains the wire `ClientLayout` and the
 exact pane actors resolved by the daemon, so the instance does not rediscover
@@ -336,13 +335,13 @@ sequenceDiagram
     I-->>F: SESSION_ATTACH_OK with resume token
     I-->>F: Register matching input-mode cleanup
     I-->>F: Enable frontend input-reporting modes
-    I->>I: Open status and pane streams, create output leases
+    I->>I: Open eight pane streams and create output leases
     I->>D: ClientInitialized with ClientID and dimensions
     D->>D: Promote connection and prepare initial view
     D-->>I: ViewTransition
     I->>P: Install lease, revision, and grid
     P->>P: Resize atomically and start full snapshot
-    I-->>F: Initial status and CLIENT_LAYOUT
+    I-->>F: CLIENT_LAYOUT then complete CLIENT_STATUS
     P-->>F: START_RENDER and presented pane frames
 ```
 
@@ -500,7 +499,8 @@ does not re-walk the graph or derive a second binding answer.
 
 `applyViewTransition` rejects stale plans before disturbing the installed view,
 hands off any reused slots, and atomically installs each pane's lease, revision,
-and grid. It then publishes status and the prepared `CLIENT_LAYOUT`.
+and grid. It then publishes the prepared `CLIENT_LAYOUT` followed by a complete
+`CLIENT_STATUS` snapshot on the same control stream.
 `START_RENDER` and `CLIENT_LAYOUT` use the same allocated revision.
 
 Attach, reconnect, session/window changes, splits, layout and terminal resize,
@@ -554,11 +554,20 @@ exact-pointer detach and is a no-op once the pane holds the new lease.
 
 ## Client and status ownership
 
-Status output is part of the ClientInstance actor. The daemon supplies the
-current passive status model; the client owns status encoding, stream writes,
-prompts, and full refresh after replacement. Attaching or switching a client
-changes daemon assignment first, then the ClientInstance performs its output
-handoff without making the daemon wait for stream I/O.
+Status publication is part of the ClientInstance actor. The daemon supplies the
+current passive session/window status model; the instance combines it with its
+prompt or temporary-message state and sends a complete structured snapshot on
+the control stream. The stable client identity owns the wire revision allocator,
+so prompt edits, message changes, session switches, and replacement transports
+remain monotonically ordered. Attaching or switching a client changes daemon
+assignment first, then the ClientInstance performs its output handoff without
+making the daemon wait for stream I/O.
+
+The native terminal client renders this snapshot as its bottom physical row and
+therefore subtracts one row before reporting drawable pane dimensions. A browser
+can instead render HTML chrome and report the cell grid left after its own
+layout. The server never globally subtracts a status row or truncates status
+fields.
 
 Status-only canonical changes return or post a `publishClientStatusAction`
 rather than forcing a view transition. For example, `set-root` commits the
@@ -1028,9 +1037,12 @@ This yields the main relayout invariant:
 
 # Client rendering
 
-The client deliberately separates parallel stream decoding from serialized terminal output. QUIC gives each status or pane output stream independent ordering, so each accepted output stream receives its own decoder worker. For pane streams this is one goroutine per fixed pane output stream/render slot, whether that slot is currently bound or idle—not one goroutine per long-lived server pane. An output lease may later bind the same stream and worker to a different pane, with `START_RENDER` resetting the stream-local compiler.
+The client deliberately separates parallel stream decoding from serialized terminal output. Each of the eight pane output streams receives its own decoder worker, whether that slot is currently bound or idle—not one goroutine per long-lived server pane. An output lease may later bind the same stream and worker to a different pane, with `START_RENDER` resetting the stream-local compiler. These workers may block and decode independently, which preserves QUIC's cross-stream isolation, but none of them writes to the user's terminal.
 
-There is one additional worker for the status stream. These workers may block and decode independently, which preserves QUIC's cross-stream isolation, but none of them writes to the user's terminal.
+The control-stream worker decodes both `CLIENT_LAYOUT` and `CLIENT_STATUS`.
+Structured status snapshots enter the same render-event queue as pane frames;
+the single render goroutine rejects stale status revisions and paints the native
+status row from the newest snapshot.
 
 ## Per-stream `renderFrame` compilation
 
@@ -1053,10 +1065,10 @@ Text commands become pane-relative `paintSpan` values. A multi-row text command 
 flowchart LR
     Q1["Pane stream / slot 0"] --> G1["decoder goroutine"]
     Q2["Pane stream / slot 1"] --> G2["decoder goroutine"]
-    QS["Status stream"] --> GS["decoder goroutine"]
+    QC["Control stream"] --> GC["control decoder"]
     G1 -->|"presented renderFrame"| E["shared render-event channel"]
     G2 -->|"presented renderFrame"| E
-    GS -->|"presented renderFrame"| E
+    GC -->|"layout / status event"| E
     E --> R["single render goroutine"]
     R --> O["stdout / physical terminal"]
 ```
@@ -1511,7 +1523,7 @@ The following statements summarize the contracts contributors should preserve:
 33. Recovery snapshots and `.meja` project files are restart recipes, not process images.
 34. `restore` consumes daemon-managed named-session snapshots; `new -f` consumes explicit project files.
 35. Initial remote attachment authority is transferred through SSH; the direct QUIC connection must match that bootstrap.
-36. ClientInstance local state is ordinary actor-owned state; status/output workers receive immutable messages and timers post only copied generation IDs.
+36. ClientInstance local state is ordinary actor-owned state; pane-output workers receive immutable render batches, wire status snapshots are complete and monotonically revised, and timers post only copied generation IDs.
 37. Daemon transactions prepare client deliveries but never block delivering them; required FIFO and coalescible status traffic use distinct bounded mailbox semantics.
 38. The synchronization allowlist is exact and enforced by a production-source AST/type test.
 

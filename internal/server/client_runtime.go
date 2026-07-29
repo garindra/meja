@@ -262,14 +262,14 @@ func (c *ClientInstance) handleServerInputEvent(event serverInputEvent) (bool, e
 		// invalid command must be reported in the status bar, not escape the
 		// control-frame handler and tear down the transport.
 		c.showStatusMessage(err.Error())
-		return false, c.publishStatusBar()
+		return false, c.publishClientStatus()
 	case serverCommandPrompt:
 		return c.handlePromptEvent(event)
 	case serverCommandOpenCommandPrompt:
 		if _, err := c.BeginCommandPrompt(); err != nil {
 			return false, err
 		}
-		return false, c.publishStatusBar()
+		return false, c.publishClientStatus()
 	}
 	return false, nil
 }
@@ -277,7 +277,7 @@ func (c *ClientInstance) handleServerInputEvent(event serverInputEvent) (bool, e
 func (c *ClientInstance) handlePromptEvent(event serverInputEvent) (bool, error) {
 	switch event.PromptAction {
 	case PromptActionChanged:
-		return false, c.publishStatusBar()
+		return false, c.publishClientStatus()
 	case PromptActionSubmit, PromptActionCancel:
 		return c.resolvePrompt(promptResult{Submitted: event.PromptAction == PromptActionSubmit, Text: event.PromptText})
 	default:
@@ -287,7 +287,7 @@ func (c *ClientInstance) handlePromptEvent(event serverInputEvent) (bool, error)
 
 func (c *ClientInstance) runCommandPromptAnswer(result promptResult) (bool, error) {
 	if !result.Submitted {
-		return false, c.publishStatusBar()
+		return false, c.publishClientStatus()
 	}
 	argv, err := parseCommandLine(result.Text)
 	if err == nil {
@@ -297,11 +297,11 @@ func (c *ClientInstance) runCommandPromptAnswer(result promptResult) (bool, erro
 			if detach {
 				return true, nil
 			}
-			return false, c.publishStatusBar()
+			return false, c.publishClientStatus()
 		}
 	}
 	c.showStatusMessage(err.Error())
-	return false, c.publishStatusBar()
+	return false, c.publishClientStatus()
 }
 
 func (c *ClientInstance) commandEnterHistory() error {

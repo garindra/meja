@@ -214,11 +214,11 @@ func (c *ClientInstance) installClientView(transition ViewTransition, handoff *o
 	nextView := c.orderedViewStatus(plan.View, plan.SessionID)
 	c.currentView.Status = nextView.Status
 	c.currentView.StatusValid = nextView.StatusValid
-	if err := c.publishStatusBar(); err != nil {
-		return fmt.Errorf("%s publish status: %w", transition.Reason, err)
-	}
 	if err := c.sendClientLayout(nextView.Layout); err != nil {
 		return fmt.Errorf("%s publish layout: %w", transition.Reason, err)
+	}
+	if err := c.publishClientStatus(); err != nil {
+		return fmt.Errorf("%s publish status: %w", transition.Reason, err)
 	}
 	c.currentView = nextView
 	c.appliedProjectionRevision = plan.ProjectionRevision

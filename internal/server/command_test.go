@@ -1564,8 +1564,10 @@ func TestPaneCLISetRootRefreshesAttachedStatus(t *testing.T) {
 	d.sessions[s.ID] = s
 
 	statusClient := newStatusTestClient()
-	attachStatusTestClient(t, s, testClientInstance(nil, nil, &statusClient.wire))
-	if err := clientForState(s).publishStatusBar(); err != nil {
+	statusConnection := testClientInstance(nil, nil)
+	statusConnection.controlOut = statusClient.frames
+	attachStatusTestClient(t, s, statusConnection)
+	if err := clientForState(s).publishClientStatus(); err != nil {
 		t.Fatal(err)
 	}
 	statusClient.read(t)

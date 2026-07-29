@@ -1043,12 +1043,9 @@ func TestStatusFullRefreshClearsReconnectIndicator(t *testing.T) {
 	ui.emit(sizeEvent{cols: 80, rows: 24})
 	ui.beginConnection(true, time.Now())
 	waitForBufferText(t, &stdout, " Reconnecting")
-	ui.emit(paneFrameEvent{slot: protocol.StatusRenderSlot, frame: renderFrame{
-		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 88, B: 170}}}},
-		spans: []paintSpan{
-			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: ' ', fillColumns: 80},
-			{kind: paintText, styleID: 1, cellWidth: 1, text: []byte("ready")},
-		},
+	ui.emit(statusEvent{status: protocol.ClientStatus{
+		Revision: 1, SessionID: 1, ServerHostname: "host",
+		Kind: protocol.ClientStatusMessage, Message: protocol.ClientStatusMessageState{ID: 1, Text: "ready"},
 	}})
 	ui.beginConnection(false, time.Time{})
 	waitForBufferText(t, &stdout, "ready")
@@ -1064,14 +1061,11 @@ func TestStatusFullRefreshClearsReconnectIndicator(t *testing.T) {
 func TestLayoutActivationPreservesStatusRow(t *testing.T) {
 	s := newScanoutState(true)
 	s.cols, s.rows = 12, 4
-	status := renderFrame{
-		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 88, B: 170}}}},
-		spans: []paintSpan{
-			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: ' ', fillColumns: 12},
-			{kind: paintText, styleID: 1, cellWidth: 1, text: []byte("1:shell*")},
-		},
+	status := protocol.ClientStatus{
+		Revision: 1, SessionID: 1, ServerHostname: "host", Kind: protocol.ClientStatusNormal,
+		Windows: []protocol.ClientStatusWindow{{WindowID: 1, Index: 1, Title: "shell", Active: true}},
 	}
-	if _, err := s.acceptFrame(protocol.StatusRenderSlot, status); err != nil {
+	if _, err := s.acceptStatus(status); err != nil {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
@@ -1089,25 +1083,19 @@ func TestLayoutActivationPreservesStatusRow(t *testing.T) {
 	}
 }
 
-func TestStaleWideStatusFrameIsClippedAfterNarrowResize(t *testing.T) {
+func TestStructuredStatusUsesCurrentTerminalWidth(t *testing.T) {
 	state := newScanoutState(true)
 	state.cols, state.rows = 20, 4
-	status := renderFrame{
-		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "indexed", Index: 4}}}},
-		spans: []paintSpan{
-			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: 'x', fillColumns: 80},
-			{kind: paintText, column: 70, styleID: 1, cellWidth: 1, text: []byte("offscreen")},
-		},
+	status := protocol.ClientStatus{
+		Revision: 1, SessionID: 1, ServerHostname: "host", Kind: protocol.ClientStatusMessage,
+		Message: protocol.ClientStatusMessageState{ID: 1, Text: strings.Repeat("x", 80)},
 	}
-	if _, err := state.acceptFrame(protocol.StatusRenderSlot, status); err != nil {
+	if _, err := state.acceptStatus(status); err != nil {
 		t.Fatal(err)
 	}
 	out := string(state.takeANSI())
-	if got := strings.Count(out, "x"); got != 20 {
-		t.Fatalf("narrow status emitted %d cells from stale wide frame, want 20: %q", got, out)
-	}
-	if strings.Contains(out, "offscreen") {
-		t.Fatalf("narrow status emitted off-screen stale text: %q", out)
+	if got := strings.Count(out, "x"); got >= 80 {
+		t.Fatalf("narrow status was not truncated: %q", out)
 	}
 }
 
@@ -1116,11 +1104,11 @@ func TestStatusFrameCannotWrapWhileLocalResizeEventIsPending(t *testing.T) {
 	// The kernel terminal is already 20 columns wide, but the render loop has
 	// not consumed its sizeEvent yet and still believes the old width is 80.
 	state.cols, state.rows = 80, 4
-	status := renderFrame{
-		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "indexed", Index: 4}}}},
-		spans:         []paintSpan{{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: 'x', fillColumns: 80}},
+	status := protocol.ClientStatus{
+		Revision: 1, SessionID: 1, ServerHostname: "host", Kind: protocol.ClientStatusMessage,
+		Message: protocol.ClientStatusMessageState{ID: 1, Text: strings.Repeat("x", 80)},
 	}
-	if _, err := state.acceptFrame(protocol.StatusRenderSlot, status); err != nil {
+	if _, err := state.acceptStatus(status); err != nil {
 		t.Fatal(err)
 	}
 	out := state.takeANSI()
@@ -1341,31 +1329,36 @@ func TestPinnedTLSRequiresExactSPKI(t *testing.T) {
 	}
 }
 
-func TestStatusOutputAcceptsBarrierlessDisplayFrame(t *testing.T) {
-	encoder := protocol.NewDisplayEncoder(nil)
-	commands := []protocol.DisplayCommand{
-		{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: 1, Style: protocol.Style{Bold: true}},
-		{Opcode: protocol.DisplayOpcodeSetWritePosition},
-		{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: 1},
-		{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("status")},
-		{Opcode: protocol.DisplayOpcodePresent},
+func TestStatusSnapshotsIgnoreOlderRevisions(t *testing.T) {
+	state := newScanoutState(false)
+	state.cols, state.rows = 20, 4
+	if changed, err := state.acceptStatus(protocol.ClientStatus{Revision: 2, Kind: protocol.ClientStatusMessage, Message: protocol.ClientStatusMessageState{Text: "new"}}); err != nil || !changed {
+		t.Fatalf("new status changed=%v err=%v", changed, err)
 	}
-	for _, command := range commands {
-		if err := encoder.AppendCommand(command); err != nil {
-			t.Fatal(err)
-		}
+	_ = state.takeANSI()
+	if changed, err := state.acceptStatus(protocol.ClientStatus{Revision: 1, Kind: protocol.ClientStatusMessage, Message: protocol.ClientStatusMessageState{Text: "old"}}); err != nil || changed {
+		t.Fatalf("stale status changed=%v err=%v", changed, err)
 	}
-	ui := &runtimeState{events: make(chan renderEvent, 1)}
-	errs := make(chan error, 1)
-	readOutputStream(protocol.StatusRenderSlot, protocol.NewDisplayDecoder(bytes.NewReader(encoder.Bytes())), ui, errs, nil, nil)
-	select {
-	case event := <-ui.events:
-		frame, ok := event.(paneFrameEvent)
-		if !ok || frame.slot != protocol.StatusRenderSlot || frame.frame.layoutRevision != 0 || len(frame.frame.spans) != 1 {
-			t.Fatalf("status event = %#v", event)
-		}
-	default:
-		t.Fatal("barrierless status batch was not emitted")
+	if out := state.takeANSI(); len(out) != 0 {
+		t.Fatalf("stale status emitted output %q", out)
+	}
+}
+
+func TestStructuredPromptStatusSelectsNativeStatusCursor(t *testing.T) {
+	state := newScanoutState(false)
+	state.cols, state.rows = 20, 4
+	status := protocol.ClientStatus{
+		Revision: 1,
+		Kind:     protocol.ClientStatusPrompt,
+		Prompt: protocol.ClientStatusPromptState{
+			Mode: protocol.ClientStatusPromptText, Label: ":", Text: "abc", Cursor: 2,
+		},
+	}
+	if changed, err := state.acceptStatus(status); err != nil || !changed {
+		t.Fatalf("prompt status changed=%v err=%v", changed, err)
+	}
+	if got, want := state.activeCursor, (physicalCursor{row: 4, column: 4, visible: true, valid: true}); got != want {
+		t.Fatalf("prompt cursor = %#v, want %#v", got, want)
 	}
 }
 

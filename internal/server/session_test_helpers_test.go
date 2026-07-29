@@ -519,9 +519,6 @@ func setTestClient(state *SessionState, client *ClientInstance) {
 	if client.Daemon == nil {
 		client.Daemon = state.daemon
 	}
-	if client.statusCommands == nil {
-		client.statusCommands = make(chan statusCommand, 64)
-	}
 	if client.lifetimeDone == nil {
 		client.lifetimeDone = make(chan struct{})
 	}
@@ -544,10 +541,6 @@ func setTestClient(state *SessionState, client *ClientInstance) {
 	startTestClientCommandLoop(client)
 	if len(state.Windows) > 0 {
 		_ = installTestCurrentProjection(client)
-	}
-	if !client.statusWorkerStarted {
-		client.statusWorkerStarted = true
-		go client.runStatusOutput()
 	}
 }
 

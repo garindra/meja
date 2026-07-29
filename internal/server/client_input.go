@@ -68,7 +68,7 @@ func (c *ClientInstance) resolvePrompt(result promptResult) (bool, error) {
 	continuation := c.promptContinuation
 	c.promptContinuation = nil
 	if continuation == nil {
-		return false, c.publishStatusBar()
+		return false, c.publishClientStatus()
 	}
 	return continuation(result)
 }

@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -130,6 +131,7 @@ type paneFrameEvent struct {
 }
 type localInputEvent struct{ data []byte }
 type layoutEvent struct{ layout protocol.ClientLayout }
+type statusEvent struct{ status protocol.ClientStatus }
 type sizeEvent struct{ cols, rows int }
 type reconnectEvent struct {
 	reconnecting bool
@@ -750,10 +752,7 @@ func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeS
 			return
 		}
 		seen[index] = struct{}{}
-		slot := protocol.StatusRenderSlot
-		if index > 0 {
-			slot = index - 1
-		}
+		slot := index
 		start(func() {
 			readOutputStream(slot, protocol.NewDisplayDecoder(stream), ui, sessionDone, conn.Context(), lastContact)
 		})
@@ -769,9 +768,6 @@ func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeS
 		slot:          slot,
 		styles:        defaultStyles(),
 		cursorVisible: true,
-	}
-	if slot == protocol.StatusRenderSlot {
-		state.cols, state.rows = int(protocol.MaxGridCols), 1
 	}
 	for {
 		command, wireBytes, err := decoder.ReadCommand()
@@ -829,9 +825,6 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		c.cursorUpdated = false
 	}
 	if command.Opcode == protocol.DisplayOpcodeStartRender {
-		if c.slot == protocol.StatusRenderSlot {
-			return false, errors.New("START_RENDER on status output")
-		}
 		if command.GridCols <= 0 || command.GridRows <= 0 || uint64(command.GridCols) > protocol.MaxGridCols || uint64(command.GridRows) > protocol.MaxGridRows {
 			return false, fmt.Errorf("invalid display grid %dx%d on slot %d", command.GridCols, command.GridRows, c.slot)
 		}
@@ -845,7 +838,7 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		c.paintStarted = false
 		return false, nil
 	}
-	if !c.hasBarrier && c.slot != protocol.StatusRenderSlot {
+	if !c.hasBarrier {
 		return false, fmt.Errorf("display command 0x%02x on slot %d before START_RENDER", byte(command.Opcode), c.slot)
 	}
 
@@ -1029,6 +1022,13 @@ func controlLoop(decoder *protocol.Decoder, ui *runtimeState, controlFrames chan
 				return
 			}
 			ui.emit(layoutEvent{layout: msg})
+		case protocol.MsgClientStatus:
+			msg, err := protocol.DecodeClientStatus(frame.Payload)
+			if err != nil {
+				done <- connectionResult{err: fmt.Errorf("decode CLIENT_STATUS: %w", err)}
+				return
+			}
+			ui.emit(statusEvent{status: msg})
 		case protocol.MsgFrontendTerminalWrite:
 			msg, err := protocol.DecodeFrontendTerminalWrite(frame.Payload)
 			if err != nil {
@@ -1455,6 +1455,7 @@ type scanoutState struct {
 	caches            map[uint8]*paneScanoutCache
 	predictor         inputPredictor
 	activeCursor      physicalCursor
+	status            protocol.ClientStatus
 }
 
 type physicalCursor struct {
@@ -1590,9 +1591,6 @@ func sameClientLayoutGeometry(left, right protocol.ClientLayout) bool {
 }
 
 func (s *scanoutState) acceptFrame(slot uint8, frame renderFrame) (bool, error) {
-	if slot == protocol.StatusRenderSlot {
-		return true, s.emitFrame(slot, protocol.Rect{Y: max(0, s.rows-1), Width: s.cols, Height: 1}, frame)
-	}
 	if frame.layoutRevision < s.layout.LayoutRevision {
 		return false, nil
 	}
@@ -1641,11 +1639,7 @@ func (s *scanoutState) tryActivate(revision protocol.ClientLayoutRevision) (bool
 	s.predictor.clear()
 	s.activeCursor = physicalCursor{}
 	s.layout = layout
-	statusStyles := s.styles[protocol.StatusRenderSlot]
 	s.styles = make(map[uint8]map[uint32]protocol.Style)
-	if statusStyles != nil {
-		s.styles[protocol.StatusRenderSlot] = statusStyles
-	}
 	s.cursors = make(map[uint8]protocol.CursorUpdate)
 	s.caches = make(map[uint8]*paneScanoutCache)
 	for _, placement := range layout.Panes {
@@ -1810,7 +1804,7 @@ func paneFrameMatchesRect(frame renderFrame, rect protocol.Rect) bool {
 }
 
 func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFrame) error {
-	if slot != protocol.StatusRenderSlot && !paneFrameMatchesRect(frame, rect) {
+	if !paneFrameMatchesRect(frame, rect) {
 		return fmt.Errorf("pane slot %d frame grid %dx%d does not match layout %dx%d", slot, frame.cols, frame.rows, rect.Width, rect.Height)
 	}
 	styles := s.styles[slot]
@@ -1845,9 +1839,7 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 	// The OS terminal can already have its new width before this render loop
 	// consumes the corresponding sizeEvent. All Meja painting is absolutely
 	// positioned, so wrapping is never useful: suppress it for the complete
-	// frame to keep stale wide pane or status spans from spilling into adjacent
-	// rows. Status span clipping additionally handles frames processed after
-	// the sizeEvent has installed the new geometry.
+	// frame to keep stale wide pane spans from spilling into adjacent rows.
 	s.ansi.WriteString("\x1b[?7l")
 	defer s.ansi.WriteString("\x1b[?7h")
 	fullPaneEmitted := false
@@ -1892,19 +1884,15 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 		}
 		s.setActiveCursor(rect, cursor)
 	}
+	if s.status.Kind == protocol.ClientStatusPrompt {
+		s.selectAuthoritativeCursor()
+	}
 	s.emitActiveCursor()
 	return nil
 }
 
 func (s *scanoutState) emitSpans(slot uint8, rect protocol.Rect, spans []paintSpan, styles map[uint32]protocol.Style) error {
 	for _, span := range spans {
-		if slot == protocol.StatusRenderSlot {
-			var visible bool
-			span, visible = clipStatusSpan(span, rect.Width, rect.Height)
-			if !visible {
-				continue
-			}
-		}
 		style, ok := styles[span.styleID]
 		if !ok {
 			return fmt.Errorf("undefined style %d on slot %d", span.styleID, slot)
@@ -1920,40 +1908,6 @@ func (s *scanoutState) emitSpans(slot uint8, rect protocol.Rect, spans []paintSp
 		}
 	}
 	return nil
-}
-
-// Status frames are barrierless and can race terminal resize events. Clip a
-// frame produced for an older, wider terminal to the current one-row status
-// rectangle so excess cells cannot wrap and scroll pane content upward.
-func clipStatusSpan(span paintSpan, width, height int) (paintSpan, bool) {
-	if width <= 0 || height <= 0 || span.row < 0 || span.row >= height || span.column < 0 || span.column >= width {
-		return paintSpan{}, false
-	}
-	cellWidth := int(span.cellWidth)
-	if cellWidth <= 0 {
-		return paintSpan{}, false
-	}
-	available := width - span.column
-	switch span.kind {
-	case paintFill:
-		span.fillColumns = min(span.fillColumns, available)
-		span.fillColumns -= span.fillColumns % cellWidth
-		return span, span.fillColumns > 0
-	case paintCluster:
-		return span, cellWidth <= available
-	case paintText:
-		maxRunes := available / cellWidth
-		if maxRunes <= 0 {
-			return paintSpan{}, false
-		}
-		runes := []rune(string(span.text))
-		if len(runes) > maxRunes {
-			span.text = []byte(string(runes[:maxRunes]))
-		}
-		return span, len(span.text) > 0
-	default:
-		return paintSpan{}, false
-	}
 }
 
 func applySpanToCache(cache *paneScanoutCache, span paintSpan, evidence *frameEvidence) error {
@@ -2071,6 +2025,11 @@ func (s *scanoutState) setActiveCursor(rect protocol.Rect, cursor protocol.Curso
 }
 
 func (s *scanoutState) selectAuthoritativeCursor() {
+	if s.status.Kind == protocol.ClientStatusPrompt && s.status.Revision != 0 && s.cols > 0 && s.rows > 0 {
+		column := len([]rune(s.status.Prompt.Label)) + s.status.Prompt.Cursor + 1
+		s.activeCursor = physicalCursor{row: s.rows, column: min(max(1, column), s.cols), visible: true, valid: true}
+		return
+	}
 	for _, placement := range s.layout.Panes {
 		if placement.PaneID == s.layout.FocusedPaneID {
 			s.setActiveCursor(placement.Rect, s.cursors[placement.Slot])
@@ -2137,6 +2096,171 @@ func (s *scanoutState) setTerminalStatus(message string) {
 	s.emitActiveCursor()
 }
 
+func (s *scanoutState) acceptStatus(status protocol.ClientStatus) (bool, error) {
+	if status.Revision <= s.status.Revision {
+		return false, nil
+	}
+	status.Windows = append([]protocol.ClientStatusWindow(nil), status.Windows...)
+	s.status = status
+	s.emitStatus()
+	return true, nil
+}
+
+func (s *scanoutState) emitStatus() {
+	if s.status.Revision == 0 || s.cols <= 0 || s.rows <= 0 {
+		return
+	}
+	style := protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 15}, BG: theme.AccentColor()}
+	text := ""
+	switch s.status.Kind {
+	case protocol.ClientStatusPrompt:
+		style = protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 0}, BG: protocol.Color{Mode: "indexed", Index: 3}}
+		text = s.status.Prompt.Label + s.status.Prompt.Text
+	case protocol.ClientStatusMessage:
+		style = protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 0}, BG: protocol.Color{Mode: "indexed", Index: 3}}
+		text = s.status.Message.Text
+	default:
+		if s.status.SessionName != "" {
+			text = fmt.Sprintf("[%s] ", s.status.SessionName)
+		} else {
+			text = fmt.Sprintf("[%d] ", s.status.SessionID)
+		}
+		for _, window := range s.status.Windows {
+			flags := ""
+			if window.Active {
+				flags += "*"
+			}
+			if window.Zoomed {
+				flags += "Z"
+			}
+			if flags == "" {
+				flags = " "
+			}
+			text += fmt.Sprintf("%d:%s%s ", window.Index, window.Title, flags)
+		}
+	}
+	location := statusLocation(s.status.ServerHostname, s.status.Root, s.status.ServerHome)
+	left, right := statusLineParts(s.cols, text, location)
+	row := s.rows
+	s.ansi.WriteString("\x1b[?25l\x1b[?7l")
+	writeCursorPosition(&s.ansi, row, 1)
+	s.ansi.WriteString(sgrForStyle(style))
+	for range s.cols {
+		s.ansi.WriteByte(' ')
+	}
+	if len(left) > 0 {
+		writeCursorPosition(&s.ansi, row, 1)
+		s.ansi.WriteString(string(left))
+	}
+	if len(right) > 0 {
+		writeCursorPosition(&s.ansi, row, s.cols-len(right)+1)
+		s.ansi.WriteString(string(right))
+	}
+	s.ansi.WriteString("\x1b[?7h")
+	s.selectAuthoritativeCursor()
+	s.emitActiveCursor()
+}
+
+func statusLineParts(width int, text, location string) ([]rune, []rune) {
+	if width <= 0 {
+		return nil, nil
+	}
+	left, right := []rune(text), []rune(location)
+	if len(left)+len(right) <= width {
+		return left, right
+	}
+	leftWidth := width / 2
+	rightWidth := width - leftWidth
+	if len(left) < leftWidth {
+		rightWidth += leftWidth - len(left)
+		leftWidth = len(left)
+	}
+	if len(right) < rightWidth {
+		leftWidth += rightWidth - len(right)
+		rightWidth = len(right)
+	}
+	if len(left) > leftWidth {
+		left = ellipsizeStatusPrefix(left, leftWidth)
+	}
+	if len(right) > rightWidth {
+		right = ellipsizeStatusLocation(right, rightWidth)
+	}
+	return left, right
+}
+
+func ellipsizeStatusPrefix(value []rune, width int) []rune {
+	if width <= 0 {
+		return nil
+	}
+	if width == 1 {
+		return []rune{'…'}
+	}
+	result := make([]rune, width)
+	copy(result, value[:width-1])
+	result[width-1] = '…'
+	return result
+}
+
+func ellipsizeStatusLocation(value []rune, width int) []rune {
+	if width <= 0 {
+		return nil
+	}
+	if width == 1 {
+		return []rune{'…'}
+	}
+	colon := -1
+	for i, r := range value {
+		if r == ':' {
+			colon = i
+			break
+		}
+	}
+	if len(value) >= 3 && value[0] == '[' && value[len(value)-1] == ']' && colon > 0 {
+		prefixWidth := colon + 1
+		tailWidth := width - prefixWidth - 2
+		if tailWidth >= 4 {
+			result := make([]rune, 0, width)
+			result = append(result, value[:prefixWidth]...)
+			result = append(result, '…')
+			result = append(result, value[len(value)-1-tailWidth:len(value)-1]...)
+			result = append(result, ']')
+			return result
+		}
+	}
+	result := make([]rune, width)
+	result[0] = '…'
+	copy(result[1:], value[len(value)-width+1:])
+	return result
+}
+
+func statusLocation(hostname, root, home string) string {
+	if root != "" {
+		root = filepath.Clean(root)
+	}
+	if home != "" {
+		home = filepath.Clean(home)
+	}
+	if root == "." {
+		root = ""
+	}
+	if root != "" && home != "" {
+		if relative, err := filepath.Rel(home, root); err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			if relative == "." {
+				root = "~"
+			} else {
+				root = "~/" + filepath.ToSlash(relative)
+			}
+		}
+	}
+	if hostname == "" {
+		hostname = "?"
+	}
+	if root == "" {
+		return "[" + hostname + "]"
+	}
+	return "[" + hostname + ":" + filepath.ToSlash(root) + "]"
+}
+
 func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 	var terminalExitCommand []byte
 	if r.renderDone != nil {
@@ -2192,6 +2316,10 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 				err = resetErr
 			}
 			state.cols, state.rows = e.cols, e.rows
+			if state.status.Revision != 0 {
+				state.emitStatus()
+				needsPresent = true
+			}
 			reason = "terminal-size"
 		case localInputEvent:
 			if r.dropConnectionEvents.Load() {
@@ -2250,6 +2378,12 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 					state.layout.LayoutRevision, len(state.pendingLayouts), len(state.pendingFrames)))
 			}
 			reason = "client-layout"
+		case statusEvent:
+			if r.dropConnectionEvents.Load() {
+				return false, "", nil
+			}
+			needsPresent, err = state.acceptStatus(e.status)
+			reason = "client-status"
 		case paneFrameEvent:
 			if r.dropConnectionEvents.Load() {
 				return false, "", nil

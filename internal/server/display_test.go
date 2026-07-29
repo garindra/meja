@@ -257,6 +257,49 @@ type renderBatchWriter struct {
 	batches [][]byte
 }
 
+type synchronizedBuffer struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	data bytes.Buffer
+}
+
+func (b *synchronizedBuffer) init() {
+	if b.cond == nil {
+		b.cond = sync.NewCond(&b.mu)
+	}
+}
+
+func (b *synchronizedBuffer) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.init()
+	for b.data.Len() == 0 {
+		b.cond.Wait()
+	}
+	return b.data.Read(p)
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.init()
+	n, err := b.data.Write(p)
+	b.cond.Broadcast()
+	return n, err
+}
+
+func (b *synchronizedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.data.Len()
+}
+
+func (b *synchronizedBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.data.Bytes()...)
+}
+
 func (w *renderBatchWriter) Write(data []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -414,11 +457,18 @@ func resizeTestSessionWindow(state *SessionState, windowID uint64, cols, rows ui
 	return nil
 }
 
-func testClientInstance(frames chan protocol.Frame, leases map[int]*OutputLease, status ...io.Writer) *ClientInstance {
+func testClientInstance(frames chan protocol.Frame, leases map[int]*OutputLease) *ClientInstance {
 	connection := newClientInstance(nil, nil)
-	connection.controlOut = frames
-	if len(status) > 0 {
-		connection.StatusOutput = status[0]
+	controlOut := make(chan protocol.Frame, 256)
+	connection.controlOut = controlOut
+	if frames != nil {
+		go func() {
+			for frame := range controlOut {
+				if frame.Type != protocol.MsgClientStatus {
+					frames <- frame
+				}
+			}
+		}()
 	}
 	for slot, lease := range leases {
 		connection.Output[slot] = lease
@@ -754,7 +804,7 @@ func TestBindingPublicationWaitsForHandoffCompletion(t *testing.T) {
 		if frame.Type != protocol.MsgClientLayout {
 			t.Fatalf("published frame type = %d, want CLIENT_LAYOUT", frame.Type)
 		}
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("layout was not published after binding completion")
 	}
 }
@@ -1805,9 +1855,6 @@ func TestMissingPrefixWindowShowsStatusWithoutDetaching(t *testing.T) {
 	fixtureClient.setTestTerminalSize(16, 4)
 	createTestWindow(state, &Pane{ID: testAddPaneID(state), terminal: newTerminal(16, 4)})
 	client := clientForState(state)
-	var status bytes.Buffer
-	client.StatusOutput = &status
-
 	detach, err := client.handleInputBytes(client.currentView.Layout.LayoutRevision, []byte{0x02, '2'})
 	if err != nil || detach {
 		t.Fatalf("missing prefix window detach=%v err=%v", detach, err)

@@ -12,17 +12,16 @@ const (
 	MaxBytesLen           uint64 = 4 << 20
 	MaxArgvCount          uint64 = 256
 	MaxVisiblePanes       uint64 = 8
+	MaxStatusWindows      uint64 = 4096
 	MaxRenderSlots        uint64 = 8
-	OutputStreamCount     uint64 = MaxRenderSlots + 1
-	StatusRenderSlot      uint8  = uint8(MaxRenderSlots)
+	OutputStreamCount     uint64 = MaxRenderSlots
 	MaxGridCols           uint64 = 1024
 	MaxGridRows           uint64 = 1024
 	MaxGridCells                 = MaxGridCols * MaxGridRows
 )
 
 // OutputIndexFromStreamID maps server-initiated unidirectional QUIC stream IDs
-// (3, 7, 11, ...) to Meja's connection-local display output indices. Index 0
-// is the status surface; indices 1..8 correspond to pane slots 0..7.
+// (3, 7, 11, ...) to Meja's connection-local pane render slots 0..7.
 func OutputIndexFromStreamID(id uint64) (uint8, bool) {
 	if id&3 != 3 {
 		return 0, false
