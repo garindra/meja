@@ -13,7 +13,11 @@ import (
 )
 
 const (
-	maxCSISequenceBytes             = 256
+	maxCSISequenceBytes = 256
+	// OSC payloads are normally consumed without retention. OSC 52 is the one
+	// allowlisted exception because clipboard writes must be delivered to the
+	// attached frontend rather than represented in the terminal grid.
+	maxForwardedOSC52Bytes          = 2 << 20
 	maxTerminalStyles               = 4096
 	initialStyleCapacity            = 32
 	historyCounterStyleID    uint32 = 1
@@ -184,13 +188,19 @@ func isIndicVirama(r rune) bool {
 }
 
 type Update struct {
-	DirtySpans    []DirtySpan
-	ScrollDelta   int
-	FullRedraw    bool
-	CursorChanged bool
-	VisibleChange bool
-	Replies       [][]byte
-	trackDamage   bool
+	DirtySpans     []DirtySpan
+	ScrollDelta    int
+	FullRedraw     bool
+	CursorChanged  bool
+	VisibleChange  bool
+	Replies        [][]byte
+	FrontendWrites []FrontendWrite
+	trackDamage    bool
+}
+
+type FrontendWrite struct {
+	Data          []byte
+	OSC52Sequence uint64
 }
 
 type DirtySpan struct {
@@ -469,6 +479,8 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 		if t.Parser.state != parserText && (data[0] == 0x18 || data[0] == 0x1a) {
 			t.Parser.state = parserText
 			t.Parser.csiBuf = t.Parser.csiBuf[:0]
+			t.Parser.oscBuf = t.Parser.oscBuf[:0]
+			t.Parser.oscCandidate = false
 			data = data[1:]
 			continue
 		}
@@ -550,7 +562,7 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 				t.Parser.state = parserCSI
 				t.Parser.csiBuf = t.Parser.csiBuf[:0]
 			case ']':
-				t.Parser.state = parserOSC
+				t.startOSC()
 			case 'P':
 				t.Parser.state = parserDCS
 			case '7':
@@ -642,17 +654,23 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 			data = data[1:]
 			switch b {
 			case 0x07:
-				t.Parser.state = parserText
+				t.finishOSC(update, []byte{0x07})
 			case 0x1b:
 				t.Parser.state = parserOSCESC
+			default:
+				t.consumeOSCByte(b)
 			}
 		case parserOSCESC:
 			b := data[0]
 			data = data[1:]
 			if b == '\\' {
-				t.Parser.state = parserText
+				t.finishOSC(update, []byte{0x1b, '\\'})
 				continue
 			}
+			// An ESC that is not the first byte of ST makes the OSC malformed.
+			// Continue consuming it, but never forward the ambiguous sequence.
+			t.Parser.oscBuf = t.Parser.oscBuf[:0]
+			t.Parser.oscCandidate = false
 			t.Parser.state = parserOSC
 		case parserDCS:
 			b := data[0]
@@ -670,6 +688,51 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 			}
 		}
 	}
+}
+
+func (t *TerminalState) startOSC() {
+	t.Parser.state = parserOSC
+	t.Parser.oscBuf = t.Parser.oscBuf[:0]
+	t.Parser.oscCandidate = true
+	t.Parser.oscSequence++
+	if t.Parser.oscSequence == 0 {
+		t.Parser.oscSequence++
+	}
+}
+
+func (t *TerminalState) consumeOSCByte(b byte) {
+	if !t.Parser.oscCandidate {
+		return
+	}
+	const prefix = "52;"
+	offset := len(t.Parser.oscBuf)
+	if offset < len(prefix) && b != prefix[offset] {
+		t.Parser.oscBuf = t.Parser.oscBuf[:0]
+		t.Parser.oscCandidate = false
+		return
+	}
+	if offset == maxForwardedOSC52Bytes {
+		t.Parser.oscBuf = t.Parser.oscBuf[:0]
+		t.Parser.oscCandidate = false
+		return
+	}
+	t.Parser.oscBuf = append(t.Parser.oscBuf, b)
+}
+
+func (t *TerminalState) finishOSC(update *Update, terminator []byte) {
+	if t.Parser.oscCandidate && len(t.Parser.oscBuf) >= len("52;") {
+		write := make([]byte, 0, len("\x1b]")+len(t.Parser.oscBuf)+len(terminator))
+		write = append(write, "\x1b]"...)
+		write = append(write, t.Parser.oscBuf...)
+		write = append(write, terminator...)
+		update.FrontendWrites = append(update.FrontendWrites, FrontendWrite{
+			Data:          write,
+			OSC52Sequence: t.Parser.oscSequence,
+		})
+	}
+	t.Parser.oscBuf = t.Parser.oscBuf[:0]
+	t.Parser.oscCandidate = false
+	t.Parser.state = parserText
 }
 
 func (t *TerminalState) putASCII(data []byte, update *Update) {
@@ -1401,6 +1464,7 @@ func (u *Update) ResetFor(rows int, trackDamage bool) {
 	u.CursorChanged = false
 	u.VisibleChange = false
 	u.Replies = u.Replies[:0]
+	u.FrontendWrites = u.FrontendWrites[:0]
 }
 
 func (u *Update) HasDamage() bool {

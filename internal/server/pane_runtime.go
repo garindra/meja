@@ -392,6 +392,10 @@ func (p *Pane) run() {
 				return
 			}
 			trackDamage := p.outputLease != nil && p.currentViewMode() == paneViewLive
+			var currentFrontendWrite func([]byte) error
+			if p.outputLease != nil {
+				currentFrontendWrite = p.outputLease.frontendTerminalWrite
+			}
 			update.ResetFor(p.terminal.Rows, trackDamage)
 			p.terminal.ApplyInto(data, &update)
 			if len(startupInput) > 0 {
@@ -402,6 +406,9 @@ func (p *Pane) run() {
 				if err := p.sendOwnedInput(reply); err != nil {
 					return
 				}
+			}
+			if err := p.routeFrontendWrites(&update, currentFrontendWrite); err != nil {
+				return
 			}
 			p.publishTerminalMetadata()
 			if !trackDamage {
@@ -435,6 +442,28 @@ func (p *Pane) run() {
 			return
 		}
 	}
+}
+
+func (p *Pane) routeFrontendWrites(update *Update, current func([]byte) error) error {
+	for _, write := range update.FrontendWrites {
+		destination := current
+		if write.OSC52Sequence == p.pendingOSC52Sequence {
+			destination = p.pendingOSC52FrontendWrite
+		}
+		if destination != nil {
+			if err := destination(write.Data); err != nil {
+				return err
+			}
+		}
+	}
+	if !p.terminal.Parser.oscCandidate {
+		p.pendingOSC52FrontendWrite = nil
+		p.pendingOSC52Sequence = 0
+	} else if p.pendingOSC52Sequence != p.terminal.Parser.oscSequence {
+		p.pendingOSC52FrontendWrite = current
+		p.pendingOSC52Sequence = p.terminal.Parser.oscSequence
+	}
+	return nil
 }
 
 func historySelectionContains(selection *paneHistorySelection, row, column int) bool {

@@ -1428,8 +1428,9 @@ func (d *Daemon) discardPendingClientInstance(instance *ClientInstance) {
 // production. Exactly one pane actor or the session's unused pool holds a
 // lease at a time.
 type OutputLease struct {
-	Slot   int
-	Stream io.Writer
+	Slot                  int
+	Stream                io.Writer
+	frontendTerminalWrite func([]byte) error
 
 	workerOnce sync.Once
 	available  chan *paneRenderBuffer
@@ -1549,9 +1550,10 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		}
 		leaseSlot := slot
 		outputLeases[slot] = &OutputLease{
-			Slot:   slot,
-			Stream: outputStream,
-			done:   conn.Context().Done(),
+			Slot:                  slot,
+			Stream:                outputStream,
+			frontendTerminalWrite: clientInstance.writeFrontendTerminal,
+			done:                  conn.Context().Done(),
 			onFailure: func(writeErr error) {
 				_ = conn.CloseWithError(protocol.RenderOutputErrorCode, fmt.Sprintf("pane output slot %d failed: %v", leaseSlot, writeErr))
 			},

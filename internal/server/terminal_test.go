@@ -931,6 +931,41 @@ func TestOSCSTTerminatorIsConsumed(t *testing.T) {
 	}
 }
 
+func TestOSC52IsForwardedToFrontendAndNotPrinted(t *testing.T) {
+	term := newTerminal(8, 1)
+	update := term.Apply([]byte("\x1b]52;c;Y29weQ==\x1b\\prompt"))
+	if len(update.FrontendWrites) != 1 || string(update.FrontendWrites[0].Data) != "\x1b]52;c;Y29weQ==\x1b\\" || update.FrontendWrites[0].OSC52Sequence == 0 {
+		t.Fatalf("frontend writes = %#v", update.FrontendWrites)
+	}
+	if got := rowString(term, 0, 6); got != "prompt" {
+		t.Fatalf("got %q, want prompt", got)
+	}
+}
+
+func TestFragmentedOSC52IsForwardedOnlyWhenComplete(t *testing.T) {
+	term := newTerminal(8, 1)
+	for _, fragment := range []string{"\x1b]", "5", "2;c;", "Y29w", "eQ==\x1b"} {
+		if update := term.Apply([]byte(fragment)); len(update.FrontendWrites) != 0 {
+			t.Fatalf("incomplete fragment produced frontend writes %#v", update.FrontendWrites)
+		}
+	}
+	update := term.Apply([]byte("\\"))
+	if len(update.FrontendWrites) != 1 || string(update.FrontendWrites[0].Data) != "\x1b]52;c;Y29weQ==\x1b\\" || update.FrontendWrites[0].OSC52Sequence == 0 {
+		t.Fatalf("frontend writes = %#v", update.FrontendWrites)
+	}
+}
+
+func TestNonClipboardOSCIsNotForwarded(t *testing.T) {
+	term := newTerminal(8, 1)
+	update := term.Apply([]byte("\x1b]0;title\a"))
+	if len(update.FrontendWrites) != 0 {
+		t.Fatalf("frontend writes = %#v, want none", update.FrontendWrites)
+	}
+	if len(term.Parser.oscBuf) != 0 {
+		t.Fatalf("parser retained non-clipboard OSC: %d bytes", len(term.Parser.oscBuf))
+	}
+}
+
 func TestDCSAndUTF8DesignationAreConsumed(t *testing.T) {
 	term := newTerminal(8, 1)
 	term.Apply([]byte("\x1b%G\x1bP$qm\x1b\\prompt"))

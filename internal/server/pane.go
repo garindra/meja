@@ -53,6 +53,11 @@ type Pane struct {
 	// QUIC stream. Same-client handoff returns it; a new connection atomically
 	// replaces it and stale cleanup is conditional on the exact lease pointer.
 	outputLease *OutputLease
+
+	// An OSC 52 may span PTY reads and pane swaps. Keep the frontend destination
+	// that owned the pane when the sequence began until its terminator arrives.
+	pendingOSC52FrontendWrite func([]byte) error
+	pendingOSC52Sequence      uint64
 }
 
 // notifyProcessActivity is called directly by the PTY/input producers. The

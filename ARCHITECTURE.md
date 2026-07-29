@@ -1289,7 +1289,7 @@ connection completes.
 
 ## Frontend terminal-control boundary
 
-After a pinned, authorized attachment, the server may send bounded terminal-control writes and register an attachment-specific exit command. This channel is used for frontend capture setup, cleanup, and OSC 52 clipboard delivery. It is not available before attach or resume succeeds, and arbitrary pane output is never copied raw onto this path; pane output is parsed into terminal state and rendered through the display protocol.
+After a pinned, authorized attachment, the server may send bounded terminal-control writes and register an attachment-specific exit command. This channel is used for frontend capture setup, cleanup, and OSC 52 clipboard delivery, including bounded OSC 52 writes allowlisted from the application in the attached pane. It is not available before attach or resume succeeds, and other pane output is never copied raw onto this path; pane output is parsed into terminal state and rendered through the display protocol.
 
 The client serializes these writes with rendering and executes cleanup before reconnecting or leaving. A compromised authenticated daemon could still emit hostile terminal controls, just as it could emit hostile rendered content. The trust decision is therefore the same pinned server attachment described above, not a second weaker channel.
 
