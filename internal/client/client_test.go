@@ -395,7 +395,7 @@ func TestQUICDialALPNRejectionReportsIncompatibleServer(t *testing.T) {
 		ErrorMessage: "tls: no application protocol",
 	}
 	err := quicDialError("example.com:60000", cause)
-	want := `server at example.com:60000 did not accept client QUIC profile "meja-quic/13"; the remote meja binary and running server must use the same QUIC profile as this client. Compare "meja version --verbose" locally with "meja server-version" using the same remote transport options, check --remote-path, and restart the remote server: CRYPTO_ERROR 0x178 (remote): tls: no application protocol`
+	want := `server at example.com:60000 did not accept client QUIC profile "meja-quic/14"; the remote meja binary and running server must use the same QUIC profile as this client. Compare "meja version --verbose" locally with "meja server-version" using the same remote transport options, check --remote-path, and restart the remote server: CRYPTO_ERROR 0x178 (remote): tls: no application protocol`
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err, want)
 	}
@@ -1441,9 +1441,67 @@ func TestDisplayFrameCompilerRejectsWriteBeyondGrid(t *testing.T) {
 func TestDisplayFrameCompilerRejectsMultipleScrolls(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
 	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2})
-	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: -1})
-	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: -1}); err == nil {
+	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: protocol.ScrollRegion{Top: 0, Bottom: 2, Delta: -1}})
+	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: protocol.ScrollRegion{Top: 0, Bottom: 2, Delta: -1}}); err == nil {
 		t.Fatal("multiple scroll commands in one frame were accepted")
+	}
+}
+
+func TestDisplayFrameCompilerRejectsInvalidScrollRegionForGrid(t *testing.T) {
+	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
+	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 3})
+	for _, region := range []protocol.ScrollRegion{
+		{Top: 0, Bottom: 4, Delta: -1},
+		{Top: 1, Bottom: 1, Delta: -1},
+		{Top: 0, Bottom: 3, Delta: 0},
+		{Top: 0, Bottom: 3, Delta: 4},
+	} {
+		if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: region}); err == nil {
+			t.Fatalf("accepted invalid region %#v", region)
+		}
+	}
+}
+
+func TestPaneScanoutCacheScrollRegion(t *testing.T) {
+	cache := newPaneScanoutCache(2, 20)
+	for row := 0; row < cache.rows; row++ {
+		cache.row(row)[0] = scanoutCell{Cluster: fmt.Sprintf("%02d", row), StyleID: uint32(row + 1), Width: 1}
+		cache.row(row)[1] = scanoutCell{Cluster: "x", StyleID: uint32(row + 1), Width: 1}
+	}
+	statusBefore := append([]scanoutCell(nil), cache.row(19)...)
+	cache.scrollRegion(protocol.ScrollRegion{Top: 0, Bottom: 19, Delta: -1})
+	for row := 0; row < 18; row++ {
+		if got := cache.row(row)[0].Cluster; got != fmt.Sprintf("%02d", row+1) {
+			t.Fatalf("row %d cluster = %q", row, got)
+		}
+	}
+	for column, cell := range cache.row(18) {
+		if cell != (scanoutCell{Width: 1}) {
+			t.Fatalf("blank row 18 column %d = %#v", column, cell)
+		}
+	}
+	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange)}
+	if err := applySpanToCache(cache, paintSpan{kind: paintText, row: 18, column: 0, styleID: 7, cellWidth: 1, text: []byte("ok")}, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if cache.row(18)[0].Cluster != "o" || cache.row(18)[1].Cluster != "k" {
+		t.Fatalf("following write did not populate exposed row: %#v", cache.row(18))
+	}
+	if !reflect.DeepEqual(cache.row(19), statusBefore) {
+		t.Fatalf("status row changed: got %#v want %#v", cache.row(19), statusBefore)
+	}
+
+	cache.scrollRegion(protocol.ScrollRegion{Top: 3, Bottom: 19, Delta: 1})
+	if got := cache.row(4)[0].Cluster; got != "04" {
+		t.Fatalf("downward scroll row 4 = %q, want old row 3", got)
+	}
+	for column, cell := range cache.row(3) {
+		if cell != (scanoutCell{Width: 1}) {
+			t.Fatalf("blank row 3 column %d = %#v", column, cell)
+		}
+	}
+	if !reflect.DeepEqual(cache.row(19), statusBefore) {
+		t.Fatal("non-zero-top scroll changed row below its region")
 	}
 }
 
@@ -1637,7 +1695,7 @@ func TestNativeScrollUsesRectangularMargins(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
-	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDelta: -1}); err != nil {
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollRegion: &protocol.ScrollRegion{Top: 0, Bottom: 4, Delta: -1}}); err != nil {
 		t.Fatal(err)
 	}
 	out := string(s.takeANSI())
@@ -1778,7 +1836,7 @@ func TestFullWidthScrollUsesOnlyVerticalMargins(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
-	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDelta: -1}); err != nil {
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollRegion: &protocol.ScrollRegion{Top: 0, Bottom: 4, Delta: -1}}); err != nil {
 		t.Fatal(err)
 	}
 	out := string(s.takeANSI())
@@ -1804,7 +1862,7 @@ func TestFallbackScrollRetainsVisibleRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
-	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDelta: -1, spans: []paintSpan{{kind: paintText, row: 2, styleID: 0, cellWidth: 1, text: []byte("dddd")}}}); err != nil {
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollRegion: &protocol.ScrollRegion{Top: 0, Bottom: 3, Delta: -1}, spans: []paintSpan{{kind: paintText, row: 2, styleID: 0, cellWidth: 1, text: []byte("dddd")}}}); err != nil {
 		t.Fatal(err)
 	}
 	out := string(s.takeANSI())

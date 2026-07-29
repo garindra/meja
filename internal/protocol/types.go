@@ -1,7 +1,7 @@
 package protocol
 
 const (
-	ALPN = "meja-quic/13"
+	ALPN = "meja-quic/14"
 
 	// SessionReplacedErrorCode is a terminal QUIC application close: another
 	// client has taken ownership of the session, so the displaced client must
@@ -135,8 +135,10 @@ type CursorUpdate struct {
 	Visible bool
 }
 
-type Scroll struct {
-	Delta int
+type ScrollRegion struct {
+	Top    int
+	Bottom int
+	Delta  int
 }
 
 type Color struct {

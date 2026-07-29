@@ -27,7 +27,7 @@ type paneRenderState struct {
 	installedStyles map[uint32]protocol.Style
 	dirty           []DirtySpan
 	dirtyRows       int
-	scrollDelta     int
+	scrollRegion    *ScrollRegion
 	cursorDirty     bool
 	nextRow         int
 	progressive     bool
@@ -47,7 +47,7 @@ func (s *paneRenderState) attach(lease *OutputLease, layoutRevision protocol.Cli
 	s.layoutRevision = layoutRevision
 	s.barrierPending = refresh == nil
 	s.installedStyles = make(map[uint32]protocol.Style, 32)
-	s.scrollDelta = 0
+	s.scrollRegion = nil
 	s.cursorDirty = true
 	s.nextRow = 0
 	s.progressive = false
@@ -73,7 +73,7 @@ func (s *paneRenderState) detach() {
 	s.installedStyles = nil
 	s.dirty = nil
 	s.dirtyRows = 0
-	s.scrollDelta = 0
+	s.scrollRegion = nil
 	s.cursorDirty = false
 	s.progressive = false
 	s.due = false
@@ -134,7 +134,7 @@ func (s *paneRenderState) markFull() {
 		s.dirty[row] = DirtySpan{Start: 0, End: cols}
 	}
 	s.dirtyRows = len(s.dirty)
-	s.scrollDelta = 0
+	s.scrollRegion = nil
 	s.cursorDirty = true
 	s.progressive = false
 }
@@ -144,11 +144,11 @@ func (s *paneRenderState) hasDirty() bool {
 }
 
 func (s *paneRenderState) hasWork() bool {
-	return s.lease != nil && (s.refresh != nil || len(s.queued) > 0 || s.barrierPending || s.scrollDelta != 0 || s.cursorDirty || s.hasDirty())
+	return s.lease != nil && (s.refresh != nil || len(s.queued) > 0 || s.barrierPending || s.scrollRegion != nil || s.cursorDirty || s.hasDirty())
 }
 
 func (s *paneRenderState) hasVisualWork() bool {
-	return s.barrierPending || s.scrollDelta != 0 || s.cursorDirty || s.hasDirty()
+	return s.barrierPending || s.scrollRegion != nil || s.cursorDirty || s.hasDirty()
 }
 
 func (s *paneRenderState) available() <-chan *paneRenderBuffer {
@@ -193,20 +193,27 @@ func (s *paneRenderState) merge(update Update) {
 		return
 	}
 	s.ensureRows()
-	if update.FullRedraw || update.ScrollDelta != 0 && s.progressive {
+	if update.FullRedraw || update.ScrollRegion != nil && s.progressive {
 		s.markFull()
 	} else {
-		if update.ScrollDelta != 0 {
-			if s.scrollDelta != 0 && (s.scrollDelta < 0) != (update.ScrollDelta < 0) {
+		if region := update.ScrollRegion; region != nil {
+			if s.scrollRegion != nil &&
+				(s.scrollRegion.Top != region.Top || s.scrollRegion.Bottom != region.Bottom ||
+					(s.scrollRegion.Delta < 0) != (region.Delta < 0)) {
 				s.markFull()
 			} else {
-				s.dirtyRows -= shiftDirtyRows(s.dirty, update.ScrollDelta)
-				s.scrollDelta += update.ScrollDelta
-				rows := len(s.dirty)
-				if s.scrollDelta < -rows {
-					s.scrollDelta = -rows
-				} else if s.scrollDelta > rows {
-					s.scrollDelta = rows
+				s.dirtyRows -= shiftDirtyRows(s.dirty, region.Top, region.Bottom, region.Delta)
+				if s.scrollRegion == nil {
+					copyRegion := *region
+					s.scrollRegion = &copyRegion
+				} else {
+					s.scrollRegion.Delta += region.Delta
+					height := region.Bottom - region.Top
+					if s.scrollRegion.Delta < -height {
+						s.scrollRegion.Delta = -height
+					} else if s.scrollRegion.Delta > height {
+						s.scrollRegion.Delta = height
+					}
 				}
 			}
 		}
@@ -220,11 +227,12 @@ func (s *paneRenderState) merge(update Update) {
 	s.cursorDirty = s.cursorDirty || update.CursorChanged || update.VisibleChange
 }
 
-func shiftDirtyRows(spans []DirtySpan, delta int) int {
-	rows := len(spans)
-	if rows == 0 || delta == 0 {
+func shiftDirtyRows(spans []DirtySpan, top, bottom, delta int) int {
+	if top < 0 || top >= bottom || bottom > len(spans) || delta == 0 {
 		return 0
 	}
+	spans = spans[top:bottom]
+	rows := len(spans)
 	dropped := 0
 	if delta < 0 {
 		shift := min(-delta, rows)
@@ -406,13 +414,18 @@ func (s *paneRenderState) render(buffer *paneRenderBuffer) error {
 	dirtyBefore := cloneDirty(s.dirty)
 	dirtyRowsBefore := s.dirtyRows
 	stylesBefore := cloneRenderStyles(s.installedStyles)
-	barrierBefore, scrollBefore, cursorBefore := s.barrierPending, s.scrollDelta, s.cursorDirty
+	barrierBefore, cursorBefore := s.barrierPending, s.cursorDirty
+	var scrollBefore *ScrollRegion
+	if s.scrollRegion != nil {
+		copyRegion := *s.scrollRegion
+		scrollBefore = &copyRegion
+	}
 	nextBefore, progressiveBefore := s.nextRow, s.progressive
 	rollback := func() {
 		s.dirty = dirtyBefore
 		s.dirtyRows = dirtyRowsBefore
 		s.installedStyles = stylesBefore
-		s.barrierPending, s.scrollDelta, s.cursorDirty = barrierBefore, scrollBefore, cursorBefore
+		s.barrierPending, s.scrollRegion, s.cursorDirty = barrierBefore, scrollBefore, cursorBefore
 		s.nextRow, s.progressive = nextBefore, progressiveBefore
 	}
 
@@ -428,12 +441,13 @@ func (s *paneRenderState) render(buffer *paneRenderBuffer) error {
 		}
 		s.barrierPending = false
 	}
-	if s.scrollDelta != 0 {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: s.scrollDelta}); err != nil {
+	if s.scrollRegion != nil {
+		region := protocol.ScrollRegion{Top: s.scrollRegion.Top, Bottom: s.scrollRegion.Bottom, Delta: s.scrollRegion.Delta}
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: region}); err != nil {
 			rollback()
 			return err
 		}
-		s.scrollDelta = 0
+		s.scrollRegion = nil
 	}
 
 	for len(output.pending) < output.limit {

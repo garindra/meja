@@ -38,6 +38,62 @@ func TestDisplayCompilerUsesSpecializedTextAndFill(t *testing.T) {
 	}
 }
 
+func TestShiftDirtyRowsWithinRegionPreservesOutsideDamage(t *testing.T) {
+	spans := []DirtySpan{
+		{Start: 0, End: 1},
+		{Start: 1, End: 2},
+		{Start: 2, End: 3},
+		{Start: 3, End: 4},
+		{Start: 4, End: 5},
+	}
+	if dropped := shiftDirtyRows(spans, 1, 4, -1); dropped != 1 {
+		t.Fatalf("dropped dirty rows = %d, want 1", dropped)
+	}
+	want := []DirtySpan{
+		{Start: 0, End: 1},
+		{Start: 2, End: 3},
+		{Start: 3, End: 4},
+		{},
+		{Start: 4, End: 5},
+	}
+	for row := range want {
+		if spans[row] != want[row] {
+			t.Fatalf("row %d damage = %#v, want %#v", row, spans[row], want[row])
+		}
+	}
+}
+
+func TestPaneRenderStateCoalescesOnlyCompatibleRegions(t *testing.T) {
+	pane := &Pane{terminal: newTerminal(4, 5)}
+	state := newPaneRenderState(pane)
+	state.lease = &OutputLease{}
+	state.ensureRows()
+
+	first := Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}}
+	second := Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}}
+	state.merge(first)
+	state.merge(second)
+	if state.scrollRegion == nil || *state.scrollRegion != (ScrollRegion{Top: 1, Bottom: 4, Delta: -2}) {
+		t.Fatalf("coalesced render region = %#v", state.scrollRegion)
+	}
+
+	state.merge(Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 0, Bottom: 4, Delta: -1}})
+	if state.scrollRegion != nil || state.dirtyRows != 5 {
+		t.Fatalf("incompatible region did not force full redraw: region=%#v dirty=%#v", state.scrollRegion, state.dirty)
+	}
+}
+
+func TestPaneRenderStateRejectsRegionDuringProgressiveRender(t *testing.T) {
+	pane := &Pane{terminal: newTerminal(4, 5)}
+	state := newPaneRenderState(pane)
+	state.lease = &OutputLease{}
+	state.progressive = true
+	state.merge(Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}})
+	if state.scrollRegion != nil || state.progressive || state.dirtyRows != 5 {
+		t.Fatalf("progressive scroll did not force full redraw: %#v", state)
+	}
+}
+
 func TestDisplayCompilerMergesCompatibleRows(t *testing.T) {
 	word := func(r rune) cellWord {
 		value, _ := makeScalarCellWord(r, 1, 0)
@@ -311,11 +367,12 @@ func emitTestTerminalUpdate(output *renderOutput, pane *Pane, update Update) err
 	if update.FullRedraw {
 		return sendFullRender(output, pane)
 	}
-	if !update.HasDamage() && !update.CursorChanged && !update.VisibleChange && update.ScrollDelta == 0 {
+	if !update.HasDamage() && !update.CursorChanged && !update.VisibleChange && update.ScrollRegion == nil {
 		return nil
 	}
-	if update.ScrollDelta != 0 {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: update.ScrollDelta}); err != nil {
+	if update.ScrollRegion != nil {
+		region := protocol.ScrollRegion{Top: update.ScrollRegion.Top, Bottom: update.ScrollRegion.Bottom, Delta: update.ScrollRegion.Delta}
+		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: region}); err != nil {
 			return err
 		}
 	}
@@ -2180,7 +2237,8 @@ func TestBottomEdgeOutputEmitsScrollBeforeNewRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	commands := decodePendingCommands(t, wire.Bytes())
-	if len(commands) == 0 || commands[0].Opcode != protocol.DisplayOpcodeScroll || commands[0].Delta != -1 {
+	if len(commands) == 0 || commands[0].Opcode != protocol.DisplayOpcodeScrollRegion ||
+		commands[0].ScrollRegion != (protocol.ScrollRegion{Top: 0, Bottom: 2, Delta: -1}) {
 		t.Fatalf("first command = %#v, want scroll -1", commands)
 	}
 	positions := 0
@@ -2195,6 +2253,56 @@ func TestBottomEdgeOutputEmitsScrollBeforeNewRow(t *testing.T) {
 	}
 	if positions != 1 {
 		t.Fatalf("write positions = %d, want one bottom-row write", positions)
+	}
+}
+
+func TestVimStyleMarginScrollEmitsOnlyExposedRow(t *testing.T) {
+	session := NewSessionState(0)
+	client := newTestClient(session)
+	client.setTestTerminalSize(4, 21)
+	pane := &Pane{ID: testAddPaneID(session), terminal: newTerminal(4, 20)}
+	createTestWindow(session, pane)
+
+	var initial bytes.Buffer
+	for row := 0; row < 20; row++ {
+		initial.WriteString("\x1b[")
+		initial.WriteString(itoa(row + 1))
+		initial.WriteString(";1H")
+		initial.WriteByte(byte('A' + row))
+	}
+	pane.terminal.Apply(initial.Bytes())
+	statusBefore := rowString(pane.terminal, 19, 4)
+	pane.terminal.Apply([]byte("\x1b[1;19r\x1b[19;1H"))
+	update := pane.terminal.Apply([]byte("\nNEW"))
+	if update.FullRedraw || update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 0, Bottom: 19, Delta: -1}) {
+		t.Fatalf("margin scroll update = %#v", update)
+	}
+	if got := rowString(pane.terminal, 19, 4); got != statusBefore {
+		t.Fatalf("status row = %q, want unchanged %q", got, statusBefore)
+	}
+
+	var wire bytes.Buffer
+	if err := emitTestTerminalUpdate(newRenderOutput(&wire), pane, update); err != nil {
+		t.Fatal(err)
+	}
+	commands := decodePendingCommands(t, wire.Bytes())
+	scrolls, positions := 0, 0
+	for _, command := range commands {
+		switch command.Opcode {
+		case protocol.DisplayOpcodeScrollRegion:
+			scrolls++
+			if command.ScrollRegion != (protocol.ScrollRegion{Top: 0, Bottom: 19, Delta: -1}) {
+				t.Fatalf("scroll command = %#v", command.ScrollRegion)
+			}
+		case protocol.DisplayOpcodeSetWritePosition:
+			positions++
+			if command.Row != 18 {
+				t.Fatalf("ordinary write targeted row %d, want only exposed row 18", command.Row)
+			}
+		}
+	}
+	if scrolls != 1 || positions != 1 {
+		t.Fatalf("commands contain %d scrolls and %d write positions: %#v", scrolls, positions, commands)
 	}
 }
 

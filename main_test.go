@@ -579,7 +579,7 @@ func TestVerboseVersionCommandOutput(t *testing.T) {
 	if err := run(context.Background(), []string{"version", "--verbose"}, stdin, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	want := "meja:             1.2.3\ncommand protocol: 1\nQUIC profile:     meja-quic/13\n"
+	want := "meja:             1.2.3\ncommand protocol: 1\nQUIC profile:     meja-quic/14\n"
 	if got := stdout.String(); got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}

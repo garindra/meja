@@ -806,12 +806,23 @@ The packed representation is an implementation optimization, not a change to ter
 Applying PTY bytes produces an `Update` describing visible consequences:
 
 * one dirty column span for each affected visible row;
-* a scroll delta;
+* an optional full-width `ScrollRegion` with inclusive `top`, exclusive
+  `bottom`, and signed row delta;
 * cursor or visibility changes;
 * terminal replies; and
 * a full-redraw marker for transformations that cannot be expressed safely as local damage.
 
-The pane actor merges updates into persistent per-row dirty spans. A brief idle period makes newly accumulated work eligible for rendering quickly; a maximum batch age prevents a continuous stream from postponing it forever. Damage coordinates are client-relative visible rows, even though the underlying row store also contains history. Detached panes parse without tracking render damage because their authoritative grid is sufficient for the next full refresh.
+The pane actor merges updates into persistent per-row dirty spans. Compatible
+scrolls coalesce only when their `[top,bottom)` regions and directions match;
+the accumulated delta is clamped to the region height. Dirty spans move only
+inside that region. Different regions, opposing directions, and other
+coordinate-space ambiguities promote the pending work to a full redraw. A
+brief idle period makes newly accumulated work eligible for rendering quickly;
+a maximum batch age prevents a continuous stream from postponing it forever.
+Damage coordinates are client-relative visible rows, even though the
+underlying row store also contains history. Detached panes parse without
+tracking render damage because their authoritative grid is sufficient for the
+next full refresh.
 
 Eligibility and buffer availability are separate. Once damage is due, the actor borrows the lease's buffer when the output worker offers it and encodes as much current grid state as fits. A successfully encoded prefix advances that row's dirty-span start; a complete span is cleared. A span that does not fit is left unchanged, and an encoded prefix leaves its suffix dirty. New PTY damage is unioned with any retained suffix, so later batches render the newest authoritative cells rather than an old cell snapshot. Scroll during a progressive multi-batch update promotes the work to a full redraw when shifting retained coordinates would be ambiguous.
 
@@ -885,9 +896,13 @@ Display streams use an opcode grammar rather than the generic control-frame enve
 | `WRITE_TEXT_UTF8_DEFAULT` | Advances one column per scalar and logically uses style zero | Avoids a separate style-selection command for common canonical-default text. |
 | `WRITE_CLUSTER` | Advances by one supplied cluster width | Writes exactly one opaque grapheme cluster. The client must not split or remeasure it. |
 | `FILL` | Advances by a column count | Repeats one scalar cell value and width across a run of columns. |
-| `SCROLL` | Changes the pane surface without moving the write latch | Scrolls the pane by a signed row delta. A frame carries at most one accumulated scroll operation. |
+| `SCROLL_REGION` | Changes the pane surface without moving the write latch | Scrolls complete-width rows in `[top,bottom)` by a signed delta. Negative moves surviving content upward; positive moves it downward. A frame carries at most one accumulated region operation. |
 | `CURSOR_UPDATE` | Replaces remembered cursor state | Publishes pane-relative cursor position and visibility. |
 | `PRESENT` | Ends the current semantic frame | Makes all commands since the previous presentation eligible for the client UI loop. |
+
+`SCROLL_REGION` encodes `top` and `bottom` as uvarints and `delta` with the
+display protocol's signed-varint convention. Its bottom coordinate is always
+exclusive.
 
 The command stream is stateful, but the state is deliberately small and reconstructable. `START_RENDER` supplies the grid needed to validate implicit advancement. Style installations and selection are local to the physical render stream. Position advances after writes, including an exact wrap from the last column to column zero of the next row. Cursor state is remembered separately and copied into the completed frame at `PRESENT`.
 
@@ -1028,7 +1043,7 @@ Each decoder goroutine owns one `displayFrameCompiler`. It reads commands in ord
 * remembered cursor position and visibility; and
 * whether `START_RENDER` and a paint operation have occurred.
 
-It validates the stream while compiling: pane commands require `START_RENDER`; positions and implicit writes must stay inside the declared grid; styles must be defined before use; clusters and fills must have valid widths; a width-two cell cannot be split at a row edge; and a frame cannot contain multiple `SCROLL` commands.
+It validates the stream while compiling: pane commands require `START_RENDER`; positions and implicit writes must stay inside the declared grid; styles must be defined before use; clusters and fills must have valid widths; a width-two cell cannot be split at a row edge; `SCROLL_REGION` must satisfy `0 <= top < bottom <= rows`, `delta != 0`, and `abs(delta) <= bottom-top`; and a frame cannot contain multiple `SCROLL_REGION` commands.
 
 Text commands become pane-relative `paintSpan` values. A multi-row text command is split into row-local spans while the compiler's implicit position continues across the boundary. Fills are similarly split at row edges. `STYLE_INSTALL` definitions are collected in the frame rather than immediately affecting the physical terminal. Cursor updates change the compiler's remembered cursor and mark whether the frame explicitly changed it.
 
@@ -1075,13 +1090,21 @@ For every visible slot, the client keeps a pane-sized cache of client-only decod
 * before-and-after evidence for prediction reconciliation; and
 * atomic handling of wide and clustered cells.
 
-The cache is authoritative only in the sense that it mirrors the last server data received. It does not replace server state.
+For `SCROLL_REGION`, the cache discards rows leaving `[top,bottom)`, moves
+surviving row values in the indicated direction, and initializes exposed rows
+to canonical blank/default cells. Rows outside the region are not copied or
+mutated. The cache is authoritative only in the sense that it mirrors the last
+server data received. It does not replace server state.
 
 ## Physical terminal output
 
 Paint spans are translated into cursor movement, SGR style changes, UTF-8 writes, and fills on the user's terminal. Pane-relative coordinates are offset through the active layout rectangle. The focused pane's cursor becomes the physical cursor; non-focused pane cursors remain cached.
 
-When available, Meja uses top, bottom, left, and right margins to perform a native rectangular scroll within one pane. Margins are immediately reset afterward. If that operation is unavailable or unsafe, Meja scrolls the cache and repaints the pane instead.
+When available, Meja maps the operation's row region through the pane placement
+and uses top, bottom, left, and right margins to perform a native rectangular
+scroll within one pane. Full-width panes need only vertical margins. Margins
+are immediately reset afterward. If that operation is unavailable or unsafe,
+Meja scrolls the cache and repaints the pane instead.
 
 Raw mode, alternate-screen entry, frontend capture setup, frontend cleanup, OSC 52 writes, and final terminal restoration are serialized with normal rendering. A registered server-provided exit command is paired with a fixed client fallback so transport loss cannot leave the user's terminal in an attachment-specific input mode.
 
@@ -1355,7 +1378,7 @@ scrolling, and input-event coalescing.
 Meja has two live compatibility surfaces. The command protocol versions the
 Unix/SSH request and result framing; its attach result contains a separately
 validated bootstrap payload in the current implementation. The exact QUIC
-ALPN, currently `meja-quic/13`, versions the complete interactive profile:
+ALPN, currently `meja-quic/14`, versions the complete interactive profile:
 attachment and resume messages, stream topology, control codecs, display
 opcodes, scanout/cache semantics, reconnect behavior, and coupled terminal
 behavior such as DSCLRM probing. Attach and resume messages therefore do not

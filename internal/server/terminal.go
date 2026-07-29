@@ -189,13 +189,22 @@ func isIndicVirama(r rune) bool {
 
 type Update struct {
 	DirtySpans     []DirtySpan
-	ScrollDelta    int
+	ScrollRegion   *ScrollRegion
 	FullRedraw     bool
 	CursorChanged  bool
 	VisibleChange  bool
 	Replies        [][]byte
 	FrontendWrites []FrontendWrite
 	trackDamage    bool
+}
+
+// ScrollRegion describes a complete-width row transformation. Top is
+// inclusive, Bottom is exclusive, and a negative Delta moves surviving rows
+// upward.
+type ScrollRegion struct {
+	Top    int
+	Bottom int
+	Delta  int
 }
 
 type FrontendWrite struct {
@@ -1123,23 +1132,31 @@ func (t *TerminalState) executeCSI(seq []byte, update *Update) {
 		update.markDirty(t.CursorY, t.CursorX, t.Cols, t.Cols)
 	case 'L':
 		styleID := t.eraseStyleID()
-		t.insertLines(max1(params, 1), styleID)
-		update.FullRedraw = true
+		count := min(max1(params, 1), t.ScrollBottom-t.CursorY+1)
+		if t.CursorY >= t.ScrollTop && t.CursorY <= t.ScrollBottom {
+			t.insertLines(count, styleID)
+			update.recordScrollRegion(t.CursorY, t.ScrollBottom+1, count)
+			for row := t.CursorY; row < t.CursorY+count; row++ {
+				update.markDirty(row, 0, t.Cols, t.Cols)
+			}
+		}
 	case 'M':
 		styleID := t.eraseStyleID()
-		t.deleteLines(max1(params, 1), styleID)
-		update.FullRedraw = true
+		count := min(max1(params, 1), t.ScrollBottom-t.CursorY+1)
+		if t.CursorY >= t.ScrollTop && t.CursorY <= t.ScrollBottom {
+			t.deleteLines(count, styleID)
+			update.recordScrollRegion(t.CursorY, t.ScrollBottom+1, -count)
+			for row := t.ScrollBottom - count + 1; row <= t.ScrollBottom; row++ {
+				update.markDirty(row, 0, t.Cols, t.Cols)
+			}
+		}
 	case 'S':
 		count := min(max1(params, 1), t.ScrollBottom-t.ScrollTop+1)
 		styleID := t.eraseStyleID()
 		for range count {
 			t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
 		}
-		if t.ScrollTop == 0 && t.ScrollBottom == t.Rows-1 {
-			update.recordScroll(-count, t.Rows)
-		} else {
-			update.FullRedraw = true
-		}
+		update.recordScrollRegion(t.ScrollTop, t.ScrollBottom+1, -count)
 		for row := t.ScrollBottom - count + 1; row <= t.ScrollBottom; row++ {
 			update.markDirty(row, 0, t.Cols, t.Cols)
 		}
@@ -1149,11 +1166,7 @@ func (t *TerminalState) executeCSI(seq []byte, update *Update) {
 		for range count {
 			t.scrollDownRegion(t.ScrollTop, t.ScrollBottom, styleID)
 		}
-		if t.ScrollTop == 0 && t.ScrollBottom == t.Rows-1 {
-			update.recordScroll(count, t.Rows)
-		} else {
-			update.FullRedraw = true
-		}
+		update.recordScrollRegion(t.ScrollTop, t.ScrollBottom+1, count)
 		for row := t.ScrollTop; row < t.ScrollTop+count; row++ {
 			update.markDirty(row, 0, t.Cols, t.Cols)
 		}
@@ -1406,33 +1419,44 @@ func (u *Update) markDirty(row, start, end, cols int) {
 	u.DirtySpans[row] = span
 }
 
-func (u *Update) recordScroll(delta, rows int) {
+func (u *Update) recordScrollRegion(top, bottom, delta int) {
 	if u == nil || !u.trackDamage {
 		return
 	}
-	if delta == 0 || (u.ScrollDelta != 0 && (u.ScrollDelta < 0) != (delta < 0)) {
+	if top < 0 || top >= bottom || bottom > len(u.DirtySpans) || delta == 0 || delta < -(bottom-top) || delta > bottom-top {
 		u.FullRedraw = true
-		u.ScrollDelta = 0
+		u.ScrollRegion = nil
 		return
 	}
 	if u.FullRedraw {
 		return
 	}
-	rows = min(rows, len(u.DirtySpans))
-	if delta < 0 {
-		shift := min(-delta, rows)
-		copy(u.DirtySpans[:rows-shift], u.DirtySpans[shift:rows])
-		clear(u.DirtySpans[rows-shift : rows])
-	} else {
-		shift := min(delta, rows)
-		copy(u.DirtySpans[shift:rows], u.DirtySpans[:rows-shift])
-		clear(u.DirtySpans[:shift])
+	if pending := u.ScrollRegion; pending != nil &&
+		(pending.Top != top || pending.Bottom != bottom || (pending.Delta < 0) != (delta < 0)) {
+		u.FullRedraw = true
+		u.ScrollRegion = nil
+		return
 	}
-	u.ScrollDelta += delta
-	if u.ScrollDelta < -rows {
-		u.ScrollDelta = -rows
-	} else if u.ScrollDelta > rows {
-		u.ScrollDelta = rows
+	spans := u.DirtySpans[top:bottom]
+	if delta < 0 {
+		shift := -delta
+		copy(spans[:len(spans)-shift], spans[shift:])
+		clear(spans[len(spans)-shift:])
+	} else {
+		shift := delta
+		copy(spans[shift:], spans[:len(spans)-shift])
+		clear(spans[:shift])
+	}
+	if u.ScrollRegion == nil {
+		u.ScrollRegion = &ScrollRegion{Top: top, Bottom: bottom, Delta: delta}
+		return
+	}
+	u.ScrollRegion.Delta += delta
+	height := bottom - top
+	if u.ScrollRegion.Delta < -height {
+		u.ScrollRegion.Delta = -height
+	} else if u.ScrollRegion.Delta > height {
+		u.ScrollRegion.Delta = height
 	}
 }
 
@@ -1459,7 +1483,7 @@ func (u *Update) ResetFor(rows int, trackDamage bool) {
 	} else {
 		u.DirtySpans = u.DirtySpans[:0]
 	}
-	u.ScrollDelta = 0
+	u.ScrollRegion = nil
 	u.FullRedraw = false
 	u.CursorChanged = false
 	u.VisibleChange = false
@@ -1477,7 +1501,7 @@ func (u *Update) HasDamage() bool {
 }
 
 func (u *Update) HasRenderChange() bool {
-	return u.FullRedraw || u.ScrollDelta != 0 || u.CursorChanged || u.VisibleChange || u.HasDamage()
+	return u.FullRedraw || u.ScrollRegion != nil || u.CursorChanged || u.VisibleChange || u.HasDamage()
 }
 
 func (t *TerminalState) fillRow(row, start, end int, styleID uint32) {
@@ -1586,11 +1610,8 @@ func (t *TerminalState) reverseIndex(update *Update) {
 	}
 	styleID := t.eraseStyleID()
 	t.scrollDownRegion(t.ScrollTop, t.ScrollBottom, styleID)
-	delta := t.fullViewportScrollDelta(1)
-	update.recordScroll(delta, t.Rows)
-	if delta != 0 {
-		update.markDirty(t.ScrollTop, 0, t.Cols, t.Cols)
-	}
+	update.recordScrollRegion(t.ScrollTop, t.ScrollBottom+1, 1)
+	update.markDirty(t.ScrollTop, 0, t.Cols, t.Cols)
 	update.CursorChanged = true
 }
 
@@ -1940,11 +1961,8 @@ func (t *TerminalState) lineFeed(update *Update) {
 	if t.CursorY == t.ScrollBottom {
 		styleID := t.eraseStyleID()
 		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
-		delta := t.fullViewportScrollDelta(-1)
-		update.recordScroll(delta, t.Rows)
-		if delta != 0 {
-			update.markDirty(t.ScrollBottom, 0, t.Cols, t.Cols)
-		}
+		update.recordScrollRegion(t.ScrollTop, t.ScrollBottom+1, -1)
+		update.markDirty(t.ScrollBottom, 0, t.Cols, t.Cols)
 		return
 	}
 	if t.CursorY < t.Rows-1 {
@@ -1956,11 +1974,8 @@ func (t *TerminalState) wrapLine(update *Update) {
 	if t.CursorY == t.ScrollBottom {
 		styleID := t.eraseStyleID()
 		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
-		delta := t.fullViewportScrollDelta(-1)
-		update.recordScroll(delta, t.Rows)
-		if delta != 0 {
-			update.markDirty(t.ScrollBottom, 0, t.Cols, t.Cols)
-		}
+		update.recordScrollRegion(t.ScrollTop, t.ScrollBottom+1, -1)
+		update.markDirty(t.ScrollBottom, 0, t.Cols, t.Cols)
 		return
 	}
 	if t.CursorY < t.Rows-1 {
@@ -1970,13 +1985,6 @@ func (t *TerminalState) wrapLine(update *Update) {
 
 func (t *TerminalState) eraseStyleID() uint32 {
 	return t.currentStyleID()
-}
-
-func (t *TerminalState) fullViewportScrollDelta(delta int) int {
-	if t.ScrollTop == 0 && t.ScrollBottom == t.Rows-1 {
-		return delta
-	}
-	return 0
 }
 
 func (t *TerminalState) styleID(style Style) (uint32, bool) {

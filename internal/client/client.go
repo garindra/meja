@@ -117,7 +117,7 @@ type renderFrame struct {
 	layoutRevision protocol.ClientLayoutRevision
 	cols, rows     int
 	styleInstalls  []protocol.StyleDefinition
-	scrollDelta    int
+	scrollRegion   *protocol.ScrollRegion
 	spans          []paintSpan
 	cursor         protocol.Cursor
 	cursorVisible  bool
@@ -904,16 +904,19 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		c.cursor = command.Cursor.Cursor
 		c.cursorVisible = command.Cursor.Visible
 		c.cursorUpdated = true
-	case protocol.DisplayOpcodeScroll:
+	case protocol.DisplayOpcodeScrollRegion:
 		if c.paintStarted {
-			return false, fmt.Errorf("SCROLL after paint on slot %d", c.slot)
+			return false, fmt.Errorf("SCROLL_REGION after paint on slot %d", c.slot)
 		}
-		if command.Delta != 0 {
-			if c.frame.scrollDelta != 0 {
-				return false, fmt.Errorf("multiple SCROLL commands in one frame on slot %d", c.slot)
-			}
-			c.frame.scrollDelta = command.Delta
+		region := command.ScrollRegion
+		if region.Top < 0 || region.Top >= region.Bottom || region.Bottom > c.rows ||
+			region.Delta == 0 || region.Delta < -(region.Bottom-region.Top) || region.Delta > region.Bottom-region.Top {
+			return false, fmt.Errorf("invalid SCROLL_REGION [%d,%d) delta %d for %d-row grid on slot %d", region.Top, region.Bottom, region.Delta, c.rows, c.slot)
 		}
+		if c.frame.scrollRegion != nil {
+			return false, fmt.Errorf("multiple SCROLL_REGION commands in one frame on slot %d", c.slot)
+		}
+		c.frame.scrollRegion = &region
 	case protocol.DisplayOpcodePresent:
 		c.frame.layoutRevision = c.layoutRevision
 		c.frame.cursor = c.cursor
@@ -1484,10 +1487,35 @@ func (p *paneScanoutCache) row(row int) []scanoutCell {
 	return p.cells[physical*p.cols : (physical+1)*p.cols]
 }
 
-func (p *paneScanoutCache) scroll(delta int) {
-	if p.rows == 0 || delta == 0 {
+func (p *paneScanoutCache) scrollRegion(region protocol.ScrollRegion) {
+	if p.rows == 0 || region.Top < 0 || region.Top >= region.Bottom || region.Bottom > p.rows ||
+		region.Delta == 0 || region.Delta < -(region.Bottom-region.Top) || region.Delta > region.Bottom-region.Top {
 		return
 	}
+	if region.Top == 0 && region.Bottom == p.rows {
+		p.scrollViewport(region.Delta)
+		return
+	}
+	height := region.Bottom - region.Top
+	shift := min(absInt(region.Delta), height)
+	if region.Delta < 0 {
+		for row := region.Top; row < region.Bottom-shift; row++ {
+			copy(p.row(row), p.row(row+shift))
+		}
+		for row := region.Bottom - shift; row < region.Bottom; row++ {
+			fillBlank(p.row(row))
+		}
+		return
+	}
+	for row := region.Bottom - 1; row >= region.Top+shift; row-- {
+		copy(p.row(row), p.row(row-shift))
+	}
+	for row := region.Top; row < region.Top+shift; row++ {
+		fillBlank(p.row(row))
+	}
+}
+
+func (p *paneScanoutCache) scrollViewport(delta int) {
 	if delta <= -p.rows || delta >= p.rows {
 		fillBlank(p.cells)
 		p.head = 0
@@ -1504,6 +1532,13 @@ func (p *paneScanoutCache) scroll(delta int) {
 		p.head = (p.head + p.rows - 1) % p.rows
 		fillBlank(p.row(0))
 	}
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func newScanoutState(rectangularScroll bool) *scanoutState {
@@ -1787,9 +1822,11 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 		styles[def.ID] = def.Style
 	}
 	cache := s.caches[slot]
-	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange), cursorUpdated: frame.cursorUpdated, scrolled: frame.scrollDelta != 0}
+	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange), cursorUpdated: frame.cursorUpdated, scrolled: frame.scrollRegion != nil}
 	if cache != nil {
-		cache.scroll(frame.scrollDelta)
+		if frame.scrollRegion != nil {
+			cache.scrollRegion(*frame.scrollRegion)
+		}
 		for _, span := range frame.spans {
 			if err := applySpanToCache(cache, span, &evidence); err != nil {
 				return err
@@ -1816,20 +1853,20 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 	fullPaneEmitted := false
 	fullWidth := rect.X == 0 && rect.Width == s.cols
 	nativeScroll := !result.repaintPane && (fullWidth || s.rectangularScroll)
-	if delta := display.scrollDelta; delta != 0 {
+	if region := display.scrollRegion; region != nil {
 		if nativeScroll {
 			// Vertical margins are sufficient when the pane spans the full
 			// terminal width. Non-full-width panes additionally require
 			// DECLRMM/DECSLRM, which is gated by rectangularScroll.
-			fmt.Fprintf(&s.ansi, "\x1b[%d;%dr", rect.Y+1, rect.Y+rect.Height)
+			fmt.Fprintf(&s.ansi, "\x1b[%d;%dr", rect.Y+region.Top+1, rect.Y+region.Bottom)
 			if !fullWidth {
 				fmt.Fprintf(&s.ansi, "\x1b[%d;%ds", rect.X+1, rect.X+rect.Width)
 			}
-			fmt.Fprintf(&s.ansi, "\x1b[%d;%dH", rect.Y+1, rect.X+1)
-			if delta < 0 {
-				fmt.Fprintf(&s.ansi, "\x1b[%dS", -delta)
+			fmt.Fprintf(&s.ansi, "\x1b[%d;%dH", rect.Y+region.Top+1, rect.X+1)
+			if region.Delta < 0 {
+				fmt.Fprintf(&s.ansi, "\x1b[%dS", -region.Delta)
 			} else {
-				fmt.Fprintf(&s.ansi, "\x1b[%dT", delta)
+				fmt.Fprintf(&s.ansi, "\x1b[%dT", region.Delta)
 			}
 			fmt.Fprintf(&s.ansi, "\x1b[r")
 			if !fullWidth {
@@ -1837,7 +1874,7 @@ func (s *scanoutState) emitFrame(slot uint8, rect protocol.Rect, frame renderFra
 			}
 		}
 	}
-	if cache != nil && display.scrollDelta != 0 && !nativeScroll {
+	if cache != nil && display.scrollRegion != nil && !nativeScroll {
 		if err := s.emitCachedPane(rect, cache, styles); err != nil {
 			return err
 		}

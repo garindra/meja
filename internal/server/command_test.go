@@ -1292,7 +1292,7 @@ func TestServerVersionCommandReportsDaemonCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "server:           meja 1.2.3\ncommand protocol: 1\nQUIC profile:     meja-quic/13\n"
+	want := "server:           meja 1.2.3\ncommand protocol: 1\nQUIC profile:     meja-quic/14\n"
 	if got := string(outcome.Stdout); got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
