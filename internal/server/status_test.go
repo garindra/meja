@@ -22,7 +22,7 @@ func attachStatusTestClient(t *testing.T, s *SessionState, client *ClientInstanc
 	setLeasedTestClient(t, s, client, 1)
 }
 
-func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
+func TestRenameWindowPromptPublishesDescriptorThenAcceptsResult(t *testing.T) {
 	s := NewSessionState(1)
 	client := newTestClient(s)
 	client.setTestTerminalSize(80, 23)
@@ -40,49 +40,13 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 	status := statusClient.read(t)
 	assertStatusText(t, status, "(rename-window) bash")
 	if status.Status.Kind != protocol.ClientStatusPrompt ||
+		status.Status.Prompt.PromptID == 0 ||
 		status.Status.Prompt.Mode != protocol.ClientStatusPromptText ||
 		status.Status.Prompt.Label != "(rename-window) " ||
-		status.Status.Prompt.Text != "bash" ||
-		status.Status.Prompt.Cursor != len([]rune("bash")) {
+		status.Status.Prompt.Initial != "bash" {
 		t.Fatalf("rename prompt snapshot = %#v", status.Status)
 	}
-	if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte('x')); err != nil {
-		t.Fatal(err)
-	}
-	statusClient.read(t)
-	if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte(0x7f)); err != nil {
-		t.Fatal(err)
-	}
-	statusClient.read(t)
-
-	for _, b := range []byte("xy") {
-		if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte(b)); err != nil {
-			t.Fatal(err)
-		}
-		statusClient.read(t)
-	}
-	consumed, events, terminated := clientForState(s).ConsumePromptInput([]byte("\x1b[3~"))
-	if consumed != 4 || len(events) != 1 || terminated {
-		t.Fatalf("delete sequence consumed=%d events=%#v", consumed, events)
-	}
-	if err := runStatusEvent(t, s, events[0]); err != nil {
-		t.Fatal(err)
-	}
-	statusClient.read(t)
-
-	for i := 0; i < len("bashx"); i++ {
-		if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte(0x7f)); err != nil {
-			t.Fatal(err)
-		}
-		statusClient.read(t)
-	}
-	for _, b := range []byte("zsh") {
-		if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte(b)); err != nil {
-			t.Fatal(err)
-		}
-		statusClient.read(t)
-	}
-	if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte('\r')); err != nil {
+	if _, err := resolveTestPrompt(clientForState(s), true, "zsh"); err != nil {
 		t.Fatal(err)
 	}
 	status = statusClient.read(t)
@@ -96,8 +60,7 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 	statusClient.read(t)
-	clientForState(s).ConsumeInputByte(0x1b)
-	if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte('x')); err != nil {
+	if _, err := resolveTestPrompt(clientForState(s), false, "ignored"); err != nil {
 		t.Fatal(err)
 	}
 	status = statusClient.read(t)
@@ -106,16 +69,6 @@ func TestRenameWindowPromptRendersEditsSubmitAndCancel(t *testing.T) {
 		t.Fatalf("cancel changed window name to %q", window.Name)
 	}
 
-	clientForState(s).ConsumeInputByte(0x02)
-	if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte(',')); err != nil {
-		t.Fatal(err)
-	}
-	statusClient.read(t)
-	if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte(0x03)); err != nil {
-		t.Fatal(err)
-	}
-	status = statusClient.read(t)
-	assertStatusText(t, status, "[1] 0:zsh* ")
 }
 
 func TestRenameSessionPromptUpdatesStatusName(t *testing.T) {
@@ -138,19 +91,7 @@ func TestRenameSessionPromptUpdatesStatusName(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertStatusText(t, statusClient.read(t), "(rename-session) work")
-	for range "work" {
-		if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte(0x7f)); err != nil {
-			t.Fatal(err)
-		}
-		statusClient.read(t)
-	}
-	for _, b := range []byte("dev") {
-		if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte(b)); err != nil {
-			t.Fatal(err)
-		}
-		statusClient.read(t)
-	}
-	if err := runStatusEvent(t, s, clientForState(s).ConsumeInputByte('\r')); err != nil {
+	if _, err := resolveTestPrompt(clientForState(s), true, "dev"); err != nil {
 		t.Fatal(err)
 	}
 	assertStatusText(t, statusClient.read(t), "[dev] 0:bash* ")
@@ -203,11 +144,7 @@ func TestCommandErrorUsesPromptStyleThenRestoresNormalStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	statusClient.read(t)
-	_, events, terminated := clientForState(s).ConsumePromptInput([]byte("send-keys\r"))
-	if !terminated || len(events) == 0 {
-		t.Fatalf("command prompt events=%#v terminated=%v", events, terminated)
-	}
-	if err := runStatusEvent(t, s, events[len(events)-1]); err != nil {
+	if _, err := resolveTestPrompt(clientForState(s), true, "send-keys"); err != nil {
 		t.Fatal(err)
 	}
 	if got := snapshotTestClientActor(clientForState(s)).StatusMessage; got == "" {
@@ -269,20 +206,11 @@ func TestSuccessfulSetRootPromptRestoresNormalStatus(t *testing.T) {
 	}
 	assertStatusTextWithLocation(t, statusClient.read(t), ":", currentStatusLocation(root))
 
-	command := []byte("set-root " + nextRoot + "\r")
-	for _, b := range command {
-		event := clientForState(s).ConsumeInputByte(b)
-		if event.Command == serverCommandNone {
-			continue
-		}
-		if err := runStatusEvent(t, s, event); err != nil {
-			t.Fatal(err)
-		}
-		status := statusClient.read(t)
-		if b == '\r' {
-			assertStatusTextWithLocation(t, status, "[1] 0:bash* ", currentStatusLocation(nextRoot))
-		}
+	if _, err := resolveTestPrompt(clientForState(s), true, "set-root "+nextRoot); err != nil {
+		t.Fatal(err)
 	}
+	status := statusClient.read(t)
+	assertStatusTextWithLocation(t, status, "[1] 0:bash* ", currentStatusLocation(nextRoot))
 }
 
 func runStatusEvent(t *testing.T, s *SessionState, event serverInputEvent) error {
@@ -322,7 +250,7 @@ func (c *statusTestClient) read(t *testing.T) testStatusBar {
 	text := ""
 	switch status.Kind {
 	case protocol.ClientStatusPrompt:
-		text = status.Prompt.Label + status.Prompt.Text
+		text = status.Prompt.Label + status.Prompt.Initial
 	case protocol.ClientStatusMessage:
 		text = status.Message.Text
 	default:

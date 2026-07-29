@@ -901,14 +901,35 @@ func TestConfirmedFinalPaneCloseWaitsForFrontendTerminalExitCompletion(t *testin
 	conn, control, decoder, _ := dialTestClientInstance(t, *result.bootstrap, "")
 	defer conn.CloseWithError(0, "")
 	encoder := protocol.NewEncoder(control)
-	for _, data := range [][]byte{{0x02, 'x'}, {'y'}} {
-		input := encodedTestFrame(t, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: data}, protocol.EncodeFrontendInputBytes)
-		if err := encoder.WriteFrame(input); err != nil {
-			t.Fatal(err)
-		}
+	input := encodedTestFrame(t, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: []byte{0x02, 'x'}}, protocol.EncodeFrontendInputBytes)
+	if err := encoder.WriteFrame(input); err != nil {
+		t.Fatal(err)
 	}
 
 	if err := control.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var prompt protocol.ClientStatusPromptState
+	for prompt.PromptID == 0 {
+		frame, err := decoder.ReadFrame()
+		if err != nil {
+			t.Fatalf("read confirmation prompt: %v", err)
+		}
+		if frame.Type != protocol.MsgClientStatus {
+			continue
+		}
+		status, err := protocol.DecodeClientStatus(frame.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Kind == protocol.ClientStatusPrompt {
+			prompt = status.Prompt
+		}
+	}
+	resultFrame := encodedTestFrame(t, protocol.MsgFrontendPromptResult, protocol.FrontendPromptResult{
+		PromptID: prompt.PromptID, Submitted: true, Text: "y",
+	}, protocol.EncodeFrontendPromptResult)
+	if err := encoder.WriteFrame(resultFrame); err != nil {
 		t.Fatal(err)
 	}
 	for {

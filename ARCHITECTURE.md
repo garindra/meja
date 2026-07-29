@@ -57,7 +57,7 @@ Remote typing should not need to wait for a full round trip when its visible eff
 
 ## Terminal modes are interpreted on the server
 
-The frontend terminal is an input and output device, not the authority for a pane application's input protocol. The server learns application cursor mode, bracketed paste, focus reporting, mouse tracking, mouse encoding, and Kitty keyboard flags from authoritative pane output. It parses rich frontend events and re-encodes them for the focused pane's current mode. This keeps prefix commands, prompts, history interaction, mouse routing, and application input under one serialized session policy.
+The frontend terminal is an input and output device, not the authority for a pane application's input protocol. The server learns application cursor mode, bracketed paste, focus reporting, mouse tracking, mouse encoding, and Kitty keyboard flags from authoritative pane output. It parses rich frontend events and re-encodes them for the focused pane's current mode. Prefix commands, history interaction, mouse routing, and application input therefore remain under one serialized session policy. Meja's own transient prompt draft is the deliberate exception: the server owns the prompt's lifecycle and continuation, while the frontend edits and renders its draft locally and returns one structured result.
 
 ## Correct state before clever compression
 
@@ -126,7 +126,7 @@ The most important architectural question is not which package contains an objec
 | Window | Session lifetime | Owns a layout tree, pane membership, active pane, name, zoom state, and layout revision |
 | Pane | Child-process lifetime | Actor-owns a PTY, packed terminal store, parser modes, history, process recipe, pending render damage, and at most one output lease |
 | Client identity | Logical-client lifetime | Is keyed by stable `ClientID`; retains the resume token, session assignment, active/pending connection lifecycle, terminal dimensions, and projection/layout revision allocators |
-| Client instance | One live QUIC transport | Owns the control stream, connection-local pane output leases, frontend parser and prompt state, the installed `ClientView`, structured status publication, and transport teardown |
+| Client instance | One live QUIC transport | Owns the control stream, connection-local pane output leases, frontend parser, prompt lifecycle descriptor and continuation, the installed `ClientView`, structured status publication, and transport teardown |
 | Output lease | One client transport | Owns one render-slot stream, its fixed-capacity render buffer, and the worker that performs blocking stream writes |
 | Client pane cache | Current layout lifetime | Stores the last decoded authoritative scanout cells for one visible render slot |
 
@@ -300,10 +300,12 @@ session.
 
 A `ClientInstance` is the disposable server-side actor for one QUIC
 connection. It owns that connection's control and pane render streams, output
-leases and workers, frontend input and prompt state, terminal dimensions, and
-installed `ClientView`. `ClientView` contains the wire `ClientLayout` and the
-exact pane actors resolved by the daemon, so the instance does not rediscover
-bindings from mutable graph state.
+leases and workers, frontend input, prompt lifecycle descriptor and
+continuation, terminal dimensions, and installed `ClientView`. Prompt draft
+text, cursor position, and escape-sequence parsing do not exist in this
+server-side object. `ClientView` contains the wire `ClientLayout` and the exact
+pane actors resolved by the daemon, so the instance does not rediscover bindings
+from mutable graph state.
 
 The daemon sees the instance only through a passive `clientConnection`: its
 bounded delivery mailboxes, actor command channel, and `done` signal. QUIC
@@ -556,12 +558,14 @@ exact-pointer detach and is a no-op once the pane holds the new lease.
 
 Status publication is part of the ClientInstance actor. The daemon supplies the
 current passive session/window status model; the instance combines it with its
-prompt or temporary-message state and sends a complete structured snapshot on
-the control stream. The stable client identity owns the wire revision allocator,
-so prompt edits, message changes, session switches, and replacement transports
-remain monotonically ordered. Attaching or switching a client changes daemon
-assignment first, then the ClientInstance performs its output handoff without
-making the daemon wait for stream I/O.
+prompt descriptor or temporary-message state and sends a complete structured
+snapshot on the control stream. A prompt descriptor contains an opaque prompt
+ID, mode, label, and initial value, never the frontend's transient draft or
+cursor. The stable client identity owns the wire revision allocator, so prompt
+open/resolve transitions, message changes, session switches, and replacement
+transports remain monotonically ordered. Attaching or switching a client changes
+daemon assignment first, then the ClientInstance performs its output handoff
+without making the daemon wait for stream I/O.
 
 The native terminal client renders this snapshot as its bottom physical row and
 therefore subtracts one row before reporting drawable pane dimensions. A browser
@@ -593,8 +597,10 @@ the daemon transaction and return only immutable/advisory results.
 
 A group is the authority for one shared execution graph. It owns canonical
 windows, panes, layouts, dimensions, and daemon-global IDs. A session is the
-external view of that graph: active and previous window, focused pane, prompt,
-and status state belong to the session rather than the physical terminal.
+external view of that graph: active and previous window, focused pane, and
+passive status data belong to the session rather than the physical terminal.
+An interactive prompt's lifecycle descriptor and continuation belong to the
+transport-local ClientInstance; its editable draft belongs to the frontend.
 
 The final pane exiting ends the session. A network connection ending does not.
 
@@ -631,7 +637,7 @@ Preset layouts rebuild a tree from the current panes. Zoom is a projection of th
 
 Each pane starts a child process on a fresh PTY. An empty requested command starts the user's shell; an explicit command is resolved and launched through the same pane recipe. The pane records immutable launch metadata separately from later process observation.
 
-PTY output is read into pooled buffers and sent to the pane actor. Terminal-generated replies, such as device-status responses, travel back through the pane's owned input channel. User input follows the same PTY writer after session-level prefix, prompt, history, and application-cursor handling.
+PTY output is read into pooled buffers and sent to the pane actor. Terminal-generated replies, such as device-status responses, travel back through the pane's owned input channel. Ordinary user input follows the same PTY writer after session-level prefix, history, and application-cursor handling. While a Meja prompt is active, the frontend does not send ordinary input frames.
 
 ### Live process and command monitoring
 
@@ -693,7 +699,17 @@ A trailing Escape is held for 25 milliseconds at the client's local TTY boundary
 
 ## Server-side routing and re-encoding
 
-The ClientInstance actor decides whether an event belongs to Meja or to a pane application. Prefix commands, prompts, history interaction, and session switching stay on the command path. Ordinary pane input is re-encoded from the semantic event according to the pane's authoritative terminal metadata:
+The ClientInstance actor decides whether an event belongs to Meja or to a pane
+application. Prefix commands, history interaction, and session switching stay
+on the command path. An active Meja prompt is announced through
+`CLIENT_STATUS`; the frontend then intercepts keyboard and paste input, edits
+the draft locally, and sends exactly one `FRONTEND_PROMPT_RESULT` on submit or
+cancel. The result must carry the active opaque prompt ID. Stale results are
+ignored, and ordinary `FRONTEND_INPUT_BYTES` received while a prompt is active
+are dropped rather than interpreted as either prompt or pane input.
+
+Ordinary pane input is re-encoded from the semantic event according to the
+pane's authoritative terminal metadata:
 
 * normal versus application cursor keys;
 * bracketed paste;
@@ -1042,7 +1058,15 @@ The client deliberately separates parallel stream decoding from serialized termi
 The control-stream worker decodes both `CLIENT_LAYOUT` and `CLIENT_STATUS`.
 Structured status snapshots enter the same render-event queue as pane frames;
 the single render goroutine rejects stale status revisions and paints the native
-status row from the newest snapshot.
+status row from the newest snapshot. On a new prompt ID it creates a local draft
+from the descriptor's initial value. Further snapshots for the same prompt ID
+preserve that draft and cursor. The input goroutine sends prompt keystrokes into
+the render loop for immediate local editing and emits only the completed
+`FRONTEND_PROMPT_RESULT` on the control stream.
+
+The browser-facing implementation contract for ALPN `meja-quic/14`, including
+stream startup, status snapshots, prompt editing, and reconnect behavior, is
+documented in [`docs/ALPN14_BROWSER_CLIENT.md`](docs/ALPN14_BROWSER_CLIENT.md).
 
 ## Per-stream `renderFrame` compilation
 
@@ -1491,13 +1515,13 @@ The following statements summarize the contracts contributors should preserve:
 1. The daemon actor alone mutates server-wide session, group, window-link, and attachment registries.
 2. The daemon actor alone mutates canonical windows, panes, leases, and grouped relationships.
 3. SessionState is passive; the daemon mutates its view and graph data in short transactions.
-4. A ClientInstance actor owns prompts, frontend routing, output handoff, status, and transport-local state.
+4. A ClientInstance actor owns prompt lifecycle descriptors and continuations, frontend routing, output handoff, status, and transport-local state; the frontend alone owns transient prompt drafts and cursors.
 5. A pane actor alone mutates its terminal state, packed row store, history view, pending damage, and output lease.
 6. A pane and its PTY outlive replacement of the attached client transport.
 7. One stable `ClientID` and canonical `ClientIdentity` represent one logical client across many disposable client instances; `clients` and `clientTokens` are the only client indexes.
 8. A client identity has at most one active and one pending connection address; a pending replacement receives its initial view only after the previous active connection completes.
 9. A session has at most one controlling logical client.
-10. The bidirectional control stream is the authoritative interactive lifecycle and input path.
+10. The bidirectional control stream is the authoritative interactive lifecycle and input path; prompt descriptors arrive in complete status snapshots and prompt submit/cancel results return as structured control messages.
 11. Disconnected ordinary input is dropped rather than replayed later.
 12. Server-provided frontend setup has paired cleanup, and terminal writes are serialized by the client UI loop.
 13. Every full visible replacement is installed from one daemon-resolved `ViewTransition`; application uses its `ClientView` and does not rebuild pane placements or layout from live graph state.
@@ -1523,7 +1547,7 @@ The following statements summarize the contracts contributors should preserve:
 33. Recovery snapshots and `.meja` project files are restart recipes, not process images.
 34. `restore` consumes daemon-managed named-session snapshots; `new -f` consumes explicit project files.
 35. Initial remote attachment authority is transferred through SSH; the direct QUIC connection must match that bootstrap.
-36. ClientInstance local state is ordinary actor-owned state; pane-output workers receive immutable render batches, wire status snapshots are complete and monotonically revised, and timers post only copied generation IDs.
+36. ClientInstance local state is ordinary actor-owned state; frontend prompt drafts are client render-loop state, pane-output workers receive immutable render batches, wire status snapshots are complete and monotonically revised, and timers post only copied generation IDs.
 37. Daemon transactions prepare client deliveries but never block delivering them; required FIFO and coalescible status traffic use distinct bounded mailbox semantics.
 38. The synchronization allowlist is exact and enforced by a production-source AST/type test.
 

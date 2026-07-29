@@ -1241,12 +1241,7 @@ func TestCommandPromptIsClientLocalAndSubmitsToCommandEngine(t *testing.T) {
 	if prompt == nil || prompt.Mode != PromptModeText || prompt.Label != ":" {
 		t.Fatalf("command prompt = %#v", prompt)
 	}
-	for _, b := range []byte(`rename-window "build output"`) {
-		if detach, err := clientForState(s).handleServerInputEvent(clientForState(s).ConsumeInputByte(b)); err != nil || detach {
-			t.Fatalf("type command prompt: detach=%v err=%v", detach, err)
-		}
-	}
-	if detach, err := clientForState(s).handleServerInputEvent(clientForState(s).ConsumeInputByte('\r')); err != nil || detach {
+	if detach, err := resolveTestPrompt(clientForState(s), true, `rename-window "build output"`); err != nil || detach {
 		t.Fatalf("submit command prompt: detach=%v err=%v", detach, err)
 	}
 	if got := s.Windows[window.ID].Name; got != "build output" {
@@ -1270,15 +1265,13 @@ func TestCommandPromptReportsCommandErrorsWithoutClosingInput(t *testing.T) {
 	if _, err := clientForState(s).BeginCommandPrompt(); err != nil {
 		t.Fatal(err)
 	}
-	for _, b := range []byte("not-a-command\r") {
-		detach, err := clientForState(s).handleServerInputEvent(clientForState(s).ConsumeInputByte(b))
-		if err != nil || detach {
-			t.Fatalf("prompt error escaped command engine: detach=%v err=%v", detach, err)
-		}
+	detach, err := resolveTestPrompt(clientForState(s), true, "not-a-command")
+	if err != nil || detach {
+		t.Fatalf("prompt error escaped command engine: detach=%v err=%v", detach, err)
 	}
 	state := snapshotTestClient(s)
 	message := clientForState(s).statusMessage
-	if state.Prompt != nil || message != `unknown command "not-a-command"` {
+	if clientForState(s).ActivePrompt() != nil || message != `unknown command "not-a-command"` {
 		t.Fatalf("client after command error = %#v", state)
 	}
 }

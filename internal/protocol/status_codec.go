@@ -16,22 +16,22 @@ func EncodeClientStatus(dst []byte, msg ClientStatus) ([]byte, error) {
 		return nil, fmt.Errorf("encode ClientStatus: invalid presentation kind %d", msg.Kind)
 	}
 	for name, value := range map[string]string{
-		"session name": msg.SessionName,
-		"hostname":     msg.ServerHostname,
-		"server home":  msg.ServerHome,
-		"root":         msg.Root,
-		"prompt label": msg.Prompt.Label,
-		"prompt text":  msg.Prompt.Text,
-		"message":      msg.Message.Text,
+		"session name":   msg.SessionName,
+		"hostname":       msg.ServerHostname,
+		"server home":    msg.ServerHome,
+		"root":           msg.Root,
+		"prompt label":   msg.Prompt.Label,
+		"prompt initial": msg.Prompt.Initial,
+		"message":        msg.Message.Text,
 	} {
 		if err := validateClientStatusString(name, value); err != nil {
 			return nil, err
 		}
 	}
-	if msg.Prompt.Cursor < 0 || msg.Prompt.Cursor > utf8.RuneCountInString(msg.Prompt.Text) {
-		return nil, fmt.Errorf("encode ClientStatus: invalid prompt cursor %d", msg.Prompt.Cursor)
-	}
 	if msg.Kind == ClientStatusPrompt {
+		if msg.Prompt.PromptID == 0 {
+			return nil, fmt.Errorf("encode ClientStatus: zero prompt ID")
+		}
 		if msg.Prompt.Mode < ClientStatusPromptText || msg.Prompt.Mode > ClientStatusPromptConfirm {
 			return nil, fmt.Errorf("encode ClientStatus: invalid prompt mode %d", msg.Prompt.Mode)
 		}
@@ -58,10 +58,10 @@ func EncodeClientStatus(dst []byte, msg ClientStatus) ([]byte, error) {
 		w.Bool(window.Zoomed)
 	}
 	w.Byte(byte(msg.Kind))
+	w.Uvarint(msg.Prompt.PromptID)
 	w.Byte(byte(msg.Prompt.Mode))
 	w.String(msg.Prompt.Label)
-	w.String(msg.Prompt.Text)
-	w.Uvarint(uint64(msg.Prompt.Cursor))
+	w.String(msg.Prompt.Initial)
 	w.Uvarint(msg.Message.ID)
 	w.String(msg.Message.Text)
 	if len(w.Buf)-len(dst) > DefaultMaxFrameSize {
@@ -139,6 +139,9 @@ func DecodeClientStatus(payload []byte) (ClientStatus, error) {
 		return ClientStatus{}, fmt.Errorf("decode ClientStatus presentation: %w", err)
 	}
 	msg.Kind = ClientStatusPresentationKind(kind)
+	if msg.Prompt.PromptID, err = r.Uvarint(); err != nil {
+		return ClientStatus{}, fmt.Errorf("decode ClientStatus prompt ID: %w", err)
+	}
 	mode, err := r.Byte()
 	if err != nil {
 		return ClientStatus{}, fmt.Errorf("decode ClientStatus prompt mode: %w", err)
@@ -147,17 +150,9 @@ func DecodeClientStatus(payload []byte) (ClientStatus, error) {
 	if msg.Prompt.Label, err = r.String(MaxStringLen); err != nil {
 		return ClientStatus{}, fmt.Errorf("decode ClientStatus prompt label: %w", err)
 	}
-	if msg.Prompt.Text, err = r.String(MaxStringLen); err != nil {
-		return ClientStatus{}, fmt.Errorf("decode ClientStatus prompt text: %w", err)
+	if msg.Prompt.Initial, err = r.String(MaxStringLen); err != nil {
+		return ClientStatus{}, fmt.Errorf("decode ClientStatus prompt initial: %w", err)
 	}
-	cursor, err := r.Uvarint()
-	if err != nil {
-		return ClientStatus{}, fmt.Errorf("decode ClientStatus prompt cursor: %w", err)
-	}
-	if cursor > uint64(utf8.RuneCountInString(msg.Prompt.Text)) {
-		return ClientStatus{}, fmt.Errorf("decode ClientStatus prompt cursor: %d exceeds text length", cursor)
-	}
-	msg.Prompt.Cursor = int(cursor)
 	if msg.Message.ID, err = r.Uvarint(); err != nil {
 		return ClientStatus{}, fmt.Errorf("decode ClientStatus message ID: %w", err)
 	}
@@ -170,8 +165,13 @@ func DecodeClientStatus(payload []byte) (ClientStatus, error) {
 	if msg.Kind < ClientStatusNormal || msg.Kind > ClientStatusMessage {
 		return ClientStatus{}, fmt.Errorf("decode ClientStatus: invalid presentation kind %d", msg.Kind)
 	}
-	if msg.Kind == ClientStatusPrompt && (msg.Prompt.Mode < ClientStatusPromptText || msg.Prompt.Mode > ClientStatusPromptConfirm) {
-		return ClientStatus{}, fmt.Errorf("decode ClientStatus: invalid prompt mode %d", msg.Prompt.Mode)
+	if msg.Kind == ClientStatusPrompt {
+		if msg.Prompt.PromptID == 0 {
+			return ClientStatus{}, fmt.Errorf("decode ClientStatus: zero prompt ID")
+		}
+		if msg.Prompt.Mode < ClientStatusPromptText || msg.Prompt.Mode > ClientStatusPromptConfirm {
+			return ClientStatus{}, fmt.Errorf("decode ClientStatus: invalid prompt mode %d", msg.Prompt.Mode)
+		}
 	}
 	return msg, nil
 }

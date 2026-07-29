@@ -1351,11 +1351,15 @@ func TestStructuredPromptStatusSelectsNativeStatusCursor(t *testing.T) {
 		Revision: 1,
 		Kind:     protocol.ClientStatusPrompt,
 		Prompt: protocol.ClientStatusPromptState{
-			Mode: protocol.ClientStatusPromptText, Label: ":", Text: "abc", Cursor: 2,
+			PromptID: 1, Mode: protocol.ClientStatusPromptText, Label: ":", Initial: "abc",
 		},
 	}
 	if changed, err := state.acceptStatus(status); err != nil || !changed {
 		t.Fatalf("prompt status changed=%v err=%v", changed, err)
+	}
+	outcome := state.acceptPromptInput([]byte("\x1b[D"), false)
+	if !outcome.handled || !outcome.changed || outcome.result != nil {
+		t.Fatalf("left prompt input = %#v", outcome)
 	}
 	if got, want := state.activeCursor, (physicalCursor{row: 4, column: 4, visible: true, valid: true}); got != want {
 		t.Fatalf("prompt cursor = %#v, want %#v", got, want)

@@ -30,6 +30,7 @@ const (
 	MsgFrontendExecuteTerminalExitCommand
 	MsgFrontendTerminalExitComplete
 	MsgClientStatus
+	MsgFrontendPromptResult
 )
 
 type SessionAttach struct {
@@ -80,6 +81,12 @@ type FrontendExecuteTerminalExitCommand struct {
 	Message string
 }
 
+type FrontendPromptResult struct {
+	PromptID  uint64
+	Submitted bool
+	Text      string
+}
+
 type ClientStatusPresentationKind uint8
 
 const (
@@ -104,10 +111,10 @@ type ClientStatusWindow struct {
 }
 
 type ClientStatusPromptState struct {
-	Mode   ClientStatusPromptMode
-	Label  string
-	Text   string
-	Cursor int
+	PromptID uint64
+	Mode     ClientStatusPromptMode
+	Label    string
+	Initial  string
 }
 
 type ClientStatusMessageState struct {
@@ -116,7 +123,7 @@ type ClientStatusMessageState struct {
 }
 
 // ClientStatus is a complete authoritative status snapshot. Revision orders
-// every publication, including prompt edits and temporary-message changes.
+// every publication, including prompt lifecycle and temporary-message changes.
 type ClientStatus struct {
 	Revision       uint64
 	SessionID      uint64

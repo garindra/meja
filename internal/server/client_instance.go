@@ -38,8 +38,9 @@ type ClientInstance struct {
 	// client-view revision.
 	appliedProjectionRevision uint64
 	Daemon                    *Daemon
-	// inputState is the client actor's prefix, prompt, and directional-focus
-	// parser state. It contains no session, viewport, or installed-view data.
+	// inputState is the client actor's prefix and directional-focus parser
+	// state. It contains no prompt draft, session, viewport, or installed-view
+	// data.
 	inputState clientInputState
 	// currentView is the last daemon-resolved view this client actor
 	// successfully published. It is also the exact source for output handoff.
@@ -57,6 +58,8 @@ type ClientInstance struct {
 	frontendInput             frontendInputParser
 	heldKeys                  map[frontendHeldKey]uint64
 	promptContinuation        promptContinuation
+	activePrompt              *activePrompt
+	nextPromptID              uint64
 	pointerCapture            frontendPaneCapture
 	pasteCapture              frontendPaneCapture
 }
@@ -131,7 +134,6 @@ type clientInputState struct {
 	InputState        serverInputState
 	PrefixEscape      []byte
 	ResizeRepeatUntil time.Time
-	Prompt            *PromptState
 }
 
 func (c *ClientInstance) commitProjectionPlan(plan ClientProjectionPlan) error {
@@ -755,6 +757,8 @@ func (c *ClientInstance) inputLayoutForRevision(revision protocol.ClientLayoutRe
 func (c *ClientInstance) resetInputForSessionSwitch() {
 	c.frontendInput.reset()
 	clear(c.heldKeys)
+	c.activePrompt = nil
+	c.promptContinuation = nil
 	c.pointerCapture = frontendPaneCapture{}
 	c.pasteCapture = frontendPaneCapture{}
 	c.currentView.Layout = protocol.ClientLayout{}

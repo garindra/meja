@@ -316,8 +316,17 @@ func snapshotTestClient(s *SessionState) *clientInputState {
 	state := &clientForState(s).inputState
 	snapshot := *state
 	snapshot.PrefixEscape = append([]byte(nil), state.PrefixEscape...)
-	snapshot.Prompt = clonePromptState(state.Prompt)
 	return &snapshot
+}
+
+func resolveTestPrompt(client *ClientInstance, submitted bool, text string) (bool, error) {
+	prompt := client.ActivePrompt()
+	if prompt == nil {
+		return false, errors.New("test client has no active prompt")
+	}
+	return client.resolvePrompt(protocol.FrontendPromptResult{
+		PromptID: prompt.ID, Submitted: submitted, Text: text,
+	})
 }
 
 func setTestClientSize(s *SessionState, cols, rows uint16) protocol.ClientLayout {

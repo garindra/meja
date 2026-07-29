@@ -23,7 +23,7 @@ func TestClientStatusRoundTrip(t *testing.T) {
 			Windows: []ClientStatusWindow{{WindowID: 91, Index: 0, Title: "shell", Active: true}},
 			Kind:    ClientStatusPrompt,
 			Prompt: ClientStatusPromptState{
-				Mode: ClientStatusPromptText, Label: "(rename-window) ", Text: "編輯", Cursor: 1,
+				PromptID: 12, Mode: ClientStatusPromptText, Label: "(rename-window) ", Initial: "編輯",
 			},
 		},
 		{
@@ -62,11 +62,12 @@ func TestClientStatusCodecRejectsInvalidValues(t *testing.T) {
 		}},
 		{name: "invalid prompt mode", edit: func(msg *ClientStatus) {
 			msg.Kind = ClientStatusPrompt
+			msg.Prompt.PromptID = 1
 			msg.Prompt.Mode = 99
 		}},
-		{name: "prompt cursor", edit: func(msg *ClientStatus) {
+		{name: "zero prompt ID", edit: func(msg *ClientStatus) {
 			msg.Kind = ClientStatusPrompt
-			msg.Prompt = ClientStatusPromptState{Mode: ClientStatusPromptText, Text: "x", Cursor: 2}
+			msg.Prompt = ClientStatusPromptState{Mode: ClientStatusPromptText}
 		}},
 		{name: "oversized string", edit: func(msg *ClientStatus) {
 			msg.SessionName = strings.Repeat("x", int(MaxStringLen)+1)
@@ -87,7 +88,7 @@ func TestDecodeClientStatusRejectsMalformedPayload(t *testing.T) {
 	payload, err := EncodeClientStatus(nil, ClientStatus{
 		Revision: 1,
 		Kind:     ClientStatusPrompt,
-		Prompt:   ClientStatusPromptState{Mode: ClientStatusPromptText, Text: "abc", Cursor: 2},
+		Prompt:   ClientStatusPromptState{PromptID: 1, Mode: ClientStatusPromptText, Initial: "abc"},
 	})
 	if err != nil {
 		t.Fatal(err)

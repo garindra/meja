@@ -60,7 +60,7 @@ func (c *ClientInstance) publishClientStatus() error {
 			mode = protocol.ClientStatusPromptConfirm
 		}
 		msg.Prompt = protocol.ClientStatusPromptState{
-			Mode: mode, Label: prompt.Label, Text: string(prompt.Text), Cursor: prompt.Cursor,
+			PromptID: prompt.ID, Mode: mode, Label: prompt.Label, Initial: prompt.Initial,
 		}
 	} else if c.statusMessage != "" {
 		msg.Kind = protocol.ClientStatusMessage

@@ -146,7 +146,7 @@ func (c *ClientInstance) handleFrontendKey(key frontendKeyEvent) (bool, error) {
 		}
 	}
 
-	commandPath := c.ActivePrompt() != nil || !c.InputIsNormal() ||
+	commandPath := !c.InputIsNormal() ||
 		(pane != nil && pane.isHistoryMode()) || isMejaPrefixKey(key)
 	if commandPath {
 		commandBytes := encodeLegacyKey(key, paneTerminalMetadata{})

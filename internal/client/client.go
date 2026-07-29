@@ -79,6 +79,12 @@ type runtimeState struct {
 	renderExitCommand     chan []byte
 	dropConnectionEvents  atomic.Bool
 	appliedLayoutRevision atomic.Uint64
+	promptInputStatus     atomic.Pointer[promptInputStatus]
+}
+
+type promptInputStatus struct {
+	revision uint64
+	active   bool
 }
 
 func writeAll(w io.Writer, data []byte) error {
@@ -132,6 +138,11 @@ type paneFrameEvent struct {
 type localInputEvent struct{ data []byte }
 type layoutEvent struct{ layout protocol.ClientLayout }
 type statusEvent struct{ status protocol.ClientStatus }
+type localPromptInputEvent struct {
+	data       []byte
+	sourceIdle bool
+	done       chan promptInputOutcome
+}
 type sizeEvent struct{ cols, rows int }
 type reconnectEvent struct {
 	reconnecting bool
@@ -483,6 +494,22 @@ func sendFrontendInput(destination *controlDestination, ui *runtimeState, layout
 		if len(prediction) > 0 {
 			ui.emit(localInputEvent{data: append([]byte(nil), prediction...)})
 		}
+		return true, nil
+	case <-destination.done:
+		return true, nil
+	}
+}
+
+func sendFrontendPromptResult(destination *controlDestination, result protocol.FrontendPromptResult) (bool, error) {
+	if destination == nil {
+		return false, nil
+	}
+	payload, err := protocol.EncodeFrontendPromptResult(nil, result)
+	if err != nil {
+		return true, err
+	}
+	select {
+	case destination.frames <- protocol.Frame{Type: protocol.MsgFrontendPromptResult, Payload: payload}:
 		return true, nil
 	case <-destination.done:
 		return true, nil
@@ -1029,6 +1056,7 @@ func controlLoop(decoder *protocol.Decoder, ui *runtimeState, controlFrames chan
 				return
 			}
 			ui.emit(statusEvent{status: msg})
+			ui.updatePromptInputStatus(msg.Revision, msg.Kind == protocol.ClientStatusPrompt)
 		case protocol.MsgFrontendTerminalWrite:
 			msg, err := protocol.DecodeFrontendTerminalWrite(frame.Payload)
 			if err != nil {
@@ -1213,6 +1241,20 @@ func forwardInputReads(ctx context.Context, reads <-chan terminalInputRead, cont
 	defer stopEscapeTimer()
 
 	sendBytes := func(destination *controlDestination, revision protocol.ClientLayoutRevision, sourceIdle bool, data []byte) (bool, error) {
+		if status := ui.promptInputStatus.Load(); status != nil && status.active {
+			outcome, err := ui.handlePromptInput(ctx, data, sourceIdle)
+			if err != nil {
+				return true, err
+			}
+			if outcome.handled {
+				predictionDecoder.reset()
+				predictionDestination = destination
+				if outcome.result != nil {
+					return sendFrontendPromptResult(destination, *outcome.result)
+				}
+				return true, nil
+			}
+		}
 		prediction := predictionDecoder.Feed(data)
 		if sourceIdle {
 			prediction = append(prediction, predictionDecoder.FlushLoneEscape()...)
@@ -1456,6 +1498,7 @@ type scanoutState struct {
 	predictor         inputPredictor
 	activeCursor      physicalCursor
 	status            protocol.ClientStatus
+	prompt            *clientPromptDraft
 }
 
 type physicalCursor struct {
@@ -2025,8 +2068,8 @@ func (s *scanoutState) setActiveCursor(rect protocol.Rect, cursor protocol.Curso
 }
 
 func (s *scanoutState) selectAuthoritativeCursor() {
-	if s.status.Kind == protocol.ClientStatusPrompt && s.status.Revision != 0 && s.cols > 0 && s.rows > 0 {
-		column := len([]rune(s.status.Prompt.Label)) + s.status.Prompt.Cursor + 1
+	if s.prompt != nil && !s.prompt.resolved && s.status.Revision != 0 && s.cols > 0 && s.rows > 0 {
+		column := len([]rune(s.prompt.descriptor.Label)) + s.prompt.cursor + 1
 		s.activeCursor = physicalCursor{row: s.rows, column: min(max(1, column), s.cols), visible: true, valid: true}
 		return
 	}
@@ -2101,9 +2144,29 @@ func (s *scanoutState) acceptStatus(status protocol.ClientStatus) (bool, error) 
 		return false, nil
 	}
 	status.Windows = append([]protocol.ClientStatusWindow(nil), status.Windows...)
+	if status.Kind == protocol.ClientStatusPrompt {
+		if s.prompt == nil || s.prompt.descriptor.PromptID != status.Prompt.PromptID {
+			s.prompt = newClientPromptDraft(status.Prompt)
+		} else {
+			s.prompt.descriptor = status.Prompt
+		}
+	} else {
+		s.prompt = nil
+	}
 	s.status = status
 	s.emitStatus()
 	return true, nil
+}
+
+func (s *scanoutState) acceptPromptInput(data []byte, sourceIdle bool) promptInputOutcome {
+	if s.prompt == nil {
+		return promptInputOutcome{}
+	}
+	outcome := s.prompt.consume(data, sourceIdle)
+	if outcome.changed {
+		s.emitStatus()
+	}
+	return outcome
 }
 
 func (s *scanoutState) emitStatus() {
@@ -2112,11 +2175,11 @@ func (s *scanoutState) emitStatus() {
 	}
 	style := protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 15}, BG: theme.AccentColor()}
 	text := ""
-	switch s.status.Kind {
-	case protocol.ClientStatusPrompt:
+	switch {
+	case s.status.Kind == protocol.ClientStatusPrompt && s.prompt != nil && !s.prompt.resolved:
 		style = protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 0}, BG: protocol.Color{Mode: "indexed", Index: 3}}
-		text = s.status.Prompt.Label + s.status.Prompt.Text
-	case protocol.ClientStatusMessage:
+		text = s.prompt.descriptor.Label + string(s.prompt.text)
+	case s.status.Kind == protocol.ClientStatusMessage:
 		style = protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 0}, BG: protocol.Color{Mode: "indexed", Index: 3}}
 		text = s.status.Message.Text
 	default:
@@ -2327,6 +2390,11 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 			}
 			needsPresent, err = state.acceptLocalInput(e.data)
 			reason = "local-input"
+		case localPromptInputEvent:
+			outcome := state.acceptPromptInput(e.data, e.sourceIdle)
+			needsPresent = outcome.changed
+			reason = "local-prompt-input"
+			e.done <- outcome
 		case terminalWriteEvent:
 			if presentErr := present("before terminal control write"); presentErr != nil {
 				e.done <- presentErr
@@ -2450,6 +2518,45 @@ func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {
 }
 
 func (r *runtimeState) emit(event renderEvent) { r.events <- event }
+
+func (r *runtimeState) updatePromptInputStatus(revision uint64, active bool) {
+	next := &promptInputStatus{revision: revision, active: active}
+	for {
+		current := r.promptInputStatus.Load()
+		if current != nil && revision <= current.revision {
+			return
+		}
+		if r.promptInputStatus.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
+func (r *runtimeState) handlePromptInput(ctx context.Context, data []byte, sourceIdle bool) (promptInputOutcome, error) {
+	status := r.promptInputStatus.Load()
+	if status == nil || !status.active {
+		return promptInputOutcome{}, nil
+	}
+	done := make(chan promptInputOutcome, 1)
+	event := localPromptInputEvent{
+		data: append([]byte(nil), data...), sourceIdle: sourceIdle, done: done,
+	}
+	select {
+	case r.events <- event:
+	case <-r.renderDone:
+		return promptInputOutcome{}, io.ErrClosedPipe
+	case <-ctx.Done():
+		return promptInputOutcome{}, ctx.Err()
+	}
+	select {
+	case outcome := <-done:
+		return outcome, nil
+	case <-r.renderDone:
+		return promptInputOutcome{}, io.ErrClosedPipe
+	case <-ctx.Done():
+		return promptInputOutcome{}, ctx.Err()
+	}
+}
 
 func (r *runtimeState) writeTerminal(ctx context.Context, data []byte) error {
 	if len(data) == 0 {

@@ -6,31 +6,36 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/garindra/meja/internal/protocol"
 )
 
 const paneResizeRepeatWindow = 500 * time.Millisecond
 
-func (c *ClientInstance) BeginPrompt(mode PromptMode, label, initial string) (*PromptState, error) {
+func (c *ClientInstance) BeginPrompt(mode PromptMode, label, initial string) (*activePrompt, error) {
 	if c == nil {
 		return nil, errors.New("client is unavailable")
 	}
-	client := &c.inputState
 	windowID := c.currentView.Layout.WindowID
 	if windowID == 0 {
 		return nil, errors.New("client has no active window")
 	}
-	text := []rune(initial)
+	if c.activePrompt != nil {
+		return nil, errors.New("client already has an active prompt")
+	}
+	if c.nextPromptID == ^uint64(0) {
+		return nil, errors.New("client prompt ID space exhausted")
+	}
+	c.nextPromptID++
+	client := &c.inputState
 	client.InputState = serverInputNormal
 	client.PrefixEscape = nil
 	client.ResizeRepeatUntil = time.Time{}
-	client.Prompt = &PromptState{Mode: mode, Label: label, Text: text, Cursor: len(text)}
-	return clonePromptState(client.Prompt), nil
+	c.activePrompt = &activePrompt{ID: c.nextPromptID, Mode: mode, Label: label, Initial: initial}
+	return cloneActivePrompt(c.activePrompt), nil
 }
 
-func (c *ClientInstance) BeginCommandPrompt() (*PromptState, error) {
+func (c *ClientInstance) BeginCommandPrompt() (*activePrompt, error) {
 	prompt, err := c.BeginPrompt(PromptModeText, ":", "")
 	if err != nil {
 		return nil, err
@@ -55,7 +60,7 @@ func (c *ClientInstance) showStatusMessage(message string) {
 	})
 }
 
-func (c *ClientInstance) beginPrompt(mode PromptMode, label, initial string, continuation promptContinuation) (*PromptState, error) {
+func (c *ClientInstance) beginPrompt(mode PromptMode, label, initial string, continuation promptContinuation) (*activePrompt, error) {
 	prompt, err := c.BeginPrompt(mode, label, initial)
 	if err != nil {
 		return nil, err
@@ -64,21 +69,25 @@ func (c *ClientInstance) beginPrompt(mode PromptMode, label, initial string, con
 	return prompt, nil
 }
 
-func (c *ClientInstance) resolvePrompt(result promptResult) (bool, error) {
+func (c *ClientInstance) resolvePrompt(result protocol.FrontendPromptResult) (bool, error) {
+	prompt := c.activePrompt
+	if prompt == nil || prompt.ID != result.PromptID {
+		return false, nil
+	}
+	c.activePrompt = nil
 	continuation := c.promptContinuation
 	c.promptContinuation = nil
 	if continuation == nil {
 		return false, c.publishClientStatus()
 	}
-	return continuation(result)
+	return continuation(promptResult{Submitted: result.Submitted, Text: result.Text})
 }
 
-func (c *ClientInstance) ActivePrompt() *PromptState {
+func (c *ClientInstance) ActivePrompt() *activePrompt {
 	if c == nil {
 		return nil
 	}
-	client := &c.inputState
-	return clonePromptState(client.Prompt)
+	return cloneActivePrompt(c.activePrompt)
 }
 
 type serverInputState uint8
@@ -98,29 +107,21 @@ const (
 	serverCommandNone serverInputCommand = iota
 	serverCommandLiteral
 	serverCommandExecute
-	serverCommandPrompt
 	serverCommandOpenCommandPrompt
 )
 
 type serverInputEvent struct {
-	Command      serverInputCommand
-	Byte         byte
-	Data         []byte
-	CommandArgs  []string
-	PromptAction PromptAction
-	PromptMode   PromptMode
-	PromptText   string
+	Command     serverInputCommand
+	Byte        byte
+	Data        []byte
+	CommandArgs []string
 }
 
 func (c *ClientInstance) ConsumeInputByte(b byte) serverInputEvent {
 	if c == nil {
 		return serverInputEvent{}
 	}
-	client := &c.inputState
-	if client.Prompt != nil {
-		return consumePromptByte(client, b)
-	}
-	return consumeInputByteAt(client, b, time.Now())
+	return consumeInputByteAt(&c.inputState, b, time.Now())
 }
 
 func consumeInputByteAt(client *clientInputState, b byte, now time.Time) serverInputEvent {
@@ -349,150 +350,8 @@ func directionFlag(final byte) string {
 	}
 }
 
-func consumePromptByte(client *clientInputState, b byte) serverInputEvent {
-	prompt := client.Prompt
-	if prompt.Mode == PromptModeConfirm {
-		return consumeConfirmationByte(client, b)
-	}
-	if len(prompt.PendingEscape) > 0 {
-		return consumePromptEscapeByte(client, b)
-	}
-	if b == 0x1b {
-		prompt.PendingEscape = []byte{b}
-		return serverInputEvent{}
-	}
-	event := serverInputEvent{
-		Command:    serverCommandPrompt,
-		PromptMode: prompt.Mode,
-	}
-	switch b {
-	case '\r', '\n':
-		prompt.Action = PromptActionSubmit
-		prompt.PendingEscape = nil
-		prompt.pendingUTF8 = nil
-		event.PromptAction = PromptActionSubmit
-		event.PromptText = string(prompt.Text)
-		client.Prompt = nil
-	case 0x03, 0x1b:
-		prompt.Action = PromptActionCancel
-		prompt.PendingEscape = nil
-		prompt.pendingUTF8 = nil
-		event.PromptAction = PromptActionCancel
-		client.Prompt = nil
-	case 0x08, 0x7f:
-		prompt.pendingUTF8 = nil
-		deletePromptRune(prompt)
-		prompt.Action = PromptActionChanged
-		event.PromptAction = PromptActionChanged
-	case 0x15: // Ctrl-U
-		prompt.pendingUTF8 = nil
-		prompt.Text = nil
-		prompt.Cursor = 0
-		prompt.Action = PromptActionChanged
-		event.PromptAction = PromptActionChanged
-	default:
-		if b < 0x20 {
-			return serverInputEvent{}
-		}
-		if !appendPromptByte(prompt, b) {
-			return serverInputEvent{}
-		}
-		prompt.Action = PromptActionChanged
-		event.PromptAction = PromptActionChanged
-	}
-	return event
-}
-
-func consumeConfirmationByte(client *clientInputState, b byte) serverInputEvent {
-	prompt := client.Prompt
-	event := serverInputEvent{Command: serverCommandPrompt, PromptMode: prompt.Mode}
-	switch b {
-	case 'y', 'Y':
-		event.PromptAction = PromptActionSubmit
-		event.PromptText = "y"
-		client.Prompt = nil
-	case 'n', 'N', '\r', '\n', 0x03, 0x1b:
-		event.PromptAction = PromptActionCancel
-		client.Prompt = nil
-	}
-	return event
-}
-
-func consumePromptEscapeByte(client *clientInputState, b byte) serverInputEvent {
-	prompt := client.Prompt
-	switch len(prompt.PendingEscape) {
-	case 1:
-		if b == '[' {
-			prompt.PendingEscape = append(prompt.PendingEscape, b)
-			return serverInputEvent{}
-		}
-		return cancelPrompt(client)
-	case 2:
-		if b == '3' {
-			prompt.PendingEscape = append(prompt.PendingEscape, b)
-			return serverInputEvent{}
-		}
-		return cancelPrompt(client)
-	case 3:
-		if b == '~' {
-			prompt.PendingEscape = nil
-			prompt.pendingUTF8 = nil
-			deletePromptRune(prompt)
-			prompt.Action = PromptActionChanged
-			return promptEvent(prompt, PromptActionChanged, "")
-		}
-		return cancelPrompt(client)
-	default:
-		return cancelPrompt(client)
-	}
-}
-
-func cancelPrompt(client *clientInputState) serverInputEvent {
-	prompt := client.Prompt
-	prompt.Action = PromptActionCancel
-	prompt.PendingEscape = nil
-	prompt.pendingUTF8 = nil
-	event := promptEvent(prompt, PromptActionCancel, "")
-	client.Prompt = nil
-	return event
-}
-
-func promptEvent(prompt *PromptState, action PromptAction, text string) serverInputEvent {
-	return serverInputEvent{
-		Command:      serverCommandPrompt,
-		PromptAction: action,
-		PromptMode:   prompt.Mode,
-		PromptText:   text,
-	}
-}
-
-// ConsumePromptInput keeps incomplete escape sequences in PromptState. Escape
-// is resolved as cancel only once its next byte proves it is not CSI Delete.
-// Any submit/cancel terminates ownership of the current input payload.
-func (c *ClientInstance) ConsumePromptInput(data []byte) (int, []serverInputEvent, bool) {
-	if c == nil || c.inputState.Prompt == nil {
-		return 0, nil, false
-	}
-	client := &c.inputState
-	events := make([]serverInputEvent, 0, len(data))
-	index := 0
-	terminated := false
-	for index < len(data) && client.Prompt != nil {
-		event := consumePromptByte(client, data[index])
-		index++
-		if event.Command != serverCommandNone {
-			events = append(events, event)
-			if event.PromptAction == PromptActionSubmit || event.PromptAction == PromptActionCancel {
-				terminated = true
-				break
-			}
-		}
-	}
-	return index, events, terminated
-}
-
 func (c *ClientInstance) InputIsNormal() bool {
-	return c != nil && c.inputState.Prompt == nil && c.inputState.InputState == serverInputNormal && !paneResizeRepeatActive(&c.inputState, time.Now())
+	return c != nil && c.inputState.InputState == serverInputNormal && !paneResizeRepeatActive(&c.inputState, time.Now())
 }
 
 func translateApplicationCursor(data []byte, enabled bool) ([]byte, int, bool) {
@@ -500,54 +359,6 @@ func translateApplicationCursor(data []byte, enabled bool) ([]byte, int, bool) {
 		return nil, 0, false
 	}
 	return []byte{0x1b, 'O', data[2]}, 3, true
-}
-
-func appendPromptByte(prompt *PromptState, b byte) bool {
-	prompt.pendingUTF8 = append(prompt.pendingUTF8, b)
-	changed := false
-	for len(prompt.pendingUTF8) > 0 {
-		if prompt.pendingUTF8[0] < utf8.RuneSelf {
-			insertPromptRune(prompt, rune(prompt.pendingUTF8[0]))
-			prompt.pendingUTF8 = prompt.pendingUTF8[1:]
-			changed = true
-			continue
-		}
-		if !utf8.FullRune(prompt.pendingUTF8) {
-			break
-		}
-		r, size := utf8.DecodeRune(prompt.pendingUTF8)
-		if r == utf8.RuneError && size == 1 {
-			insertPromptRune(prompt, utf8.RuneError)
-			prompt.pendingUTF8 = prompt.pendingUTF8[1:]
-			changed = true
-			continue
-		}
-		insertPromptRune(prompt, r)
-		prompt.pendingUTF8 = prompt.pendingUTF8[size:]
-		changed = true
-	}
-	return changed
-}
-
-func insertPromptRune(prompt *PromptState, r rune) {
-	if prompt.Cursor < 0 || prompt.Cursor > len(prompt.Text) {
-		prompt.Cursor = len(prompt.Text)
-	}
-	prompt.Text = append(prompt.Text, 0)
-	copy(prompt.Text[prompt.Cursor+1:], prompt.Text[prompt.Cursor:])
-	prompt.Text[prompt.Cursor] = r
-	prompt.Cursor++
-}
-
-func deletePromptRune(prompt *PromptState) {
-	if prompt.Cursor <= 0 || len(prompt.Text) == 0 {
-		return
-	}
-	// There is no cursor movement binding yet, so Delete at the end removes
-	// the previous rune just like Backspace while retaining cursor semantics.
-	prompt.Cursor--
-	copy(prompt.Text[prompt.Cursor:], prompt.Text[prompt.Cursor+1:])
-	prompt.Text = prompt.Text[:len(prompt.Text)-1]
 }
 
 func (c *ClientInstance) FocusPaneDirection(direction byte) (*Window, protocol.ClientLayout, error) {
