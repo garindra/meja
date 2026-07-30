@@ -57,6 +57,13 @@ func (f synchronizedField) key() string {
 //	forwarders; published value: immutable installed-layout revision; forwarding
 //	must stamp input without a synchronous UI round trip.
 //
+// client.runtimeState.promptInputStatus
+//
+//	owner: frontend runtime; writer: control decoder; reader: terminal-input
+//	forwarder; published value: the greatest status revision observed together
+//	with whether raw terminal input must be routed through the display actor's
+//	client-local prompt editor instead of to the server.
+//
 // client.liveConnection.lastContact
 //
 //	owner: live connection; writers: connection readers; reader: watchdog;
@@ -70,6 +77,7 @@ var atomicFieldContract = map[string]string{
 	"server.processWatch.activityPending":       "*atomic.Bool",
 	"client.runtimeState.dropConnectionEvents":  "atomic.Bool",
 	"client.runtimeState.appliedLayoutRevision": "atomic.Uint64",
+	"client.runtimeState.promptInputStatus":     "atomic.Pointer",
 	"client.liveConnection.lastContact":         "atomic.Int64",
 }
 

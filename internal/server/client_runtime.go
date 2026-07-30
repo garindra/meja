@@ -25,6 +25,9 @@ func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) 
 		if msg.SourceIdle && !bytes.Equal(msg.Data, []byte{0x1b}) {
 			return false, errors.New("source-idle frontend input must contain one Escape byte")
 		}
+		if c.ActivePrompt() != nil {
+			return false, nil
+		}
 		var detach bool
 		var processErr error
 		detach, processErr = c.handleInputBytes(msg.LayoutRevision, msg.Data)
@@ -42,6 +45,18 @@ func (c *ClientInstance) handleControlFrame(frame protocol.Frame) (bool, error) 
 		}
 		if processErr != nil {
 			return false, processErr
+		}
+		if detach || (c.connection != nil && c.connection.isRevoked()) {
+			return true, nil
+		}
+	case protocol.MsgFrontendPromptResult:
+		msg, err := protocol.DecodeFrontendPromptResult(frame.Payload)
+		if err != nil {
+			return false, err
+		}
+		detach, err := c.resolvePrompt(msg)
+		if err != nil {
+			return false, err
 		}
 		if detach || (c.connection != nil && c.connection.isRevoked()) {
 			return true, nil
@@ -109,20 +124,19 @@ func (c *ClientInstance) handleInputBytes(layoutRevision protocol.ClientLayoutRe
 	if c == nil {
 		return false, nil
 	}
+	if c.ActivePrompt() != nil {
+		return false, nil
+	}
 	// Plain legacy text remains the overwhelmingly common path, including
 	// printable text while Kitty flags 1|2 are active. Preserve batching and
-	// the existing prompt/prefix behavior when no escape sequence is pending.
+	// the existing prefix behavior when no escape sequence is pending.
 	if c.frontendInput.state == frontendParserGround && bytes.IndexByte(data, 0x1b) < 0 {
 		return c.handleLegacyInputBytes(data)
 	}
 	dispatch := func(event frontendInputEvent) (bool, bool, error) {
-		hadPrompt := c.ActivePrompt() != nil
 		detach, err := c.handleFrontendInputEvent(event)
 		if err != nil || detach {
 			return detach, false, err
-		}
-		if hadPrompt && c.ActivePrompt() == nil {
-			return false, true, nil
 		}
 		return false, false, nil
 	}
@@ -162,22 +176,6 @@ func (c *ClientInstance) handleLegacyInputBytes(data []byte) (bool, error) {
 		return false, nil
 	}
 	for index := 0; index < len(data); index++ {
-		if c.ActivePrompt() != nil {
-			consumed, events, terminated := c.ConsumePromptInput(data[index:])
-			for _, event := range events {
-				detach, err := c.handleServerInputEvent(event)
-				if err != nil || detach {
-					return detach, err
-				}
-			}
-			if consumed > 0 {
-				index += consumed - 1
-				if terminated {
-					break
-				}
-				continue
-			}
-		}
 		pane := c.activePane()
 		if pane == nil {
 			break
@@ -262,32 +260,19 @@ func (c *ClientInstance) handleServerInputEvent(event serverInputEvent) (bool, e
 		// invalid command must be reported in the status bar, not escape the
 		// control-frame handler and tear down the transport.
 		c.showStatusMessage(err.Error())
-		return false, c.publishStatusBar()
-	case serverCommandPrompt:
-		return c.handlePromptEvent(event)
+		return false, c.publishClientStatus()
 	case serverCommandOpenCommandPrompt:
 		if _, err := c.BeginCommandPrompt(); err != nil {
 			return false, err
 		}
-		return false, c.publishStatusBar()
+		return false, c.publishClientStatus()
 	}
 	return false, nil
 }
 
-func (c *ClientInstance) handlePromptEvent(event serverInputEvent) (bool, error) {
-	switch event.PromptAction {
-	case PromptActionChanged:
-		return false, c.publishStatusBar()
-	case PromptActionSubmit, PromptActionCancel:
-		return c.resolvePrompt(promptResult{Submitted: event.PromptAction == PromptActionSubmit, Text: event.PromptText})
-	default:
-		return false, nil
-	}
-}
-
 func (c *ClientInstance) runCommandPromptAnswer(result promptResult) (bool, error) {
 	if !result.Submitted {
-		return false, c.publishStatusBar()
+		return false, c.publishClientStatus()
 	}
 	argv, err := parseCommandLine(result.Text)
 	if err == nil {
@@ -297,11 +282,11 @@ func (c *ClientInstance) runCommandPromptAnswer(result promptResult) (bool, erro
 			if detach {
 				return true, nil
 			}
-			return false, c.publishStatusBar()
+			return false, c.publishClientStatus()
 		}
 	}
 	c.showStatusMessage(err.Error())
-	return false, c.publishStatusBar()
+	return false, c.publishClientStatus()
 }
 
 func (c *ClientInstance) commandEnterHistory() error {

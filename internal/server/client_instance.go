@@ -38,32 +38,30 @@ type ClientInstance struct {
 	// client-view revision.
 	appliedProjectionRevision uint64
 	Daemon                    *Daemon
-	// inputState is the client actor's prefix, prompt, and directional-focus
-	// parser state. It contains no session, viewport, or installed-view data.
+	// inputState is the client actor's prefix and directional-focus parser
+	// state. It contains no prompt draft, session, viewport, or installed-view
+	// data.
 	inputState clientInputState
 	// currentView is the last daemon-resolved view this client actor
 	// successfully published. It is also the exact source for output handoff.
 	currentView ClientView
 
-	QUIC         quic.Connection
-	Output       [protocol.MaxRenderSlots]*OutputLease
-	StatusOutput io.Writer
+	QUIC   quic.Connection
+	Output [protocol.MaxRenderSlots]*OutputLease
 
-	controlOut     chan protocol.Frame
-	statusCommands chan statusCommand
-	// statusWorkerStarted is set during construction, before publication. Test
-	// fixtures assembled incrementally use it only for initialization; it is not
-	// cross-goroutine synchronization.
-	statusWorkerStarted   bool
-	statusMessage         string
-	statusMessageID       uint64
-	statusMessageDuration time.Duration
-	lifetimeDone          chan struct{}
-	frontendInput         frontendInputParser
-	heldKeys              map[frontendHeldKey]uint64
-	promptContinuation    promptContinuation
-	pointerCapture        frontendPaneCapture
-	pasteCapture          frontendPaneCapture
+	controlOut                chan protocol.Frame
+	statusPublicationRevision uint64
+	statusMessage             string
+	statusMessageID           uint64
+	statusMessageDuration     time.Duration
+	lifetimeDone              chan struct{}
+	frontendInput             frontendInputParser
+	heldKeys                  map[frontendHeldKey]uint64
+	promptContinuation        promptContinuation
+	activePrompt              *activePrompt
+	nextPromptID              uint64
+	pointerCapture            frontendPaneCapture
+	pasteCapture              frontendPaneCapture
 }
 
 type clientInstanceCommand struct {
@@ -136,7 +134,6 @@ type clientInputState struct {
 	InputState        serverInputState
 	PrefixEscape      []byte
 	ResizeRepeatUntil time.Time
-	Prompt            *PromptState
 }
 
 func (c *ClientInstance) commitProjectionPlan(plan ClientProjectionPlan) error {
@@ -288,7 +285,7 @@ func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
 	case command.ClearStatusMessage != 0:
 		if c.sessionID != 0 && c.statusMessageID == command.ClearStatusMessage {
 			c.statusMessage = ""
-			err = c.publishStatusBar()
+			err = c.publishClientStatus()
 		}
 	case command.RefreshStatus:
 		if command.HasStatus {
@@ -296,7 +293,7 @@ func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
 				break
 			}
 		}
-		err = c.publishStatusBar()
+		err = c.publishClientStatus()
 	case command.FocusDirection != 0:
 		_, _, err = c.FocusPaneDirection(command.FocusDirection)
 	case command.EnterHistory:
@@ -653,14 +650,13 @@ func newClientInstanceFromAdmission(d *Daemon, admission ClientAdmission) *Clien
 		connection.commands = make(chan clientInstanceCommand)
 	}
 	instance := &ClientInstance{
-		clientID:       admission.ClientID,
-		connection:     connection,
-		Daemon:         d,
-		shell:          defaultShell(),
-		commands:       connection.commands,
-		lifetimeDone:   make(chan struct{}),
-		statusCommands: make(chan statusCommand, 64),
-		heldKeys:       make(map[frontendHeldKey]uint64),
+		clientID:     admission.ClientID,
+		connection:   connection,
+		Daemon:       d,
+		shell:        defaultShell(),
+		commands:     connection.commands,
+		lifetimeDone: make(chan struct{}),
+		heldKeys:     make(map[frontendHeldKey]uint64),
 	}
 	instance.sessionID = admission.SessionID
 	if admission.Shell != "" {
@@ -670,8 +666,6 @@ func newClientInstanceFromAdmission(d *Daemon, admission ClientAdmission) *Clien
 	instance.terminalRows = admission.Rows
 	connection.done = instance.lifetimeDone
 	connection.startDeliveryWorker()
-	instance.statusWorkerStarted = true
-	go instance.runStatusOutput()
 	return instance
 }
 
@@ -763,6 +757,8 @@ func (c *ClientInstance) inputLayoutForRevision(revision protocol.ClientLayoutRe
 func (c *ClientInstance) resetInputForSessionSwitch() {
 	c.frontendInput.reset()
 	clear(c.heldKeys)
+	c.activePrompt = nil
+	c.promptContinuation = nil
 	c.pointerCapture = frontendPaneCapture{}
 	c.pasteCapture = frontendPaneCapture{}
 	c.currentView.Layout = protocol.ClientLayout{}
@@ -840,8 +836,8 @@ func isSessionReplacedClose(err error) bool {
 	return errors.As(err, &applicationErr) && applicationErr.ErrorCode == protocol.SessionReplacedErrorCode
 }
 
-// releaseFrontendResources tears down transport-local status and pane output
-// resources after the daemon has fenced and unregistered this instance.
+// releaseFrontendResources tears down transport-local pane output resources
+// after the daemon has fenced and unregistered this instance.
 func (c *ClientInstance) releaseFrontendResources() {
 	if c == nil {
 		return
@@ -856,9 +852,6 @@ func (c *ClientInstance) releaseFrontendResources() {
 		if err := resolved.Pane.cancelHistorySelection(); err != nil && detachErr == nil {
 			detachErr = err
 		}
-	}
-	if err := c.detachStatusOutput(); err != nil {
-		detachErr = err
 	}
 	if err := c.detachLeases(panes, c.outputLeases()); err != nil && detachErr == nil {
 		detachErr = err
@@ -1428,8 +1421,9 @@ func (d *Daemon) discardPendingClientInstance(instance *ClientInstance) {
 // production. Exactly one pane actor or the session's unused pool holds a
 // lease at a time.
 type OutputLease struct {
-	Slot   int
-	Stream io.Writer
+	Slot                  int
+	Stream                io.Writer
+	frontendTerminalWrite func([]byte) error
 
 	workerOnce sync.Once
 	available  chan *paneRenderBuffer
@@ -1525,33 +1519,24 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		return err
 	}
 	d.logSessionAttached(admission.SessionID)
-	statusOutput, err := conn.OpenUniStreamSync(ctx)
-	if err != nil {
-		return fmt.Errorf("open status output stream: %w", err)
-	}
-	if index, ok := protocol.OutputIndexFromStreamID(uint64(statusOutput.StreamID())); !ok || index != 0 {
-		return fmt.Errorf("status output stream ID %d has index %d", statusOutput.StreamID(), index)
-	}
-	if _, err := statusOutput.Write([]byte{byte(protocol.DisplayOpcodeNoop)}); err != nil {
-		return fmt.Errorf("materialize status output stream: %w", err)
-	}
 	outputLeases := make(map[int]*OutputLease, int(protocol.MaxRenderSlots))
 	for slot := 0; slot < int(protocol.MaxRenderSlots); slot++ {
 		outputStream, err := conn.OpenUniStreamSync(ctx)
 		if err != nil {
 			return fmt.Errorf("open output stream %d: %w", slot, err)
 		}
-		if index, ok := protocol.OutputIndexFromStreamID(uint64(outputStream.StreamID())); !ok || int(index) != slot+1 {
-			return fmt.Errorf("pane output stream ID %d has index %d, want %d", outputStream.StreamID(), index, slot+1)
+		if index, ok := protocol.OutputIndexFromStreamID(uint64(outputStream.StreamID())); !ok || int(index) != slot {
+			return fmt.Errorf("pane output stream ID %d has index %d, want %d", outputStream.StreamID(), index, slot)
 		}
 		if _, err := outputStream.Write([]byte{byte(protocol.DisplayOpcodeNoop)}); err != nil {
 			return fmt.Errorf("materialize pane output stream %d: %w", slot, err)
 		}
 		leaseSlot := slot
 		outputLeases[slot] = &OutputLease{
-			Slot:   slot,
-			Stream: outputStream,
-			done:   conn.Context().Done(),
+			Slot:                  slot,
+			Stream:                outputStream,
+			frontendTerminalWrite: clientInstance.writeFrontendTerminal,
+			done:                  conn.Context().Done(),
 			onFailure: func(writeErr error) {
 				_ = conn.CloseWithError(protocol.RenderOutputErrorCode, fmt.Sprintf("pane output slot %d failed: %v", leaseSlot, writeErr))
 			},
@@ -1559,12 +1544,8 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 	}
 
 	clientInstance.QUIC = conn
-	clientInstance.StatusOutput = statusOutput
 	for slot := range clientInstance.Output {
 		clientInstance.Output[slot] = outputLeases[slot]
-	}
-	if err := clientInstance.attachStatusOutput(statusOutput); err != nil {
-		return err
 	}
 	transition, err := d.initializeClient(ClientInitialized{
 		ClientID: admission.ClientID, Cols: attachCols, Rows: attachRows,

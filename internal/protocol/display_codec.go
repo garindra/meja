@@ -32,7 +32,7 @@ const (
 	DisplayOpcodeWriteTextUTF8Default DisplayOpcode = 0x07
 	DisplayOpcodeFill                 DisplayOpcode = 0x08
 	DisplayOpcodeCursorUpdate         DisplayOpcode = 0x09
-	DisplayOpcodeScroll               DisplayOpcode = 0x0a
+	DisplayOpcodeScrollRegion         DisplayOpcode = 0x0a
 	DisplayOpcodeWriteCluster         DisplayOpcode = 0x0b
 	DisplayOpcodePresent              DisplayOpcode = 0xff
 )
@@ -52,7 +52,7 @@ type DisplayCommand struct {
 	Text           []byte
 	Fill           Fill
 	Cursor         CursorUpdate
-	Delta          int
+	ScrollRegion   ScrollRegion
 }
 
 type DisplayEncoder struct{ buf []byte }
@@ -85,8 +85,8 @@ func (e *DisplayEncoder) AppendCommand(cmd DisplayCommand) error {
 		return e.AppendFill(cmd.Fill)
 	case DisplayOpcodeCursorUpdate:
 		return e.AppendCursorUpdate(cmd.Cursor)
-	case DisplayOpcodeScroll:
-		return e.AppendScroll(Scroll{Delta: cmd.Delta})
+	case DisplayOpcodeScrollRegion:
+		return e.AppendScrollRegion(cmd.ScrollRegion)
 	case DisplayOpcodePresent:
 		e.AppendPresent()
 		return nil
@@ -207,8 +207,14 @@ func (e *DisplayEncoder) AppendCursorUpdate(msg CursorUpdate) error {
 	return nil
 }
 
-func (e *DisplayEncoder) AppendScroll(msg Scroll) error {
-	e.opcode(DisplayOpcodeScroll)
+func (e *DisplayEncoder) AppendScrollRegion(msg ScrollRegion) error {
+	if msg.Top < 0 || msg.Top >= msg.Bottom || uint64(msg.Bottom) > MaxGridRows ||
+		msg.Delta == 0 || msg.Delta < -(msg.Bottom-msg.Top) || msg.Delta > msg.Bottom-msg.Top {
+		return fmt.Errorf("invalid scroll region [%d,%d) delta %d", msg.Top, msg.Bottom, msg.Delta)
+	}
+	e.opcode(DisplayOpcodeScrollRegion)
+	e.buf = appendUvarint(e.buf, uint64(msg.Top))
+	e.buf = appendUvarint(e.buf, uint64(msg.Bottom))
 	e.buf = appendVarint(e.buf, int64(msg.Delta))
 	return nil
 }
@@ -344,13 +350,21 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 		if err == nil {
 			cmd.Cursor.Visible, err = d.readBool()
 		}
-	case DisplayOpcodeScroll:
-		var delta int64
-		delta, err = d.readVarint()
-		if err == nil && (delta < -int64(MaxGridRows) || delta > int64(MaxGridRows)) {
-			err = fmt.Errorf("invalid scroll delta")
+	case DisplayOpcodeScrollRegion:
+		cmd.ScrollRegion.Top, err = d.readCoord(MaxGridRows)
+		if err == nil {
+			cmd.ScrollRegion.Bottom, err = d.readCoord(MaxGridRows)
 		}
-		cmd.Delta = int(delta)
+		var delta int64
+		if err == nil {
+			delta, err = d.readVarint()
+		}
+		if err == nil && (cmd.ScrollRegion.Top < 0 || cmd.ScrollRegion.Top >= cmd.ScrollRegion.Bottom ||
+			delta == 0 || delta < -int64(cmd.ScrollRegion.Bottom-cmd.ScrollRegion.Top) ||
+			delta > int64(cmd.ScrollRegion.Bottom-cmd.ScrollRegion.Top)) {
+			err = fmt.Errorf("invalid scroll region [%d,%d) delta %d", cmd.ScrollRegion.Top, cmd.ScrollRegion.Bottom, delta)
+		}
+		cmd.ScrollRegion.Delta = int(delta)
 	case DisplayOpcodePresent:
 	default:
 		err = fmt.Errorf("unknown display opcode 0x%02x", op)

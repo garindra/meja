@@ -684,6 +684,9 @@ func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := decodeTestClientLayout(t, <-instance.controlOut)
+	if status := <-instance.controlOut; status.Type != protocol.MsgClientStatus {
+		t.Fatalf("post-layout frame type = %d, want CLIENT_STATUS", status.Type)
+	}
 
 	transition, err := d.transitionClientToSession(instance.clientID, instance.connection, target.ID, 80, 23)
 	if err != nil {
@@ -693,6 +696,9 @@ func TestRepeatedLiveSwitchKeepsLayoutRevisionsMonotonic(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := decodeTestClientLayout(t, <-instance.controlOut)
+	if status := <-instance.controlOut; status.Type != protocol.MsgClientStatus {
+		t.Fatalf("post-layout frame type = %d, want CLIENT_STATUS", status.Type)
+	}
 	if second.LayoutRevision <= first.LayoutRevision {
 		t.Fatalf("first switch revision = %d, want greater than %d", second.LayoutRevision, first.LayoutRevision)
 	}
@@ -895,14 +901,35 @@ func TestConfirmedFinalPaneCloseWaitsForFrontendTerminalExitCompletion(t *testin
 	conn, control, decoder, _ := dialTestClientInstance(t, *result.bootstrap, "")
 	defer conn.CloseWithError(0, "")
 	encoder := protocol.NewEncoder(control)
-	for _, data := range [][]byte{{0x02, 'x'}, {'y'}} {
-		input := encodedTestFrame(t, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: data}, protocol.EncodeFrontendInputBytes)
-		if err := encoder.WriteFrame(input); err != nil {
-			t.Fatal(err)
-		}
+	input := encodedTestFrame(t, protocol.MsgFrontendInputBytes, protocol.FrontendInputBytes{Data: []byte{0x02, 'x'}}, protocol.EncodeFrontendInputBytes)
+	if err := encoder.WriteFrame(input); err != nil {
+		t.Fatal(err)
 	}
 
 	if err := control.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var prompt protocol.ClientStatusPromptState
+	for prompt.PromptID == 0 {
+		frame, err := decoder.ReadFrame()
+		if err != nil {
+			t.Fatalf("read confirmation prompt: %v", err)
+		}
+		if frame.Type != protocol.MsgClientStatus {
+			continue
+		}
+		status, err := protocol.DecodeClientStatus(frame.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Kind == protocol.ClientStatusPrompt {
+			prompt = status.Prompt
+		}
+	}
+	resultFrame := encodedTestFrame(t, protocol.MsgFrontendPromptResult, protocol.FrontendPromptResult{
+		PromptID: prompt.PromptID, Submitted: true, Text: "y",
+	}, protocol.EncodeFrontendPromptResult)
+	if err := encoder.WriteFrame(resultFrame); err != nil {
 		t.Fatal(err)
 	}
 	for {
@@ -1090,7 +1117,7 @@ func stopPersistenceTestSession(t *testing.T, session *SessionState) {
 	stopState(session)
 }
 
-func TestInitialQUICAttachPublishesStatusAtNegotiatedWidth(t *testing.T) {
+func TestInitialQUICAttachPublishesStructuredStatusAndEightPaneStreams(t *testing.T) {
 	d := newCommandTestDaemonWithActor(t)
 	setCommandTestPersistenceDir(t, d)
 	result := d.executeCommand(protocol.CommandRequest{
@@ -1102,36 +1129,38 @@ func TestInitialQUICAttachPublishesStatusAtNegotiatedWidth(t *testing.T) {
 		t.Fatalf("create result = %#v", result)
 	}
 
-	conn, _, _, _ := dialTestClientInstance(t, *result.bootstrap, "")
+	conn, _, control, _ := dialTestClientInstance(t, *result.bootstrap, "")
 	defer conn.CloseWithError(0, "")
-	statusStream, err := conn.AcceptUniStream(context.Background())
+	layoutFrame, err := control.ReadFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if index, ok := protocol.OutputIndexFromStreamID(uint64(statusStream.StreamID())); !ok || index != 0 {
-		t.Fatalf("first output stream ID %d has index %d, want status index 0", statusStream.StreamID(), index)
+	if layoutFrame.Type != protocol.MsgClientLayout {
+		t.Fatalf("first control frame type = %d, want CLIENT_LAYOUT", layoutFrame.Type)
 	}
-	if err := statusStream.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+	statusFrame, err := control.ReadFrame()
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	decoder := protocol.NewDisplayDecoder(statusStream)
-	fillWidth := 0
-	presented := false
-	for !presented {
-		command, _, err := decoder.ReadCommand()
-		if err != nil {
-			t.Fatalf("read initial status frame: %v", err)
-		}
-		switch command.Opcode {
-		case protocol.DisplayOpcodeFill:
-			fillWidth = command.Fill.Columns
-		case protocol.DisplayOpcodePresent:
-			presented = true
-		}
+	if statusFrame.Type != protocol.MsgClientStatus {
+		t.Fatalf("second control frame type = %d, want CLIENT_STATUS", statusFrame.Type)
 	}
-	if fillWidth != 80 {
-		t.Fatalf("initial status fill width = %d, want negotiated width 80", fillWidth)
+	status, err := protocol.DecodeClientStatus(statusFrame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Revision == 0 || len(status.Windows) != 1 || !status.Windows[0].Active {
+		t.Fatalf("initial structured status = %#v", status)
+	}
+	for want := uint8(0); want < uint8(protocol.MaxRenderSlots); want++ {
+		stream, err := conn.AcceptUniStream(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		index, ok := protocol.OutputIndexFromStreamID(uint64(stream.StreamID()))
+		if !ok || index != want {
+			t.Fatalf("pane stream ID %d has index %d, want %d", stream.StreamID(), index, want)
+		}
 	}
 }
 

@@ -13,7 +13,11 @@ import (
 )
 
 const (
-	maxCSISequenceBytes             = 256
+	maxCSISequenceBytes = 256
+	// OSC payloads are normally consumed without retention. OSC 52 is the one
+	// allowlisted exception because clipboard writes must be delivered to the
+	// attached frontend rather than represented in the terminal grid.
+	maxForwardedOSC52Bytes          = 2 << 20
 	maxTerminalStyles               = 4096
 	initialStyleCapacity            = 32
 	historyCounterStyleID    uint32 = 1
@@ -184,13 +188,28 @@ func isIndicVirama(r rune) bool {
 }
 
 type Update struct {
-	DirtySpans    []DirtySpan
-	ScrollDelta   int
-	FullRedraw    bool
-	CursorChanged bool
-	VisibleChange bool
-	Replies       [][]byte
-	trackDamage   bool
+	DirtySpans     []DirtySpan
+	ScrollRegion   *ScrollRegion
+	FullRedraw     bool
+	CursorChanged  bool
+	VisibleChange  bool
+	Replies        [][]byte
+	FrontendWrites []FrontendWrite
+	trackDamage    bool
+}
+
+// ScrollRegion describes a complete-width row transformation. Top is
+// inclusive, Bottom is exclusive, and a negative Delta moves surviving rows
+// upward.
+type ScrollRegion struct {
+	Top    int
+	Bottom int
+	Delta  int
+}
+
+type FrontendWrite struct {
+	Data          []byte
+	OSC52Sequence uint64
 }
 
 type DirtySpan struct {
@@ -469,6 +488,8 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 		if t.Parser.state != parserText && (data[0] == 0x18 || data[0] == 0x1a) {
 			t.Parser.state = parserText
 			t.Parser.csiBuf = t.Parser.csiBuf[:0]
+			t.Parser.oscBuf = t.Parser.oscBuf[:0]
+			t.Parser.oscCandidate = false
 			data = data[1:]
 			continue
 		}
@@ -550,7 +571,7 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 				t.Parser.state = parserCSI
 				t.Parser.csiBuf = t.Parser.csiBuf[:0]
 			case ']':
-				t.Parser.state = parserOSC
+				t.startOSC()
 			case 'P':
 				t.Parser.state = parserDCS
 			case '7':
@@ -642,17 +663,23 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 			data = data[1:]
 			switch b {
 			case 0x07:
-				t.Parser.state = parserText
+				t.finishOSC(update, []byte{0x07})
 			case 0x1b:
 				t.Parser.state = parserOSCESC
+			default:
+				t.consumeOSCByte(b)
 			}
 		case parserOSCESC:
 			b := data[0]
 			data = data[1:]
 			if b == '\\' {
-				t.Parser.state = parserText
+				t.finishOSC(update, []byte{0x1b, '\\'})
 				continue
 			}
+			// An ESC that is not the first byte of ST makes the OSC malformed.
+			// Continue consuming it, but never forward the ambiguous sequence.
+			t.Parser.oscBuf = t.Parser.oscBuf[:0]
+			t.Parser.oscCandidate = false
 			t.Parser.state = parserOSC
 		case parserDCS:
 			b := data[0]
@@ -670,6 +697,51 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 			}
 		}
 	}
+}
+
+func (t *TerminalState) startOSC() {
+	t.Parser.state = parserOSC
+	t.Parser.oscBuf = t.Parser.oscBuf[:0]
+	t.Parser.oscCandidate = true
+	t.Parser.oscSequence++
+	if t.Parser.oscSequence == 0 {
+		t.Parser.oscSequence++
+	}
+}
+
+func (t *TerminalState) consumeOSCByte(b byte) {
+	if !t.Parser.oscCandidate {
+		return
+	}
+	const prefix = "52;"
+	offset := len(t.Parser.oscBuf)
+	if offset < len(prefix) && b != prefix[offset] {
+		t.Parser.oscBuf = t.Parser.oscBuf[:0]
+		t.Parser.oscCandidate = false
+		return
+	}
+	if offset == maxForwardedOSC52Bytes {
+		t.Parser.oscBuf = t.Parser.oscBuf[:0]
+		t.Parser.oscCandidate = false
+		return
+	}
+	t.Parser.oscBuf = append(t.Parser.oscBuf, b)
+}
+
+func (t *TerminalState) finishOSC(update *Update, terminator []byte) {
+	if t.Parser.oscCandidate && len(t.Parser.oscBuf) >= len("52;") {
+		write := make([]byte, 0, len("\x1b]")+len(t.Parser.oscBuf)+len(terminator))
+		write = append(write, "\x1b]"...)
+		write = append(write, t.Parser.oscBuf...)
+		write = append(write, terminator...)
+		update.FrontendWrites = append(update.FrontendWrites, FrontendWrite{
+			Data:          write,
+			OSC52Sequence: t.Parser.oscSequence,
+		})
+	}
+	t.Parser.oscBuf = t.Parser.oscBuf[:0]
+	t.Parser.oscCandidate = false
+	t.Parser.state = parserText
 }
 
 func (t *TerminalState) putASCII(data []byte, update *Update) {
@@ -1060,23 +1132,31 @@ func (t *TerminalState) executeCSI(seq []byte, update *Update) {
 		update.markDirty(t.CursorY, t.CursorX, t.Cols, t.Cols)
 	case 'L':
 		styleID := t.eraseStyleID()
-		t.insertLines(max1(params, 1), styleID)
-		update.FullRedraw = true
+		count := min(max1(params, 1), t.ScrollBottom-t.CursorY+1)
+		if t.CursorY >= t.ScrollTop && t.CursorY <= t.ScrollBottom {
+			t.insertLines(count, styleID)
+			update.recordScrollRegion(t.CursorY, t.ScrollBottom+1, count)
+			for row := t.CursorY; row < t.CursorY+count; row++ {
+				update.markDirty(row, 0, t.Cols, t.Cols)
+			}
+		}
 	case 'M':
 		styleID := t.eraseStyleID()
-		t.deleteLines(max1(params, 1), styleID)
-		update.FullRedraw = true
+		count := min(max1(params, 1), t.ScrollBottom-t.CursorY+1)
+		if t.CursorY >= t.ScrollTop && t.CursorY <= t.ScrollBottom {
+			t.deleteLines(count, styleID)
+			update.recordScrollRegion(t.CursorY, t.ScrollBottom+1, -count)
+			for row := t.ScrollBottom - count + 1; row <= t.ScrollBottom; row++ {
+				update.markDirty(row, 0, t.Cols, t.Cols)
+			}
+		}
 	case 'S':
 		count := min(max1(params, 1), t.ScrollBottom-t.ScrollTop+1)
 		styleID := t.eraseStyleID()
 		for range count {
 			t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
 		}
-		if t.ScrollTop == 0 && t.ScrollBottom == t.Rows-1 {
-			update.recordScroll(-count, t.Rows)
-		} else {
-			update.FullRedraw = true
-		}
+		update.recordScrollRegion(t.ScrollTop, t.ScrollBottom+1, -count)
 		for row := t.ScrollBottom - count + 1; row <= t.ScrollBottom; row++ {
 			update.markDirty(row, 0, t.Cols, t.Cols)
 		}
@@ -1086,11 +1166,7 @@ func (t *TerminalState) executeCSI(seq []byte, update *Update) {
 		for range count {
 			t.scrollDownRegion(t.ScrollTop, t.ScrollBottom, styleID)
 		}
-		if t.ScrollTop == 0 && t.ScrollBottom == t.Rows-1 {
-			update.recordScroll(count, t.Rows)
-		} else {
-			update.FullRedraw = true
-		}
+		update.recordScrollRegion(t.ScrollTop, t.ScrollBottom+1, count)
 		for row := t.ScrollTop; row < t.ScrollTop+count; row++ {
 			update.markDirty(row, 0, t.Cols, t.Cols)
 		}
@@ -1343,33 +1419,44 @@ func (u *Update) markDirty(row, start, end, cols int) {
 	u.DirtySpans[row] = span
 }
 
-func (u *Update) recordScroll(delta, rows int) {
+func (u *Update) recordScrollRegion(top, bottom, delta int) {
 	if u == nil || !u.trackDamage {
 		return
 	}
-	if delta == 0 || (u.ScrollDelta != 0 && (u.ScrollDelta < 0) != (delta < 0)) {
+	if top < 0 || top >= bottom || bottom > len(u.DirtySpans) || delta == 0 || delta < -(bottom-top) || delta > bottom-top {
 		u.FullRedraw = true
-		u.ScrollDelta = 0
+		u.ScrollRegion = nil
 		return
 	}
 	if u.FullRedraw {
 		return
 	}
-	rows = min(rows, len(u.DirtySpans))
-	if delta < 0 {
-		shift := min(-delta, rows)
-		copy(u.DirtySpans[:rows-shift], u.DirtySpans[shift:rows])
-		clear(u.DirtySpans[rows-shift : rows])
-	} else {
-		shift := min(delta, rows)
-		copy(u.DirtySpans[shift:rows], u.DirtySpans[:rows-shift])
-		clear(u.DirtySpans[:shift])
+	if pending := u.ScrollRegion; pending != nil &&
+		(pending.Top != top || pending.Bottom != bottom || (pending.Delta < 0) != (delta < 0)) {
+		u.FullRedraw = true
+		u.ScrollRegion = nil
+		return
 	}
-	u.ScrollDelta += delta
-	if u.ScrollDelta < -rows {
-		u.ScrollDelta = -rows
-	} else if u.ScrollDelta > rows {
-		u.ScrollDelta = rows
+	spans := u.DirtySpans[top:bottom]
+	if delta < 0 {
+		shift := -delta
+		copy(spans[:len(spans)-shift], spans[shift:])
+		clear(spans[len(spans)-shift:])
+	} else {
+		shift := delta
+		copy(spans[shift:], spans[:len(spans)-shift])
+		clear(spans[:shift])
+	}
+	if u.ScrollRegion == nil {
+		u.ScrollRegion = &ScrollRegion{Top: top, Bottom: bottom, Delta: delta}
+		return
+	}
+	u.ScrollRegion.Delta += delta
+	height := bottom - top
+	if u.ScrollRegion.Delta < -height {
+		u.ScrollRegion.Delta = -height
+	} else if u.ScrollRegion.Delta > height {
+		u.ScrollRegion.Delta = height
 	}
 }
 
@@ -1396,11 +1483,12 @@ func (u *Update) ResetFor(rows int, trackDamage bool) {
 	} else {
 		u.DirtySpans = u.DirtySpans[:0]
 	}
-	u.ScrollDelta = 0
+	u.ScrollRegion = nil
 	u.FullRedraw = false
 	u.CursorChanged = false
 	u.VisibleChange = false
 	u.Replies = u.Replies[:0]
+	u.FrontendWrites = u.FrontendWrites[:0]
 }
 
 func (u *Update) HasDamage() bool {
@@ -1413,7 +1501,7 @@ func (u *Update) HasDamage() bool {
 }
 
 func (u *Update) HasRenderChange() bool {
-	return u.FullRedraw || u.ScrollDelta != 0 || u.CursorChanged || u.VisibleChange || u.HasDamage()
+	return u.FullRedraw || u.ScrollRegion != nil || u.CursorChanged || u.VisibleChange || u.HasDamage()
 }
 
 func (t *TerminalState) fillRow(row, start, end int, styleID uint32) {
@@ -1522,11 +1610,8 @@ func (t *TerminalState) reverseIndex(update *Update) {
 	}
 	styleID := t.eraseStyleID()
 	t.scrollDownRegion(t.ScrollTop, t.ScrollBottom, styleID)
-	delta := t.fullViewportScrollDelta(1)
-	update.recordScroll(delta, t.Rows)
-	if delta != 0 {
-		update.markDirty(t.ScrollTop, 0, t.Cols, t.Cols)
-	}
+	update.recordScrollRegion(t.ScrollTop, t.ScrollBottom+1, 1)
+	update.markDirty(t.ScrollTop, 0, t.Cols, t.Cols)
 	update.CursorChanged = true
 }
 
@@ -1876,11 +1961,8 @@ func (t *TerminalState) lineFeed(update *Update) {
 	if t.CursorY == t.ScrollBottom {
 		styleID := t.eraseStyleID()
 		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
-		delta := t.fullViewportScrollDelta(-1)
-		update.recordScroll(delta, t.Rows)
-		if delta != 0 {
-			update.markDirty(t.ScrollBottom, 0, t.Cols, t.Cols)
-		}
+		update.recordScrollRegion(t.ScrollTop, t.ScrollBottom+1, -1)
+		update.markDirty(t.ScrollBottom, 0, t.Cols, t.Cols)
 		return
 	}
 	if t.CursorY < t.Rows-1 {
@@ -1892,11 +1974,8 @@ func (t *TerminalState) wrapLine(update *Update) {
 	if t.CursorY == t.ScrollBottom {
 		styleID := t.eraseStyleID()
 		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)
-		delta := t.fullViewportScrollDelta(-1)
-		update.recordScroll(delta, t.Rows)
-		if delta != 0 {
-			update.markDirty(t.ScrollBottom, 0, t.Cols, t.Cols)
-		}
+		update.recordScrollRegion(t.ScrollTop, t.ScrollBottom+1, -1)
+		update.markDirty(t.ScrollBottom, 0, t.Cols, t.Cols)
 		return
 	}
 	if t.CursorY < t.Rows-1 {
@@ -1906,13 +1985,6 @@ func (t *TerminalState) wrapLine(update *Update) {
 
 func (t *TerminalState) eraseStyleID() uint32 {
 	return t.currentStyleID()
-}
-
-func (t *TerminalState) fullViewportScrollDelta(delta int) int {
-	if t.ScrollTop == 0 && t.ScrollBottom == t.Rows-1 {
-		return delta
-	}
-	return 0
 }
 
 func (t *TerminalState) styleID(style Style) (uint32, bool) {

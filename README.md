@@ -32,14 +32,14 @@ Readable `.meja` files can live in version control, letting anyone recreate the 
 On Linux x86-64:
 
 ```sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.19/meja_0.0.19_linux_amd64.tar.gz \
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.20/meja_0.0.20_linux_amd64.tar.gz \
   | sudo tar -xz -C /usr/local/bin meja
 ```
 
 On macOS with Apple Silicon:
 
 ```sh
-curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.19/meja_0.0.19_darwin_arm64.tar.gz \
+curl -fsSL https://github.com/garindra/meja/releases/download/v0.0.20/meja_0.0.20_darwin_arm64.tar.gz \
   | sudo tar -xz -C /usr/local/bin meja
 ```
 

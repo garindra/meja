@@ -57,7 +57,7 @@ Remote typing should not need to wait for a full round trip when its visible eff
 
 ## Terminal modes are interpreted on the server
 
-The frontend terminal is an input and output device, not the authority for a pane application's input protocol. The server learns application cursor mode, bracketed paste, focus reporting, mouse tracking, mouse encoding, and Kitty keyboard flags from authoritative pane output. It parses rich frontend events and re-encodes them for the focused pane's current mode. This keeps prefix commands, prompts, history interaction, mouse routing, and application input under one serialized session policy.
+The frontend terminal is an input and output device, not the authority for a pane application's input protocol. The server learns application cursor mode, bracketed paste, focus reporting, mouse tracking, mouse encoding, and Kitty keyboard flags from authoritative pane output. It parses rich frontend events and re-encodes them for the focused pane's current mode. Prefix commands, history interaction, mouse routing, and application input therefore remain under one serialized session policy. Meja's own transient prompt draft is the deliberate exception: the server owns the prompt's lifecycle and continuation, while the frontend edits and renders its draft locally and returns one structured result.
 
 ## Correct state before clever compression
 
@@ -107,7 +107,7 @@ flowchart LR
 
 The command plane is request/response oriented. It handles operations such as creating a session, listing sessions, saving, restoring, requesting help, and requesting attachment. An attach-capable command returns a short-lived authorization bundle rather than opening the interactive terminal itself.
 
-The interactive data plane is a QUIC connection. It has one framed bidirectional control stream for attachment, reconnection, frontend input, terminal-size changes, layout publication, and server-directed frontend terminal control. A separate status display stream and a bounded pool of pane display streams carry the compact display protocol. SSH is no longer in the path after a remote bootstrap succeeds.
+The interactive data plane is a QUIC connection. It has one framed bidirectional control stream for attachment, reconnection, frontend input, terminal-size changes, layout and structured status publication, and server-directed frontend terminal control. Eight server-initiated unidirectional pane streams carry the compact display protocol. SSH is no longer in the path after a remote bootstrap succeeds.
 
 The server is per user and per profile. Each profile has its own command socket, daemon process, session registry, QUIC listener and certificate, session-ID sequence, and private snapshot directory. The default profile is rooted at `~/.meja/default/`; another profile is an independent instance rather than a label inside one global daemon.
 
@@ -126,7 +126,7 @@ The most important architectural question is not which package contains an objec
 | Window | Session lifetime | Owns a layout tree, pane membership, active pane, name, zoom state, and layout revision |
 | Pane | Child-process lifetime | Actor-owns a PTY, packed terminal store, parser modes, history, process recipe, pending render damage, and at most one output lease |
 | Client identity | Logical-client lifetime | Is keyed by stable `ClientID`; retains the resume token, session assignment, active/pending connection lifecycle, terminal dimensions, and projection/layout revision allocators |
-| Client instance | One live QUIC transport | Owns control/status streams, connection-local pane output leases, frontend parser and prompt state, the installed `ClientView`, render/status workers, and transport teardown |
+| Client instance | One live QUIC transport | Owns the control stream, connection-local pane output leases, frontend parser, prompt lifecycle descriptor and continuation, the installed `ClientView`, structured status publication, and transport teardown |
 | Output lease | One client transport | Owns one render-slot stream, its fixed-capacity render buffer, and the worker that performs blocking stream writes |
 | Client pane cache | Current layout lifetime | Stores the last decoded authoritative scanout cells for one visible render slot |
 
@@ -234,19 +234,18 @@ The attach token authorizes one initial attachment. It is not reused as the long
 
 ## QUIC stream topology
 
-Each client connection has three classes of streams:
+Each client connection has two classes of streams:
 
 | Stream | Direction | Purpose |
 |---|---|---|
-| Control | Bidirectional | Attach/resume handshake, frontend input, terminal-size changes, layouts, session switching, and server-directed frontend terminal writes |
-| Status output | Server to client | Status bar, prompts, and session/window state |
+| Control | Bidirectional | Attach/resume handshake, frontend input, terminal-size changes, layouts, structured status snapshots, session switching, and server-directed frontend terminal writes |
 | Pane render slots | Server to client | Custom display commands for visible panes |
 
-The server pre-establishes one status stream and a bounded set of unidirectional pane render streams. A visible pane receives exclusive use of one pane stream through an output lease. The stream is identified by its connection-local render slot; layout messages on the control stream map that slot to a pane ID and rectangle.
+The server pre-establishes exactly eight unidirectional pane render streams. A visible pane receives exclusive use of one pane stream through an output lease. The stream is identified by its connection-local render slot, numbered 0 through 7; layout messages on the control stream map that slot to a pane ID and rectangle.
 
 Using an independent QUIC stream for each visible pane matters under load. Ordering and stream-level flow control are isolated, so a pane producing a large or awkward output sequence is less likely to hold up the ordered bytes for another pane. QUIC congestion control and total connection capacity are still shared, so a noisy pane can consume bandwidth; the design reduces cross-pane interference rather than pretending it cannot occur.
 
-The status surface has its own stream because it is not part of any pane's terminal state or geometry. It can update independently and survives pane-slot rebinding.
+Status is semantic client UI rather than pane terminal content. The server publishes a complete `CLIENT_STATUS` snapshot on the control stream, including a monotonic publication revision, session identity, server location data, stable window IDs and presentation indexes, titles, active/zoom state, and structured prompt or temporary-message state. Frontends ignore stale revisions and choose their own status placement, styling, and truncation.
 
 The control stream is the authoritative lifecycle signal. Output streams carry display data but do not independently decide whether the session was detached, replaced, switched, or terminated.
 
@@ -256,7 +255,7 @@ Meja uses separate encodings for different traffic shapes:
 
 1. The command protocol uses length-delimited structured frames because it is low-frequency, extensible request/response traffic.
 2. The interactive control stream uses typed binary frames with bounded payloads.
-3. Status and pane display output use a compact opcode grammar with no generic frame wrapper around every operation.
+3. Pane display output uses a compact opcode grammar with no generic frame wrapper around every operation.
 
 Treating display output separately keeps the hot path small without forcing commands, attachment, or frontend events into a rendering-oriented format.
 
@@ -300,11 +299,13 @@ session.
 ## Client instance
 
 A `ClientInstance` is the disposable server-side actor for one QUIC
-connection. It owns that connection's control and display streams, output
-leases and workers, frontend input and prompt state, terminal dimensions, and
-installed `ClientView`. `ClientView` contains the wire `ClientLayout` and the
-exact pane actors resolved by the daemon, so the instance does not rediscover
-bindings from mutable graph state.
+connection. It owns that connection's control and pane render streams, output
+leases and workers, frontend input, prompt lifecycle descriptor and
+continuation, terminal dimensions, and installed `ClientView`. Prompt draft
+text, cursor position, and escape-sequence parsing do not exist in this
+server-side object. `ClientView` contains the wire `ClientLayout` and the exact
+pane actors resolved by the daemon, so the instance does not rediscover bindings
+from mutable graph state.
 
 The daemon sees the instance only through a passive `clientConnection`: its
 bounded delivery mailboxes, actor command channel, and `done` signal. QUIC
@@ -336,13 +337,13 @@ sequenceDiagram
     I-->>F: SESSION_ATTACH_OK with resume token
     I-->>F: Register matching input-mode cleanup
     I-->>F: Enable frontend input-reporting modes
-    I->>I: Open status and pane streams, create output leases
+    I->>I: Open eight pane streams and create output leases
     I->>D: ClientInitialized with ClientID and dimensions
     D->>D: Promote connection and prepare initial view
     D-->>I: ViewTransition
     I->>P: Install lease, revision, and grid
     P->>P: Resize atomically and start full snapshot
-    I-->>F: Initial status and CLIENT_LAYOUT
+    I-->>F: CLIENT_LAYOUT then complete CLIENT_STATUS
     P-->>F: START_RENDER and presented pane frames
 ```
 
@@ -500,7 +501,8 @@ does not re-walk the graph or derive a second binding answer.
 
 `applyViewTransition` rejects stale plans before disturbing the installed view,
 hands off any reused slots, and atomically installs each pane's lease, revision,
-and grid. It then publishes status and the prepared `CLIENT_LAYOUT`.
+and grid. It then publishes the prepared `CLIENT_LAYOUT` followed by a complete
+`CLIENT_STATUS` snapshot on the same control stream.
 `START_RENDER` and `CLIENT_LAYOUT` use the same allocated revision.
 
 Attach, reconnect, session/window changes, splits, layout and terminal resize,
@@ -554,11 +556,22 @@ exact-pointer detach and is a no-op once the pane holds the new lease.
 
 ## Client and status ownership
 
-Status output is part of the ClientInstance actor. The daemon supplies the
-current passive status model; the client owns status encoding, stream writes,
-prompts, and full refresh after replacement. Attaching or switching a client
-changes daemon assignment first, then the ClientInstance performs its output
-handoff without making the daemon wait for stream I/O.
+Status publication is part of the ClientInstance actor. The daemon supplies the
+current passive session/window status model; the instance combines it with its
+prompt descriptor or temporary-message state and sends a complete structured
+snapshot on the control stream. A prompt descriptor contains an opaque prompt
+ID, mode, label, and initial value, never the frontend's transient draft or
+cursor. The stable client identity owns the wire revision allocator, so prompt
+open/resolve transitions, message changes, session switches, and replacement
+transports remain monotonically ordered. Attaching or switching a client changes
+daemon assignment first, then the ClientInstance performs its output handoff
+without making the daemon wait for stream I/O.
+
+The native terminal client renders this snapshot as its bottom physical row and
+therefore subtracts one row before reporting drawable pane dimensions. A browser
+can instead render HTML chrome and report the cell grid left after its own
+layout. The server never globally subtracts a status row or truncates status
+fields.
 
 Status-only canonical changes return or post a `publishClientStatusAction`
 rather than forcing a view transition. For example, `set-root` commits the
@@ -584,8 +597,10 @@ the daemon transaction and return only immutable/advisory results.
 
 A group is the authority for one shared execution graph. It owns canonical
 windows, panes, layouts, dimensions, and daemon-global IDs. A session is the
-external view of that graph: active and previous window, focused pane, prompt,
-and status state belong to the session rather than the physical terminal.
+external view of that graph: active and previous window, focused pane, and
+passive status data belong to the session rather than the physical terminal.
+An interactive prompt's lifecycle descriptor and continuation belong to the
+transport-local ClientInstance; its editable draft belongs to the frontend.
 
 The final pane exiting ends the session. A network connection ending does not.
 
@@ -622,7 +637,7 @@ Preset layouts rebuild a tree from the current panes. Zoom is a projection of th
 
 Each pane starts a child process on a fresh PTY. An empty requested command starts the user's shell; an explicit command is resolved and launched through the same pane recipe. The pane records immutable launch metadata separately from later process observation.
 
-PTY output is read into pooled buffers and sent to the pane actor. Terminal-generated replies, such as device-status responses, travel back through the pane's owned input channel. User input follows the same PTY writer after session-level prefix, prompt, history, and application-cursor handling.
+PTY output is read into pooled buffers and sent to the pane actor. Terminal-generated replies, such as device-status responses, travel back through the pane's owned input channel. Ordinary user input follows the same PTY writer after session-level prefix, history, and application-cursor handling. While a Meja prompt is active, the frontend does not send ordinary input frames.
 
 ### Live process and command monitoring
 
@@ -684,7 +699,17 @@ A trailing Escape is held for 25 milliseconds at the client's local TTY boundary
 
 ## Server-side routing and re-encoding
 
-The ClientInstance actor decides whether an event belongs to Meja or to a pane application. Prefix commands, prompts, history interaction, and session switching stay on the command path. Ordinary pane input is re-encoded from the semantic event according to the pane's authoritative terminal metadata:
+The ClientInstance actor decides whether an event belongs to Meja or to a pane
+application. Prefix commands, history interaction, and session switching stay
+on the command path. An active Meja prompt is announced through
+`CLIENT_STATUS`; the frontend then intercepts keyboard and paste input, edits
+the draft locally, and sends exactly one `FRONTEND_PROMPT_RESULT` on submit or
+cancel. The result must carry the active opaque prompt ID. Stale results are
+ignored, and ordinary `FRONTEND_INPUT_BYTES` received while a prompt is active
+are dropped rather than interpreted as either prompt or pane input.
+
+Ordinary pane input is re-encoded from the semantic event according to the
+pane's authoritative terminal metadata:
 
 * normal versus application cursor keys;
 * bracketed paste;
@@ -806,12 +831,23 @@ The packed representation is an implementation optimization, not a change to ter
 Applying PTY bytes produces an `Update` describing visible consequences:
 
 * one dirty column span for each affected visible row;
-* a scroll delta;
+* an optional full-width `ScrollRegion` with inclusive `top`, exclusive
+  `bottom`, and signed row delta;
 * cursor or visibility changes;
 * terminal replies; and
 * a full-redraw marker for transformations that cannot be expressed safely as local damage.
 
-The pane actor merges updates into persistent per-row dirty spans. A brief idle period makes newly accumulated work eligible for rendering quickly; a maximum batch age prevents a continuous stream from postponing it forever. Damage coordinates are client-relative visible rows, even though the underlying row store also contains history. Detached panes parse without tracking render damage because their authoritative grid is sufficient for the next full refresh.
+The pane actor merges updates into persistent per-row dirty spans. Compatible
+scrolls coalesce only when their `[top,bottom)` regions and directions match;
+the accumulated delta is clamped to the region height. Dirty spans move only
+inside that region. Different regions, opposing directions, and other
+coordinate-space ambiguities promote the pending work to a full redraw. A
+brief idle period makes newly accumulated work eligible for rendering quickly;
+a maximum batch age prevents a continuous stream from postponing it forever.
+Damage coordinates are client-relative visible rows, even though the
+underlying row store also contains history. Detached panes parse without
+tracking render damage because their authoritative grid is sufficient for the
+next full refresh.
 
 Eligibility and buffer availability are separate. Once damage is due, the actor borrows the lease's buffer when the output worker offers it and encodes as much current grid state as fits. A successfully encoded prefix advances that row's dirty-span start; a complete span is cleared. A span that does not fit is left unchanged, and an encoded prefix leaves its suffix dirty. New PTY damage is unioned with any retained suffix, so later batches render the newest authoritative cells rather than an old cell snapshot. Scroll during a progressive multi-batch update promotes the work to a full redraw when shifting retained coordinates would be ambiguous.
 
@@ -885,9 +921,13 @@ Display streams use an opcode grammar rather than the generic control-frame enve
 | `WRITE_TEXT_UTF8_DEFAULT` | Advances one column per scalar and logically uses style zero | Avoids a separate style-selection command for common canonical-default text. |
 | `WRITE_CLUSTER` | Advances by one supplied cluster width | Writes exactly one opaque grapheme cluster. The client must not split or remeasure it. |
 | `FILL` | Advances by a column count | Repeats one scalar cell value and width across a run of columns. |
-| `SCROLL` | Changes the pane surface without moving the write latch | Scrolls the pane by a signed row delta. A frame carries at most one accumulated scroll operation. |
+| `SCROLL_REGION` | Changes the pane surface without moving the write latch | Scrolls complete-width rows in `[top,bottom)` by a signed delta. Negative moves surviving content upward; positive moves it downward. A frame carries at most one accumulated region operation. |
 | `CURSOR_UPDATE` | Replaces remembered cursor state | Publishes pane-relative cursor position and visibility. |
 | `PRESENT` | Ends the current semantic frame | Makes all commands since the previous presentation eligible for the client UI loop. |
+
+`SCROLL_REGION` encodes `top` and `bottom` as uvarints and `delta` with the
+display protocol's signed-varint convention. Its bottom coordinate is always
+exclusive.
 
 The command stream is stateful, but the state is deliberately small and reconstructable. `START_RENDER` supplies the grid needed to validate implicit advancement. Style installations and selection are local to the physical render stream. Position advances after writes, including an exact wrap from the last column to column zero of the next row. Cursor state is remembered separately and copied into the completed frame at `PRESENT`.
 
@@ -1013,9 +1053,16 @@ This yields the main relayout invariant:
 
 # Client rendering
 
-The client deliberately separates parallel stream decoding from serialized terminal output. QUIC gives each status or pane output stream independent ordering, so each accepted output stream receives its own decoder worker. For pane streams this is one goroutine per fixed pane output stream/render slot, whether that slot is currently bound or idle—not one goroutine per long-lived server pane. An output lease may later bind the same stream and worker to a different pane, with `START_RENDER` resetting the stream-local compiler.
+The client deliberately separates parallel stream decoding from serialized terminal output. Each of the eight pane output streams receives its own decoder worker, whether that slot is currently bound or idle—not one goroutine per long-lived server pane. An output lease may later bind the same stream and worker to a different pane, with `START_RENDER` resetting the stream-local compiler. These workers may block and decode independently, which preserves QUIC's cross-stream isolation, but none of them writes to the user's terminal.
 
-There is one additional worker for the status stream. These workers may block and decode independently, which preserves QUIC's cross-stream isolation, but none of them writes to the user's terminal.
+The control-stream worker decodes both `CLIENT_LAYOUT` and `CLIENT_STATUS`.
+Structured status snapshots enter the same render-event queue as pane frames;
+the single render goroutine rejects stale status revisions and paints the native
+status row from the newest snapshot. On a new prompt ID it creates a local draft
+from the descriptor's initial value. Further snapshots for the same prompt ID
+preserve that draft and cursor. The input goroutine sends prompt keystrokes into
+the render loop for immediate local editing and emits only the completed
+`FRONTEND_PROMPT_RESULT` on the control stream.
 
 ## Per-stream `renderFrame` compilation
 
@@ -1028,7 +1075,7 @@ Each decoder goroutine owns one `displayFrameCompiler`. It reads commands in ord
 * remembered cursor position and visibility; and
 * whether `START_RENDER` and a paint operation have occurred.
 
-It validates the stream while compiling: pane commands require `START_RENDER`; positions and implicit writes must stay inside the declared grid; styles must be defined before use; clusters and fills must have valid widths; a width-two cell cannot be split at a row edge; and a frame cannot contain multiple `SCROLL` commands.
+It validates the stream while compiling: pane commands require `START_RENDER`; positions and implicit writes must stay inside the declared grid; styles must be defined before use; clusters and fills must have valid widths; a width-two cell cannot be split at a row edge; `SCROLL_REGION` must satisfy `0 <= top < bottom <= rows`, `delta != 0`, and `abs(delta) <= bottom-top`; and a frame cannot contain multiple `SCROLL_REGION` commands.
 
 Text commands become pane-relative `paintSpan` values. A multi-row text command is split into row-local spans while the compiler's implicit position continues across the boundary. Fills are similarly split at row edges. `STYLE_INSTALL` definitions are collected in the frame rather than immediately affecting the physical terminal. Cursor updates change the compiler's remembered cursor and mark whether the frame explicitly changed it.
 
@@ -1038,10 +1085,10 @@ Text commands become pane-relative `paintSpan` values. A multi-row text command 
 flowchart LR
     Q1["Pane stream / slot 0"] --> G1["decoder goroutine"]
     Q2["Pane stream / slot 1"] --> G2["decoder goroutine"]
-    QS["Status stream"] --> GS["decoder goroutine"]
+    QC["Control stream"] --> GC["control decoder"]
     G1 -->|"presented renderFrame"| E["shared render-event channel"]
     G2 -->|"presented renderFrame"| E
-    GS -->|"presented renderFrame"| E
+    GC -->|"layout / status event"| E
     E --> R["single render goroutine"]
     R --> O["stdout / physical terminal"]
 ```
@@ -1075,13 +1122,21 @@ For every visible slot, the client keeps a pane-sized cache of client-only decod
 * before-and-after evidence for prediction reconciliation; and
 * atomic handling of wide and clustered cells.
 
-The cache is authoritative only in the sense that it mirrors the last server data received. It does not replace server state.
+For `SCROLL_REGION`, the cache discards rows leaving `[top,bottom)`, moves
+surviving row values in the indicated direction, and initializes exposed rows
+to canonical blank/default cells. Rows outside the region are not copied or
+mutated. The cache is authoritative only in the sense that it mirrors the last
+server data received. It does not replace server state.
 
 ## Physical terminal output
 
 Paint spans are translated into cursor movement, SGR style changes, UTF-8 writes, and fills on the user's terminal. Pane-relative coordinates are offset through the active layout rectangle. The focused pane's cursor becomes the physical cursor; non-focused pane cursors remain cached.
 
-When available, Meja uses top, bottom, left, and right margins to perform a native rectangular scroll within one pane. Margins are immediately reset afterward. If that operation is unavailable or unsafe, Meja scrolls the cache and repaints the pane instead.
+When available, Meja maps the operation's row region through the pane placement
+and uses top, bottom, left, and right margins to perform a native rectangular
+scroll within one pane. Full-width panes need only vertical margins. Margins
+are immediately reset afterward. If that operation is unavailable or unsafe,
+Meja scrolls the cache and repaints the pane instead.
 
 Raw mode, alternate-screen entry, frontend capture setup, frontend cleanup, OSC 52 writes, and final terminal restoration are serialized with normal rendering. A registered server-provided exit command is paired with a fixed client fallback so transport loss cannot leave the user's terminal in an attachment-specific input mode.
 
@@ -1289,7 +1344,7 @@ connection completes.
 
 ## Frontend terminal-control boundary
 
-After a pinned, authorized attachment, the server may send bounded terminal-control writes and register an attachment-specific exit command. This channel is used for frontend capture setup, cleanup, and OSC 52 clipboard delivery. It is not available before attach or resume succeeds, and arbitrary pane output is never copied raw onto this path; pane output is parsed into terminal state and rendered through the display protocol.
+After a pinned, authorized attachment, the server may send bounded terminal-control writes and register an attachment-specific exit command. This channel is used for frontend capture setup, cleanup, and OSC 52 clipboard delivery, including bounded OSC 52 writes allowlisted from the application in the attached pane. It is not available before attach or resume succeeds, and other pane output is never copied raw onto this path; pane output is parsed into terminal state and rendered through the display protocol.
 
 The client serializes these writes with rendering and executes cleanup before reconnecting or leaving. A compromised authenticated daemon could still emit hostile terminal controls, just as it could emit hostile rendered content. The trust decision is therefore the same pinned server attachment described above, not a second weaker channel.
 
@@ -1355,7 +1410,7 @@ scrolling, and input-event coalescing.
 Meja has two live compatibility surfaces. The command protocol versions the
 Unix/SSH request and result framing; its attach result contains a separately
 validated bootstrap payload in the current implementation. The exact QUIC
-ALPN, currently `meja-quic/13`, versions the complete interactive profile:
+ALPN, currently `meja-quic/14`, versions the complete interactive profile:
 attachment and resume messages, stream topology, control codecs, display
 opcodes, scanout/cache semantics, reconnect behavior, and coupled terminal
 behavior such as DSCLRM probing. Attach and resume messages therefore do not
@@ -1456,13 +1511,13 @@ The following statements summarize the contracts contributors should preserve:
 1. The daemon actor alone mutates server-wide session, group, window-link, and attachment registries.
 2. The daemon actor alone mutates canonical windows, panes, leases, and grouped relationships.
 3. SessionState is passive; the daemon mutates its view and graph data in short transactions.
-4. A ClientInstance actor owns prompts, frontend routing, output handoff, status, and transport-local state.
+4. A ClientInstance actor owns prompt lifecycle descriptors and continuations, frontend routing, output handoff, status, and transport-local state; the frontend alone owns transient prompt drafts and cursors.
 5. A pane actor alone mutates its terminal state, packed row store, history view, pending damage, and output lease.
 6. A pane and its PTY outlive replacement of the attached client transport.
 7. One stable `ClientID` and canonical `ClientIdentity` represent one logical client across many disposable client instances; `clients` and `clientTokens` are the only client indexes.
 8. A client identity has at most one active and one pending connection address; a pending replacement receives its initial view only after the previous active connection completes.
 9. A session has at most one controlling logical client.
-10. The bidirectional control stream is the authoritative interactive lifecycle and input path.
+10. The bidirectional control stream is the authoritative interactive lifecycle and input path; prompt descriptors arrive in complete status snapshots and prompt submit/cancel results return as structured control messages.
 11. Disconnected ordinary input is dropped rather than replayed later.
 12. Server-provided frontend setup has paired cleanup, and terminal writes are serialized by the client UI loop.
 13. Every full visible replacement is installed from one daemon-resolved `ViewTransition`; application uses its `ClientView` and does not rebuild pane placements or layout from live graph state.
@@ -1488,7 +1543,7 @@ The following statements summarize the contracts contributors should preserve:
 33. Recovery snapshots and `.meja` project files are restart recipes, not process images.
 34. `restore` consumes daemon-managed named-session snapshots; `new -f` consumes explicit project files.
 35. Initial remote attachment authority is transferred through SSH; the direct QUIC connection must match that bootstrap.
-36. ClientInstance local state is ordinary actor-owned state; status/output workers receive immutable messages and timers post only copied generation IDs.
+36. ClientInstance local state is ordinary actor-owned state; frontend prompt drafts are client render-loop state, pane-output workers receive immutable render batches, wire status snapshots are complete and monotonically revised, and timers post only copied generation IDs.
 37. Daemon transactions prepare client deliveries but never block delivering them; required FIFO and coalescible status traffic use distinct bounded mailbox semantics.
 38. The synchronization allowlist is exact and enforced by a production-source AST/type test.
 

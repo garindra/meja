@@ -1,6 +1,9 @@
 package protocol
 
-import "fmt"
+import (
+	"fmt"
+	"unicode/utf8"
+)
 
 func EncodeSessionAttach(dst []byte, msg SessionAttach) ([]byte, error) {
 	w := PayloadWriter{Buf: dst}
@@ -203,4 +206,44 @@ func DecodeFrontendExecuteTerminalExitCommand(payload []byte) (FrontendExecuteTe
 		return FrontendExecuteTerminalExitCommand{}, fmt.Errorf("decode FrontendExecuteTerminalExitCommand: %w", err)
 	}
 	return FrontendExecuteTerminalExitCommand{Message: message}, nil
+}
+
+func EncodeFrontendPromptResult(dst []byte, msg FrontendPromptResult) ([]byte, error) {
+	if msg.PromptID == 0 {
+		return nil, fmt.Errorf("encode FrontendPromptResult: zero prompt ID")
+	}
+	if !utf8.ValidString(msg.Text) {
+		return nil, fmt.Errorf("encode FrontendPromptResult: text is not valid UTF-8")
+	}
+	if uint64(len(msg.Text)) > MaxStringLen {
+		return nil, fmt.Errorf("encode FrontendPromptResult: text length %d exceeds max %d", len(msg.Text), MaxStringLen)
+	}
+	w := PayloadWriter{Buf: dst}
+	w.Uvarint(msg.PromptID)
+	w.Bool(msg.Submitted)
+	w.String(msg.Text)
+	return w.Buf, nil
+}
+
+func DecodeFrontendPromptResult(payload []byte) (FrontendPromptResult, error) {
+	r := PayloadReader{Data: payload}
+	promptID, err := r.Uvarint()
+	if err != nil {
+		return FrontendPromptResult{}, fmt.Errorf("decode FrontendPromptResult prompt ID: %w", err)
+	}
+	if promptID == 0 {
+		return FrontendPromptResult{}, fmt.Errorf("decode FrontendPromptResult: zero prompt ID")
+	}
+	submitted, err := r.Bool()
+	if err != nil {
+		return FrontendPromptResult{}, fmt.Errorf("decode FrontendPromptResult submitted: %w", err)
+	}
+	text, err := r.String(MaxStringLen)
+	if err != nil {
+		return FrontendPromptResult{}, fmt.Errorf("decode FrontendPromptResult text: %w", err)
+	}
+	if err := r.Done(); err != nil {
+		return FrontendPromptResult{}, fmt.Errorf("decode FrontendPromptResult: %w", err)
+	}
+	return FrontendPromptResult{PromptID: promptID, Submitted: submitted, Text: text}, nil
 }

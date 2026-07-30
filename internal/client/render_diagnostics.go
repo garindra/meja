@@ -322,8 +322,8 @@ func incomingRenderOpcodeName(opcode protocol.DisplayOpcode) string {
 		return "Fill"
 	case protocol.DisplayOpcodeCursorUpdate:
 		return "CursorUpdate"
-	case protocol.DisplayOpcodeScroll:
-		return "Scroll"
+	case protocol.DisplayOpcodeScrollRegion:
+		return "ScrollRegion"
 	case protocol.DisplayOpcodePresent:
 		return "Present"
 	default:

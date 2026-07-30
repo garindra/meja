@@ -80,6 +80,7 @@ func TestClientViewBindsResolvedPaneWithoutGraphReread(t *testing.T) {
 	state, client, pane, plan := preparedTransitionFixture(t, 12, 4)
 	wire := &bytes.Buffer{}
 	client.Output[0] = testOutputLease(0, wire)
+	client.controlOut = make(chan protocol.Frame, 4)
 	transition := ViewTransition{Reason: viewTransitionSelectWindow, Projection: plan}
 
 	// Once prepared, application must use the resolved pane carried in the

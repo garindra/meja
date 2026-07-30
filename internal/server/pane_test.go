@@ -63,6 +63,76 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 	<-pane.writerDone
 }
 
+func TestPaneForwardsApplicationOSC52ToAttachedFrontend(t *testing.T) {
+	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
+	pane.initializeRuntime()
+	go pane.run()
+	defer func() {
+		close(pane.ptyOutput)
+		<-pane.mainDone
+	}()
+
+	writes := make(chan []byte, 1)
+	lease := &OutputLease{
+		Slot:   0,
+		Stream: io.Discard,
+		frontendTerminalWrite: func(data []byte) error {
+			writes <- append([]byte(nil), data...)
+			return nil
+		},
+	}
+	if err := pane.installOutputLease(lease, 1, 8, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	output := takePTYReadBuffer()
+	const sequence = "\x1b]52;c;Y29weQ==\x1b\\"
+	n := copy(output, sequence)
+	pane.ptyOutput <- output[:n]
+
+	select {
+	case got := <-writes:
+		if string(got) != sequence {
+			t.Fatalf("frontend write = %q, want %q", got, sequence)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for OSC 52 frontend write")
+	}
+}
+
+func TestPaneOSC52KeepsFrontendDestinationAcrossPaneSwap(t *testing.T) {
+	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
+	var firstWrites, replacementWrites [][]byte
+	first := func(data []byte) error {
+		firstWrites = append(firstWrites, append([]byte(nil), data...))
+		return nil
+	}
+	replacement := func(data []byte) error {
+		replacementWrites = append(replacementWrites, append([]byte(nil), data...))
+		return nil
+	}
+
+	var update Update
+	update.Reset(pane.terminal.Rows)
+	pane.terminal.ApplyInto([]byte("\x1b]52;c;Y29w"), &update)
+	if err := pane.routeFrontendWrites(&update, first); err != nil {
+		t.Fatal(err)
+	}
+
+	update.Reset(pane.terminal.Rows)
+	pane.terminal.ApplyInto([]byte("eQ==\x1b\\"), &update)
+	if err := pane.routeFrontendWrites(&update, replacement); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(firstWrites) != 1 || string(firstWrites[0]) != "\x1b]52;c;Y29weQ==\x1b\\" {
+		t.Fatalf("original frontend writes = %q", firstWrites)
+	}
+	if len(replacementWrites) != 0 {
+		t.Fatalf("replacement frontend writes = %q, want none", replacementWrites)
+	}
+}
+
 func TestPaneStartupInputWaitsForInitialOutputToSettle(t *testing.T) {
 	reader, writer, err := os.Pipe()
 	if err != nil {

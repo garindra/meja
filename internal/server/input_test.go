@@ -170,7 +170,7 @@ func TestClosePanePromptsBeforeKilling(t *testing.T) {
 		t.Fatal("pane was killed before confirmation")
 	}
 
-	if _, err := clientForState(s).handleServerInputEvent(clientForState(s).ConsumeInputByte('\r')); err != nil {
+	if _, err := resolveTestPrompt(clientForState(s), false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if clientForState(s).ActivePrompt() != nil || s.Pane(second.ID) == nil {
@@ -182,7 +182,7 @@ func TestClosePanePromptsBeforeKilling(t *testing.T) {
 	if _, err := clientForState(s).handleServerInputEvent(event); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := clientForState(s).handleServerInputEvent(clientForState(s).ConsumeInputByte('y')); err != nil {
+	if _, err := resolveTestPrompt(clientForState(s), true, "y"); err != nil {
 		t.Fatal(err)
 	}
 	if clientForState(s).ActivePrompt() != nil || s.Pane(second.ID) != nil {
@@ -191,6 +191,40 @@ func TestClosePanePromptsBeforeKilling(t *testing.T) {
 	got, _ := testActivePane(s)
 	if got != first {
 		t.Fatalf("active pane after close = %#v, want %#v", got, first)
+	}
+}
+
+func TestStalePromptResultDoesNotResolveActivePrompt(t *testing.T) {
+	s := NewSessionState(1)
+	client := newTestClient(s)
+	window, _ := createTestWindow(s, &Pane{
+		ID: testAddPaneID(s), Title: "before", terminal: newTerminal(80, 24),
+	})
+	if _, err := executeTestClientCommand(client, []string{"rename-window"}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := client.ActivePrompt()
+	if prompt == nil {
+		t.Fatal("rename-window did not open a prompt")
+	}
+	if _, err := client.resolvePrompt(protocol.FrontendPromptResult{
+		PromptID: prompt.ID + 1, Submitted: true, Text: "stale",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if active := client.ActivePrompt(); active == nil || active.ID != prompt.ID {
+		t.Fatalf("stale result changed active prompt: %#v", active)
+	}
+	if window.Name != "before" {
+		t.Fatalf("stale result renamed window to %q", window.Name)
+	}
+	if _, err := client.resolvePrompt(protocol.FrontendPromptResult{
+		PromptID: prompt.ID, Submitted: true, Text: "after",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if client.ActivePrompt() != nil || window.Name != "after" {
+		t.Fatalf("matching result left prompt=%#v window=%q", client.ActivePrompt(), window.Name)
 	}
 }
 
@@ -237,12 +271,26 @@ func TestSwitchSessionPromptAppliesPreparedTransition(t *testing.T) {
 	identity.lastAllocatedClientLayoutRevision = client.currentView.Layout.LayoutRevision
 	d.windowLeases[source.ActiveWindowID] = &WindowViewLease{WindowID: source.ActiveWindowID, SessionID: source.ID, ClientID: client.clientID, Generation: 1}
 
-	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: append([]byte{0x02, ':'}, []byte("switch-session -t logs\r")...)})
+	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: []byte{0x02, ':'}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var input bytes.Buffer
 	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handleTestControlFrames(source, client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize)); err != nil {
+		t.Fatal(err)
+	}
+	prompt := client.ActivePrompt()
+	resultPayload, err := protocol.EncodeFrontendPromptResult(nil, protocol.FrontendPromptResult{
+		PromptID: prompt.ID, Submitted: true, Text: "switch-session -t logs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.Reset()
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendPromptResult, Payload: resultPayload}); err != nil {
 		t.Fatal(err)
 	}
 	if err := handleTestControlFrames(source, client, protocol.NewDecoder(&input, protocol.DefaultMaxFrameSize)); err != nil {
@@ -408,92 +456,7 @@ func TestHandleInputBytesAppliesRepeatedPaneResize(t *testing.T) {
 	}
 }
 
-func TestServerPromptEditsAndCancelsAuthoritatively(t *testing.T) {
-	s := NewSessionState(0)
-	newTestClient(s)
-	pane := &Pane{ID: testAddPaneID(s), Title: "bash"}
-	window, _ := createTestWindow(s, pane)
-
-	clientForState(s).ConsumeInputByte(0x02)
-	if event := clientForState(s).ConsumeInputByte(','); !isCommandInput(event, "rename-window") {
-		t.Fatalf("rename prompt event = %#v", event)
-	}
-	if _, err := executeTestClientCommand(clientForState(s), []string{"rename-window"}); err != nil {
-		t.Fatal(err)
-	}
-	if event := clientForState(s).ConsumeInputByte('x'); event.Command != serverCommandPrompt || event.PromptAction != PromptActionChanged {
-		t.Fatalf("prompt text event = %#v", event)
-	}
-	if got := string(clientForState(s).ActivePrompt().Text); got != "bashx" {
-		t.Fatalf("prompt text after typing = %q", got)
-	}
-	if event := clientForState(s).ConsumeInputByte(0x7f); event.Command != serverCommandPrompt || event.PromptAction != PromptActionChanged {
-		t.Fatalf("backspace event = %#v", event)
-	}
-	if got := string(clientForState(s).ActivePrompt().Text); got != "bash" {
-		t.Fatalf("prompt text after backspace = %q", got)
-	}
-	for _, b := range []byte("xy") {
-		clientForState(s).ConsumeInputByte(b)
-	}
-	consumed, events, terminated := clientForState(s).ConsumePromptInput([]byte("\x1b[3~"))
-	if consumed != 4 || len(events) != 1 || events[0].PromptAction != PromptActionChanged || terminated {
-		t.Fatalf("delete sequence consumed=%d events=%#v terminated=%v", consumed, events, terminated)
-	}
-	if got := string(clientForState(s).ActivePrompt().Text); got != "bashx" {
-		t.Fatalf("prompt text after delete = %q", got)
-	}
-	if event := clientForState(s).ConsumeInputByte(0x1b); event.Command != serverCommandNone {
-		t.Fatalf("escape prefix event = %#v", event)
-	}
-	if event := clientForState(s).ConsumeInputByte('x'); event.Command != serverCommandPrompt || event.PromptAction != PromptActionCancel {
-		t.Fatalf("bare escape cancel event = %#v", event)
-	}
-	if clientForState(s).ActivePrompt() != nil {
-		t.Fatal("prompt remained active after escape")
-	}
-	if s.Windows[window.ID].Name != "bash" {
-		t.Fatalf("cancel changed window name to %q", s.Windows[window.ID].Name)
-	}
-}
-
-func TestPromptDeleteSequenceSurvivesEveryPayloadBoundary(t *testing.T) {
-	sequence := []byte{0x1b, '[', '3', '~'}
-	for boundary := 1; boundary < len(sequence); boundary++ {
-		s := NewSessionState(0)
-		newTestClient(s)
-		createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash"})
-		if _, err := executeTestClientCommand(clientForState(s), []string{"rename-window"}); err != nil {
-			t.Fatal(err)
-		}
-		for _, b := range []byte("x") {
-			clientForState(s).ConsumeInputByte(b)
-		}
-
-		consumed, events, terminated := clientForState(s).ConsumePromptInput(sequence[:boundary])
-		if consumed != boundary || len(events) != 0 || terminated {
-			t.Fatalf("boundary %d first payload consumed=%d events=%#v terminated=%v", boundary, consumed, events, terminated)
-		}
-		prompt := clientForState(s).ActivePrompt()
-		if prompt == nil || !bytes.Equal(prompt.PendingEscape, sequence[:boundary]) {
-			var pending []byte
-			if prompt != nil {
-				pending = prompt.PendingEscape
-			}
-			t.Fatalf("boundary %d pending escape=%#v prompt=%#v", boundary, pending, prompt)
-		}
-
-		consumed, events, terminated = clientForState(s).ConsumePromptInput(sequence[boundary:])
-		if consumed != len(sequence)-boundary || len(events) != 1 || events[0].PromptAction != PromptActionChanged || terminated {
-			t.Fatalf("boundary %d second payload consumed=%d events=%#v terminated=%v", boundary, consumed, events, terminated)
-		}
-		if got := string(clientForState(s).ActivePrompt().Text); got != "bash" {
-			t.Fatalf("boundary %d prompt text=%q, want bash", boundary, got)
-		}
-	}
-}
-
-func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
+func TestPromptBlocksOrdinaryInputAndAcceptsStructuredResult(t *testing.T) {
 	s := NewSessionState(1)
 	client := newTestClient(s)
 	client.setTestTerminalSize(80, 23)
@@ -511,11 +474,21 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 	}
 
 	var input bytes.Buffer
-	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: []byte("x\rLEAK")})
+	payload, err := protocol.EncodeFrontendInputBytes(nil, protocol.FrontendInputBytes{Data: []byte("LEAK")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendInputBytes, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := clientForState(s).ActivePrompt()
+	resultPayload, err := protocol.EncodeFrontendPromptResult(nil, protocol.FrontendPromptResult{
+		PromptID: prompt.ID, Submitted: true, Text: "bashx",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.NewEncoder(&input).WriteFrame(protocol.Frame{Type: protocol.MsgFrontendPromptResult, Payload: resultPayload}); err != nil {
 		t.Fatal(err)
 	}
 	state := s
@@ -530,7 +503,7 @@ func TestPromptTerminationConsumesRemainderWithoutPTYLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 0 {
-		t.Fatalf("prompt input leaked to PTY: %q", got)
+		t.Fatalf("ordinary input while prompt active leaked to PTY: %q", got)
 	}
 	if window.Name != "bashx" || clientForState(s).ActivePrompt() != nil {
 		t.Fatalf("prompt termination state window=%q prompt=%#v", window.Name, clientForState(s).ActivePrompt())
@@ -604,26 +577,6 @@ func TestStaleTransportInputIsIgnoredAfterReconnect(t *testing.T) {
 	current := clientForState(s)
 	if cols, rows := current.terminalCols, current.terminalRows; cols != 80 || rows != 24 {
 		t.Fatalf("stale resize changed client size to %dx%d", cols, rows)
-	}
-}
-
-func TestPromptBufferIsRuneAware(t *testing.T) {
-	s := NewSessionState(0)
-	newTestClient(s)
-	createTestWindow(s, &Pane{ID: testAddPaneID(s), Title: "bash"})
-	if _, err := clientForState(s).BeginPrompt(PromptModeText, "prompt ", "猫"); err != nil {
-		t.Fatal(err)
-	}
-	for _, b := range []byte("é") {
-		clientForState(s).ConsumeInputByte(b)
-	}
-	prompt := clientForState(s).ActivePrompt()
-	if got := string(prompt.Text); got != "猫é" || prompt.Cursor != 2 {
-		t.Fatalf("rune prompt = %#v, want text 猫é cursor 2", prompt)
-	}
-	clientForState(s).ConsumeInputByte(0x7f)
-	if got := string(clientForState(s).ActivePrompt().Text); got != "猫" {
-		t.Fatalf("rune prompt after backspace = %q", got)
 	}
 }
 

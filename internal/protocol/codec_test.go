@@ -56,7 +56,7 @@ func TestDisplayWireBytesCoverAllCommandSchemas(t *testing.T) {
 	_ = encoder.AppendWriteTextUTF8Default([]byte(" "))
 	_ = encoder.AppendFill(Fill{Columns: 3, Rune: ' ', Width: 1})
 	_ = encoder.AppendCursorUpdate(CursorUpdate{Cursor: Cursor{X: 2, Y: 3}, Visible: true})
-	_ = encoder.AppendScroll(Scroll{Delta: -1})
+	_ = encoder.AppendScrollRegion(ScrollRegion{Top: 0, Bottom: 24, Delta: -1})
 	encoder.AppendPresent()
 	want := []byte{
 		0x02, 0x02, 0x01, 0x01, 0x07, 0x00,
@@ -66,7 +66,7 @@ func TestDisplayWireBytesCoverAllCommandSchemas(t *testing.T) {
 		0x07, 0x01, ' ',
 		0x08, 0x03, 0x20, 0x01,
 		0x09, 0x02, 0x03, 0x01,
-		0x0a, 0x01,
+		0x0a, 0x00, 0x18, 0x01,
 		0xff,
 	}
 	if !bytes.Equal(encoder.Bytes(), want) {
@@ -85,7 +85,7 @@ func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
 		{Opcode: DisplayOpcodeWriteCluster, Width: 2, Text: []byte("👩‍💻")},
 		{Opcode: DisplayOpcodeFill, Fill: Fill{Columns: 3, Rune: ' ', Width: 1}},
 		{Opcode: DisplayOpcodeCursorUpdate, Cursor: CursorUpdate{Cursor: Cursor{X: 2, Y: 3}, Visible: true}},
-		{Opcode: DisplayOpcodeScroll, Delta: -1},
+		{Opcode: DisplayOpcodeScrollRegion, ScrollRegion: ScrollRegion{Top: 2, Bottom: 20, Delta: -1}},
 	}
 	if err := encoder.AppendStartRender(StartRender{LayoutRevision: 7, Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
@@ -201,11 +201,14 @@ func TestDisplayDecoderMultipleBatches(t *testing.T) {
 
 func TestDisplayDecoderRejectsMalformedCommands(t *testing.T) {
 	for name, data := range map[string][]byte{
-		"unknown opcode":     {0x7f},
-		"truncated position": {byte(DisplayOpcodeSetWritePosition), 0x01},
-		"invalid width":      {byte(DisplayOpcodeWriteText), 0x03, 0x00},
-		"truncated text":     {byte(DisplayOpcodeWriteTextUTF8), 0x03, 'a'},
-		"invalid utf8":       {byte(DisplayOpcodeWriteTextUTF8), 0x01, 0xff},
+		"unknown opcode":      {0x7f},
+		"truncated position":  {byte(DisplayOpcodeSetWritePosition), 0x01},
+		"invalid width":       {byte(DisplayOpcodeWriteText), 0x03, 0x00},
+		"truncated text":      {byte(DisplayOpcodeWriteTextUTF8), 0x03, 'a'},
+		"invalid utf8":        {byte(DisplayOpcodeWriteTextUTF8), 0x01, 0xff},
+		"empty scroll region": {byte(DisplayOpcodeScrollRegion), 0x02, 0x02, 0x01},
+		"zero scroll delta":   {byte(DisplayOpcodeScrollRegion), 0x00, 0x02, 0x00},
+		"oversize scroll":     {byte(DisplayOpcodeScrollRegion), 0x01, 0x03, 0x06},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, _, err := NewDisplayDecoder(bytes.NewReader(data)).ReadCommand()
@@ -213,6 +216,38 @@ func TestDisplayDecoderRejectsMalformedCommands(t *testing.T) {
 				t.Fatal("accepted malformed display stream")
 			}
 		})
+	}
+}
+
+func TestScrollRegionEncoderRejectsInvalidValues(t *testing.T) {
+	for _, region := range []ScrollRegion{
+		{Top: -1, Bottom: 2, Delta: -1},
+		{Top: 2, Bottom: 2, Delta: -1},
+		{Top: 0, Bottom: 2, Delta: 0},
+		{Top: 0, Bottom: 2, Delta: 3},
+	} {
+		if err := NewDisplayEncoder(nil).AppendScrollRegion(region); err == nil {
+			t.Fatalf("accepted invalid scroll region %#v", region)
+		}
+	}
+}
+
+func TestScrollRegionRoundTripsBothDirections(t *testing.T) {
+	for _, region := range []ScrollRegion{
+		{Top: 0, Bottom: 20, Delta: -1},
+		{Top: 6, Bottom: 19, Delta: 1},
+	} {
+		encoder := NewDisplayEncoder(nil)
+		if err := encoder.AppendScrollRegion(region); err != nil {
+			t.Fatal(err)
+		}
+		command, _, err := NewDisplayDecoder(bytes.NewReader(encoder.Bytes())).ReadCommand()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if command.Opcode != DisplayOpcodeScrollRegion || command.ScrollRegion != region {
+			t.Fatalf("round trip = %#v, want %#v", command, region)
+		}
 	}
 }
 

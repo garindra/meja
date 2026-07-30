@@ -395,7 +395,7 @@ func TestQUICDialALPNRejectionReportsIncompatibleServer(t *testing.T) {
 		ErrorMessage: "tls: no application protocol",
 	}
 	err := quicDialError("example.com:60000", cause)
-	want := `server at example.com:60000 did not accept client QUIC profile "meja-quic/13"; the remote meja binary and running server must use the same QUIC profile as this client. Compare "meja version --verbose" locally with "meja server-version" using the same remote transport options, check --remote-path, and restart the remote server: CRYPTO_ERROR 0x178 (remote): tls: no application protocol`
+	want := `server at example.com:60000 did not accept client QUIC profile "meja-quic/14"; the remote meja binary and running server must use the same QUIC profile as this client. Compare "meja version --verbose" locally with "meja server-version" using the same remote transport options, check --remote-path, and restart the remote server: CRYPTO_ERROR 0x178 (remote): tls: no application protocol`
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err, want)
 	}
@@ -1043,12 +1043,9 @@ func TestStatusFullRefreshClearsReconnectIndicator(t *testing.T) {
 	ui.emit(sizeEvent{cols: 80, rows: 24})
 	ui.beginConnection(true, time.Now())
 	waitForBufferText(t, &stdout, " Reconnecting")
-	ui.emit(paneFrameEvent{slot: protocol.StatusRenderSlot, frame: renderFrame{
-		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 88, B: 170}}}},
-		spans: []paintSpan{
-			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: ' ', fillColumns: 80},
-			{kind: paintText, styleID: 1, cellWidth: 1, text: []byte("ready")},
-		},
+	ui.emit(statusEvent{status: protocol.ClientStatus{
+		Revision: 1, SessionID: 1, ServerHostname: "host",
+		Kind: protocol.ClientStatusMessage, Message: protocol.ClientStatusMessageState{ID: 1, Text: "ready"},
 	}})
 	ui.beginConnection(false, time.Time{})
 	waitForBufferText(t, &stdout, "ready")
@@ -1064,14 +1061,11 @@ func TestStatusFullRefreshClearsReconnectIndicator(t *testing.T) {
 func TestLayoutActivationPreservesStatusRow(t *testing.T) {
 	s := newScanoutState(true)
 	s.cols, s.rows = 12, 4
-	status := renderFrame{
-		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "rgb", R: 42, G: 88, B: 170}}}},
-		spans: []paintSpan{
-			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: ' ', fillColumns: 12},
-			{kind: paintText, styleID: 1, cellWidth: 1, text: []byte("1:shell*")},
-		},
+	status := protocol.ClientStatus{
+		Revision: 1, SessionID: 1, ServerHostname: "host", Kind: protocol.ClientStatusNormal,
+		Windows: []protocol.ClientStatusWindow{{WindowID: 1, Index: 1, Title: "shell", Active: true}},
 	}
-	if _, err := s.acceptFrame(protocol.StatusRenderSlot, status); err != nil {
+	if _, err := s.acceptStatus(status); err != nil {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
@@ -1089,25 +1083,19 @@ func TestLayoutActivationPreservesStatusRow(t *testing.T) {
 	}
 }
 
-func TestStaleWideStatusFrameIsClippedAfterNarrowResize(t *testing.T) {
+func TestStructuredStatusUsesCurrentTerminalWidth(t *testing.T) {
 	state := newScanoutState(true)
 	state.cols, state.rows = 20, 4
-	status := renderFrame{
-		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "indexed", Index: 4}}}},
-		spans: []paintSpan{
-			{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: 'x', fillColumns: 80},
-			{kind: paintText, column: 70, styleID: 1, cellWidth: 1, text: []byte("offscreen")},
-		},
+	status := protocol.ClientStatus{
+		Revision: 1, SessionID: 1, ServerHostname: "host", Kind: protocol.ClientStatusMessage,
+		Message: protocol.ClientStatusMessageState{ID: 1, Text: strings.Repeat("x", 80)},
 	}
-	if _, err := state.acceptFrame(protocol.StatusRenderSlot, status); err != nil {
+	if _, err := state.acceptStatus(status); err != nil {
 		t.Fatal(err)
 	}
 	out := string(state.takeANSI())
-	if got := strings.Count(out, "x"); got != 20 {
-		t.Fatalf("narrow status emitted %d cells from stale wide frame, want 20: %q", got, out)
-	}
-	if strings.Contains(out, "offscreen") {
-		t.Fatalf("narrow status emitted off-screen stale text: %q", out)
+	if got := strings.Count(out, "x"); got >= 80 {
+		t.Fatalf("narrow status was not truncated: %q", out)
 	}
 }
 
@@ -1116,11 +1104,11 @@ func TestStatusFrameCannotWrapWhileLocalResizeEventIsPending(t *testing.T) {
 	// The kernel terminal is already 20 columns wide, but the render loop has
 	// not consumed its sizeEvent yet and still believes the old width is 80.
 	state.cols, state.rows = 80, 4
-	status := renderFrame{
-		styleInstalls: []protocol.StyleDefinition{{ID: 1, Style: protocol.Style{BG: protocol.Color{Mode: "indexed", Index: 4}}}},
-		spans:         []paintSpan{{kind: paintFill, styleID: 1, cellWidth: 1, fillRune: 'x', fillColumns: 80}},
+	status := protocol.ClientStatus{
+		Revision: 1, SessionID: 1, ServerHostname: "host", Kind: protocol.ClientStatusMessage,
+		Message: protocol.ClientStatusMessageState{ID: 1, Text: strings.Repeat("x", 80)},
 	}
-	if _, err := state.acceptFrame(protocol.StatusRenderSlot, status); err != nil {
+	if _, err := state.acceptStatus(status); err != nil {
 		t.Fatal(err)
 	}
 	out := state.takeANSI()
@@ -1341,31 +1329,40 @@ func TestPinnedTLSRequiresExactSPKI(t *testing.T) {
 	}
 }
 
-func TestStatusOutputAcceptsBarrierlessDisplayFrame(t *testing.T) {
-	encoder := protocol.NewDisplayEncoder(nil)
-	commands := []protocol.DisplayCommand{
-		{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: 1, Style: protocol.Style{Bold: true}},
-		{Opcode: protocol.DisplayOpcodeSetWritePosition},
-		{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: 1},
-		{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("status")},
-		{Opcode: protocol.DisplayOpcodePresent},
+func TestStatusSnapshotsIgnoreOlderRevisions(t *testing.T) {
+	state := newScanoutState(false)
+	state.cols, state.rows = 20, 4
+	if changed, err := state.acceptStatus(protocol.ClientStatus{Revision: 2, Kind: protocol.ClientStatusMessage, Message: protocol.ClientStatusMessageState{Text: "new"}}); err != nil || !changed {
+		t.Fatalf("new status changed=%v err=%v", changed, err)
 	}
-	for _, command := range commands {
-		if err := encoder.AppendCommand(command); err != nil {
-			t.Fatal(err)
-		}
+	_ = state.takeANSI()
+	if changed, err := state.acceptStatus(protocol.ClientStatus{Revision: 1, Kind: protocol.ClientStatusMessage, Message: protocol.ClientStatusMessageState{Text: "old"}}); err != nil || changed {
+		t.Fatalf("stale status changed=%v err=%v", changed, err)
 	}
-	ui := &runtimeState{events: make(chan renderEvent, 1)}
-	errs := make(chan error, 1)
-	readOutputStream(protocol.StatusRenderSlot, protocol.NewDisplayDecoder(bytes.NewReader(encoder.Bytes())), ui, errs, nil, nil)
-	select {
-	case event := <-ui.events:
-		frame, ok := event.(paneFrameEvent)
-		if !ok || frame.slot != protocol.StatusRenderSlot || frame.frame.layoutRevision != 0 || len(frame.frame.spans) != 1 {
-			t.Fatalf("status event = %#v", event)
-		}
-	default:
-		t.Fatal("barrierless status batch was not emitted")
+	if out := state.takeANSI(); len(out) != 0 {
+		t.Fatalf("stale status emitted output %q", out)
+	}
+}
+
+func TestStructuredPromptStatusSelectsNativeStatusCursor(t *testing.T) {
+	state := newScanoutState(false)
+	state.cols, state.rows = 20, 4
+	status := protocol.ClientStatus{
+		Revision: 1,
+		Kind:     protocol.ClientStatusPrompt,
+		Prompt: protocol.ClientStatusPromptState{
+			PromptID: 1, Mode: protocol.ClientStatusPromptText, Label: ":", Initial: "abc",
+		},
+	}
+	if changed, err := state.acceptStatus(status); err != nil || !changed {
+		t.Fatalf("prompt status changed=%v err=%v", changed, err)
+	}
+	outcome := state.acceptPromptInput([]byte("\x1b[D"), false)
+	if !outcome.handled || !outcome.changed || outcome.result != nil {
+		t.Fatalf("left prompt input = %#v", outcome)
+	}
+	if got, want := state.activeCursor, (physicalCursor{row: 4, column: 4, visible: true, valid: true}); got != want {
+		t.Fatalf("prompt cursor = %#v, want %#v", got, want)
 	}
 }
 
@@ -1441,9 +1438,67 @@ func TestDisplayFrameCompilerRejectsWriteBeyondGrid(t *testing.T) {
 func TestDisplayFrameCompilerRejectsMultipleScrolls(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
 	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2})
-	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: -1})
-	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScroll, Delta: -1}); err == nil {
+	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: protocol.ScrollRegion{Top: 0, Bottom: 2, Delta: -1}})
+	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: protocol.ScrollRegion{Top: 0, Bottom: 2, Delta: -1}}); err == nil {
 		t.Fatal("multiple scroll commands in one frame were accepted")
+	}
+}
+
+func TestDisplayFrameCompilerRejectsInvalidScrollRegionForGrid(t *testing.T) {
+	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
+	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 3})
+	for _, region := range []protocol.ScrollRegion{
+		{Top: 0, Bottom: 4, Delta: -1},
+		{Top: 1, Bottom: 1, Delta: -1},
+		{Top: 0, Bottom: 3, Delta: 0},
+		{Top: 0, Bottom: 3, Delta: 4},
+	} {
+		if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: region}); err == nil {
+			t.Fatalf("accepted invalid region %#v", region)
+		}
+	}
+}
+
+func TestPaneScanoutCacheScrollRegion(t *testing.T) {
+	cache := newPaneScanoutCache(2, 20)
+	for row := 0; row < cache.rows; row++ {
+		cache.row(row)[0] = scanoutCell{Cluster: fmt.Sprintf("%02d", row), StyleID: uint32(row + 1), Width: 1}
+		cache.row(row)[1] = scanoutCell{Cluster: "x", StyleID: uint32(row + 1), Width: 1}
+	}
+	statusBefore := append([]scanoutCell(nil), cache.row(19)...)
+	cache.scrollRegion(protocol.ScrollRegion{Top: 0, Bottom: 19, Delta: -1})
+	for row := 0; row < 18; row++ {
+		if got := cache.row(row)[0].Cluster; got != fmt.Sprintf("%02d", row+1) {
+			t.Fatalf("row %d cluster = %q", row, got)
+		}
+	}
+	for column, cell := range cache.row(18) {
+		if cell != (scanoutCell{Width: 1}) {
+			t.Fatalf("blank row 18 column %d = %#v", column, cell)
+		}
+	}
+	evidence := frameEvidence{touched: make(map[cellPosition]authoritativeCellChange)}
+	if err := applySpanToCache(cache, paintSpan{kind: paintText, row: 18, column: 0, styleID: 7, cellWidth: 1, text: []byte("ok")}, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if cache.row(18)[0].Cluster != "o" || cache.row(18)[1].Cluster != "k" {
+		t.Fatalf("following write did not populate exposed row: %#v", cache.row(18))
+	}
+	if !reflect.DeepEqual(cache.row(19), statusBefore) {
+		t.Fatalf("status row changed: got %#v want %#v", cache.row(19), statusBefore)
+	}
+
+	cache.scrollRegion(protocol.ScrollRegion{Top: 3, Bottom: 19, Delta: 1})
+	if got := cache.row(4)[0].Cluster; got != "04" {
+		t.Fatalf("downward scroll row 4 = %q, want old row 3", got)
+	}
+	for column, cell := range cache.row(3) {
+		if cell != (scanoutCell{Width: 1}) {
+			t.Fatalf("blank row 3 column %d = %#v", column, cell)
+		}
+	}
+	if !reflect.DeepEqual(cache.row(19), statusBefore) {
+		t.Fatal("non-zero-top scroll changed row below its region")
 	}
 }
 
@@ -1637,7 +1692,7 @@ func TestNativeScrollUsesRectangularMargins(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
-	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDelta: -1}); err != nil {
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollRegion: &protocol.ScrollRegion{Top: 0, Bottom: 4, Delta: -1}}); err != nil {
 		t.Fatal(err)
 	}
 	out := string(s.takeANSI())
@@ -1778,7 +1833,7 @@ func TestFullWidthScrollUsesOnlyVerticalMargins(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
-	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDelta: -1}); err != nil {
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollRegion: &protocol.ScrollRegion{Top: 0, Bottom: 4, Delta: -1}}); err != nil {
 		t.Fatal(err)
 	}
 	out := string(s.takeANSI())
@@ -1804,7 +1859,7 @@ func TestFallbackScrollRetainsVisibleRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = s.takeANSI()
-	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollDelta: -1, spans: []paintSpan{{kind: paintText, row: 2, styleID: 0, cellWidth: 1, text: []byte("dddd")}}}); err != nil {
+	if _, err := s.acceptFrame(0, renderFrame{layoutRevision: 1, scrollRegion: &protocol.ScrollRegion{Top: 0, Bottom: 3, Delta: -1}, spans: []paintSpan{{kind: paintText, row: 2, styleID: 0, cellWidth: 1, text: []byte("dddd")}}}); err != nil {
 		t.Fatal(err)
 	}
 	out := string(s.takeANSI())

@@ -94,3 +94,21 @@ func TestFrontendExecuteTerminalExitCommandRoundTrip(t *testing.T) {
 		t.Fatalf("terminal exit request = %#v, err = %v", got, err)
 	}
 }
+
+func TestFrontendPromptResultRoundTrip(t *testing.T) {
+	want := FrontendPromptResult{PromptID: 17, Submitted: true, Text: "renamed"}
+	payload, err := EncodeFrontendPromptResult(nil, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeFrontendPromptResult(payload)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("frontend prompt result = %#v, err = %v", got, err)
+	}
+}
+
+func TestFrontendPromptResultRejectsZeroPromptID(t *testing.T) {
+	if _, err := EncodeFrontendPromptResult(nil, FrontendPromptResult{}); err == nil {
+		t.Fatal("EncodeFrontendPromptResult accepted a zero prompt ID")
+	}
+}

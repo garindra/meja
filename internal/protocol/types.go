@@ -1,7 +1,7 @@
 package protocol
 
 const (
-	ALPN = "meja-quic/13"
+	ALPN = "meja-quic/14"
 
 	// SessionReplacedErrorCode is a terminal QUIC application close: another
 	// client has taken ownership of the session, so the displaced client must
@@ -29,6 +29,8 @@ const (
 	MsgFrontendRegisterTerminalExitCommand
 	MsgFrontendExecuteTerminalExitCommand
 	MsgFrontendTerminalExitComplete
+	MsgClientStatus
+	MsgFrontendPromptResult
 )
 
 type SessionAttach struct {
@@ -77,6 +79,62 @@ type FrontendRegisterTerminalExitCommand struct {
 
 type FrontendExecuteTerminalExitCommand struct {
 	Message string
+}
+
+type FrontendPromptResult struct {
+	PromptID  uint64
+	Submitted bool
+	Text      string
+}
+
+type ClientStatusPresentationKind uint8
+
+const (
+	ClientStatusNormal ClientStatusPresentationKind = iota + 1
+	ClientStatusPrompt
+	ClientStatusMessage
+)
+
+type ClientStatusPromptMode uint8
+
+const (
+	ClientStatusPromptText ClientStatusPromptMode = iota + 1
+	ClientStatusPromptConfirm
+)
+
+type ClientStatusWindow struct {
+	WindowID uint64
+	Index    int
+	Title    string
+	Active   bool
+	Zoomed   bool
+}
+
+type ClientStatusPromptState struct {
+	PromptID uint64
+	Mode     ClientStatusPromptMode
+	Label    string
+	Initial  string
+}
+
+type ClientStatusMessageState struct {
+	ID   uint64
+	Text string
+}
+
+// ClientStatus is a complete authoritative status snapshot. Revision orders
+// every publication, including prompt lifecycle and temporary-message changes.
+type ClientStatus struct {
+	Revision       uint64
+	SessionID      uint64
+	SessionName    string
+	ServerHostname string
+	ServerHome     string
+	Root           string
+	Windows        []ClientStatusWindow
+	Kind           ClientStatusPresentationKind
+	Prompt         ClientStatusPromptState
+	Message        ClientStatusMessageState
 }
 
 type Rect struct {
@@ -135,8 +193,10 @@ type CursorUpdate struct {
 	Visible bool
 }
 
-type Scroll struct {
-	Delta int
+type ScrollRegion struct {
+	Top    int
+	Bottom int
+	Delta  int
 }
 
 type Color struct {

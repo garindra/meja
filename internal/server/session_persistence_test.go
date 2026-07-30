@@ -373,7 +373,7 @@ func TestSessionRenameConfirmsBeforeOverwritingPersistence(t *testing.T) {
 		prompt.Label != `persisted session "work" exists; overwrite? (y/N) ` {
 		t.Fatalf("confirmation prompt = %#v", prompt)
 	}
-	if _, err := connection.handleServerInputEvent(connection.ConsumeInputByte('\r')); err != nil {
+	if _, err := resolveTestPrompt(connection, false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if session.Name != "current" || clientForState(session).ActivePrompt() != nil {
@@ -387,7 +387,7 @@ func TestSessionRenameConfirmsBeforeOverwritingPersistence(t *testing.T) {
 	if _, err := connection.applyAttachedCommandOutcome(outcome); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := connection.handleServerInputEvent(connection.ConsumeInputByte('y')); err != nil {
+	if _, err := resolveTestPrompt(connection, true, "y"); err != nil {
 		t.Fatal(err)
 	}
 	if session.Name != "work" || d.names["work"] != session || d.names["current"] != nil {

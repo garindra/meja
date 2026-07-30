@@ -959,12 +959,12 @@ func (c *ClientInstance) applyAttachedCommandOutcome(outcome commandOutcome) (bo
 			if result.Submitted {
 				c.refreshCommandStatusSnapshot()
 			}
-			return false, c.publishStatusBar()
+			return false, c.publishClientStatus()
 		})
 		if err != nil {
 			return false, err
 		}
-		return false, c.publishStatusBar()
+		return false, c.publishClientStatus()
 	case applyViewTransitionAction:
 		if action.Transition.Projection.ClientID != c.clientID {
 			return false, errors.New("view transition belongs to another client")
@@ -977,7 +977,7 @@ func (c *ClientInstance) applyAttachedCommandOutcome(outcome commandOutcome) (bo
 		if !c.installStatusSnapshot(action.Status) {
 			return false, nil
 		}
-		return false, c.publishStatusBar()
+		return false, c.publishClientStatus()
 	case focusClientDirectionAction:
 		if action.ClientID != c.clientID {
 			return false, errors.New("focus action belongs to another client")

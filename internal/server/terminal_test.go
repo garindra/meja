@@ -472,7 +472,7 @@ func TestApplyIntoAccumulatesChunkedDamage(t *testing.T) {
 			t.Fatalf("row %d = %q, want %q", row, got, expected)
 		}
 	}
-	if update.ScrollDelta != want.ScrollDelta || update.FullRedraw != want.FullRedraw || update.CursorChanged != want.CursorChanged {
+	if !reflect.DeepEqual(update.ScrollRegion, want.ScrollRegion) || update.FullRedraw != want.FullRedraw || update.CursorChanged != want.CursorChanged {
 		t.Fatalf("chunked update = %#v, whole update = %#v", update, want)
 	}
 	for row := range update.DirtySpans {
@@ -672,8 +672,8 @@ func TestFullViewportLineFeedReportsScrollAndNewRowDamage(t *testing.T) {
 	if update.FullRedraw {
 		t.Fatal("full viewport scroll forced full redraw")
 	}
-	if update.ScrollDelta != -1 {
-		t.Fatalf("scroll delta = %d, want -1", update.ScrollDelta)
+	if update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 0, Bottom: 2, Delta: -1}) {
+		t.Fatalf("scroll region = %#v, want [0,2) delta -1", update.ScrollRegion)
 	}
 	if update.DirtySpans[0].End != 0 || update.DirtySpans[1].End == 0 {
 		t.Fatalf("dirty spans = %#v, want only newly exposed row", update.DirtySpans)
@@ -689,7 +689,7 @@ func TestBareLineFeedReportsStyledExposedRow(t *testing.T) {
 
 	update := term.Apply([]byte("\n"))
 
-	if update.ScrollDelta != -1 || update.FullRedraw {
+	if update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 0, Bottom: 2, Delta: -1}) || update.FullRedraw {
 		t.Fatalf("bare line-feed update = %#v", update)
 	}
 	if got, want := update.DirtySpans[1], (DirtySpan{Start: 0, End: 3}); got != want {
@@ -709,14 +709,14 @@ func TestLineFeedOutsideScrollRegionStaysWithinGrid(t *testing.T) {
 	}
 }
 
-func TestPartialRegionLineFeedStillRequiresFullRedraw(t *testing.T) {
+func TestPartialRegionLineFeedReportsScrollRegion(t *testing.T) {
 	term := newTerminal(4, 4)
 	term.Apply([]byte("\x1b[2;3r\x1b[3;1H"))
 
 	update := term.Apply([]byte("\n"))
 
-	if !update.FullRedraw || update.ScrollDelta != 0 {
-		t.Fatalf("partial scroll update = %#v, want full redraw without viewport scroll", update)
+	if update.FullRedraw || update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 1, Bottom: 3, Delta: -1}) {
+		t.Fatalf("partial scroll update = %#v, want [1,3) delta -1", update)
 	}
 }
 
@@ -931,6 +931,41 @@ func TestOSCSTTerminatorIsConsumed(t *testing.T) {
 	}
 }
 
+func TestOSC52IsForwardedToFrontendAndNotPrinted(t *testing.T) {
+	term := newTerminal(8, 1)
+	update := term.Apply([]byte("\x1b]52;c;Y29weQ==\x1b\\prompt"))
+	if len(update.FrontendWrites) != 1 || string(update.FrontendWrites[0].Data) != "\x1b]52;c;Y29weQ==\x1b\\" || update.FrontendWrites[0].OSC52Sequence == 0 {
+		t.Fatalf("frontend writes = %#v", update.FrontendWrites)
+	}
+	if got := rowString(term, 0, 6); got != "prompt" {
+		t.Fatalf("got %q, want prompt", got)
+	}
+}
+
+func TestFragmentedOSC52IsForwardedOnlyWhenComplete(t *testing.T) {
+	term := newTerminal(8, 1)
+	for _, fragment := range []string{"\x1b]", "5", "2;c;", "Y29w", "eQ==\x1b"} {
+		if update := term.Apply([]byte(fragment)); len(update.FrontendWrites) != 0 {
+			t.Fatalf("incomplete fragment produced frontend writes %#v", update.FrontendWrites)
+		}
+	}
+	update := term.Apply([]byte("\\"))
+	if len(update.FrontendWrites) != 1 || string(update.FrontendWrites[0].Data) != "\x1b]52;c;Y29weQ==\x1b\\" || update.FrontendWrites[0].OSC52Sequence == 0 {
+		t.Fatalf("frontend writes = %#v", update.FrontendWrites)
+	}
+}
+
+func TestNonClipboardOSCIsNotForwarded(t *testing.T) {
+	term := newTerminal(8, 1)
+	update := term.Apply([]byte("\x1b]0;title\a"))
+	if len(update.FrontendWrites) != 0 {
+		t.Fatalf("frontend writes = %#v, want none", update.FrontendWrites)
+	}
+	if len(term.Parser.oscBuf) != 0 {
+		t.Fatalf("parser retained non-clipboard OSC: %d bytes", len(term.Parser.oscBuf))
+	}
+}
+
 func TestDCSAndUTF8DesignationAreConsumed(t *testing.T) {
 	term := newTerminal(8, 1)
 	term.Apply([]byte("\x1b%G\x1bP$qm\x1b\\prompt"))
@@ -1141,7 +1176,10 @@ func TestReverseIndexAtTopMarginScrollsDown(t *testing.T) {
 	term.Apply([]byte("1111\n2222\n3333\n4444"))
 	term.Apply([]byte("\x1b[2;3r"))
 	term.CursorY = 1
-	term.Apply([]byte("\x1bM"))
+	update := term.Apply([]byte("\x1bM"))
+	if update.FullRedraw || update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 1, Bottom: 3, Delta: 1}) {
+		t.Fatalf("RI update = %#v", update)
+	}
 	if got := rowString(term, 1, 4); got != "    " {
 		t.Fatalf("top margin row after RI = %q", got)
 	}
@@ -1232,11 +1270,17 @@ func TestTabStopsHTSTBCCBTAndResize(t *testing.T) {
 func TestInsertDeleteLinesWithinScrollRegion(t *testing.T) {
 	term := newTerminal(4, 4)
 	term.Apply([]byte("1111\r\n2222\r\n3333\r\n4444"))
-	term.Apply([]byte("\x1b[2;3r\x1b[2;1H\x1b[L"))
+	update := term.Apply([]byte("\x1b[2;3r\x1b[2;1H\x1b[L"))
+	if update.FullRedraw || update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 1, Bottom: 3, Delta: 1}) {
+		t.Fatalf("IL update = %#v", update)
+	}
 	if got := []string{rowString(term, 0, 4), rowString(term, 1, 4), rowString(term, 2, 4), rowString(term, 3, 4)}; strings.Join(got, "/") != "1111/    /2222/4444" {
 		t.Fatalf("IL rows=%v", got)
 	}
-	term.Apply([]byte("\x1b[M"))
+	update = term.Apply([]byte("\x1b[M"))
+	if update.FullRedraw || update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 1, Bottom: 3, Delta: -1}) {
+		t.Fatalf("DL update = %#v", update)
+	}
 	if got := []string{rowString(term, 0, 4), rowString(term, 1, 4), rowString(term, 2, 4), rowString(term, 3, 4)}; strings.Join(got, "/") != "1111/2222/    /4444" {
 		t.Fatalf("DL rows=%v", got)
 	}
@@ -1246,12 +1290,49 @@ func TestScrollUpDownCommandsAndDamage(t *testing.T) {
 	term := newTerminal(4, 3)
 	term.Apply([]byte("1111\r\n2222\r\n3333"))
 	update := term.Apply([]byte("\x1b[S"))
-	if update.ScrollDelta != -1 || update.FullRedraw || rowString(term, 0, 4) != "2222" {
+	if update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 0, Bottom: 3, Delta: -1}) || update.FullRedraw || rowString(term, 0, 4) != "2222" {
 		t.Fatalf("SU update=%#v row0=%q", update, rowString(term, 0, 4))
 	}
 	update = term.Apply([]byte("\x1b[T"))
-	if update.ScrollDelta != 1 || update.FullRedraw || rowString(term, 0, 4) != "    " {
+	if update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 0, Bottom: 3, Delta: 1}) || update.FullRedraw || rowString(term, 0, 4) != "    " {
 		t.Fatalf("SD update=%#v row0=%q", update, rowString(term, 0, 4))
+	}
+}
+
+func TestPartialScrollCommandsReportMargins(t *testing.T) {
+	term := newTerminal(4, 5)
+	term.Apply([]byte("\x1b[2;4r"))
+	update := term.Apply([]byte("\x1b[2S"))
+	if update.FullRedraw || update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 1, Bottom: 4, Delta: -2}) {
+		t.Fatalf("partial SU update = %#v", update)
+	}
+	update = term.Apply([]byte("\x1b[T"))
+	if update.FullRedraw || update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 1, Bottom: 4, Delta: 1}) {
+		t.Fatalf("partial SD update = %#v", update)
+	}
+}
+
+func TestScrollRegionCoalescingAndFallback(t *testing.T) {
+	var update Update
+	update.Reset(6)
+	update.recordScrollRegion(1, 5, -2)
+	update.recordScrollRegion(1, 5, -3)
+	if update.FullRedraw || update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 1, Bottom: 5, Delta: -4}) {
+		t.Fatalf("coalesced update = %#v", update)
+	}
+
+	update.Reset(6)
+	update.recordScrollRegion(1, 5, -1)
+	update.recordScrollRegion(0, 5, -1)
+	if !update.FullRedraw || update.ScrollRegion != nil {
+		t.Fatalf("different regions did not force redraw: %#v", update)
+	}
+
+	update.Reset(6)
+	update.recordScrollRegion(1, 5, -1)
+	update.recordScrollRegion(1, 5, 1)
+	if !update.FullRedraw || update.ScrollRegion != nil {
+		t.Fatalf("opposing regions did not force redraw: %#v", update)
 	}
 }
 

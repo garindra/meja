@@ -77,23 +77,11 @@ const (
 	PromptModeConfirm
 )
 
-type PromptAction uint8
-
-const (
-	PromptActionNone PromptAction = iota
-	PromptActionChanged
-	PromptActionSubmit
-	PromptActionCancel
-)
-
-type PromptState struct {
-	Mode          PromptMode
-	Action        PromptAction
-	Label         string
-	Text          []rune
-	Cursor        int
-	pendingUTF8   []byte
-	PendingEscape []byte
+type activePrompt struct {
+	ID      uint64
+	Mode    PromptMode
+	Label   string
+	Initial string
 }
 
 type promptResult struct {
@@ -563,13 +551,10 @@ func (s *SessionState) orderedWindowIDs() []uint64 {
 	return ids
 }
 
-func clonePromptState(prompt *PromptState) *PromptState {
+func cloneActivePrompt(prompt *activePrompt) *activePrompt {
 	if prompt == nil {
 		return nil
 	}
 	out := *prompt
-	out.Text = append([]rune(nil), prompt.Text...)
-	out.pendingUTF8 = append([]byte(nil), prompt.pendingUTF8...)
-	out.PendingEscape = append([]byte(nil), prompt.PendingEscape...)
 	return &out
 }

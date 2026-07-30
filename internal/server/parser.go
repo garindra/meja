@@ -23,6 +23,9 @@ type Parser struct {
 	state         parserState
 	csiBuf        []byte
 	utf8Buf       []byte
+	oscBuf        []byte
+	oscCandidate  bool
+	oscSequence   uint64
 	charsetTarget int
 }
 
@@ -31,6 +34,9 @@ func (p *Parser) clone() Parser {
 		state:         p.state,
 		csiBuf:        append([]byte(nil), p.csiBuf...),
 		utf8Buf:       append([]byte(nil), p.utf8Buf...),
+		oscBuf:        append([]byte(nil), p.oscBuf...),
+		oscCandidate:  p.oscCandidate,
+		oscSequence:   p.oscSequence,
 		charsetTarget: p.charsetTarget,
 	}
 	return next
