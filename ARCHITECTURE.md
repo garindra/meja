@@ -1064,10 +1064,6 @@ preserve that draft and cursor. The input goroutine sends prompt keystrokes into
 the render loop for immediate local editing and emits only the completed
 `FRONTEND_PROMPT_RESULT` on the control stream.
 
-The browser-facing implementation contract for ALPN `meja-quic/14`, including
-stream startup, status snapshots, prompt editing, and reconnect behavior, is
-documented in [`docs/ALPN14_BROWSER_CLIENT.md`](docs/ALPN14_BROWSER_CLIENT.md).
-
 ## Per-stream `renderFrame` compilation
 
 Each decoder goroutine owns one `displayFrameCompiler`. It reads commands in order and expands their implicit state into an explicit in-progress `renderFrame`. The compiler tracks:
