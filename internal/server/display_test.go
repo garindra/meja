@@ -65,46 +65,35 @@ func TestShiftDirtyRowsWithinRegionPreservesOutsideDamage(t *testing.T) {
 
 func TestPaneRenderStateCoalescesOnlyCompatibleRegions(t *testing.T) {
 	pane := &Pane{terminal: newTerminal(4, 5)}
-	state := newPaneRenderState(pane)
+	state := newPanePublicationState(pane)
 	state.lease = &OutputLease{}
-	state.ensureRows()
+	state.ensureGeometry()
 
 	first := Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}}
 	second := Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}}
 	state.merge(first)
 	state.merge(second)
-	if state.scrollRegion == nil || *state.scrollRegion != (ScrollRegion{Top: 1, Bottom: 4, Delta: -2}) {
-		t.Fatalf("coalesced render region = %#v", state.scrollRegion)
+	if state.scroll == nil || *state.scroll != (ScrollRegion{Top: 1, Bottom: 4, Delta: -2}) {
+		t.Fatalf("coalesced render region = %#v", state.scroll)
 	}
 
 	state.merge(Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 0, Bottom: 4, Delta: -1}})
-	if state.scrollRegion != nil || state.dirtyRows != 5 {
-		t.Fatalf("incompatible region did not force full redraw: region=%#v dirty=%#v", state.scrollRegion, state.dirty)
-	}
-}
-
-func TestPaneRenderStateRejectsRegionDuringProgressiveRender(t *testing.T) {
-	pane := &Pane{terminal: newTerminal(4, 5)}
-	state := newPaneRenderState(pane)
-	state.lease = &OutputLease{}
-	state.progressive = true
-	state.merge(Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}})
-	if state.scrollRegion != nil || state.progressive || state.dirtyRows != 5 {
-		t.Fatalf("progressive scroll did not force full redraw: %#v", state)
+	if state.scroll != nil || state.dirtyRows != 5 {
+		t.Fatalf("incompatible region did not force full redraw: region=%#v dirty=%#v", state.scroll, state.dirty)
 	}
 }
 
 func TestPaneRenderStatePromotesFullRegionDisplacementToFullRedraw(t *testing.T) {
 	pane := &Pane{terminal: newTerminal(4, 5)}
-	state := newPaneRenderState(pane)
+	state := newPanePublicationState(pane)
 	state.lease = &OutputLease{}
-	state.ensureRows()
+	state.ensureGeometry()
 
 	update := Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -2}}
 	state.merge(update)
 	update.ScrollRegion = &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}
 	state.merge(update)
-	if state.scrollRegion != nil || state.dirtyRows != 5 {
+	if state.scroll != nil || state.dirtyRows != 5 {
 		t.Fatalf("full-region displacement did not force full redraw: %#v", state)
 	}
 }
@@ -318,7 +307,7 @@ func (w *renderBatchWriter) snapshotBatches() [][]byte {
 	return append([][]byte(nil), w.batches...)
 }
 
-func TestFixedLeaseBufferPresentsLargeRedrawInBoundedBatches(t *testing.T) {
+func TestConfirmerPresentsLargeRedrawAtomicallyAcrossBoundedWrites(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(int(protocol.MaxGridCols), 64)}
 	for row := 0; row < pane.terminal.Rows; row++ {
 		cells := pane.terminal.gridRow(row)
@@ -334,31 +323,36 @@ func TestFixedLeaseBufferPresentsLargeRedrawInBoundedBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, pane)
-	if len(wire.batches) < 2 {
-		t.Fatalf("large redraw used %d batch, want progressive presentation", len(wire.batches))
+	batches := wire.snapshotBatches()
+	if len(batches) < 2 {
+		t.Fatalf("large redraw used %d physical write, want bounded streaming", len(batches))
+	}
+	joined := bytes.Join(batches, nil)
+	commands := decodePendingCommands(t, joined)
+	if got := countOpcode(commandOpcodes(commands), protocol.DisplayOpcodePresent); got != 1 {
+		t.Fatalf("PRESENT commands = %d, want exactly one semantic commit", got)
+	}
+	if commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
+		t.Fatalf("final command = %#v, want PRESENT", commands[len(commands)-1])
 	}
 	renderedCells := 0
-	for index, batch := range wire.batches {
-		if len(batch) > paneRenderBufferCapacity {
-			t.Fatalf("batch %d has %d bytes, capacity %d", index, len(batch), paneRenderBufferCapacity)
+	for index, batch := range batches {
+		if len(batch) > renderStreamChunkSize {
+			t.Fatalf("physical write %d has %d bytes, limit %d", index, len(batch), renderStreamChunkSize)
 		}
-		commands := decodePendingCommands(t, batch)
-		if len(commands) == 0 || commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
-			t.Fatalf("batch %d is not PRESENT-terminated: %#v", index, commands)
-		}
-		for _, command := range commands {
-			switch command.Opcode {
-			case protocol.DisplayOpcodeWriteText, protocol.DisplayOpcodeWriteTextUTF8, protocol.DisplayOpcodeWriteTextUTF8Default:
-				width := int(command.Width)
-				if command.Opcode != protocol.DisplayOpcodeWriteText {
-					width = 1
-				}
-				renderedCells += utf8.RuneCount(command.Text) * width
-			case protocol.DisplayOpcodeWriteCluster:
-				renderedCells += int(command.Width)
-			case protocol.DisplayOpcodeFill:
-				renderedCells += command.Fill.Columns
+	}
+	for _, command := range commands {
+		switch command.Opcode {
+		case protocol.DisplayOpcodeWriteText, protocol.DisplayOpcodeWriteTextUTF8, protocol.DisplayOpcodeWriteTextUTF8Default:
+			width := int(command.Width)
+			if command.Opcode != protocol.DisplayOpcodeWriteText {
+				width = 1
 			}
+			renderedCells += utf8.RuneCount(command.Text) * width
+		case protocol.DisplayOpcodeWriteCluster:
+			renderedCells += int(command.Width)
+		case protocol.DisplayOpcodeFill:
+			renderedCells += command.Fill.Columns
 		}
 	}
 	if want := pane.terminal.Cols * pane.terminal.Rows; renderedCells != want {
@@ -377,30 +371,19 @@ func testOutputLease(slot int, stream io.Writer) *OutputLease {
 }
 
 func attachTestOutputWithRefresh(pane *Pane, lease *OutputLease, refresh func(*renderOutput) error) error {
-	installation := &paneOutputInstall{
-		Lease: lease, Cols: uint16(pane.terminal.Cols), Rows: uint16(pane.terminal.Rows), Refresh: refresh,
-	}
-	if pane.commands == nil {
-		if refresh == nil {
-			return nil
-		}
-		return refresh(newRenderOutput(lease.Stream))
-	}
-	select {
-	case pane.commands <- paneCommand{install: installation, done: make(chan error, 1)}:
-		return nil
-	case <-pane.mainDone:
-		return nil
-	case <-pane.done:
-		return nil
-	}
+	_ = refresh
+	return pane.installOutputLease(lease, 0, uint16(pane.terminal.Cols), uint16(pane.terminal.Rows))
 }
 
 func applyTestRender(pane *Pane, render func(*renderOutput) error) error {
+	_ = render
 	if pane.commands == nil {
 		return nil
 	}
-	return pane.sendRenderCommand(paneCommand{apply: render})
+	if err := pane.sendRenderCommand(paneCommand{republish: true}); err != nil {
+		return err
+	}
+	return pane.syncOutput()
 }
 
 func emitTestTerminalUpdate(output *renderOutput, pane *Pane, update Update) error {
@@ -670,7 +653,7 @@ func TestPaneRendererCanAttachReplacementAfterWriteFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	syncPaneRenderer(t, pane)
+	_ = pane.syncOutput()
 
 	var replacement bytes.Buffer
 	if err := attachTestOutputWithRefresh(pane, testOutputLease(0, &replacement), func(output *renderOutput) error {
@@ -1880,9 +1863,7 @@ func TestDaemonPostedPaneExitCannotDetachNewerFallbackProjection(t *testing.T) {
 	if err := attachTestOutputWithRefresh(first, lease, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyTestRender(first, func(*renderOutput) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
+	syncPaneRenderer(t, first)
 	client.Output[0] = lease
 	firstPlacement := protocol.PanePlacement{PaneID: first.ID, Slot: 0}
 	client.currentView.Layout.Panes = []protocol.PanePlacement{firstPlacement}
@@ -2093,7 +2074,7 @@ type errorWriter struct {
 
 func syncPaneRenderer(t *testing.T, pane *Pane) {
 	t.Helper()
-	if err := applyTestRender(pane, func(*renderOutput) error { return nil }); err != nil {
+	if err := pane.syncOutput(); err != nil {
 		t.Fatal(err)
 	}
 }

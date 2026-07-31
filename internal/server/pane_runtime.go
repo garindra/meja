@@ -98,26 +98,24 @@ func (p *Pane) installOutputLease(lease *OutputLease, layoutRevision protocol.Cl
 		if lease == nil {
 			return nil
 		}
-		return p.renderAttachedView(newRenderOutput(lease.Stream), layoutRevision)
+		return p.publishAttachedViewSynchronously(lease, layoutRevision)
 	}
 	return p.sendRenderCommand(paneCommand{install: installation})
 }
 
-func (p *Pane) renderAttachedView(output *renderOutput, layoutRevision protocol.ClientLayoutRevision) error {
-	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: layoutRevision, GridCols: p.terminal.Cols, GridRows: p.terminal.Rows}); err != nil {
+func (p *Pane) publishAttachedViewSynchronously(lease *OutputLease, layoutRevision protocol.ClientLayoutRevision) error {
+	state := newPanePublicationState(p)
+	state.attach(lease, layoutRevision)
+	buffer := <-state.free
+	if err := state.prepare(buffer); err != nil {
 		return err
 	}
-	if err := installStyle(output, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {
-		return err
+	if state.pending == nil {
+		return nil
 	}
-	switch p.currentViewMode() {
-	case paneViewLive:
-		return sendFullRender(output, p)
-	case paneViewHistory:
-		return fmt.Errorf("pane %d history output requires its actor", p.ID)
-	default:
-		return fmt.Errorf("pane %d has invalid view mode %d", p.ID, p.currentViewMode())
-	}
+	lease.submissions() <- confirmerMessage{publication: state.pending}
+	state.handedOff()
+	return lease.sync()
 }
 
 func (p *Pane) detachOutputLease(lease *OutputLease) error {
@@ -173,6 +171,35 @@ func (p *Pane) sendRenderCommand(command paneCommand) error {
 	}
 }
 
+func (p *Pane) syncOutput() error {
+	if p.commands == nil {
+		if p.outputLease == nil {
+			return nil
+		}
+		return p.outputLease.sync()
+	}
+	ready := make(chan *OutputLease, 1)
+	select {
+	case p.commands <- paneCommand{sync: ready}:
+	case <-p.mainDone:
+		return nil
+	case <-p.done:
+		return nil
+	}
+	var lease *OutputLease
+	select {
+	case lease = <-ready:
+	case <-p.mainDone:
+		return nil
+	case <-p.done:
+		return nil
+	}
+	if lease == nil {
+		return nil
+	}
+	return lease.sync()
+}
+
 func relayPTYOutput(pane *Pane) {
 	relayPTYOutputFrom(pane, pane.PTY)
 }
@@ -226,7 +253,7 @@ func (p *Pane) run() {
 		}
 		close(p.mainDone)
 	}()
-	renderer := newPaneRenderState(p)
+	renderer := newPanePublicationState(p)
 	var update Update
 	pacingInterval := p.ptyPacingInterval
 	if pacingInterval <= 0 {
@@ -286,30 +313,44 @@ func (p *Pane) run() {
 		return p.sendOwnedInput(input)
 	}
 	for {
+		renderer.flushSyncWaiters()
 		available := renderer.available()
 		failures := renderer.failures()
+		submission, publication := renderer.submission()
 		var ptyOutput <-chan []byte
 		// Detached panes continue advancing their canonical terminal state at
 		// the same paced cadence. Attached panes additionally stop admission
 		// while visual work is waiting for their bounded output path.
-		if admission.canAdmit() && (p.outputLease == nil || !renderer.hasWork()) {
+		if admission.canAdmit() && !renderer.blocksPTY() {
 			ptyOutput = p.ptyOutput
 		}
 		select {
 		case buffer := <-available:
 			lease := p.outputLease
-			if err := renderer.render(buffer); err != nil {
+			if err := renderer.prepare(buffer); err != nil {
 				if lease != nil {
-					lease.recycle(buffer)
 					lease.reportFailure(fmt.Errorf("render pane %d: %w", p.ID, err))
 				}
 				p.outputLease = nil
 				renderer.detach()
 			}
+		case submission <- publication:
+			renderer.handedOff()
 		case <-failures:
 			p.outputLease = nil
 			renderer.detach()
 		case command := <-p.commands:
+			if command.sync != nil {
+				renderer.requestSync(command.sync)
+				continue
+			}
+			if command.republish {
+				if p.outputLease != nil {
+					renderer.invalidateEpoch(false)
+				}
+				command.done <- nil
+				continue
+			}
 			if command.capture != nil {
 				data, err := captureTerminalViewport(p.terminal, command.capture.Options)
 				command.capture.Result <- paneCaptureResult{Data: data, Err: err}
@@ -349,24 +390,24 @@ func (p *Pane) run() {
 					command.done <- nil
 					continue
 				}
-				renderer.attach(installation.Lease, installation.LayoutRevision, installation.Refresh)
+				renderer.attach(installation.Lease, installation.LayoutRevision)
 				admission.grantStructuralOpportunity()
 				command.done <- nil
 				continue
 			}
 			if command.history != nil {
+				beforeMode := p.currentViewMode()
 				result := p.handleHistoryRequest(command.history)
+				if p.currentViewMode() != beforeMode && p.outputLease != nil {
+					renderer.invalidateEpoch(false)
+				}
 				if result.Render.HasRenderChange() && p.outputLease != nil {
 					renderer.mergeViewMutation(result.Render)
-					renderer.due = true
 				}
 				command.history.Result <- result
 				continue
 			}
-			if command.apply != nil && p.outputLease != nil {
-				renderer.queued = append(renderer.queued, queuedPaneRender{render: command.apply, done: command.done})
-				renderer.due = true
-			} else if command.resize != nil {
+			if command.resize != nil {
 				err := error(nil)
 				if p.outputLease != nil {
 					command.done <- fmt.Errorf("resize pane %d while its output grid is still attached", p.ID)
@@ -377,11 +418,8 @@ func (p *Pane) run() {
 				}
 				p.terminal.Resize(int(command.resize.cols), int(command.resize.rows))
 				p.publishTerminalMetadata()
+				renderer.invalidateEpoch(false)
 				admission.grantStructuralOpportunity()
-				if p.outputLease != nil {
-					renderer.markFull()
-					renderer.due = true
-				}
 				command.done <- err
 			} else {
 				command.done <- nil
@@ -391,6 +429,8 @@ func (p *Pane) run() {
 				return
 			}
 			admission.admit(time.Now())
+			p.renderMetrics.ptyTurns.Add(1)
+			p.renderMetrics.ptyBytes.Add(uint64(len(data)))
 			arm(&ptyTimer, &ptyTimerC, pacingInterval)
 			select {
 			case <-p.ptyInteractive:
@@ -420,10 +460,6 @@ func (p *Pane) run() {
 				continue
 			}
 			renderer.merge(update)
-			if !renderer.hasWork() {
-				continue
-			}
-			renderer.due = true
 		case <-ptyTimerC:
 			ptyTimerC = nil
 			admission.timerFired()
@@ -543,20 +579,6 @@ func newRenderOutput(stream ...io.Writer) *renderOutput {
 		output.stream = stream[0]
 	}
 	return output
-}
-
-func newBoundedRenderOutput(buffer *paneRenderBuffer, installed map[uint32]protocol.Style, limit int) *renderOutput {
-	if installed == nil {
-		installed = make(map[uint32]protocol.Style, 32)
-	}
-	buffer.data = buffer.data[:0]
-	return &renderOutput{
-		stream:          io.Discard,
-		pending:         buffer.data,
-		installedStyles: installed,
-		limit:           limit,
-		bufferedOnly:    true,
-	}
 }
 
 func (o *renderOutput) hasRoom(bytes int) bool {

@@ -253,9 +253,9 @@ func TestPTYBufferHandoffSteadyStateDoesNotAllocate(t *testing.T) {
 
 func TestPTYParseAndMutationMergeSteadyStateDoesNotAllocate(t *testing.T) {
 	pane := &Pane{terminal: newTerminal(8, 1)}
-	renderer := newPaneRenderState(pane)
+	renderer := newPanePublicationState(pane)
 	renderer.lease = &OutputLease{}
-	renderer.ensureRows()
+	renderer.ensureGeometry()
 	var update Update
 	chunk := []byte("\n")
 	update.ResetFor(pane.terminal.Rows, true)

@@ -1,195 +1,373 @@
 package server
 
 import (
-	"errors"
 	"fmt"
+	"math"
+	"strconv"
+	"sync/atomic"
 
 	"github.com/garindra/meja/internal/protocol"
 )
 
-const paneRenderTrailerReserve = 512
+type RenderEpoch uint64
+type RenderVersion uint64
 
-type queuedPaneRender struct {
-	render func(*renderOutput) error
-	done   chan error
+type PublicationKind uint8
+
+const (
+	PublicationDelta PublicationKind = iota
+	PublicationKeyframe
+)
+
+const (
+	publicationBufferCount        = 2
+	publicationKeyframeDensityPct = 50
+	publicationAnchorInterval     = 256
+	initialPublicationClusterCap  = 64 << 10
+)
+
+type semanticCellKind uint8
+
+const (
+	semanticBlank semanticCellKind = iota
+	semanticScalar
+	semanticCluster
+	semanticContinuation
+)
+
+// semanticCell is publication-local. Cluster payloads are offsets into the
+// owning semantic viewport or publication arena, never pane cluster handles.
+type semanticCell struct {
+	payload    uint32
+	clusterLen uint16
+	style      uint16
+	kind       semanticCellKind
+	width      uint8
 }
 
-// paneRenderState is owned exclusively by the pane actor. The terminal grid is
-// authoritative; this state only records which parts have not yet been offered
-// to the current output worker.
-type paneRenderState struct {
-	pane            *Pane
-	lease           *OutputLease
-	availableBuffer <-chan *paneRenderBuffer
-	failure         <-chan error
-	layoutRevision  protocol.ClientLayoutRevision
-	barrierPending  bool
-	installedStyles map[uint32]protocol.Style
-	dirty           []DirtySpan
-	dirtyRows       int
-	scrollRegion    *ScrollRegion
-	scrollRegionBuf ScrollRegion
-	cursorDirty     bool
-	nextRow         int
-	progressive     bool
-	due             bool
-	refresh         func(*renderOutput) error
-	queued          []queuedPaneRender
+type publishedRun struct {
+	Row       uint16
+	Column    uint16
+	Columns   uint16
+	CellStart uint32
 }
 
-func newPaneRenderState(pane *Pane) *paneRenderState {
-	return &paneRenderState{pane: pane}
+type publishedScroll struct {
+	Top    uint16
+	Bottom uint16
+	Delta  int16
 }
 
-func (s *paneRenderState) attach(lease *OutputLease, layoutRevision protocol.ClientLayoutRevision, refresh func(*renderOutput) error) {
-	s.lease = lease
-	s.availableBuffer = lease.availableBuffers()
-	s.failure = lease.failures()
-	s.layoutRevision = layoutRevision
-	s.barrierPending = refresh == nil
-	s.installedStyles = make(map[uint32]protocol.Style, 32)
-	s.scrollRegion = nil
-	s.cursorDirty = true
-	s.nextRow = 0
-	s.progressive = false
-	s.refresh = refresh
-	s.queued = nil
-	s.ensureRows()
-	clear(s.dirty)
-	s.dirtyRows = 0
-	if refresh == nil {
-		s.markFull()
+type publishedCursor struct {
+	X       uint16
+	Y       uint16
+	Visible bool
+}
+
+type viewPublication struct {
+	Epoch          RenderEpoch
+	BaseVersion    RenderVersion
+	TargetVersion  RenderVersion
+	Kind           PublicationKind
+	LayoutRevision protocol.ClientLayoutRevision
+	Barrier        bool
+	Cols           uint16
+	Rows           uint16
+	HasScroll      bool
+	Scroll         publishedScroll
+	Runs           []publishedRun
+	Cells          []semanticCell
+	Styles         []protocol.Style
+	Clusters       []byte
+	Cursor         publishedCursor
+	CursorChanged  bool
+
+	candidateCells uint64
+	changedCells   uint64
+	cancelledCells uint64
+}
+
+type viewPublicationBuffer struct {
+	publication viewPublication
+	returnTo    chan<- *viewPublicationBuffer
+	metrics     *paneRenderMetrics
+}
+
+func (b *viewPublicationBuffer) reset(cols, rows int) {
+	p := &b.publication
+	p.Epoch = 0
+	p.BaseVersion = 0
+	p.TargetVersion = 0
+	p.Kind = PublicationDelta
+	p.LayoutRevision = 0
+	p.Barrier = false
+	p.Cols = uint16(cols)
+	p.Rows = uint16(rows)
+	p.HasScroll = false
+	p.Scroll = publishedScroll{}
+	p.Runs = p.Runs[:0]
+	p.Cells = p.Cells[:0]
+	p.Styles = p.Styles[:0]
+	p.Clusters = p.Clusters[:0]
+	p.Cursor = publishedCursor{}
+	p.CursorChanged = false
+	p.candidateCells = 0
+	p.changedCells = 0
+	p.cancelledCells = 0
+}
+
+func (b *viewPublicationBuffer) release() {
+	if b == nil || b.returnTo == nil {
+		return
+	}
+	returnTo := b.returnTo
+	b.returnTo = nil
+	b.metrics = nil
+	returnTo <- b
+}
+
+type semanticViewport struct {
+	cols     int
+	rows     int
+	epoch    RenderEpoch
+	version  RenderVersion
+	valid    bool
+	cells    []semanticCell
+	styles   []protocol.Style
+	clusters []byte
+	cursor   publishedCursor
+}
+
+func (v *semanticViewport) reset(cols, rows int) {
+	total := cols * rows
+	v.cols, v.rows = cols, rows
+	if cap(v.cells) < total {
+		v.cells = make([]semanticCell, total)
 	} else {
-		s.cursorDirty = false
+		v.cells = v.cells[:total]
+		clear(v.cells)
 	}
-	s.due = true
+	v.styles = v.styles[:0]
+	v.clusters = v.clusters[:0]
+	v.cursor = publishedCursor{}
 }
 
-func (s *paneRenderState) detach() {
-	s.lease = nil
-	s.availableBuffer = nil
-	s.failure = nil
-	s.layoutRevision = 0
-	s.barrierPending = false
-	s.installedStyles = nil
-	s.dirty = nil
-	s.dirtyRows = 0
-	s.scrollRegion = nil
-	s.cursorDirty = false
-	s.progressive = false
-	s.due = false
-	s.refresh = nil
-	for _, queued := range s.queued {
-		if queued.done != nil {
-			queued.done <- nil
-		}
-	}
-	s.queued = nil
+type paneRenderMetrics struct {
+	ptyTurns                   atomic.Uint64
+	ptyBytes                   atomic.Uint64
+	publications               atomic.Uint64
+	presents                   atomic.Uint64
+	candidateCells             atomic.Uint64
+	changedCells               atomic.Uint64
+	changedRuns                atomic.Uint64
+	keyframes                  atomic.Uint64
+	deltas                     atomic.Uint64
+	uncompressedBytes          atomic.Uint64
+	physicalWrites             atomic.Uint64
+	publicationBufferStarved   atomic.Uint64
+	confirmerWriteBlockedNanos atomic.Uint64
+	cancelledCells             atomic.Uint64
 }
 
-func (s *paneRenderState) rows() int {
+type paneRenderMetricsSnapshot struct {
+	PTYTurns                   uint64
+	PTYBytes                   uint64
+	Publications               uint64
+	Presents                   uint64
+	CandidateCells             uint64
+	ChangedCells               uint64
+	ChangedRuns                uint64
+	Keyframes                  uint64
+	Deltas                     uint64
+	UncompressedBytes          uint64
+	PhysicalWrites             uint64
+	PublicationBufferStarved   uint64
+	ConfirmerWriteBlockedNanos uint64
+	CancelledCells             uint64
+}
+
+func (m *paneRenderMetrics) snapshot() paneRenderMetricsSnapshot {
+	if m == nil {
+		return paneRenderMetricsSnapshot{}
+	}
+	return paneRenderMetricsSnapshot{
+		PTYTurns:                   m.ptyTurns.Load(),
+		PTYBytes:                   m.ptyBytes.Load(),
+		Publications:               m.publications.Load(),
+		Presents:                   m.presents.Load(),
+		CandidateCells:             m.candidateCells.Load(),
+		ChangedCells:               m.changedCells.Load(),
+		ChangedRuns:                m.changedRuns.Load(),
+		Keyframes:                  m.keyframes.Load(),
+		Deltas:                     m.deltas.Load(),
+		UncompressedBytes:          m.uncompressedBytes.Load(),
+		PhysicalWrites:             m.physicalWrites.Load(),
+		PublicationBufferStarved:   m.publicationBufferStarved.Load(),
+		ConfirmerWriteBlockedNanos: m.confirmerWriteBlockedNanos.Load(),
+		CancelledCells:             m.cancelledCells.Load(),
+	}
+}
+
+type panePublicationState struct {
+	pane           *Pane
+	lease          *OutputLease
+	failure        <-chan error
+	layoutRevision protocol.ClientLayoutRevision
+	epoch          RenderEpoch
+	version        RenderVersion
+	snapshot       semanticViewport
+	nextSnapshot   semanticViewport
+	free           chan *viewPublicationBuffer
+	buffers        [publicationBufferCount]viewPublicationBuffer
+	pending        *viewPublicationBuffer
+	dirty          []DirtySpan
+	dirtyRows      int
+	scroll         *ScrollRegion
+	scrollBuf      ScrollRegion
+	cursorDirty    bool
+	keyframe       bool
+	barrier        bool
+	starved        bool
+	diff           []bool
+	counterScratch []byte
+	syncWaiters    []chan<- *OutputLease
+}
+
+func newPanePublicationState(pane *Pane) *panePublicationState {
+	s := &panePublicationState{
+		pane:  pane,
+		epoch: 1,
+		free:  make(chan *viewPublicationBuffer, publicationBufferCount),
+	}
+	for index := range s.buffers {
+		s.free <- &s.buffers[index]
+	}
+	return s
+}
+
+func (s *panePublicationState) rows() int {
 	if s.pane.currentViewMode() == paneViewHistory && s.pane.historyView != nil {
 		return s.pane.historyView.Snapshot.ViewportRows
 	}
 	return s.pane.terminal.Rows
 }
 
-func (s *paneRenderState) cols() int {
+func (s *panePublicationState) cols() int {
 	if s.pane.currentViewMode() == paneViewHistory && s.pane.historyView != nil {
 		return s.pane.historyView.Snapshot.Cols
 	}
 	return s.pane.terminal.Cols
 }
 
-func (s *paneRenderState) ensureRows() {
-	rows := s.rows()
-	if len(s.dirty) == rows {
-		return
-	}
-	oldRows := len(s.dirty)
-	if cap(s.dirty) < rows {
+func (s *panePublicationState) ensureGeometry() {
+	rows, cols := s.rows(), s.cols()
+	if len(s.dirty) != rows {
 		s.dirty = make([]DirtySpan, rows)
+		s.dirtyRows = 0
+	}
+	if cap(s.diff) < cols {
+		s.diff = make([]bool, cols)
 	} else {
-		s.dirty = s.dirty[:rows]
-		if rows > oldRows {
-			clear(s.dirty[oldRows:])
-		}
+		s.diff = s.diff[:cols]
 	}
-	if rows == 0 {
-		s.nextRow = 0
-	} else if s.nextRow >= rows {
-		s.nextRow %= rows
+	total := rows * cols
+	if cap(s.snapshot.cells) < total {
+		s.snapshot.cells = make([]semanticCell, total)
+		s.snapshot.cells = s.snapshot.cells[:0]
 	}
-	s.dirtyRows = 0
-	for _, span := range s.dirty {
-		if span.End > span.Start {
-			s.dirtyRows++
-		}
+	if cap(s.nextSnapshot.cells) < total {
+		s.nextSnapshot.cells = make([]semanticCell, total)
+		s.nextSnapshot.cells = s.nextSnapshot.cells[:0]
+	}
+	clusterCap := max(initialPublicationClusterCap, total*8)
+	if cap(s.snapshot.clusters) < clusterCap {
+		s.snapshot.clusters = make([]byte, 0, clusterCap)
+	}
+	if cap(s.nextSnapshot.clusters) < clusterCap {
+		s.nextSnapshot.clusters = make([]byte, 0, clusterCap)
 	}
 }
 
-func (s *paneRenderState) markFull() {
-	s.ensureRows()
-	cols := s.cols()
+func (s *panePublicationState) attach(lease *OutputLease, layoutRevision protocol.ClientLayoutRevision) {
+	s.cancelPending()
+	s.lease = lease
+	s.failure = lease.failures()
+	s.layoutRevision = layoutRevision
+	s.invalidateEpoch(true)
+	s.ensureGeometry()
+}
+
+func (s *panePublicationState) detach() {
+	s.cancelPending()
+	s.lease = nil
+	s.failure = nil
+	s.layoutRevision = 0
+	s.clearMutation()
+	s.snapshot.valid = false
+}
+
+func (s *panePublicationState) cancelPending() {
+	if s.pending != nil {
+		s.pending.release()
+		s.pending = nil
+	}
+}
+
+func (s *panePublicationState) invalidateEpoch(barrier bool) {
+	s.cancelPending()
+	s.epoch++
+	if s.epoch == 0 {
+		s.epoch = 1
+	}
+	s.version = 0
+	s.snapshot.valid = false
+	s.keyframe = true
+	s.barrier = s.barrier || barrier
+	s.scroll = nil
+	s.cursorDirty = true
+	s.ensureGeometry()
 	for row := range s.dirty {
-		s.dirty[row] = DirtySpan{Start: 0, End: cols}
+		s.dirty[row] = DirtySpan{Start: 0, End: s.cols()}
 	}
 	s.dirtyRows = len(s.dirty)
-	s.scrollRegion = nil
-	s.cursorDirty = true
-	s.progressive = false
 }
 
-func (s *paneRenderState) hasDirty() bool {
-	return s.dirtyRows > 0
-}
-
-func (s *paneRenderState) hasWork() bool {
-	return s.lease != nil && (s.refresh != nil || len(s.queued) > 0 || s.barrierPending || s.scrollRegion != nil || s.cursorDirty || s.hasDirty())
-}
-
-func (s *paneRenderState) hasVisualWork() bool {
-	return s.barrierPending || s.scrollRegion != nil || s.cursorDirty || s.hasDirty()
-}
-
-func (s *paneRenderState) available() <-chan *paneRenderBuffer {
-	if !s.due || !s.hasWork() || s.lease == nil {
-		return nil
-	}
-	return s.availableBuffer
-}
-
-func (s *paneRenderState) failures() <-chan error {
-	if s.lease == nil {
-		return nil
-	}
+func (s *panePublicationState) failures() <-chan error {
 	return s.failure
 }
 
-func mergeDirtySpan(dst *DirtySpan, next DirtySpan, cols int) bool {
-	if next.Start < 0 {
-		next.Start = 0
-	}
-	if next.End > cols {
-		next.End = cols
-	}
-	if next.Start >= next.End {
-		return false
-	}
-	if dst.End <= dst.Start {
-		*dst = next
-		return true
-	}
-	if next.Start < dst.Start {
-		dst.Start = next.Start
-	}
-	if next.End > dst.End {
-		dst.End = next.End
-	}
-	return false
+func (s *panePublicationState) hasMutation() bool {
+	return s.lease != nil && (s.keyframe || s.barrier || s.scroll != nil || s.cursorDirty || s.dirtyRows > 0)
 }
 
-func (s *paneRenderState) merge(update Update) {
+func (s *panePublicationState) blocksPTY() bool {
+	return s.pending != nil || s.hasMutation()
+}
+
+func (s *panePublicationState) available() <-chan *viewPublicationBuffer {
+	if s.pending != nil || !s.hasMutation() {
+		s.starved = false
+		return nil
+	}
+	if len(s.free) == 0 {
+		if !s.starved {
+			s.pane.renderMetrics.publicationBufferStarved.Add(1)
+			s.starved = true
+		}
+		return s.free
+	}
+	s.starved = false
+	return s.free
+}
+
+func (s *panePublicationState) submission() (chan<- confirmerMessage, confirmerMessage) {
+	if s.pending == nil || s.lease == nil {
+		return nil, confirmerMessage{}
+	}
+	return s.lease.submissions(), confirmerMessage{publication: s.pending}
+}
+
+func (s *panePublicationState) merge(update Update) {
 	if s.lease == nil || s.pane.currentViewMode() != paneViewLive {
 		return
 	}
@@ -201,52 +379,63 @@ func (s *paneRenderState) merge(update Update) {
 	})
 }
 
-// mergeViewMutation mechanically combines explicit structural damage.
-// Ambiguous or structurally incompatible transitions intentionally become
-// full redraws.
-func (s *paneRenderState) mergeViewMutation(update ViewMutation) {
+func (s *panePublicationState) mergeViewMutation(update ViewMutation) {
 	if s.lease == nil {
 		return
 	}
-	s.ensureRows()
-	if update.FullRedraw || update.ScrollRegion != nil && s.progressive {
-		s.markFull()
-	} else {
-		if region := update.ScrollRegion; region != nil {
-			if s.scrollRegion != nil &&
-				(s.scrollRegion.Top != region.Top || s.scrollRegion.Bottom != region.Bottom ||
-					(s.scrollRegion.Delta < 0) != (region.Delta < 0)) {
-				s.markFull()
+	s.ensureGeometry()
+	if update.FullRedraw {
+		s.keyframe = true
+	}
+	if region := update.ScrollRegion; region != nil && !s.keyframe {
+		if s.scroll != nil &&
+			(s.scroll.Top != region.Top || s.scroll.Bottom != region.Bottom ||
+				(s.scroll.Delta < 0) != (region.Delta < 0)) {
+			s.keyframe = true
+			s.scroll = nil
+		} else {
+			s.dirtyRows -= shiftDirtyRows(s.dirty, region.Top, region.Bottom, region.Delta)
+			if s.scroll == nil {
+				s.scrollBuf = *region
+				s.scroll = &s.scrollBuf
 			} else {
-				s.dirtyRows -= shiftDirtyRows(s.dirty, region.Top, region.Bottom, region.Delta)
-				if s.scrollRegion == nil {
-					s.scrollRegionBuf = *region
-					s.scrollRegion = &s.scrollRegionBuf
-				} else {
-					s.scrollRegion.Delta += region.Delta
-					height := region.Bottom - region.Top
-					if s.scrollRegion.Delta < -height {
-						s.scrollRegion.Delta = -height
-					} else if s.scrollRegion.Delta > height {
-						s.scrollRegion.Delta = height
-					}
-				}
+				s.scroll.Delta += region.Delta
 			}
-		}
-		cols := s.cols()
-		for row := 0; row < len(s.dirty) && row < len(update.DirtySpans); row++ {
-			if mergeDirtySpan(&s.dirty[row], update.DirtySpans[row], cols) {
-				s.dirtyRows++
+			height := region.Bottom - region.Top
+			if s.scroll != nil && (s.scroll.Delta <= -height || s.scroll.Delta >= height) {
+				s.keyframe = true
+				s.scroll = nil
 			}
 		}
 	}
-	if region := s.scrollRegion; region != nil {
-		height := region.Bottom - region.Top
-		if region.Delta <= -height || region.Delta >= height {
-			s.markFull()
+	cols := s.cols()
+	for row := 0; row < len(s.dirty) && row < len(update.DirtySpans); row++ {
+		if mergeDirtySpan(&s.dirty[row], update.DirtySpans[row], cols) {
+			s.dirtyRows++
 		}
 	}
-	s.cursorDirty = s.cursorDirty || update.CursorChanged
+	if s.keyframe {
+		for row := range s.dirty {
+			s.dirty[row] = DirtySpan{Start: 0, End: cols}
+		}
+		s.dirtyRows = len(s.dirty)
+	}
+	s.cursorDirty = s.cursorDirty || update.CursorChanged || update.ScrollRegion != nil
+}
+
+func mergeDirtySpan(dst *DirtySpan, next DirtySpan, cols int) bool {
+	next.Start = max(0, next.Start)
+	next.End = min(cols, next.End)
+	if next.Start >= next.End {
+		return false
+	}
+	if dst.End <= dst.Start {
+		*dst = next
+		return true
+	}
+	dst.Start = min(dst.Start, next.Start)
+	dst.End = max(dst.End, next.End)
+	return false
 }
 
 func shiftDirtyRows(spans []DirtySpan, top, bottom, delta int) int {
@@ -278,243 +467,527 @@ func shiftDirtyRows(spans []DirtySpan, top, bottom, delta int) int {
 	return dropped
 }
 
-func cloneRenderStyles(styles map[uint32]protocol.Style) map[uint32]protocol.Style {
-	copyStyles := make(map[uint32]protocol.Style, len(styles))
-	for id, style := range styles {
-		copyStyles[id] = style
-	}
-	return copyStyles
+type currentSemanticCell struct {
+	kind  semanticCellKind
+	width uint8
+	r     rune
+	text  string
+	style protocol.Style
 }
 
-func cloneDirty(spans []DirtySpan) []DirtySpan {
-	return append([]DirtySpan(nil), spans...)
+func canonicalStyle(style protocol.Style) protocol.Style {
+	if style.FG.Mode == "" {
+		style.FG.Mode = "default"
+	}
+	if style.BG.Mode == "" {
+		style.BG.Mode = "default"
+	}
+	return style
 }
 
-func (s *paneRenderState) nextDirtyRow() int {
-	rows := len(s.dirty)
-	if rows == 0 {
-		return -1
-	}
-	for offset := 0; offset < rows; offset++ {
-		row := (s.nextRow + offset) % rows
-		if span := s.dirty[row]; span.End > span.Start {
-			return row
-		}
-	}
-	return -1
-}
-
-func (s *paneRenderState) cells(row int) ([]cellWord, displayStyleSource, *clusterStore) {
-	if s.pane.currentViewMode() == paneViewHistory && s.pane.historyView != nil {
-		view := s.pane.historyView
-		return view.Snapshot.row(view.ViewTop + row), view.Snapshot, view.Snapshot.clusters
-	}
-	return s.pane.terminal.gridRow(row), s.pane.terminal, &s.pane.terminal.clusters
-}
-
-func (s *paneRenderState) selectionBoundary(row, start, end int) (int, bool) {
-	if s.pane.currentViewMode() != paneViewHistory || s.pane.historyView == nil {
-		return end, false
-	}
+func (s *panePublicationState) historyCounterBytes() []byte {
 	view := s.pane.historyView
-	logicalRow := view.ViewTop + row
-	selected := historySelectionContains(view.Selection, logicalRow, start)
-	for column := start + 1; column < end; column++ {
-		if historySelectionContains(view.Selection, logicalRow, column) != selected {
-			return column, selected
-		}
-	}
-	return end, selected
+	s.counterScratch = s.counterScratch[:0]
+	s.counterScratch = append(s.counterScratch, '[')
+	s.counterScratch = strconv.AppendInt(s.counterScratch, int64(view.Snapshot.InitialTop-view.ViewTop), 10)
+	s.counterScratch = append(s.counterScratch, '/')
+	s.counterScratch = strconv.AppendInt(s.counterScratch, int64(view.Snapshot.InitialTop), 10)
+	s.counterScratch = append(s.counterScratch, ']')
+	return s.counterScratch
 }
 
-func normalizeCellEnd(cells []cellWord, start, end int) int {
-	end = min(end, len(cells))
-	for end > start && end < len(cells) && cells[end].width() == 0 {
-		end--
-	}
-	if end == start && start < len(cells) {
-		end = min(len(cells), start+int(max(uint8(1), cells[start].width())))
-	}
-	return end
-}
-
-func (s *paneRenderState) tryCells(output *renderOutput, row, start, end int) (int, error) {
-	cells, styles, clusters := s.cells(row)
-	end, selected := s.selectionBoundary(row, start, end)
-	for {
-		end = normalizeCellEnd(cells, start, end)
-		beforeBytes := output.pending
-		beforeStyles := cloneRenderStyles(output.installedStyles)
-		compiler := newDisplayCompiler(output, styles, clusters, s.cols())
-		if s.pane.currentViewMode() == paneViewLive {
-			compiler.installStyles = true
-		} else if selected {
-			compiler.installStyles = true
-			compiler.styleMapper = func(uint32) uint32 { return historySelectionStyleID }
-		} else {
-			compiler.installStyles = true
-		}
-		err := compiler.writeCells(row, start, cells[start:end])
-		if err == nil {
-			err = compiler.finish()
-		}
-		if !errors.Is(err, errRenderBufferFull) {
-			return end, err
-		}
-		output.pending = beforeBytes
-		output.installedStyles = beforeStyles
-		if end-start <= 1 || end-start <= int(cells[start].width()) {
-			return start, errRenderBufferFull
-		}
-		end = start + (end-start)/2
-	}
-}
-
-func (s *paneRenderState) appendTrailer(output *renderOutput) error {
-	output.limit = paneRenderBufferCapacity
-	if s.pane.currentViewMode() == paneViewHistory && s.pane.historyView != nil {
+func (s *panePublicationState) currentCell(row, column int, counter []byte) (currentSemanticCell, error) {
+	var cells []cellWord
+	var styles displayStyleSource
+	var clusters *clusterStore
+	history := s.pane.currentViewMode() == paneViewHistory && s.pane.historyView != nil
+	if history {
 		view := s.pane.historyView
-		compiler := newDisplayCompiler(output, view.Snapshot, view.Snapshot.clusters, view.Snapshot.Cols)
-		compiler.installStyles = true
-		if err := writeHistoryCounter(compiler, view, historyCounter(view)); err != nil {
-			return err
+		counterStart := view.Snapshot.Cols - len(counter)
+		if row == 0 && column >= counterStart {
+			return currentSemanticCell{
+				kind: semanticScalar, width: 1, r: rune(counter[column-counterStart]),
+				style: canonicalStyle(historyCounterStyle),
+			}, nil
 		}
-		if err := compiler.finish(); err != nil {
-			return err
+		cells = view.Snapshot.row(view.ViewTop + row)
+		styles = view.Snapshot
+		clusters = view.Snapshot.clusters
+	} else {
+		cells = s.pane.terminal.gridRow(row)
+		styles = s.pane.terminal
+		clusters = &s.pane.terminal.clusters
+	}
+	word := cells[column]
+	style, ok := styles.LookupStyle(uint32(word.styleID()))
+	if !ok {
+		return currentSemanticCell{}, fmt.Errorf("pane %d cell style %d is unavailable", s.pane.ID, word.styleID())
+	}
+	if history && historySelectionContains(s.pane.historyView.Selection, s.pane.historyView.ViewTop+row, column) {
+		style = historySelectionStyle
+	}
+	cell := currentSemanticCell{width: word.width(), style: canonicalStyle(style)}
+	switch {
+	case word.width() == 0:
+		cell.kind = semanticContinuation
+	case word.isBlank():
+		cell.kind = semanticBlank
+	case func() bool { r, ok := word.scalar(); cell.r = r; return ok }():
+		cell.kind = semanticScalar
+	default:
+		cell.kind = semanticCluster
+		cell.text = cellTextFromStore(word, clusters)
+		if cell.text == "" {
+			return currentSemanticCell{}, fmt.Errorf("pane %d cluster cell has no text", s.pane.ID)
 		}
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: min(view.CursorCol, view.Snapshot.Cols-1), Y: view.CursorRow - view.ViewTop}, Visible: true}}); err != nil {
-			return err
+	}
+	return cell, nil
+}
+
+func semanticStyleAt(styles []protocol.Style, index uint16) (protocol.Style, bool) {
+	if int(index) >= len(styles) {
+		return protocol.Style{}, false
+	}
+	return styles[index], true
+}
+
+func currentEqualsSemantic(current currentSemanticCell, previous semanticCell, styles []protocol.Style, clusters []byte) bool {
+	if current.kind != previous.kind || current.width != previous.width {
+		return false
+	}
+	style, ok := semanticStyleAt(styles, previous.style)
+	if !ok || current.style != style {
+		return false
+	}
+	switch current.kind {
+	case semanticScalar:
+		return uint32(current.r) == previous.payload
+	case semanticCluster:
+		start := int(previous.payload)
+		end := start + int(previous.clusterLen)
+		if start < 0 || end > len(clusters) || len(current.text) != end-start {
+			return false
 		}
-	} else if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: s.pane.terminal.CursorX, Y: s.pane.terminal.CursorY}, Visible: s.pane.terminal.CursorVisible}}); err != nil {
+		for index := start; index < end; index++ {
+			if current.text[index-start] != clusters[index] {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+func internSemanticStyle(styles *[]protocol.Style, style protocol.Style) (uint16, error) {
+	style = canonicalStyle(style)
+	for index := range *styles {
+		if (*styles)[index] == style {
+			return uint16(index), nil
+		}
+	}
+	if len(*styles) >= maxTerminalStyles || len(*styles) > math.MaxUint16 {
+		return 0, fmt.Errorf("publication style capacity exceeded")
+	}
+	*styles = append(*styles, style)
+	return uint16(len(*styles) - 1), nil
+}
+
+func appendCurrentSemantic(dst *[]semanticCell, styles *[]protocol.Style, clusters *[]byte, current currentSemanticCell) error {
+	style, err := internSemanticStyle(styles, current.style)
+	if err != nil {
 		return err
 	}
-	return output.present()
-}
-
-func (s *paneRenderState) renderCustom(buffer *paneRenderBuffer, queued queuedPaneRender) error {
-	output := newBoundedRenderOutput(buffer, s.installedStyles, paneRenderBufferCapacity)
-	if queued.render != nil {
-		if err := queued.render(output); err != nil {
-			return err
+	cell := semanticCell{kind: current.kind, width: current.width, style: style}
+	switch current.kind {
+	case semanticScalar:
+		cell.payload = uint32(current.r)
+	case semanticCluster:
+		if len(current.text) > maxGraphemeClusterBytes || len(*clusters) > math.MaxUint32-len(current.text) {
+			return fmt.Errorf("publication cluster capacity exceeded")
 		}
+		cell.payload = uint32(len(*clusters))
+		cell.clusterLen = uint16(len(current.text))
+		*clusters = append(*clusters, current.text...)
 	}
-	buffer.data = output.pending
-	s.installedStyles = output.installedStyles
-	var completed chan error
-	if queued.done != nil {
-		completed = make(chan error, 1)
-	}
-	if !s.lease.submitBatch(buffer, completed) {
-		return fmt.Errorf("pane %d output lease is unavailable", s.pane.ID)
-	}
-	if queued.done != nil {
-		go func() { queued.done <- <-completed }()
-	}
-	s.due = s.hasWork()
+	*dst = append(*dst, cell)
 	return nil
 }
 
-func (s *paneRenderState) render(buffer *paneRenderBuffer) error {
-	if s.lease == nil {
+func translateSemanticCell(dstStyles *[]protocol.Style, dstClusters *[]byte, src semanticCell, srcStyles []protocol.Style, srcClusters []byte) (semanticCell, error) {
+	style, ok := semanticStyleAt(srcStyles, src.style)
+	if !ok {
+		return semanticCell{}, fmt.Errorf("semantic cell style %d is unavailable", src.style)
+	}
+	styleIndex, err := internSemanticStyle(dstStyles, style)
+	if err != nil {
+		return semanticCell{}, err
+	}
+	cell := src
+	cell.style = styleIndex
+	if src.kind == semanticCluster {
+		start := int(src.payload)
+		end := start + int(src.clusterLen)
+		if start < 0 || end > len(srcClusters) || len(*dstClusters) > math.MaxUint32-int(src.clusterLen) {
+			return semanticCell{}, fmt.Errorf("semantic cluster range is invalid")
+		}
+		cell.payload = uint32(len(*dstClusters))
+		*dstClusters = append(*dstClusters, srcClusters[start:end]...)
+	}
+	return cell, nil
+}
+
+func (s *panePublicationState) previousCell(row, column int) (semanticCell, []protocol.Style, []byte, bool) {
+	if !s.snapshot.valid || s.snapshot.cols != s.cols() || s.snapshot.rows != s.rows() {
+		return semanticCell{}, nil, nil, false
+	}
+	sourceRow := row
+	if region := s.scroll; region != nil && row >= region.Top && row < region.Bottom {
+		sourceRow = row - region.Delta
+		if sourceRow < region.Top || sourceRow >= region.Bottom {
+			return semanticCell{}, nil, nil, false
+		}
+	}
+	index := sourceRow*s.snapshot.cols + column
+	return s.snapshot.cells[index], s.snapshot.styles, s.snapshot.clusters, true
+}
+
+func (s *panePublicationState) candidateCellCount(keyframe bool) int {
+	if keyframe {
+		return s.rows() * s.cols()
+	}
+	total := 0
+	for _, span := range s.dirty {
+		if span.End > span.Start {
+			total += span.End - span.Start
+		}
+	}
+	return total
+}
+
+func (s *panePublicationState) currentCursor() publishedCursor {
+	if s.pane.currentViewMode() == paneViewHistory && s.pane.historyView != nil {
+		view := s.pane.historyView
+		return publishedCursor{
+			X:       uint16(min(max(view.CursorCol, 0), view.Snapshot.Cols-1)),
+			Y:       uint16(min(max(view.CursorRow-view.ViewTop, 0), view.Snapshot.ViewportRows-1)),
+			Visible: true,
+		}
+	}
+	return publishedCursor{
+		X:       uint16(max(0, s.pane.terminal.CursorX)),
+		Y:       uint16(max(0, s.pane.terminal.CursorY)),
+		Visible: s.pane.terminal.CursorVisible,
+	}
+}
+
+func (s *panePublicationState) prepare(buffer *viewPublicationBuffer) error {
+	if buffer == nil || s.pending != nil || !s.hasMutation() {
 		return nil
 	}
-	if s.refresh != nil {
-		refresh := s.refresh
-		s.refresh = nil
-		return s.renderCustom(buffer, queuedPaneRender{render: refresh})
+	s.ensureGeometry()
+	rows, cols := s.rows(), s.cols()
+	buffer.reset(cols, rows)
+	buffer.returnTo = s.free
+	publication := &buffer.publication
+	total := rows * cols
+	if cap(publication.Cells) < total {
+		publication.Cells = make([]semanticCell, 0, total)
 	}
-	if len(s.queued) > 0 && !s.hasVisualWork() {
-		queued := s.queued[0]
-		s.queued = s.queued[1:]
-		err := s.renderCustom(buffer, queued)
-		if err != nil {
-			queued.done <- err
+	if cap(publication.Runs) < total {
+		publication.Runs = make([]publishedRun, 0, total)
+	}
+	clusterCap := max(initialPublicationClusterCap, total*8)
+	if cap(publication.Clusters) < clusterCap {
+		publication.Clusters = make([]byte, 0, clusterCap)
+	}
+	counter := []byte(nil)
+	counterStart := cols
+	if s.pane.currentViewMode() == paneViewHistory {
+		counter = s.historyCounterBytes()
+		counterStart = max(0, cols-len(counter))
+	}
+	keyframe := s.keyframe || s.barrier || !s.snapshot.valid ||
+		(s.version > 0 && (uint64(s.version)+1)%publicationAnchorInterval == 0)
+	candidates := s.candidateCellCount(keyframe)
+	if !keyframe && rows*cols > 0 && candidates*100 >= rows*cols*publicationKeyframeDensityPct {
+		keyframe = true
+		candidates = rows * cols
+	} else if !keyframe && len(counter) > 0 && rows > 0 {
+		span := s.dirty[0]
+		overlap := max(0, min(cols, span.End)-max(counterStart, span.Start))
+		candidates += cols - counterStart - overlap
+	}
+	publication.Epoch = s.epoch
+	publication.Kind = PublicationDelta
+	publication.BaseVersion = s.version
+	if keyframe {
+		publication.Kind = PublicationKeyframe
+		publication.BaseVersion = 0
+	}
+	publication.TargetVersion = s.version + 1
+	publication.LayoutRevision = s.layoutRevision
+	publication.Barrier = s.barrier
+	if s.scroll != nil && !keyframe {
+		publication.HasScroll = true
+		publication.Scroll = publishedScroll{
+			Top: uint16(s.scroll.Top), Bottom: uint16(s.scroll.Bottom), Delta: int16(s.scroll.Delta),
 		}
+	}
+	for row := 0; row < rows; row++ {
+		clear(s.diff)
+		start, end := 0, cols
+		if !keyframe {
+			span := s.dirty[row]
+			start, end = max(0, span.Start), min(cols, span.End)
+			if row == 0 && len(counter) > 0 {
+				if end <= start {
+					start, end = counterStart, cols
+				} else {
+					start = min(start, counterStart)
+					end = max(end, cols)
+				}
+			}
+			if end <= start {
+				continue
+			}
+			for start > 0 {
+				current, err := s.currentCell(row, start, counter)
+				if err != nil {
+					buffer.release()
+					return err
+				}
+				previous, _, _, previousOK := s.previousCell(row, start)
+				if current.kind != semanticContinuation &&
+					(!previousOK || previous.kind != semanticContinuation) {
+					break
+				}
+				start--
+			}
+			for end < cols {
+				current, err := s.currentCell(row, end-1, counter)
+				if err != nil {
+					buffer.release()
+					return err
+				}
+				previous, _, _, previousOK := s.previousCell(row, end-1)
+				if current.width != 2 && (!previousOK || previous.width != 2) {
+					break
+				}
+				end++
+			}
+		}
+		for column := start; column < end; column++ {
+			current, err := s.currentCell(row, column, counter)
+			if err != nil {
+				buffer.release()
+				return err
+			}
+			if keyframe {
+				s.diff[column] = true
+				continue
+			}
+			previous, styles, clusters, ok := s.previousCell(row, column)
+			s.diff[column] = !ok || !currentEqualsSemantic(current, previous, styles, clusters)
+		}
+		for column := start; column < end; column++ {
+			if !s.diff[column] {
+				continue
+			}
+			current, err := s.currentCell(row, column, counter)
+			if err != nil {
+				buffer.release()
+				return err
+			}
+			previous, _, _, previousOK := s.previousCell(row, column)
+			if current.kind == semanticContinuation && column > 0 {
+				s.diff[column-1] = true
+				start = min(start, column-1)
+			}
+			if current.width == 2 && column+1 < cols {
+				s.diff[column+1] = true
+				end = max(end, column+2)
+			}
+			if previousOK && previous.kind == semanticContinuation && column > 0 {
+				s.diff[column-1] = true
+				start = min(start, column-1)
+			}
+			if previousOK && previous.width == 2 && column+1 < cols {
+				s.diff[column+1] = true
+				end = max(end, column+2)
+			}
+		}
+		for column := start; column < end; {
+			if !s.diff[column] {
+				column++
+				continue
+			}
+			runStart := column
+			for column < end && s.diff[column] {
+				column++
+			}
+			runEnd := column
+			cellStart := len(publication.Cells)
+			for currentColumn := runStart; currentColumn < runEnd; currentColumn++ {
+				current, err := s.currentCell(row, currentColumn, counter)
+				if err != nil {
+					buffer.release()
+					return err
+				}
+				if err := appendCurrentSemantic(&publication.Cells, &publication.Styles, &publication.Clusters, current); err != nil {
+					buffer.release()
+					return err
+				}
+			}
+			publication.Runs = append(publication.Runs, publishedRun{
+				Row: uint16(row), Column: uint16(runStart), Columns: uint16(runEnd - runStart), CellStart: uint32(cellStart),
+			})
+			publication.changedCells += uint64(runEnd - runStart)
+		}
+	}
+	publication.candidateCells = uint64(candidates)
+	if publication.changedCells > publication.candidateCells {
+		publication.candidateCells = publication.changedCells
+	}
+	if publication.changedCells < publication.candidateCells {
+		publication.cancelledCells = publication.candidateCells - publication.changedCells
+	}
+	cursor := s.currentCursor()
+	publication.Cursor = cursor
+	publication.CursorChanged = keyframe || s.barrier || publication.HasScroll ||
+		s.cursorDirty && (!s.snapshot.valid || cursor != s.snapshot.cursor)
+	if len(publication.Runs) == 0 && !publication.HasScroll && !publication.CursorChanged && !keyframe {
+		s.pane.renderMetrics.candidateCells.Add(publication.candidateCells)
+		s.pane.renderMetrics.cancelledCells.Add(publication.cancelledCells)
+		s.clearMutation()
+		buffer.release()
+		return nil
+	}
+	buffer.metrics = &s.pane.renderMetrics
+	if err := s.prepareNextSnapshot(publication); err != nil {
+		buffer.release()
 		return err
 	}
-
-	dirtyBefore := cloneDirty(s.dirty)
-	dirtyRowsBefore := s.dirtyRows
-	stylesBefore := cloneRenderStyles(s.installedStyles)
-	barrierBefore, cursorBefore := s.barrierPending, s.cursorDirty
-	var scrollBefore *ScrollRegion
-	if s.scrollRegion != nil {
-		copyRegion := *s.scrollRegion
-		scrollBefore = &copyRegion
-	}
-	nextBefore, progressiveBefore := s.nextRow, s.progressive
-	rollback := func() {
-		s.dirty = dirtyBefore
-		s.dirtyRows = dirtyRowsBefore
-		s.installedStyles = stylesBefore
-		s.barrierPending, s.scrollRegion, s.cursorDirty = barrierBefore, scrollBefore, cursorBefore
-		s.nextRow, s.progressive = nextBefore, progressiveBefore
-	}
-
-	output := newBoundedRenderOutput(buffer, s.installedStyles, paneRenderBufferCapacity-paneRenderTrailerReserve)
-	if s.barrierPending {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: s.layoutRevision, GridCols: s.cols(), GridRows: s.rows()}); err != nil {
-			rollback()
-			return err
-		}
-		if err := installStyle(output, protocol.CanonicalDefaultStyleID, protocol.CanonicalDefaultStyle()); err != nil {
-			rollback()
-			return err
-		}
-		s.barrierPending = false
-	}
-	if s.scrollRegion != nil {
-		region := protocol.ScrollRegion{Top: s.scrollRegion.Top, Bottom: s.scrollRegion.Bottom, Delta: s.scrollRegion.Delta}
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: region}); err != nil {
-			rollback()
-			return err
-		}
-		s.scrollRegion = nil
-	}
-
-	for len(output.pending) < output.limit {
-		row := s.nextDirtyRow()
-		if row < 0 {
-			break
-		}
-		span := s.dirty[row]
-		end, err := s.tryCells(output, row, span.Start, span.End)
-		if errors.Is(err, errRenderBufferFull) && len(output.pending) > 0 {
-			break
-		}
-		if err != nil {
-			rollback()
-			return err
-		}
-		if end <= span.Start {
-			break
-		}
-		if end >= span.End {
-			s.dirty[row] = DirtySpan{}
-			s.dirtyRows--
-		} else {
-			s.dirty[row].Start = end
-		}
-		if len(s.dirty) > 0 {
-			s.nextRow = (row + 1) % len(s.dirty)
-		}
-	}
-	if err := s.appendTrailer(output); err != nil {
-		rollback()
-		return err
-	}
-	buffer.data = output.pending
-	if len(buffer.data) > paneRenderBufferCapacity {
-		rollback()
-		return fmt.Errorf("pane %d render batch is %d bytes, capacity %d", s.pane.ID, len(buffer.data), paneRenderBufferCapacity)
-	}
-	if !s.lease.submit(buffer) {
-		rollback()
-		return fmt.Errorf("pane %d output lease is unavailable", s.pane.ID)
-	}
-	s.installedStyles = output.installedStyles
-	s.cursorDirty = false
-	s.progressive = s.hasDirty()
-	s.due = s.hasWork()
+	s.pending = buffer
+	s.clearMutation()
 	return nil
+}
+
+func (s *panePublicationState) prepareNextSnapshot(publication *viewPublication) error {
+	rows, cols := int(publication.Rows), int(publication.Cols)
+	next := &s.nextSnapshot
+	next.reset(cols, rows)
+	defaultStyle, err := internSemanticStyle(&next.styles, protocol.CanonicalDefaultStyle())
+	if err != nil {
+		return err
+	}
+	blank := semanticCell{kind: semanticBlank, width: 1, style: defaultStyle}
+	for row := 0; row < rows; row++ {
+		for column := 0; column < cols; column++ {
+			if publication.Kind == PublicationKeyframe || !s.snapshot.valid {
+				next.cells[row*cols+column] = blank
+				continue
+			}
+			sourceRow := row
+			if publication.HasScroll && row >= int(publication.Scroll.Top) && row < int(publication.Scroll.Bottom) {
+				sourceRow = row - int(publication.Scroll.Delta)
+				if sourceRow < int(publication.Scroll.Top) || sourceRow >= int(publication.Scroll.Bottom) {
+					next.cells[row*cols+column] = blank
+					continue
+				}
+			}
+			source := s.snapshot.cells[sourceRow*cols+column]
+			copied, err := translateSemanticCell(&next.styles, &next.clusters, source, s.snapshot.styles, s.snapshot.clusters)
+			if err != nil {
+				return err
+			}
+			next.cells[row*cols+column] = copied
+		}
+	}
+	for _, run := range publication.Runs {
+		cellStart := int(run.CellStart)
+		for offset := 0; offset < int(run.Columns); offset++ {
+			copied, err := translateSemanticCell(&next.styles, &next.clusters,
+				publication.Cells[cellStart+offset], publication.Styles, publication.Clusters)
+			if err != nil {
+				return err
+			}
+			next.cells[int(run.Row)*cols+int(run.Column)+offset] = copied
+		}
+	}
+	if publication.CursorChanged {
+		next.cursor = publication.Cursor
+	} else {
+		next.cursor = s.snapshot.cursor
+	}
+	next.epoch = publication.Epoch
+	next.version = publication.TargetVersion
+	next.valid = true
+	return nil
+}
+
+func (s *panePublicationState) handedOff() {
+	if s.pending == nil {
+		return
+	}
+	publication := &s.pending.publication
+	s.version = publication.TargetVersion
+	s.snapshot, s.nextSnapshot = s.nextSnapshot, s.snapshot
+	metrics := &s.pane.renderMetrics
+	metrics.publications.Add(1)
+	metrics.candidateCells.Add(publication.candidateCells)
+	metrics.changedCells.Add(publication.changedCells)
+	metrics.changedRuns.Add(uint64(len(publication.Runs)))
+	metrics.cancelledCells.Add(publication.cancelledCells)
+	if publication.Kind == PublicationKeyframe {
+		metrics.keyframes.Add(1)
+	} else {
+		metrics.deltas.Add(1)
+	}
+	s.pending = nil
+}
+
+func (s *panePublicationState) clearMutation() {
+	clear(s.dirty)
+	s.dirtyRows = 0
+	s.scroll = nil
+	s.cursorDirty = false
+	s.keyframe = false
+	s.barrier = false
+}
+
+func (s *panePublicationState) requestSync(done chan<- *OutputLease) {
+	if done != nil {
+		s.syncWaiters = append(s.syncWaiters, done)
+	}
+}
+
+func (s *panePublicationState) flushSyncWaiters() {
+	if s.pending != nil || s.hasMutation() {
+		return
+	}
+	for _, done := range s.syncWaiters {
+		done <- s.lease
+	}
+	s.syncWaiters = s.syncWaiters[:0]
+}
+
+func semanticCellText(cell semanticCell, clusters []byte) ([]byte, rune, error) {
+	switch cell.kind {
+	case semanticBlank:
+		return nil, ' ', nil
+	case semanticScalar:
+		return nil, rune(cell.payload), nil
+	case semanticCluster:
+		start := int(cell.payload)
+		end := start + int(cell.clusterLen)
+		if start < 0 || end > len(clusters) {
+			return nil, 0, fmt.Errorf("publication cluster range is invalid")
+		}
+		return clusters[start:end], 0, nil
+	case semanticContinuation:
+		return nil, 0, nil
+	default:
+		return nil, 0, fmt.Errorf("invalid semantic cell kind %d", cell.kind)
+	}
 }

@@ -1426,9 +1426,9 @@ type OutputLease struct {
 	frontendTerminalWrite func([]byte) error
 
 	workerOnce sync.Once
-	available  chan *paneRenderBuffer
-	ready      chan paneRenderBatch
+	ready      chan confirmerMessage
 	failed     chan error
+	workerDone chan struct{}
 	done       <-chan struct{}
 	onFailure  func(error)
 }

@@ -45,6 +45,12 @@ func (f synchronizedField) key() string {
 //	monitor worker; published value: one outstanding activity edge; actor
 //	messaging alone cannot make producer-side enqueue nonblocking and bounded.
 //
+// server.paneRenderMetrics.*
+//
+//	owner: pane render pipeline; writers: pane actor and its single confirmer;
+//	readers: diagnostics and tests; published values: monotonic counters for
+//	semantic publication, output backpressure, and physical confirmation.
+//
 // client.runtimeState.dropConnectionEvents
 //
 //	owner: frontend runtime; writer: reconnect coordinator; readers: connection
@@ -70,15 +76,29 @@ func (f synchronizedField) key() string {
 //	published value: monotonic contact timestamp; actor messaging would turn a
 //	watchdog heartbeat into additional queued traffic.
 var atomicFieldContract = map[string]string{
-	"server.Pane.metadata":                      "atomic.Pointer",
-	"server.Pane.stopping":                      "atomic.Bool",
-	"server.Pane.processActivityPending":        "atomic.Bool",
-	"server.processActivity.pending":            "*atomic.Bool",
-	"server.processWatch.activityPending":       "*atomic.Bool",
-	"client.runtimeState.dropConnectionEvents":  "atomic.Bool",
-	"client.runtimeState.appliedLayoutRevision": "atomic.Uint64",
-	"client.runtimeState.promptInputStatus":     "atomic.Pointer",
-	"client.liveConnection.lastContact":         "atomic.Int64",
+	"server.Pane.metadata":                                "atomic.Pointer",
+	"server.Pane.stopping":                                "atomic.Bool",
+	"server.Pane.processActivityPending":                  "atomic.Bool",
+	"server.processActivity.pending":                      "*atomic.Bool",
+	"server.processWatch.activityPending":                 "*atomic.Bool",
+	"server.paneRenderMetrics.ptyTurns":                   "atomic.Uint64",
+	"server.paneRenderMetrics.ptyBytes":                   "atomic.Uint64",
+	"server.paneRenderMetrics.publications":               "atomic.Uint64",
+	"server.paneRenderMetrics.presents":                   "atomic.Uint64",
+	"server.paneRenderMetrics.candidateCells":             "atomic.Uint64",
+	"server.paneRenderMetrics.changedCells":               "atomic.Uint64",
+	"server.paneRenderMetrics.changedRuns":                "atomic.Uint64",
+	"server.paneRenderMetrics.keyframes":                  "atomic.Uint64",
+	"server.paneRenderMetrics.deltas":                     "atomic.Uint64",
+	"server.paneRenderMetrics.uncompressedBytes":          "atomic.Uint64",
+	"server.paneRenderMetrics.physicalWrites":             "atomic.Uint64",
+	"server.paneRenderMetrics.publicationBufferStarved":   "atomic.Uint64",
+	"server.paneRenderMetrics.confirmerWriteBlockedNanos": "atomic.Uint64",
+	"server.paneRenderMetrics.cancelledCells":             "atomic.Uint64",
+	"client.runtimeState.dropConnectionEvents":            "atomic.Bool",
+	"client.runtimeState.appliedLayoutRevision":           "atomic.Uint64",
+	"client.runtimeState.promptInputStatus":               "atomic.Pointer",
+	"client.liveConnection.lastContact":                   "atomic.Int64",
 }
 
 func TestProductionSynchronizationOwnershipContract(t *testing.T) {

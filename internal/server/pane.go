@@ -54,6 +54,7 @@ type Pane struct {
 	startupInput           []byte
 	viewMode               paneViewMode
 	historyView            *paneHistoryView
+	renderMetrics          paneRenderMetrics
 
 	// Held exclusively by the pane main goroutine. A lease contains the actual
 	// QUIC stream. Same-client handoff returns it; a new connection atomically
@@ -64,6 +65,13 @@ type Pane struct {
 	// that owned the pane when the sequence began until its terminator arrives.
 	pendingOSC52FrontendWrite func([]byte) error
 	pendingOSC52Sequence      uint64
+}
+
+func (p *Pane) renderMetricsSnapshot() paneRenderMetricsSnapshot {
+	if p == nil {
+		return paneRenderMetricsSnapshot{}
+	}
+	return p.renderMetrics.snapshot()
 }
 
 // notifyProcessActivity is called directly by the PTY/input producers. The
@@ -98,14 +106,15 @@ type paneRequest struct {
 }
 
 type paneCommand struct {
-	install *paneOutputInstall
-	detach  *paneOutputDetach
-	release *paneOutputRelease
-	apply   func(*renderOutput) error
-	capture *paneCaptureRequest
-	resize  *paneResize
-	history *paneHistoryRequest
-	done    chan error
+	install   *paneOutputInstall
+	detach    *paneOutputDetach
+	release   *paneOutputRelease
+	capture   *paneCaptureRequest
+	resize    *paneResize
+	history   *paneHistoryRequest
+	sync      chan<- *OutputLease
+	republish bool
+	done      chan error
 }
 
 type paneOutputInstall struct {
@@ -113,7 +122,6 @@ type paneOutputInstall struct {
 	LayoutRevision protocol.ClientLayoutRevision
 	Cols           uint16
 	Rows           uint16
-	Refresh        func(*renderOutput) error
 }
 
 type paneOutputDetach struct {
