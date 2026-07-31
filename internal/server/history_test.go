@@ -83,6 +83,158 @@ func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {
 	}
 }
 
+func TestHistoryInputBuildsIncrementalScrollDamageInBothDirections(t *testing.T) {
+	tests := []struct {
+		name        string
+		viewTop     int
+		cursorRow   int
+		input       string
+		wantDelta   int
+		wantDirty   []int
+		wantCounter string
+	}{
+		{
+			name: "content upward", viewTop: 0, cursorRow: 2, input: "jj",
+			wantDelta: -2, wantDirty: []int{1, 2}, wantCounter: "[2/4]",
+		},
+		{
+			name: "content downward", viewTop: 2, cursorRow: 2, input: "kk",
+			wantDelta: 2, wantDirty: []int{0, 1, 2}, wantCounter: "[4/4]",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pane := newHistoryRenderTestPane(t)
+			pane.historyView.ViewTop = tt.viewTop
+			pane.historyView.CursorRow = tt.cursorRow
+
+			result := pane.handleHistoryInputNow([]byte(tt.input))
+			if !result.Changed || result.Render.FullRedraw || !result.Render.CursorChanged {
+				t.Fatalf("history result = %#v", result)
+			}
+			wantRegion := ScrollRegion{Top: 0, Bottom: 3, Delta: tt.wantDelta}
+			if result.Render.ScrollRegion == nil || *result.Render.ScrollRegion != wantRegion {
+				t.Fatalf("scroll region = %#v, want %#v", result.Render.ScrollRegion, wantRegion)
+			}
+			for row, span := range result.Render.DirtySpans {
+				want := false
+				for _, dirtyRow := range tt.wantDirty {
+					want = want || row == dirtyRow
+				}
+				if want != (span.End > span.Start) {
+					t.Fatalf("row %d damage = %#v, want dirty=%t", row, span, want)
+				}
+			}
+			if got := historyCounter(pane.historyView); got != tt.wantCounter {
+				t.Fatalf("counter = %q, want %q", got, tt.wantCounter)
+			}
+			if got := result.Render.DirtySpans[0]; tt.wantDelta < 0 && got != (DirtySpan{}) {
+				t.Fatalf("upward scroll retained discarded counter damage: %#v", got)
+			}
+			if got := result.Render.DirtySpans[2]; tt.wantDelta > 0 &&
+				got != (DirtySpan{Start: 3, End: 8}) {
+				t.Fatalf("downward scroll counter cleanup = %#v, want [3,8)", got)
+			}
+		})
+	}
+}
+
+func TestHistoryRenderStateCoalescesSameDirectionAndFallsBackSafely(t *testing.T) {
+	pane := newHistoryRenderTestPane(t)
+	pane.historyView.ViewTop = 0
+	pane.historyView.CursorRow = 2
+	first := pane.handleHistoryInputNow([]byte("j"))
+	second := pane.handleHistoryInputNow([]byte("j"))
+
+	state := newPaneRenderState(pane)
+	state.lease = &OutputLease{}
+	state.ensureRows()
+	state.mergeHistory(first.Render)
+	state.mergeHistory(second.Render)
+	if state.scrollRegion == nil || *state.scrollRegion != (ScrollRegion{Top: 0, Bottom: 3, Delta: -2}) {
+		t.Fatalf("coalesced history scroll = %#v", state.scrollRegion)
+	}
+	if state.dirty[0] != (DirtySpan{}) ||
+		state.dirty[1] != (DirtySpan{Start: 0, End: 8}) ||
+		state.dirty[2] != (DirtySpan{Start: 0, End: 8}) {
+		t.Fatalf("coalesced exposed-row damage = %#v", state.dirty)
+	}
+
+	opposing := Update{}
+	opposing.Reset(3)
+	opposing.ScrollRegion = &ScrollRegion{Top: 0, Bottom: 3, Delta: 1}
+	state.mergeHistory(opposing)
+	if state.scrollRegion != nil || state.dirtyRows != 3 {
+		t.Fatalf("opposing movement did not force full redraw: %#v", state)
+	}
+
+	state = newPaneRenderState(pane)
+	state.lease = &OutputLease{}
+	state.ensureRows()
+	state.progressive = true
+	state.mergeHistory(first.Render)
+	if state.scrollRegion != nil || state.progressive || state.dirtyRows != 3 {
+		t.Fatalf("progressive history movement did not force full redraw: %#v", state)
+	}
+}
+
+func TestHistoryCursorAndSimpleSelectionDamageStayIncremental(t *testing.T) {
+	pane := newHistoryRenderTestPane(t)
+	pane.historyView.ViewTop = 1
+	pane.historyView.CursorRow = 2
+	cursorOnly := pane.handleHistoryInputNow([]byte("k"))
+	if !cursorOnly.Changed || !cursorOnly.Render.CursorChanged ||
+		cursorOnly.Render.FullRedraw || cursorOnly.Render.ScrollRegion != nil ||
+		cursorOnly.Render.HasDamage() {
+		t.Fatalf("cursor-only movement render = %#v", cursorOnly.Render)
+	}
+	if got := pane.historyView.cursorPosition(); got != (paneHistoryPosition{Row: 1, Col: 0}) {
+		t.Fatalf("cursor-only movement position = %#v", got)
+	}
+
+	pane = newHistoryRenderTestPane(t)
+	pane.historyView.ViewTop = 1
+	pane.historyView.CursorRow = 2
+	position := pane.historyView.cursorPosition()
+	pane.historyView.Selection = &paneHistorySelection{Anchor: position, Head: position}
+	selection := pane.handleHistoryInputNow([]byte("l"))
+	if !selection.Changed || !selection.Render.CursorChanged ||
+		selection.Render.FullRedraw || selection.Render.ScrollRegion != nil {
+		t.Fatalf("simple selection movement render = %#v", selection.Render)
+	}
+	if got, want := selection.Render.DirtySpans[1], (DirtySpan{Start: 0, End: 2}); got != want {
+		t.Fatalf("simple selection damage = %#v, want %#v", got, want)
+	}
+}
+
+func TestHistoryInputFallsBackForJumpsAndSelectionMovement(t *testing.T) {
+	for _, input := range []string{"g", "G"} {
+		pane := newHistoryRenderTestPane(t)
+		jump := pane.handleHistoryInputNow([]byte(input))
+		if !jump.Changed || !jump.Render.FullRedraw || jump.Render.ScrollRegion != nil {
+			t.Fatalf("jump %q render = %#v", input, jump.Render)
+		}
+	}
+
+	pane := newHistoryRenderTestPane(t)
+	pane.historyView.ViewTop = 0
+	pane.historyView.CursorRow = 2
+	position := pane.historyView.cursorPosition()
+	pane.historyView.Selection = &paneHistorySelection{Anchor: position, Head: position}
+	selectionMove := pane.handleHistoryInputNow([]byte("j"))
+	if !selectionMove.Changed || !selectionMove.Render.FullRedraw || selectionMove.Render.ScrollRegion != nil {
+		t.Fatalf("selection movement render = %#v", selectionMove.Render)
+	}
+
+	pane = newHistoryRenderTestPane(t)
+	pane.historyView.ViewTop = 0
+	pane.historyView.CursorRow = 2
+	fullViewport := pane.handleHistoryInputNow([]byte("jjj"))
+	if !fullViewport.Changed || !fullViewport.Render.FullRedraw || fullViewport.Render.ScrollRegion != nil {
+		t.Fatalf("full-viewport movement render = %#v", fullViewport.Render)
+	}
+}
+
 func TestHistorySnapshotNeverSplitsClusterAcrossRows(t *testing.T) {
 	term := newTerminal(5, 1)
 	rows := []decodedTestRow{{Cells: []decodedTestCell{
@@ -205,6 +357,9 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 		t.Fatal("entering history did not repaint the pane's existing output stream")
 	}
 	historyCommands := decodePendingCommands(t, wire.Bytes()[liveBytes:])
+	if containsOpcode(commandOpcodes(historyCommands), protocol.DisplayOpcodeScrollRegion) {
+		t.Fatalf("entering history used incremental scroll: %#v", historyCommands)
+	}
 	if !displayCommandsContainText(historyCommands, "end ") {
 		t.Fatalf("history mode did not render the pane-owned frozen view: %#v", historyCommands)
 	}
@@ -232,6 +387,9 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 		t.Fatal("exiting history did not repaint the pane's existing output stream")
 	}
 	exitCommands := decodePendingCommands(t, wire.Bytes()[historyBytes:])
+	if containsOpcode(commandOpcodes(exitCommands), protocol.DisplayOpcodeScrollRegion) {
+		t.Fatalf("exiting history used incremental scroll: %#v", exitCommands)
+	}
 	if !displayCommandsContainText(exitCommands, "X") || !displayCommandsContainText(exitCommands, "Yve") {
 		t.Fatal("exiting history did not render the pane's current terminal on the existing stream")
 	}
@@ -244,6 +402,96 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 			t.Fatalf("style %d was redefined across history/live output: %#v then %#v", command.StyleID, previous, command.Style)
 		}
 		installed[command.StyleID] = command.Style
+	}
+}
+
+func TestOneLineHistoryMovementEmitsScrollAndOnlyExposedContent(t *testing.T) {
+	pane := &Pane{ID: 0, terminal: newTerminal(8, 3)}
+	setTestRows(pane.terminal,
+		[]decodedTestRow{
+			historyTestRow("h000"),
+			historyTestRow("h111"),
+			historyTestRow("h222"),
+			historyTestRow("h333"),
+		},
+		[]decodedTestRow{
+			historyTestRow("v111"),
+			historyTestRow("v222"),
+			historyTestRow("v333"),
+		},
+	)
+	pane.terminal.CursorX = 0
+	pane.terminal.CursorY = 0
+	ptyOutput := startTestPaneLoop(pane)
+	defer func() {
+		close(ptyOutput)
+		<-pane.mainDone
+		pane.stop()
+	}()
+
+	var wire bytes.Buffer
+	if err := pane.installOutputLease(testOutputLease(0, &wire), 7, 8, 3); err != nil {
+		t.Fatal(err)
+	}
+	syncPaneRenderer(t, pane)
+	if _, err := pane.enterHistoryMode(); err != nil {
+		t.Fatal(err)
+	}
+	syncPaneRenderer(t, pane)
+	if _, err := pane.handleHistoryInput([]byte("kk")); err != nil {
+		t.Fatal(err)
+	}
+	syncPaneRenderer(t, pane)
+	if _, err := pane.handleHistoryInput([]byte("jj")); err != nil {
+		t.Fatal(err)
+	}
+	syncPaneRenderer(t, pane)
+
+	offset := wire.Len()
+	if _, err := pane.handleHistoryInput([]byte("j")); err != nil {
+		t.Fatal(err)
+	}
+	syncPaneRenderer(t, pane)
+	commands := decodePendingCommands(t, wire.Bytes()[offset:])
+
+	scrolls, exposedPositions := 0, 0
+	var cursor protocol.CursorUpdate
+	counterFound := false
+	for _, command := range commands {
+		switch command.Opcode {
+		case protocol.DisplayOpcodeScrollRegion:
+			scrolls++
+			if command.ScrollRegion != (protocol.ScrollRegion{Top: 0, Bottom: 3, Delta: -1}) {
+				t.Fatalf("scroll = %#v, want [0,3) delta -1", command.ScrollRegion)
+			}
+		case protocol.DisplayOpcodeSetWritePosition:
+			if command.Row == 2 {
+				exposedPositions++
+			} else if command.Row != 0 {
+				t.Fatalf("incremental history repaint targeted row %d", command.Row)
+			}
+		case protocol.DisplayOpcodeWriteTextUTF8:
+			counterFound = counterFound || string(command.Text) == "[1/4]"
+		case protocol.DisplayOpcodeCursorUpdate:
+			cursor = command.Cursor
+		}
+	}
+	if scrolls != 1 || exposedPositions != 1 {
+		t.Fatalf("scrolls=%d exposed positions=%d commands=%#v", scrolls, exposedPositions, commands)
+	}
+	if !displayCommandsContainText(commands, "v222") {
+		t.Fatalf("exposed bottom row was not repainted: %#v", commands)
+	}
+	for _, hidden := range []string{"h333", "v111", "v333"} {
+		if displayCommandsContainText(commands, hidden) {
+			t.Fatalf("incremental movement repainted hidden row %q: %#v", hidden, commands)
+		}
+	}
+	if !counterFound {
+		t.Fatalf("history counter was not updated: %#v", commands)
+	}
+	if cursor.Cursor != (protocol.Cursor{X: 0, Y: 2}) || !cursor.Visible {
+		t.Fatalf("history cursor = %#v, want visible (0,2)", cursor)
 	}
 }
 
@@ -303,4 +551,31 @@ func historyTestRow(text string) decodedTestRow {
 		cells[i].Cluster = string(r)
 	}
 	return decodedTestRow{Cells: cells, WrapsNext: strings.HasSuffix(text, "\\")}
+}
+
+func newHistoryRenderTestPane(t *testing.T) *Pane {
+	t.Helper()
+	pane := &Pane{ID: 0, terminal: newTerminal(8, 3)}
+	setTestRows(pane.terminal,
+		[]decodedTestRow{
+			historyTestRow("h000"),
+			historyTestRow("h111"),
+			historyTestRow("h222"),
+			historyTestRow("h333"),
+		},
+		[]decodedTestRow{
+			historyTestRow("v111"),
+			historyTestRow("v222"),
+			historyTestRow("v333"),
+		},
+	)
+	if err := pane.installHistoryView(captureTerminalHistorySnapshot(pane.terminal)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if pane.historyView != nil {
+			pane.exitHistoryModeNow()
+		}
+	})
+	return pane
 }

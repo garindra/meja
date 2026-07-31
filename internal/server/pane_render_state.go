@@ -192,6 +192,23 @@ func (s *paneRenderState) merge(update Update) {
 	if s.lease == nil || s.pane.currentViewMode() != paneViewLive {
 		return
 	}
+	s.mergeViewUpdate(update)
+}
+
+func (s *paneRenderState) mergeHistory(update Update) {
+	if s.lease == nil {
+		return
+	}
+	s.mergeViewUpdate(update)
+	if region := s.scrollRegion; region != nil {
+		height := region.Bottom - region.Top
+		if region.Delta <= -height || region.Delta >= height {
+			s.markFull()
+		}
+	}
+}
+
+func (s *paneRenderState) mergeViewUpdate(update Update) {
 	s.ensureRows()
 	if update.FullRedraw || update.ScrollRegion != nil && s.progressive {
 		s.markFull()

@@ -1234,7 +1234,7 @@ The governing invariants are:
 
 History belongs to each pane's terminal state, not to the client terminal's scrollback buffer. Full primary-screen scrolls append rows to the bounded server-side row store. Partial scroll regions do not pretend to be shell history.
 
-Entering history mode asks the pane actor to clone its bounded row store, cluster references, styles, visible grid, and cursor into a frozen view. Subsequent PTY output continues updating the live authoritative terminal, but the pane's output lease renders the frozen history projection. Navigation can use display scroll operations plus small repair runs rather than redraw every row.
+Entering history mode asks the pane actor to clone its bounded row store, cluster references, styles, visible grid, and cursor into a frozen view. Subsequent PTY output continues updating the live authoritative terminal, but the pane's output lease renders the frozen history projection. Ordinary same-direction viewport movement accumulates one full-width `SCROLL_REGION`, repaints only newly exposed rows and any displaced counter overlay, then appends the current counter and cursor. Entering or leaving history, top/bottom jumps, opposing pending movement, progressive-render ambiguity, a full-viewport displacement, and complex selection changes fall back to a complete authoritative redraw.
 
 The frozen view has its own cursor and optional selection. Keyboard commands can move through history, start or extend a selection, copy it, or cancel. Pointer selection uses layout-aware hit testing and capture: when Meja owns the mouse, a primary-button drag can enter a temporary history view, update only the spans whose selection styling changed, and return to the live view after copying.
 

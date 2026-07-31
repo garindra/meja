@@ -458,31 +458,103 @@ func extractHistorySelection(snapshot *paneHistorySnapshot, selection paneHistor
 }
 
 func (p *Pane) handleHistoryInputNow(data []byte) paneHistoryResult {
+	view := p.historyView
+	if view == nil {
+		return paneHistoryResult{}
+	}
+	var render Update
+	render.Reset(view.Snapshot.ViewportRows)
+	changed := false
+
+	result := func(data []byte, err error) paneHistoryResult {
+		return paneHistoryResult{Changed: changed, Data: data, Err: err, Render: render}
+	}
+	fullRedraw := func() {
+		render.FullRedraw = true
+		render.ScrollRegion = nil
+		clear(render.DirtySpans)
+	}
+	markSelectionChange := func(before, after paneHistoryPosition) {
+		if before.Row != after.Row {
+			fullRedraw()
+			return
+		}
+		row := before.Row - view.ViewTop
+		start, end := min(before.Col, after.Col), max(before.Col, after.Col)+1
+		render.markDirty(row, start, end, view.Snapshot.Cols)
+	}
+	recordMove := func(move historyMove, selectionChanged bool) {
+		render.CursorChanged = true
+		if selectionChanged {
+			fullRedraw()
+			return
+		}
+		if move.Delta == 0 || render.FullRedraw {
+			return
+		}
+		rows, cols := view.Snapshot.ViewportRows, view.Snapshot.Cols
+		if render.ScrollRegion == nil {
+			// The counter is part of the client's cached row zero. Mark it
+			// before shifting so a downward scroll repaints the old overlay at
+			// its post-scroll row. Upward scroll naturally discards it.
+			render.markDirty(0, cols-len(move.OldCounter), cols, cols)
+		}
+		render.recordScrollRegion(0, rows, move.Delta)
+		if render.FullRedraw {
+			return
+		}
+		if region := render.ScrollRegion; region != nil && (region.Delta <= -rows || region.Delta >= rows) {
+			fullRedraw()
+			return
+		}
+		if move.Delta < 0 {
+			render.markDirty(rows-1, 0, cols, cols)
+		} else {
+			render.markDirty(0, 0, cols, cols)
+		}
+	}
+
 	for len(data) > 0 {
 		if data[0] == ' ' {
-			view := p.historyView
-			if view == nil {
-				return paneHistoryResult{}
-			}
 			position := view.cursorPosition()
+			if view.Selection != nil {
+				fullRedraw()
+			} else {
+				row := position.Row - view.ViewTop
+				render.markDirty(row, position.Col, position.Col+1, view.Snapshot.Cols)
+			}
 			view.Selection = &paneHistorySelection{Anchor: position, Head: position, ExitOnFinish: true, CopySingle: true}
+			changed = true
 			data = data[1:]
 			continue
 		}
 		if data[0] == '\r' || data[0] == '\n' {
-			result := p.finishHistorySelectionNow()
-			if result.Changed || result.Err != nil {
-				return result
+			finished := p.finishHistorySelectionNow()
+			if finished.Changed || finished.Err != nil {
+				changed = changed || finished.Changed
+				fullRedraw()
+				return result(finished.Data, finished.Err)
 			}
 			data = data[1:]
 			continue
 		}
 		if delta, consumed := decodeHistoryHorizontalInput(data); consumed > 0 {
-			view := p.historyView
-			view.CursorCol = min(max(view.CursorCol+delta, 0), view.Snapshot.Cols-1)
+			nextColumn := min(max(view.CursorCol+delta, 0), view.Snapshot.Cols-1)
+			if nextColumn == view.CursorCol {
+				data = data[min(consumed, len(data)):]
+				continue
+			}
+			var oldHead paneHistoryPosition
+			if view.Selection != nil {
+				oldHead = view.Selection.Head
+			}
+			view.CursorCol = nextColumn
 			if view.Selection != nil {
 				view.Selection.Head = view.cursorPosition()
+				markSelectionChange(oldHead, view.Selection.Head)
 			}
+			changed = true
+			render.CursorChanged = true
 			data = data[min(consumed, len(data)):]
 			continue
 		}
@@ -493,30 +565,39 @@ func (p *Pane) handleHistoryInputNow(data []byte) paneHistoryResult {
 		data = data[min(consumed, len(data)):]
 		if exit {
 			exited := p.exitHistoryModeNow()
-			return paneHistoryResult{Changed: exited}
+			changed = changed || exited
+			fullRedraw()
+			return result(nil, nil)
 		}
 		if count < 0 {
 			if p.jumpHistory(count == -1) {
 				if p.historyView.Selection != nil {
 					p.historyView.Selection.Head = p.historyView.cursorPosition()
 				}
+				changed = true
+				fullRedraw()
 			}
 			continue
 		}
 		for i := 0; i < count; i++ {
 			move, ok := p.moveHistory(direction)
 			if !ok {
-				return paneHistoryResult{}
+				return result(nil, nil)
 			}
 			if !move.Changed {
 				break
 			}
+			selectionChanged := false
 			if p.historyView.Selection != nil {
+				oldHead := p.historyView.Selection.Head
 				p.historyView.Selection.Head = p.historyView.cursorPosition()
+				selectionChanged = oldHead != p.historyView.Selection.Head
 			}
+			changed = true
+			recordMove(move, selectionChanged)
 		}
 	}
-	return paneHistoryResult{}
+	return result(nil, nil)
 }
 
 func decodeHistoryHorizontalInput(data []byte) (delta, consumed int) {
