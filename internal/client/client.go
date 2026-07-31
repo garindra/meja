@@ -564,7 +564,10 @@ func (c *liveConnection) destroy() {
 func (c *liveConnection) monitorWorkerErrors(errs <-chan error, diagnostics *renderDiagnostics) {
 	for {
 		select {
-		case err := <-errs:
+		case err, ok := <-errs:
+			if !ok {
+				return
+			}
 			if err == nil {
 				continue
 			}
@@ -835,9 +838,6 @@ func readOutputStream(slot uint8, reader *protocol.RenderFrameReader, ui *runtim
 			}
 			if ui.diagnostics != nil {
 				ui.diagnostics.reportCommand(slot, command, wireBytes)
-			}
-			if command.Opcode == protocol.DisplayOpcodeNoop {
-				continue
 			}
 			if err := staged.apply(command); err != nil {
 				sendConnectionError(connectionContext, sessionDone, err)

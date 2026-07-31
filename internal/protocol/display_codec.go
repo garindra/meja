@@ -22,7 +22,7 @@ import (
 type DisplayOpcode byte
 
 const (
-	DisplayOpcodeNoop                 DisplayOpcode = 0x00
+	// Opcode 0x00 is reserved and intentionally invalid.
 	DisplayOpcodeStartRender          DisplayOpcode = 0x01
 	DisplayOpcodeStyleInstall         DisplayOpcode = 0x02
 	DisplayOpcodeSetWritePosition     DisplayOpcode = 0x03
@@ -61,9 +61,6 @@ func (e *DisplayEncoder) Bytes() []byte            { return e.buf }
 
 func (e *DisplayEncoder) AppendCommand(cmd DisplayCommand) error {
 	switch cmd.Opcode {
-	case DisplayOpcodeNoop:
-		e.opcode(DisplayOpcodeNoop)
-		return nil
 	case DisplayOpcodeStartRender:
 		return e.AppendStartRender(StartRender{LayoutRevision: cmd.LayoutRevision, Cols: cmd.GridCols, Rows: cmd.GridRows})
 	case DisplayOpcodeStyleInstall:
@@ -258,7 +255,6 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 	}
 	cmd := DisplayCommand{Opcode: DisplayOpcode(op)}
 	switch cmd.Opcode {
-	case DisplayOpcodeNoop:
 	case DisplayOpcodeStartRender:
 		value, readErr := d.readUvarint()
 		cmd.LayoutRevision, err = ClientLayoutRevision(value), readErr

@@ -956,7 +956,6 @@ Display streams use an opcode grammar rather than the generic control-frame enve
 
 | Command | Stream-state effect | Payload and purpose |
 |---|---|---|
-| `NOOP` | None | Retained as a semantically empty bounded command. |
 | `START_RENDER` | Resets pane compiler state | Declares the current layout revision and pane grid dimensions. It resets position, style selection, installed-style assumptions, and pending frame state for a newly bound slot. It is sent on every stream bind, even when the revision is unchanged. |
 | `STYLE_INSTALL` | Adds or replaces a stream-local style definition | Associates a compact ID with the complete style needed by later writes. ID zero must be the canonical default style. |
 | `SET_WRITE_POSITION` | Changes the implicit row and column | Starts the next write at an explicit pane-relative coordinate. |
@@ -968,6 +967,9 @@ Display streams use an opcode grammar rather than the generic control-frame enve
 | `FILL` | Advances by a column count | Repeats one scalar cell value and width across a run of columns. |
 | `SCROLL_REGION` | Changes the pane surface without moving the write latch | Scrolls complete-width rows in `[top,bottom)` by a signed delta. Negative moves surviving content upward; positive moves it downward. A frame carries at most one accumulated region operation. |
 | `CURSOR_UPDATE` | Replaces remembered cursor state | Publishes pane-relative cursor position and visibility. |
+
+Opcode `0x00` is reserved and invalid. Because network records also reject an
+empty raw payload, every valid frame contains at least one meaningful command.
 
 `SCROLL_REGION` encodes `top` and `bottom` as uvarints and `delta` with the
 display protocol's signed-varint convention. Its bottom coordinate is always

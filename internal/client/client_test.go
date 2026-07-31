@@ -669,31 +669,21 @@ func TestOpenConnectionReportsMalformedRenderStreamForReconnect(t *testing.T) {
 			return
 		}
 
-		streams := make([]quic.SendStream, 0, protocol.OutputStreamCount)
-		for slot := uint64(0); slot < protocol.OutputStreamCount; slot++ {
-			stream, openErr := conn.OpenUniStreamSync(ctx)
-			if openErr != nil {
-				serverDone <- openErr
-				return
-			}
-			streams = append(streams, stream)
-			wire := []byte{0}
-			if slot == 0 {
-				wire = append(append([]byte(nil), validFrame...), 0)
-			}
-			if _, writeErr := stream.Write(wire); writeErr != nil {
-				serverDone <- writeErr
-				return
-			}
-			if slot == 0 {
-				if closeErr := stream.Close(); closeErr != nil {
-					serverDone <- closeErr
-					return
-				}
-			}
+		stream, err := conn.OpenUniStreamSync(ctx)
+		if err != nil {
+			serverDone <- err
+			return
 		}
-		<-ctx.Done()
-		_ = streams
+		wire := append(append([]byte(nil), validFrame...), 0)
+		if _, err := stream.Write(wire); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := stream.Close(); err != nil {
+			serverDone <- err
+			return
+		}
+		<-conn.Context().Done()
 		serverDone <- nil
 	}()
 
@@ -712,7 +702,11 @@ func TestOpenConnectionReportsMalformedRenderStreamForReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer live.destroy()
+	defer func() {
+		if live != nil {
+			live.destroy()
+		}
+	}()
 
 	initialFrameSeen := false
 	for !initialFrameSeen {
@@ -734,6 +728,39 @@ func TestOpenConnectionReportsMalformedRenderStreamForReconnect(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("malformed render stream did not fail the live connection")
+	}
+	live.destroy()
+	live = nil
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("test QUIC server failed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("test QUIC server did not stop")
+	}
+}
+
+func TestWorkerErrorMonitorReturnsWhenChannelCloses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	live := &liveConnection{ctx: ctx, done: make(chan connectionResult, 1)}
+	errs := make(chan error)
+	close(errs)
+	returned := make(chan struct{})
+	go func() {
+		live.monitorWorkerErrors(errs, nil)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("worker error monitor did not return after its channel closed")
+	}
+	select {
+	case result := <-live.done:
+		t.Fatalf("closed worker error channel produced connection result %#v", result)
+	default:
 	}
 }
 

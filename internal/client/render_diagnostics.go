@@ -336,8 +336,6 @@ func formatIncomingRenderTypes(types map[protocol.DisplayOpcode]uint64) string {
 
 func incomingRenderOpcodeName(opcode protocol.DisplayOpcode) string {
 	switch opcode {
-	case protocol.DisplayOpcodeNoop:
-		return "Noop"
 	case protocol.DisplayOpcodeStartRender:
 		return "StartRender"
 	case protocol.DisplayOpcodeStyleInstall:

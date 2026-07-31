@@ -12,7 +12,11 @@ import (
 
 func TestPaneConfirmerSelectsRawOrZlibPerFrame(t *testing.T) {
 	confirmer := newPaneConfirmer()
-	tiny, err := confirmer.encodeRecord([]byte{byte(protocol.DisplayOpcodeNoop)})
+	tinyCommands := protocol.NewDisplayEncoder(nil)
+	if err := tinyCommands.AppendStartRender(protocol.StartRender{LayoutRevision: 1, Cols: 1, Rows: 1}); err != nil {
+		t.Fatal(err)
+	}
+	tiny, err := confirmer.encodeRecord(tinyCommands.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}

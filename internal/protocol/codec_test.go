@@ -181,6 +181,7 @@ func TestDisplayDecoderCleanBoundedEOF(t *testing.T) {
 
 func TestDisplayDecoderRejectsMalformedCommands(t *testing.T) {
 	for name, data := range map[string][]byte{
+		"reserved opcode":     {0x00},
 		"unknown opcode":      {0x7f},
 		"truncated position":  {byte(DisplayOpcodeSetWritePosition), 0x01},
 		"invalid width":       {byte(DisplayOpcodeWriteText), 0x03, 0x00},

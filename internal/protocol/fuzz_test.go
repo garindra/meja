@@ -28,7 +28,7 @@ func FuzzRenderFrameHeader(f *testing.F) {
 }
 
 func FuzzRenderFrameReader(f *testing.F) {
-	f.Add([]byte{0, 1, 1, byte(DisplayOpcodeNoop)})
+	f.Add([]byte{0, 4, 4, byte(DisplayOpcodeStartRender), 1, 1, 1})
 	f.Add([]byte{1, 128, 1, 16, 0x78, 0x9c})
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, _ = NewRenderFrameReader(bytes.NewReader(b)).ReadFrame()
