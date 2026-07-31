@@ -561,6 +561,30 @@ func (c *liveConnection) destroy() {
 	c.workers.Wait()
 }
 
+func (c *liveConnection) monitorWorkerErrors(errs <-chan error, diagnostics *renderDiagnostics) {
+	for {
+		select {
+		case err, ok := <-errs:
+			if !ok {
+				return
+			}
+			if err == nil {
+				continue
+			}
+			if diagnostics != nil {
+				diagnostics.reportProjection(fmt.Sprintf("connection worker error=%v", err))
+			}
+			select {
+			case c.done <- connectionResult{err: err}:
+			case <-c.ctx.Done():
+			}
+			return
+		case <-c.ctx.Done():
+			return
+		}
+	}
+}
+
 type terminalAttachError struct{ reason string }
 
 func (e *terminalAttachError) Error() string { return e.reason }
@@ -665,16 +689,7 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 		return fail(ctx.Err())
 	}
 	live.start(func() { controlLoop(controlDecoder, ui, live.controlFrames, live.done, &live.lastContact) })
-	live.start(func() {
-		for {
-			select {
-			case <-errs:
-				// The control stream is the authoritative lifecycle signal.
-			case <-connCtx.Done():
-				return
-			}
-		}
-	})
+	live.start(func() { live.monitorWorkerErrors(errs, ui.diagnostics) })
 	return live, nil
 }
 
@@ -762,6 +777,11 @@ func loadTLSConfig(spkiHash string) (*tls.Config, error) {
 }
 
 func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeState, outputReady chan<- struct{}, sessionDone chan<- error, start func(func()), lastContact *atomic.Int64) {
+	select {
+	case outputReady <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
 	seen := make(map[uint8]struct{}, int(protocol.OutputStreamCount))
 	for i := 0; i < int(protocol.OutputStreamCount); i++ {
 		stream, err := conn.AcceptUniStream(ctx)
@@ -781,23 +801,19 @@ func acceptOutputStreams(ctx context.Context, conn quic.Connection, ui *runtimeS
 		seen[index] = struct{}{}
 		slot := index
 		start(func() {
-			readOutputStream(slot, protocol.NewDisplayDecoder(stream), ui, sessionDone, conn.Context(), lastContact)
+			readOutputStream(slot, protocol.NewRenderFrameReader(stream), ui, sessionDone, conn.Context(), lastContact)
 		})
-	}
-	select {
-	case outputReady <- struct{}{}:
-	case <-ctx.Done():
 	}
 }
 
-func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeState, sessionDone chan<- error, connectionContext context.Context, lastContact *atomic.Int64) {
+func readOutputStream(slot uint8, reader *protocol.RenderFrameReader, ui *runtimeState, sessionDone chan<- error, connectionContext context.Context, lastContact *atomic.Int64) {
 	state := displayFrameCompiler{
 		slot:          slot,
 		styles:        defaultStyles(),
 		cursorVisible: true,
 	}
 	for {
-		command, wireBytes, err := decoder.ReadCommand()
+		networkFrame, err := reader.ReadFrame()
 		if err != nil {
 			connectionClosed := connectionContext != nil && connectionContext.Err() != nil
 			if errors.Is(err, io.EOF) || isTerminalQUICClose(err) {
@@ -809,23 +825,39 @@ func readOutputStream(slot uint8, decoder *protocol.DisplayDecoder, ui *runtimeS
 			sendConnectionError(connectionContext, sessionDone, fmt.Errorf("read display stream on slot %d: %w", slot, err))
 			return
 		}
-		if lastContact != nil {
-			lastContact.Store(time.Now().UnixNano())
+		staged := state.beginFrame()
+		decoder := protocol.NewDisplayDecoder(bytes.NewReader(networkFrame.Payload))
+		for {
+			command, wireBytes, commandErr := decoder.ReadCommand()
+			if errors.Is(commandErr, io.EOF) {
+				break
+			}
+			if commandErr != nil {
+				sendConnectionError(connectionContext, sessionDone, fmt.Errorf("decode display frame on slot %d: %w", slot, commandErr))
+				return
+			}
+			if ui.diagnostics != nil {
+				ui.diagnostics.reportCommand(slot, command, wireBytes)
+			}
+			if err := staged.apply(command); err != nil {
+				sendConnectionError(connectionContext, sessionDone, err)
+				return
+			}
 		}
-		if ui.diagnostics != nil {
-			ui.diagnostics.reportCommand(slot, command, wireBytes)
-		}
-		if command.Opcode == protocol.DisplayOpcodeNoop {
-			continue
-		}
-		frameReady, err := state.apply(command)
+		completed, err := staged.finishFrame()
 		if err != nil {
 			sendConnectionError(connectionContext, sessionDone, err)
 			return
 		}
-		if frameReady {
-			ui.emit(paneFrameEvent{slot: slot, frame: state.frame})
+		state = staged
+		state.frame = renderFrame{}
+		if lastContact != nil {
+			lastContact.Store(time.Now().UnixNano())
 		}
+		if ui.diagnostics != nil {
+			ui.diagnostics.reportFrame(slot, networkFrame)
+		}
+		ui.emit(paneFrameEvent{slot: slot, frame: completed})
 	}
 }
 
@@ -841,19 +873,35 @@ type displayFrameCompiler struct {
 	cursorVisible  bool
 	cursorUpdated  bool
 	frame          renderFrame
-	frameReady     bool
 	paintStarted   bool
+	stylesShared   bool
 }
 
-func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, error) {
-	if c.frameReady {
-		c.frame = renderFrame{layoutRevision: c.layoutRevision, cols: c.cols, rows: c.rows}
-		c.frameReady = false
-		c.cursorUpdated = false
+func (c *displayFrameCompiler) beginFrame() displayFrameCompiler {
+	staged := *c
+	staged.frame = renderFrame{layoutRevision: c.layoutRevision, cols: c.cols, rows: c.rows}
+	staged.cursorUpdated = false
+	staged.paintStarted = false
+	staged.stylesShared = true
+	return staged
+}
+
+func (c *displayFrameCompiler) finishFrame() (renderFrame, error) {
+	if !c.hasBarrier {
+		return renderFrame{}, fmt.Errorf("display frame on slot %d completed before START_RENDER", c.slot)
 	}
+	c.frame.layoutRevision = c.layoutRevision
+	c.frame.cursor = c.cursor
+	c.frame.cursorVisible = c.cursorVisible
+	c.frame.cursorUpdated = c.cursorUpdated
+	c.paintStarted = false
+	return c.frame, nil
+}
+
+func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) error {
 	if command.Opcode == protocol.DisplayOpcodeStartRender {
 		if command.GridCols <= 0 || command.GridRows <= 0 || uint64(command.GridCols) > protocol.MaxGridCols || uint64(command.GridRows) > protocol.MaxGridRows {
-			return false, fmt.Errorf("invalid display grid %dx%d on slot %d", command.GridCols, command.GridRows, c.slot)
+			return fmt.Errorf("invalid display grid %dx%d on slot %d", command.GridCols, command.GridRows, c.slot)
 		}
 		c.layoutRevision = command.LayoutRevision
 		c.hasBarrier = true
@@ -861,32 +909,34 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		c.row, c.column = 0, 0
 		c.styleID = protocol.CanonicalDefaultStyleID
 		c.styles = defaultStyles()
+		c.stylesShared = false
 		c.frame = renderFrame{layoutRevision: c.layoutRevision, cols: c.cols, rows: c.rows}
 		c.paintStarted = false
-		return false, nil
+		return nil
 	}
 	if !c.hasBarrier {
-		return false, fmt.Errorf("display command 0x%02x on slot %d before START_RENDER", byte(command.Opcode), c.slot)
+		return fmt.Errorf("display command 0x%02x on slot %d before START_RENDER", byte(command.Opcode), c.slot)
 	}
 
 	switch command.Opcode {
 	case protocol.DisplayOpcodeStyleInstall:
 		if command.StyleID == protocol.CanonicalDefaultStyleID && !protocol.IsCanonicalDefaultStyle(command.Style) {
-			return false, fmt.Errorf("invalid canonical default style on slot %d", c.slot)
+			return fmt.Errorf("invalid canonical default style on slot %d", c.slot)
 		}
 		if installed, ok := c.styles[command.StyleID]; ok && installed != command.Style {
-			return false, fmt.Errorf("style %d redefined on slot %d", command.StyleID, c.slot)
+			return fmt.Errorf("style %d redefined on slot %d", command.StyleID, c.slot)
 		}
+		c.ensureMutableStyles()
 		c.styles[command.StyleID] = command.Style
 		c.frame.styleInstalls = append(c.frame.styleInstalls, protocol.StyleDefinition{ID: command.StyleID, Style: command.Style})
 	case protocol.DisplayOpcodeSetWritePosition:
 		if command.Row < 0 || command.Row >= c.rows || command.Column < 0 || command.Column >= c.cols {
-			return false, fmt.Errorf("write position %d,%d outside %dx%d grid on slot %d", command.Row, command.Column, c.cols, c.rows, c.slot)
+			return fmt.Errorf("write position %d,%d outside %dx%d grid on slot %d", command.Row, command.Column, c.cols, c.rows, c.slot)
 		}
 		c.row, c.column = command.Row, command.Column
 	case protocol.DisplayOpcodeSetWriteStyle:
 		if _, ok := c.styles[command.StyleID]; !ok {
-			return false, fmt.Errorf("undefined style %d on slot %d", command.StyleID, c.slot)
+			return fmt.Errorf("undefined style %d on slot %d", command.StyleID, c.slot)
 		}
 		c.styleID = command.StyleID
 	case protocol.DisplayOpcodeWriteText, protocol.DisplayOpcodeWriteTextUTF8, protocol.DisplayOpcodeWriteTextUTF8Default:
@@ -899,15 +949,15 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 			styleID = protocol.CanonicalDefaultStyleID
 		}
 		if err := c.appendText(command.Text, width, styleID); err != nil {
-			return false, err
+			return err
 		}
 		c.paintStarted = true
 	case protocol.DisplayOpcodeWriteCluster:
 		if len(command.Text) == 0 || (command.Width != 1 && command.Width != 2) {
-			return false, fmt.Errorf("invalid display cluster on slot %d", c.slot)
+			return fmt.Errorf("invalid display cluster on slot %d", c.slot)
 		}
 		if err := c.requireCell(int(command.Width)); err != nil {
-			return false, err
+			return err
 		}
 		c.frame.spans = append(c.frame.spans, paintSpan{
 			kind: paintCluster, row: c.row, column: c.column,
@@ -917,7 +967,7 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		c.paintStarted = true
 	case protocol.DisplayOpcodeFill:
 		if err := c.appendFill(command.Fill); err != nil {
-			return false, err
+			return err
 		}
 		c.paintStarted = true
 	case protocol.DisplayOpcodeCursorUpdate:
@@ -926,29 +976,33 @@ func (c *displayFrameCompiler) apply(command protocol.DisplayCommand) (bool, err
 		c.cursorUpdated = true
 	case protocol.DisplayOpcodeScrollRegion:
 		if c.paintStarted {
-			return false, fmt.Errorf("SCROLL_REGION after paint on slot %d", c.slot)
+			return fmt.Errorf("SCROLL_REGION after paint on slot %d", c.slot)
 		}
 		region := command.ScrollRegion
 		if region.Top < 0 || region.Top >= region.Bottom || region.Bottom > c.rows ||
 			region.Delta == 0 || region.Delta < -(region.Bottom-region.Top) || region.Delta > region.Bottom-region.Top {
-			return false, fmt.Errorf("invalid SCROLL_REGION [%d,%d) delta %d for %d-row grid on slot %d", region.Top, region.Bottom, region.Delta, c.rows, c.slot)
+			return fmt.Errorf("invalid SCROLL_REGION [%d,%d) delta %d for %d-row grid on slot %d", region.Top, region.Bottom, region.Delta, c.rows, c.slot)
 		}
 		if c.frame.scrollRegion != nil {
-			return false, fmt.Errorf("multiple SCROLL_REGION commands in one frame on slot %d", c.slot)
+			return fmt.Errorf("multiple SCROLL_REGION commands in one frame on slot %d", c.slot)
 		}
 		c.frame.scrollRegion = &region
-	case protocol.DisplayOpcodePresent:
-		c.frame.layoutRevision = c.layoutRevision
-		c.frame.cursor = c.cursor
-		c.frame.cursorVisible = c.cursorVisible
-		c.frame.cursorUpdated = c.cursorUpdated
-		c.frameReady = true
-		c.paintStarted = false
-		return true, nil
 	default:
-		return false, fmt.Errorf("unexpected display opcode 0x%02x on slot %d", byte(command.Opcode), c.slot)
+		return fmt.Errorf("unexpected display opcode 0x%02x on slot %d", byte(command.Opcode), c.slot)
 	}
-	return false, nil
+	return nil
+}
+
+func (c *displayFrameCompiler) ensureMutableStyles() {
+	if !c.stylesShared {
+		return
+	}
+	styles := make(map[uint32]protocol.Style, len(c.styles)+1)
+	for id, style := range c.styles {
+		styles[id] = style
+	}
+	c.styles = styles
+	c.stylesShared = false
 }
 
 func (c *displayFrameCompiler) requireCell(width int) error {
@@ -1450,8 +1504,18 @@ func writeFrames(ctx context.Context, stream io.Writer, frames <-chan protocol.F
 }
 
 func sendConnectionError(ctx context.Context, errs chan<- error, err error) {
+	// Terminal application closes are owned by controlLoop, which translates
+	// them into the graceful connection result. Letting an output acceptor or
+	// writer report the same close as a worker failure can race that result and
+	// incorrectly send the client through reconnect.
+	if err == nil || isTerminalQUICClose(err) {
+		return
+	}
 	if ctx == nil {
 		errs <- err
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	select {

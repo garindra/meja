@@ -395,7 +395,7 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	if wire.Len() <= liveBytes {
 		t.Fatal("entering history did not repaint the pane's existing output stream")
 	}
-	historyCommands := decodePendingCommands(t, wire.Bytes()[liveBytes:])
+	historyCommands := decodeFramedCommands(t, wire.Bytes()[liveBytes:])
 	if containsOpcode(commandOpcodes(historyCommands), protocol.DisplayOpcodeScrollRegion) {
 		t.Fatalf("entering history used incremental scroll: %#v", historyCommands)
 	}
@@ -425,7 +425,7 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	if wire.Len() <= historyBytes {
 		t.Fatal("exiting history did not repaint the pane's existing output stream")
 	}
-	exitCommands := decodePendingCommands(t, wire.Bytes()[historyBytes:])
+	exitCommands := decodeFramedCommands(t, wire.Bytes()[historyBytes:])
 	if containsOpcode(commandOpcodes(exitCommands), protocol.DisplayOpcodeScrollRegion) {
 		t.Fatalf("exiting history used incremental scroll: %#v", exitCommands)
 	}
@@ -433,7 +433,7 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 		t.Fatal("exiting history did not render the pane's current terminal on the existing stream")
 	}
 	installed := make(map[uint32]protocol.Style)
-	for _, command := range decodePendingCommands(t, wire.Bytes()) {
+	for _, command := range decodeFramedCommands(t, wire.Bytes()) {
 		if command.Opcode != protocol.DisplayOpcodeStyleInstall {
 			continue
 		}
@@ -491,7 +491,7 @@ func TestOneLineHistoryMovementEmitsScrollAndOnlyExposedContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, pane)
-	commands := decodePendingCommands(t, wire.Bytes()[offset:])
+	commands := decodeFramedCommands(t, wire.Bytes()[offset:])
 
 	scrolls, exposedPositions := 0, 0
 	var cursor protocol.CursorUpdate

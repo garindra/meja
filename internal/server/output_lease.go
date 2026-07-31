@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"compress/zlib"
 	"fmt"
 	"io"
 	"time"
@@ -16,12 +18,22 @@ type confirmerMessage struct {
 
 type paneConfirmer struct {
 	frame       []byte
+	compressed  bytes.Buffer
+	zlibWriter  *zlib.Writer
+	record      []byte
 	styleIDs    map[protocol.Style]uint32
 	nextStyleID uint32
 	textScratch []byte
 	epoch       RenderEpoch
 	version     RenderVersion
 	hasBase     bool
+}
+
+type encodedRenderRecord struct {
+	header              protocol.RenderFrameHeader
+	bytes               []byte
+	headerSize          int
+	compressionDuration time.Duration
 }
 
 func newPaneConfirmer() *paneConfirmer {
@@ -495,13 +507,53 @@ func (c *paneConfirmer) compile(publication *viewPublication) ([]byte, error) {
 			return nil, err
 		}
 	}
-	if err := c.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
-		return nil, err
-	}
 	c.epoch = publication.Epoch
 	c.version = publication.TargetVersion
 	c.hasBase = true
 	return c.frame, nil
+}
+
+func (c *paneConfirmer) encodeRecord(raw []byte) (encodedRenderRecord, error) {
+	if len(raw) == 0 || len(raw) > protocol.DefaultMaxFrameSize {
+		return encodedRenderRecord{}, fmt.Errorf("compiled render payload size %d is invalid", len(raw))
+	}
+	c.compressed.Reset()
+	started := time.Now()
+	if c.zlibWriter == nil {
+		c.zlibWriter = zlib.NewWriter(&c.compressed)
+	} else {
+		c.zlibWriter.Reset(&c.compressed)
+	}
+	if _, err := c.zlibWriter.Write(raw); err != nil {
+		return encodedRenderRecord{}, fmt.Errorf("compress render payload: %w", err)
+	}
+	if err := c.zlibWriter.Close(); err != nil {
+		return encodedRenderRecord{}, fmt.Errorf("finish render payload compression: %w", err)
+	}
+	compressionDuration := time.Since(started)
+	encoding, payload := selectRenderPayload(raw, c.compressed.Bytes())
+	header := protocol.RenderFrameHeader{
+		Encoding: encoding, RawSize: uint32(len(raw)), EncodedSize: uint32(len(payload)),
+	}
+	c.record = c.record[:0]
+	var err error
+	c.record, err = protocol.AppendRenderFrameHeader(c.record, header)
+	if err != nil {
+		return encodedRenderRecord{}, err
+	}
+	headerSize := len(c.record)
+	c.record = append(c.record, payload...)
+	return encodedRenderRecord{
+		header: header, bytes: c.record, headerSize: headerSize,
+		compressionDuration: compressionDuration,
+	}, nil
+}
+
+func selectRenderPayload(raw, compressed []byte) (protocol.RenderEncoding, []byte) {
+	if len(compressed) < len(raw) {
+		return protocol.RenderEncodingZlib, compressed
+	}
+	return protocol.RenderEncodingRaw, raw
 }
 
 func (l *OutputLease) startWorker() {
@@ -563,13 +615,17 @@ func (l *OutputLease) runConfirmer() {
 			metrics := buffer.metrics
 			fromPTYDrain := buffer.fromPTYDrain
 			frame, err := confirmer.compile(&buffer.publication)
+			var record encodedRenderRecord
+			if err == nil {
+				record, err = confirmer.encodeRecord(frame)
+			}
 			buffer.release()
 			if err == nil && metrics != nil {
-				metrics.recordCompiledFrame(len(frame), fromPTYDrain)
+				metrics.recordCompiledFrame(record, fromPTYDrain)
 			}
 			if err == nil {
 				started := time.Now()
-				err = l.writeFrame(frame, metrics)
+				err = l.writeFrame(record.bytes, metrics)
 				if metrics != nil {
 					metrics.confirmerWriteBlockedNanos.Add(uint64(time.Since(started)))
 				}

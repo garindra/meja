@@ -889,9 +889,11 @@ references. A second semantic viewport is built from the publication and
 becomes the comparison baseline only when the publication is handed off.
 
 The single confirmer consumes publications in version order and compiles each
-one into a complete reliable frame. Buffer availability can delay handoff, but
-does not split a publication or expose partial dirty spans. Every compiled
-publication ends in exactly one `PRESENT`.
+one into a complete display-command payload. It independently attempts
+zlib-default compression, selects zlib only when it is smaller than the raw
+payload, and writes one bounded reliable network frame. Buffer availability
+can delay handoff, but does not split a publication or expose partial dirty
+spans.
 
 Ordinary admission is immediate after idle. After one turn, the actor does not admit another ordinary chunk before that turn's time plus 50 ms. Accepted keyboard input, attach, and resize may spend one edge-coalesced immediate credit; continuous interaction cannot repeatedly bypass the cadence until the PTY stream has gone idle. Commands, history operations, captures, terminal replies from an admitted chunk, and other non-PTY work remain responsive while the admission timer is pending.
 
@@ -942,7 +944,8 @@ cursor movement, styles, text, fills, and scrolling to the user's terminal.
 
 The protocol describes how to update a bounded rectangular cell surface:
 install a style, choose a position and style, write text or a grapheme cluster,
-fill cells, scroll rows, update the cursor, and present the completed batch. It
+fill cells, scroll rows, and update the cursor. A bounded network-frame EOF
+commits the completed batch. It
 does not carry raw PTY bytes, serialize the server's terminal object, or define
 which pane occupies which part of the frontend. Pane placement and revision
 mapping arrive separately in `CLIENT_LAYOUT` on the control stream.
@@ -953,7 +956,6 @@ Display streams use an opcode grammar rather than the generic control-frame enve
 
 | Command | Stream-state effect | Payload and purpose |
 |---|---|---|
-| `NOOP` | None | Materializes a QUIC output stream without creating a visible frame. |
 | `START_RENDER` | Resets pane compiler state | Declares the current layout revision and pane grid dimensions. It resets position, style selection, installed-style assumptions, and pending frame state for a newly bound slot. It is sent on every stream bind, even when the revision is unchanged. |
 | `STYLE_INSTALL` | Adds or replaces a stream-local style definition | Associates a compact ID with the complete style needed by later writes. ID zero must be the canonical default style. |
 | `SET_WRITE_POSITION` | Changes the implicit row and column | Starts the next write at an explicit pane-relative coordinate. |
@@ -965,20 +967,52 @@ Display streams use an opcode grammar rather than the generic control-frame enve
 | `FILL` | Advances by a column count | Repeats one scalar cell value and width across a run of columns. |
 | `SCROLL_REGION` | Changes the pane surface without moving the write latch | Scrolls complete-width rows in `[top,bottom)` by a signed delta. Negative moves surviving content upward; positive moves it downward. A frame carries at most one accumulated region operation. |
 | `CURSOR_UPDATE` | Replaces remembered cursor state | Publishes pane-relative cursor position and visibility. |
-| `PRESENT` | Ends the current semantic frame | Makes all commands since the previous presentation eligible for the client UI loop. |
+
+Opcode `0x00` is reserved and invalid. Because network records also reject an
+empty raw payload, every valid frame contains at least one meaningful command.
 
 `SCROLL_REGION` encodes `top` and `bottom` as uvarints and `delta` with the
 display protocol's signed-varint convention. Its bottom coordinate is always
 exclusive.
 
-The command stream is stateful, but the state is deliberately small and reconstructable. `START_RENDER` supplies the grid needed to validate implicit advancement. Style installations and selection are local to the physical render stream. Position advances after writes, including an exact wrap from the last column to column zero of the next row. Cursor state is remembered separately and copied into the completed frame at `PRESENT`.
+The command stream is stateful, but the state is deliberately small and reconstructable. `START_RENDER` supplies the grid needed to validate implicit advancement. Style installations and selection are local to the physical render stream. Position advances after writes, including an exact wrap from the last column to column zero of the next row. Cursor state is remembered separately and copied into the completed frame at successful bounded payload EOF.
 
-`PRESENT` is the atomic publication boundary. The confirmer appends it exactly
-once after compiling a complete immutable publication. The confirmer passes
-the complete reliable frame byte slice to the stream. The write helper handles
-genuine short writes; QUIC owns transport segmentation and packetization. The
-client does not expose any frame commands until it decodes the terminating
-`PRESENT`.
+## Reliable render-frame envelope
+
+Each long-lived per-slot output stream is a sequence of records:
+
+```text
+FrameHeader
+raw-or-zlib display-command payload
+
+FrameHeader
+raw-or-zlib display-command payload
+...
+```
+
+The canonical header grammar is `[flags byte][raw_size uvarint][encoded_size
+uvarint]`. Bit zero of `flags` selects zlib; bits one through seven are
+reserved and must be zero. Both sizes are nonzero and bounded by the protocol's
+existing 4 MiB maximum. A raw record requires equal sizes. A zlib record
+requires `encoded_size < raw_size`. The slot remains implicit in stream setup;
+the header does not repeat pane, layout, binding, or version identity.
+
+The server finishes the complete command payload, creates one independent
+standard-library zlib-default stream, and uses it only when its complete bytes
+including wrapper and checksum are smaller than raw. There is no shared
+dictionary or cross-frame compression state. It assembles header and selected
+payload in reusable confirmer-owned storage, returns the immutable publication
+buffer to the pane, then passes the complete record to the reliable write path.
+The write helper handles genuine short writes; QUIC owns transport segmentation
+and packetization.
+
+The client validates the header before allocating, reads exactly
+`encoded_size`, decompresses into exactly `raw_size`, and decodes commands only
+from that bounded payload. Zlib checksum failures, truncation, trailing bytes,
+concatenated streams, size mismatches, and commands truncated at payload EOF
+invalidate the entire record. Clean EOF at a command boundary is the sole
+commit signal. Phase 3 has no application acknowledgements; confirmation,
+datagrams, speculative confirmed-base state, and repair belong to Phase 4.
 
 ## Server display-compiler strategy
 
@@ -1001,7 +1035,8 @@ Pen, selected style, and pending text/fill state begin undefined for every
 publication; no reliable frame depends on a predecessor's transient compiler
 state. Installed wire styles remain physical-stream state until a
 `START_RENDER` barrier resets them. Scroll and cursor consequences are compiled
-from the same publication, then exactly one `PRESENT` terminates the frame.
+from the same publication, then pending aggregation is flushed and the command
+payload ends at a valid command boundary.
 
 The pane actor prepares immutable publications in two reusable buffers, while
 the confirmer owns and reuses the encoded frame buffer and text scratch. A
@@ -1009,7 +1044,10 @@ single retained grapheme cluster is capped at 1 KiB, and grapheme anchors and
 wide-cell continuations remain atomic through comparison, publication, and
 compilation.
 
-This strategy compresses semantic regularity: stable position, shared styles, scalar runs, repeated fills, and known cluster boundaries. It does not attempt general-purpose compression of arbitrary PTY bytes, because those bytes have already been interpreted into more useful structure.
+This strategy first compresses semantic regularity: stable position, shared
+styles, scalar runs, repeated fills, and known cluster boundaries. Phase 3 then
+attempts independent zlib compression on that compiled representation. It does
+not compress arbitrary PTY bytes.
 
 ## Incremental and full rendering
 
@@ -1042,6 +1080,10 @@ The connection creates a bounded pool of pane output streams. Each stream has a 
 * one `ClientLayoutRevision` shared by the active projection.
 
 Slots are reusable transport resources, not pane identities. Switching windows can bind the same slot to an entirely different pane.
+The server opens all slot streams up front, but QUIC exposes an individual
+unidirectional stream to the peer only when its first real framed render is
+written. The client's accept loop therefore runs independently of attachment
+readiness and does not require placeholder bytes on idle slots.
 
 ## Output leases
 
@@ -1055,8 +1097,9 @@ Publication ownership alternates through bounded channels:
 ```text
 pane actor borrows one of two publication buffers
     → actor compares final state and fills an immutable publication
-    → confirmer compiles and returns the publication buffer
-    → confirmer writes the complete PRESENT-terminated frame to QUIC
+    → confirmer compiles and frames raw-or-zlib commands
+    → confirmer returns the publication buffer
+    → confirmer writes the complete bounded record to QUIC
 ```
 
 The pane actor does not wait for the write. While both publication buffers are
@@ -1084,7 +1127,7 @@ sequenceDiagram
     S->>S: Validate and commit exact projection
     S->>N: Install lease + revision + grid atomically
     N->>N: Detach renderer, resize if needed, then attach renderer
-    N->>C: START_RENDER + complete keyframe + PRESENT
+    N->>C: framed START_RENDER + complete keyframe payload
     S->>C: CLIENT_LAYOUT revision and rectangles
     C->>C: Activate after layout and one presented frame per visible pane
 ```
@@ -1106,7 +1149,7 @@ handoff.
 The first command after a pane acquires a render stream is `START_RENDER`, carrying the prepared `ClientLayoutRevision` and pane grid dimensions. It resets the display compiler's stream-local position, style selection, installed styles, and pending frame state. It says that all subsequent commands belong to the current coordinate space and cannot be interpreted as a continuation of the previous pane binding. A reconnect uses a revision newer than the surviving frontend scanout even when canonical window geometry is unchanged, ensuring that the accompanying full refresh replaces the old pane caches. The client validates that the dimensions match the rectangle later activated for that slot.
 
 The pane's initial keyframe carries `START_RENDER`, any styles it uses, the
-complete visible state, and one terminating `PRESENT`. `START_RENDER` is not
+complete visible state, and any cursor update in one bounded payload. `START_RENDER` is not
 itself a control-stream layout message; it is the render stream's declaration
 of which layout the following pixels belong to.
 
@@ -1115,7 +1158,7 @@ of which layout the following pixels belong to.
 The control-stream layout message and pane frames may arrive in either order. The client stores pending layouts by revision and pending frames by revision and slot. It activates a revision only when it has:
 
 1. the layout for that revision; and
-2. at least one complete presented frame for every pane named by the layout.
+2. at least one complete committed frame for every pane named by the layout.
 
 Activation clears the previous pane caches, constructs caches with the new
 rectangles, draws borders, applies the initial keyframes, and only then exposes
@@ -1143,7 +1186,10 @@ the render loop for immediate local editing and emits only the completed
 
 ## Per-stream `renderFrame` compilation
 
-Each decoder goroutine owns one `displayFrameCompiler`. It reads commands in order and expands their implicit state into an explicit in-progress `renderFrame`. The compiler tracks:
+Each decoder goroutine owns one framed-stream reader and one
+`displayFrameCompiler`. It first reads and validates a complete header and
+payload, then expands bounded commands into an explicit staged `renderFrame`.
+The compiler tracks:
 
 * the render slot;
 * current layout revision and declared grid dimensions;
@@ -1156,15 +1202,21 @@ It validates the stream while compiling: pane commands require `START_RENDER`; p
 
 Text commands become pane-relative `paintSpan` values. A multi-row text command is split into row-local spans while the compiler's implicit position continues across the boundary. Fills are similarly split at row edges. `STYLE_INSTALL` definitions are collected in the frame rather than immediately affecting the physical terminal. Cursor updates change the compiler's remembered cursor and mark whether the frame explicitly changed it.
 
-`PRESENT` copies the remembered cursor state into the frame and marks it complete. Only then does the worker transfer ownership of that `renderFrame` to the shared event channel as a `paneFrameEvent`. The worker immediately starts a fresh frame while retaining valid stream-local latches for the next batch. Commands received before `PRESENT` are therefore decoded and validated concurrently but remain invisible to the main UI state.
+At the beginning of each network frame, the worker stages the small persistent
+decoder state. Installed styles use copy-on-write; pane scanout cell caches are
+not copied. Commands may mutate only this staged state. A decompression,
+command, or validation error discards the staged geometry, styles, cursor,
+position, and frame accumulation. At clean bounded EOF, the worker copies the
+remembered cursor into the frame, promotes the staged decoder state, and emits
+exactly one `paneFrameEvent`. No partial network frame can reach the UI loop.
 
 ```mermaid
 flowchart LR
     Q1["Pane stream / slot 0"] --> G1["decoder goroutine"]
     Q2["Pane stream / slot 1"] --> G2["decoder goroutine"]
     QC["Control stream"] --> GC["control decoder"]
-    G1 -->|"presented renderFrame"| E["shared render-event channel"]
-    G2 -->|"presented renderFrame"| E
+    G1 -->|"committed renderFrame"| E["shared render-event channel"]
+    G2 -->|"committed renderFrame"| E
     GC -->|"layout / status event"| E
     E --> R["single render goroutine"]
     R --> O["stdout / physical terminal"]
@@ -1498,7 +1550,7 @@ scrolling, and input-event coalescing.
 Meja has two live compatibility surfaces. The command protocol versions the
 Unix/SSH request and result framing; its attach result contains a separately
 validated bootstrap payload in the current implementation. The exact QUIC
-ALPN, currently `meja-quic/14`, versions the complete interactive profile:
+ALPN, currently `meja-quic/15`, versions the complete interactive profile:
 attachment and resume messages, stream topology, control codecs, display
 opcodes, scanout/cache semantics, reconnect behavior, and coupled terminal
 behavior such as DSCLRM probing. Attach and resume messages therefore do not
@@ -1584,7 +1636,7 @@ The suite includes:
 * resolved-view ownership, exact client-layout publication, grid/layout agreement, and rejected-target source preservation;
 * blocked output workers with responsive pane commands and bounded PTY backpressure;
 * bounded PTY drains, immutable keyframe/delta publications, final-state
-  cancellation, and exactly one terminating `PRESENT` per publication;
+  cancellation, and exactly one bounded network frame per publication;
 * prediction confirmation, partial confirmation, conflict, and repair;
 * history independence, frozen projection, selection overlays, and extraction;
 * snapshot consistency, project-file versus recovery-snapshot separation, validation, and command modes; and
@@ -1629,9 +1681,10 @@ The following statements summarize the contracts contributors should preserve:
     Reconnection always allocates a newer `ClientLayoutRevision`, even when
     canonical window geometry is unchanged, and stale teardown can detach only
     the exact old lease.
-21. Each immutable publication compiles to one complete frame with exactly one
-    `PRESENT`; physical stream writes may split that frame but cannot expose it
-    partially in the UI.
+21. Each immutable publication compiles to one bounded reliable frame. Its
+    command payload is independently raw or zlib encoded, and clean bounded EOF
+    is the only commit boundary; physical stream writes may split the record
+    but cannot expose it partially in the UI.
 22. A completed PTY drain produces at most one publication, based on final
     semantic comparison with the previous handed-off snapshot. Changes that
     return to their previous value are cancelled before publication.

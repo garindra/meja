@@ -2,13 +2,18 @@ package client
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -395,7 +400,7 @@ func TestQUICDialALPNRejectionReportsIncompatibleServer(t *testing.T) {
 		ErrorMessage: "tls: no application protocol",
 	}
 	err := quicDialError("example.com:60000", cause)
-	want := `server at example.com:60000 did not accept client QUIC profile "meja-quic/14"; the remote meja binary and running server must use the same QUIC profile as this client. Compare "meja version --verbose" locally with "meja server-version" using the same remote transport options, check --remote-path, and restart the remote server: CRYPTO_ERROR 0x178 (remote): tls: no application protocol`
+	want := `server at example.com:60000 did not accept client QUIC profile "meja-quic/15"; the remote meja binary and running server must use the same QUIC profile as this client. Compare "meja version --verbose" locally with "meja server-version" using the same remote transport options, check --remote-path, and restart the remote server: CRYPTO_ERROR 0x178 (remote): tls: no application protocol`
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err, want)
 	}
@@ -420,7 +425,7 @@ func TestIncomingRenderBurstLog(t *testing.T) {
 	var log bytes.Buffer
 	diagnostics := newRenderDiagnostics(&log)
 	diagnostics.reportCommand(0, protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteText, Text: []byte("x")}, 3)
-	diagnostics.reportCommand(0, protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}, 1)
+	diagnostics.reportFrame(0, protocol.DecodedRenderFrame{Header: protocol.RenderFrameHeader{Encoding: protocol.RenderEncodingRaw, RawSize: 3, EncodedSize: 3}, HeaderSize: 3})
 	diagnostics.reportRedraw("test", 7)
 	diagnostics.reportProjection("layout received revision=9 activated=false")
 	diagnostics.close()
@@ -429,10 +434,11 @@ func TestIncomingRenderBurstLog(t *testing.T) {
 	for _, want := range []string{
 		"incoming burst at=",
 		"window=50ms",
-		"wire_bytes=4",
+		"wire_bytes=3",
 		"text_bytes=1",
-		"commands=2",
-		"types=WriteText:1,Present:1",
+		"commands=1",
+		"types=WriteText:1",
+		"frame #1 slot=0 encoding=raw raw_bytes=3 encoded_bytes=3 header_bytes=3 framed_bytes=6 ratio=1.000",
 		"redraw request #1: test",
 		"redraw write #1 bytes=7",
 		"projection layout received revision=9 activated=false",
@@ -459,7 +465,346 @@ func TestFormatIncomingWriteStyles(t *testing.T) {
 	}
 }
 
-func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
+func rawRenderFrameForTest(t testing.TB, payload []byte) []byte {
+	t.Helper()
+	header := protocol.RenderFrameHeader{Encoding: protocol.RenderEncodingRaw, RawSize: uint32(len(payload)), EncodedSize: uint32(len(payload))}
+	wire, err := protocol.AppendRenderFrameHeader(nil, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(wire, payload...)
+}
+
+func zlibRenderFrameForTest(t testing.TB, payload []byte) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	w := zlib.NewWriter(&compressed)
+	if _, err := w.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	header := protocol.RenderFrameHeader{Encoding: protocol.RenderEncodingZlib, RawSize: uint32(len(payload)), EncodedSize: uint32(compressed.Len())}
+	wire, err := protocol.AppendRenderFrameHeader(nil, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(wire, compressed.Bytes()...)
+}
+
+func readFramedOutputForTest(t testing.TB, wire []byte) ([]paneFrameEvent, error) {
+	t.Helper()
+	ui := &runtimeState{events: make(chan renderEvent, 16)}
+	errs := make(chan error, 1)
+	readOutputStream(0, protocol.NewRenderFrameReader(bytes.NewReader(wire)), ui, errs, nil, nil)
+	var frames []paneFrameEvent
+	for len(ui.events) > 0 {
+		event := <-ui.events
+		if frame, ok := event.(paneFrameEvent); ok {
+			frames = append(frames, frame)
+		}
+	}
+	select {
+	case err := <-errs:
+		return frames, err
+	default:
+		return frames, nil
+	}
+}
+
+func TestRawAndZlibNetworkFramesProduceEquivalentRenderEvents(t *testing.T) {
+	encoder := protocol.NewDisplayEncoder(nil)
+	_ = encoder.AppendStartRender(protocol.StartRender{LayoutRevision: 7, Cols: 128, Rows: 3})
+	_ = encoder.AppendWriteTextUTF8Default(bytes.Repeat([]byte("x"), 128))
+	_ = encoder.AppendCursorUpdate(protocol.CursorUpdate{Cursor: protocol.Cursor{X: 2, Y: 1}, Visible: true})
+	payload := bytes.Clone(encoder.Bytes())
+	rawFrames, err := readFramedOutputForTest(t, rawRenderFrameForTest(t, payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	zlibFrames, err := readFramedOutputForTest(t, zlibRenderFrameForTest(t, payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rawFrames, zlibFrames) || len(rawFrames) != 1 {
+		t.Fatalf("raw=%#v zlib=%#v", rawFrames, zlibFrames)
+	}
+}
+
+func TestBackToBackNetworkFramesProduceOrderedRenderEvents(t *testing.T) {
+	first := protocol.NewDisplayEncoder(nil)
+	_ = first.AppendStartRender(protocol.StartRender{LayoutRevision: 3, Cols: 8, Rows: 2})
+	_ = first.AppendStyleInstall(protocol.StyleInstall{ID: 2, Style: protocol.Style{Bold: true}})
+	_ = first.AppendSetWriteStyle(protocol.SetWriteStyle{StyleID: 2})
+	_ = first.AppendWriteTextUTF8([]byte("a"))
+	second := protocol.NewDisplayEncoder(nil)
+	_ = second.AppendSetWritePosition(protocol.SetWritePosition{Row: 0, Column: 1})
+	_ = second.AppendWriteTextUTF8([]byte("b"))
+	wire := rawRenderFrameForTest(t, first.Bytes())
+	wire = append(wire, rawRenderFrameForTest(t, second.Bytes())...)
+	frames, err := readFramedOutputForTest(t, wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 2 || string(frames[0].frame.spans[0].text) != "a" || string(frames[1].frame.spans[0].text) != "b" || frames[1].frame.spans[0].styleID != 2 {
+		t.Fatalf("frames=%#v", frames)
+	}
+}
+
+func TestMalformedOrPartialNetworkFrameProducesNoRenderEvent(t *testing.T) {
+	encoder := protocol.NewDisplayEncoder(nil)
+	_ = encoder.AppendStartRender(protocol.StartRender{LayoutRevision: 1, Cols: 8, Rows: 2})
+	valid := rawRenderFrameForTest(t, encoder.Bytes())
+	malformedCommand := append(bytes.Clone(encoder.Bytes()), byte(protocol.DisplayOpcodeWriteTextUTF8), 2, 'x')
+	badHeader := protocol.RenderFrameHeader{Encoding: protocol.RenderEncodingZlib, RawSize: 100, EncodedSize: 3}
+	badZlib, err := protocol.AppendRenderFrameHeader(nil, badHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badZlib = append(badZlib, 1, 2, 3)
+	for name, wire := range map[string][]byte{
+		"partial header":    {0},
+		"partial payload":   valid[:len(valid)-1],
+		"malformed zlib":    badZlib,
+		"malformed command": rawRenderFrameForTest(t, malformedCommand),
+	} {
+		t.Run(name, func(t *testing.T) {
+			frames, err := readFramedOutputForTest(t, wire)
+			if len(frames) != 0 || err == nil {
+				t.Fatalf("frames=%#v err=%v", frames, err)
+			}
+		})
+	}
+}
+
+func testQUICCertificate(t testing.TB) (tls.Certificate, string) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "meja-client-test"},
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(parsed.RawSubjectPublicKeyInfo)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: privateKey}, fmt.Sprintf("%x", hash[:])
+}
+
+func TestOpenConnectionReportsMalformedRenderStreamForReconnect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cert, certHash := testQUICCertificate(t)
+	listener, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{protocol.ALPN},
+		MinVersion:   tls.VersionTLS13,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	validCommands := protocol.NewDisplayEncoder(nil)
+	if err := validCommands.AppendStartRender(protocol.StartRender{LayoutRevision: 1, Cols: 8, Rows: 2}); err != nil {
+		t.Fatal(err)
+	}
+	validFrame := rawRenderFrameForTest(t, validCommands.Bytes())
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		control, err := conn.AcceptStream(ctx)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		attach, err := protocol.NewDecoder(control, protocol.DefaultMaxFrameSize).ReadFrame()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if attach.Type != protocol.MsgSessionAttach {
+			serverDone <- fmt.Errorf("initial control frame type = %d", attach.Type)
+			return
+		}
+		controlEncoder := protocol.NewEncoder(control)
+		attachOK, err := protocol.EncodeSessionAttachOK(nil, protocol.SessionAttachOK{ResumeToken: "resume-token"})
+		if err == nil {
+			err = controlEncoder.WriteFrame(protocol.Frame{Type: protocol.MsgSessionAttachOK, Payload: attachOK})
+		}
+		exitCommand, encodeErr := protocol.EncodeFrontendRegisterTerminalExitCommand(nil, protocol.FrontendRegisterTerminalExitCommand{})
+		if err == nil {
+			err = encodeErr
+		}
+		if err == nil {
+			err = controlEncoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendRegisterTerminalExitCommand, Payload: exitCommand})
+		}
+		setup, encodeErr := protocol.EncodeFrontendTerminalWrite(nil, protocol.FrontendTerminalWrite{})
+		if err == nil {
+			err = encodeErr
+		}
+		if err == nil {
+			err = controlEncoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendTerminalWrite, Payload: setup})
+		}
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		stream, err := conn.OpenUniStreamSync(ctx)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		wire := append(append([]byte(nil), validFrame...), 0)
+		if _, err := stream.Write(wire); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := stream.Close(); err != nil {
+			serverDone <- err
+			return
+		}
+		<-conn.Context().Done()
+		serverDone <- nil
+	}()
+
+	addr := listener.Addr().(*net.UDPAddr)
+	ui := &runtimeState{events: make(chan renderEvent, 32), renderDone: make(chan struct{})}
+	go func() {
+		event := <-ui.events
+		registered := event.(terminalExitCommandEvent)
+		close(registered.done)
+	}()
+	live, err := openConnection(ctx, protocol.CommandBootstrap{
+		Port:           uint16(addr.Port),
+		AttachToken:    "attach-token",
+		CertSPKISHA256: certHash,
+	}, "127.0.0.1", 8, 3, Config{}, "", ui, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if live != nil {
+			live.destroy()
+		}
+	}()
+
+	initialFrameSeen := false
+	for !initialFrameSeen {
+		select {
+		case event := <-ui.events:
+			frame, ok := event.(paneFrameEvent)
+			initialFrameSeen = ok && frame.slot == 0 && frame.frame.layoutRevision == 1
+		case <-ctx.Done():
+			t.Fatal("valid initial render frame was not delivered")
+		}
+	}
+	select {
+	case result := <-live.done:
+		if result.graceful || result.err == nil {
+			t.Fatalf("connection result = %#v, want non-graceful render-stream failure", result)
+		}
+		if !strings.Contains(result.err.Error(), "read display stream on slot 0") {
+			t.Fatalf("connection error = %v", result.err)
+		}
+	case <-ctx.Done():
+		t.Fatal("malformed render stream did not fail the live connection")
+	}
+	live.destroy()
+	live = nil
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("test QUIC server failed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("test QUIC server did not stop")
+	}
+}
+
+func TestWorkerErrorMonitorReturnsWhenChannelCloses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	live := &liveConnection{ctx: ctx, done: make(chan connectionResult, 1)}
+	errs := make(chan error)
+	close(errs)
+	returned := make(chan struct{})
+	go func() {
+		live.monitorWorkerErrors(errs, nil)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("worker error monitor did not return after its channel closed")
+	}
+	select {
+	case result := <-live.done:
+		t.Fatalf("closed worker error channel produced connection result %#v", result)
+	default:
+	}
+}
+
+func TestDisplayFrameCompilerStagingDiscardsPersistentMutations(t *testing.T) {
+	committed := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
+	initial := committed.beginFrame()
+	if err := initial.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 8, GridRows: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := initial.finishFrame(); err != nil {
+		t.Fatal(err)
+	}
+	committed = initial
+
+	styleStage := committed.beginFrame()
+	if err := styleStage.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: 2, Style: protocol.Style{Bold: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := committed.styles[2]; ok {
+		t.Fatal("discarded style installation leaked into committed state")
+	}
+	checkStage := committed.beginFrame()
+	if err := checkStage.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: 2}); err == nil {
+		t.Fatal("discarded style remained selectable")
+	}
+
+	geometryStage := committed.beginFrame()
+	if err := geometryStage.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 9, GridCols: 4, GridRows: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if committed.layoutRevision != 1 || committed.cols != 8 || committed.rows != 2 {
+		t.Fatal("discarded geometry leaked into committed state")
+	}
+
+	cursorStage := committed.beginFrame()
+	if err := cursorStage.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: 3, Y: 1}, Visible: false}}); err != nil {
+		t.Fatal(err)
+	}
+	if committed.cursor != (protocol.Cursor{}) || !committed.cursorVisible {
+		t.Fatal("discarded cursor leaked into committed state")
+	}
+}
+
+func TestOutputCommandsAreNotRenderedBeforeCompleteNetworkFrame(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var stdout lockedBuffer
@@ -472,7 +817,7 @@ func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
 	defer reader.Close()
 	defer writer.Close()
 	done := make(chan error, 1)
-	go readOutputStream(0, protocol.NewDisplayDecoder(reader), ui, done, nil, nil)
+	go readOutputStream(0, protocol.NewRenderFrameReader(reader), ui, done, nil, nil)
 	write := func(data []byte) {
 		t.Helper()
 		if _, err := writer.Write(data); err != nil {
@@ -480,26 +825,23 @@ func TestOutputCommandsAreNotRenderedBeforePresent(t *testing.T) {
 		}
 	}
 	encoder := protocol.NewDisplayEncoder(nil)
-	encoder.AppendStartRender(protocol.StartRender{LayoutRevision: 1, Cols: 8, Rows: 3})
-	write(encoder.Bytes())
-	encoder = protocol.NewDisplayEncoder(nil)
-	encoder.AppendSetWritePosition(protocol.SetWritePosition{})
-	encoder.AppendSetWriteStyle(protocol.SetWriteStyle{})
-	encoder.AppendWriteTextUTF8([]byte("x"))
-	write(encoder.Bytes())
+	_ = encoder.AppendStartRender(protocol.StartRender{LayoutRevision: 1, Cols: 8, Rows: 3})
+	_ = encoder.AppendSetWritePosition(protocol.SetWritePosition{})
+	_ = encoder.AppendSetWriteStyle(protocol.SetWriteStyle{})
+	_ = encoder.AppendWriteTextUTF8([]byte("x"))
+	frame := rawRenderFrameForTest(t, encoder.Bytes())
+	write(frame[:len(frame)-1])
 	time.Sleep(10 * time.Millisecond)
 	if stdout.Len() != 0 {
-		t.Fatalf("rendered %d bytes before PRESENT", stdout.Len())
+		t.Fatalf("rendered %d bytes before complete network frame", stdout.Len())
 	}
-	encoder = protocol.NewDisplayEncoder(nil)
-	encoder.AppendPresent()
-	write(encoder.Bytes())
+	write(frame[len(frame)-1:])
 	deadline := time.Now().Add(time.Second)
 	for stdout.Len() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if stdout.Len() == 0 {
-		t.Fatal("PRESENT did not render")
+		t.Fatal("complete network frame did not render")
 	}
 }
 
@@ -1195,13 +1537,30 @@ func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
 func TestCleanQUICCloseWinsWhenOutputEOFArrivesFirst(t *testing.T) {
 	ui := &runtimeState{events: make(chan renderEvent, 1)}
 	outputErrors := make(chan error, 1)
-	readOutputStream(0, protocol.NewDisplayDecoder(bytes.NewReader(nil)), ui, outputErrors, nil, nil)
+	readOutputStream(0, protocol.NewRenderFrameReader(bytes.NewReader(nil)), ui, outputErrors, nil, nil)
 
 	done := make(chan connectionResult, 1)
 	err := &quic.ApplicationError{ErrorCode: 0, ErrorMessage: "server stopped"}
 	controlLoop(protocol.NewDecoder(failingReader{err: err}, protocol.DefaultMaxFrameSize), ui, nil, done, nil)
 	if result := <-done; !result.graceful || result.err != nil || result.terminalMessage != "[exited]" {
 		t.Fatalf("terminal result = %#v, want graceful generic exit", result)
+	}
+}
+
+func TestConnectionErrorReporterLeavesTerminalCloseToControlLoop(t *testing.T) {
+	errs := make(chan error, 1)
+	terminalClose := fmt.Errorf("accept output stream: %w", &quic.ApplicationError{ErrorCode: 0})
+	sendConnectionError(context.Background(), errs, terminalClose)
+	select {
+	case err := <-errs:
+		t.Fatalf("terminal close was reported as worker failure: %v", err)
+	default:
+	}
+
+	want := errors.New("render stream failed")
+	sendConnectionError(context.Background(), errs, want)
+	if got := <-errs; !errors.Is(got, want) {
+		t.Fatalf("worker error = %v, want %v", got, want)
 	}
 }
 
@@ -1373,7 +1732,7 @@ func TestPaneOutputStillRequiresStartRender(t *testing.T) {
 	}
 	ui := &runtimeState{events: make(chan renderEvent, 1)}
 	errs := make(chan error, 1)
-	readOutputStream(0, protocol.NewDisplayDecoder(bytes.NewReader(encoder.Bytes())), ui, errs, nil, nil)
+	readOutputStream(0, protocol.NewRenderFrameReader(bytes.NewReader(rawRenderFrameForTest(t, encoder.Bytes()))), ui, errs, nil, nil)
 	select {
 	case err := <-errs:
 		if !strings.Contains(err.Error(), "before START_RENDER") {
@@ -1390,10 +1749,9 @@ func TestDisplayFrameCompilerSplitsImplicitlyWrappedText(t *testing.T) {
 		{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2},
 		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 2},
 		{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("abcdef")},
-		{Opcode: protocol.DisplayOpcodePresent},
 	}
 	for _, command := range commands {
-		if _, err := c.apply(command); err != nil {
+		if err := c.apply(command); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1415,9 +1773,8 @@ func TestDisplayFrameCompilerSplitsImplicitlyWrappedFill(t *testing.T) {
 		{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2},
 		{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0},
 		{Opcode: protocol.DisplayOpcodeFill, Fill: protocol.Fill{Columns: 8, Rune: ' ', Width: 1}},
-		{Opcode: protocol.DisplayOpcodePresent},
 	} {
-		if _, err := c.apply(command); err != nil {
+		if err := c.apply(command); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1428,32 +1785,32 @@ func TestDisplayFrameCompilerSplitsImplicitlyWrappedFill(t *testing.T) {
 
 func TestDisplayFrameCompilerRejectsWriteBeyondGrid(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
-	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2})
-	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 1, Column: 3})
-	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("ab")}); err == nil {
+	_ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2})
+	_ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 1, Column: 3})
+	if err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("ab")}); err == nil {
 		t.Fatal("write beyond grid was accepted")
 	}
 }
 
 func TestDisplayFrameCompilerRejectsMultipleScrolls(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
-	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2})
-	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: protocol.ScrollRegion{Top: 0, Bottom: 2, Delta: -1}})
-	if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: protocol.ScrollRegion{Top: 0, Bottom: 2, Delta: -1}}); err == nil {
+	_ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 2})
+	_ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: protocol.ScrollRegion{Top: 0, Bottom: 2, Delta: -1}})
+	if err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: protocol.ScrollRegion{Top: 0, Bottom: 2, Delta: -1}}); err == nil {
 		t.Fatal("multiple scroll commands in one frame were accepted")
 	}
 }
 
 func TestDisplayFrameCompilerRejectsInvalidScrollRegionForGrid(t *testing.T) {
 	c := displayFrameCompiler{slot: 0, styles: defaultStyles(), cursorVisible: true}
-	_, _ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 3})
+	_ = c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 4, GridRows: 3})
 	for _, region := range []protocol.ScrollRegion{
 		{Top: 0, Bottom: 4, Delta: -1},
 		{Top: 1, Bottom: 1, Delta: -1},
 		{Top: 0, Bottom: 3, Delta: 0},
 		{Top: 0, Bottom: 3, Delta: 4},
 	} {
-		if _, err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: region}); err == nil {
+		if err := c.apply(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: region}); err == nil {
 			t.Fatalf("accepted invalid region %#v", region)
 		}
 	}
@@ -1511,17 +1868,15 @@ func TestDisplayFrameCompilerExpandsWireLatches(t *testing.T) {
 		{Opcode: protocol.DisplayOpcodeSetWriteStyle, StyleID: 2},
 		{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("ab")},
 		{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("c")},
-		{Opcode: protocol.DisplayOpcodePresent},
 	}
-	var frame renderFrame
 	for _, command := range commands {
-		ready, err := c.apply(command)
-		if err != nil {
+		if err := c.apply(command); err != nil {
 			t.Fatal(err)
 		}
-		if ready {
-			frame = c.frame
-		}
+	}
+	frame, err := c.finishFrame()
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(frame.spans) != 2 || frame.spans[0].column != 5 || frame.spans[0].styleID != 2 || frame.spans[1].column != 7 || frame.spans[1].styleID != 0 {
 		t.Fatalf("compiled frame = %#v", frame)
@@ -1534,17 +1889,15 @@ func TestDisplayFrameCompilerTreatsClusterAsOneDisplayUnit(t *testing.T) {
 		{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 4, GridCols: 80, GridRows: 24},
 		{Opcode: protocol.DisplayOpcodeWriteCluster, Text: []byte("👩‍💻"), Width: 2},
 		{Opcode: protocol.DisplayOpcodeWriteTextUTF8Default, Text: []byte("X")},
-		{Opcode: protocol.DisplayOpcodePresent},
 	}
-	var frame renderFrame
 	for _, command := range commands {
-		ready, err := c.apply(command)
-		if err != nil {
+		if err := c.apply(command); err != nil {
 			t.Fatal(err)
 		}
-		if ready {
-			frame = c.frame
-		}
+	}
+	frame, err := c.finishFrame()
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(frame.spans) != 2 {
 		t.Fatalf("compiled frame = %#v", frame)
@@ -1564,7 +1917,6 @@ func BenchmarkDisplayDecodeAndRenderCompilation(b *testing.B) {
 		{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 80, GridRows: 24},
 		{Opcode: protocol.DisplayOpcodeSetWritePosition},
 		{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: bytes.Repeat([]byte("x"), 80)},
-		{Opcode: protocol.DisplayOpcodePresent},
 	}
 	for _, command := range commands {
 		if err := encoder.AppendCommand(command); err != nil {
@@ -1583,7 +1935,7 @@ func BenchmarkDisplayDecodeAndRenderCompilation(b *testing.B) {
 			if err != nil {
 				break
 			}
-			if _, err := compiler.apply(command); err != nil {
+			if err := compiler.apply(command); err != nil {
 				b.Fatal(err)
 			}
 		}

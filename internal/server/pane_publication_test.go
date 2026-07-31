@@ -355,7 +355,7 @@ func TestPanePublicationKeepsWideCellsAndGraphemesAtomic(t *testing.T) {
 	}
 }
 
-func TestConfirmerReturnsPublicationBeforeBlockedWriteAndPresentsOnce(t *testing.T) {
+func TestConfirmerReturnsPublicationBeforeBlockedFramedWrite(t *testing.T) {
 	stream := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
 	lease := testOutputLease(0, stream)
 	returned := make(chan *viewPublicationBuffer, 1)
@@ -721,7 +721,7 @@ func TestReliableWriteDeadlineIsSetAndCleared(t *testing.T) {
 	}
 }
 
-func TestPaneRenderMetricsKeepOnePresentPerPublication(t *testing.T) {
+func TestPaneRenderMetricsKeepOneCompiledFramePerPublication(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(8, 2)}
 	shutdown := startTestPaneLoop(pane)
 	defer close(shutdown)
@@ -732,8 +732,8 @@ func TestPaneRenderMetricsKeepOnePresentPerPublication(t *testing.T) {
 	sendTestPTYOutput(t, pane, "x")
 	syncPaneRenderer(t, pane)
 	metrics := pane.renderMetricsSnapshot()
-	if metrics.Publications == 0 || metrics.Presents != metrics.Publications {
-		t.Fatalf("publications=%d presents=%d, want exactly one PRESENT/publication", metrics.Publications, metrics.Presents)
+	if metrics.Publications == 0 || metrics.CompiledFrames != metrics.Publications {
+		t.Fatalf("publications=%d compiled_frames=%d, want one frame/publication", metrics.Publications, metrics.CompiledFrames)
 	}
 	if metrics.ChangedCells > metrics.CandidateCells {
 		t.Fatalf("changed cells=%d candidates=%d", metrics.ChangedCells, metrics.CandidateCells)
@@ -811,15 +811,17 @@ func TestPaneRenderDiagnosticWorkload(t *testing.T) {
 	elapsed := time.Since(started).Seconds()
 	after := pane.renderMetricsSnapshot()
 	publications := after.Publications - before.Publications
-	presents := after.Presents - before.Presents
+	compiledFrames := after.CompiledFrames - before.CompiledFrames
 	drains := after.PTYDrainsCompleted - before.PTYDrainsCompleted
 	ptyBytes := after.PTYBytes - before.PTYBytes
 	drainReads := after.PTYDrainReads - before.PTYDrainReads
 	drainsAtEmpty := after.PTYDrainStoppedEmpty - before.PTYDrainStoppedEmpty
-	wireBytes := after.UncompressedBytes - before.UncompressedBytes
+	rawBytes := after.RawCommandPayloadBytes - before.RawCommandPayloadBytes
+	encodedBytes := after.EncodedPayloadBytes - before.EncodedPayloadBytes
+	framedBytes := after.CompleteFramedBytes - before.CompleteFramedBytes
 	candidates := after.CandidateCells - before.CandidateCells
 	changed := after.ChangedCells - before.ChangedCells
-	t.Logf("elapsed=%.3fs pty_drains/s=%.2f reads/drain=%.2f bytes/drain=%.1f eagain_pct=%.1f pty_bytes/s=%.0f publications/s=%.2f presents/s=%.2f presents/publication=%.2f wire_bytes/s=%.0f avg_bytes/publication=%.1f candidates=%d changed=%d cancelled=%d",
+	t.Logf("elapsed=%.3fs pty_drains/s=%.2f reads/drain=%.2f bytes/drain=%.1f eagain_pct=%.1f pty_bytes/s=%.0f publications/s=%.2f frames/s=%.2f frames/publication=%.2f raw_bytes/s=%.0f encoded_bytes/s=%.0f framed_bytes/s=%.0f avg_raw_bytes/publication=%.1f raw_frames=%d zlib_frames=%d candidates=%d changed=%d cancelled=%d",
 		elapsed,
 		float64(drains)/elapsed,
 		float64(drainReads)/float64(drains),
@@ -827,10 +829,14 @@ func TestPaneRenderDiagnosticWorkload(t *testing.T) {
 		float64(drainsAtEmpty)*100/float64(drains),
 		float64(ptyBytes)/elapsed,
 		float64(publications)/elapsed,
-		float64(presents)/elapsed,
-		float64(presents)/float64(publications),
-		float64(wireBytes)/elapsed,
-		float64(wireBytes)/float64(publications),
+		float64(compiledFrames)/elapsed,
+		float64(compiledFrames)/float64(publications),
+		float64(rawBytes)/elapsed,
+		float64(encodedBytes)/elapsed,
+		float64(framedBytes)/elapsed,
+		float64(rawBytes)/float64(publications),
+		after.RawSelectedFrames-before.RawSelectedFrames,
+		after.ZlibSelectedFrames-before.ZlibSelectedFrames,
 		candidates,
 		changed,
 		after.CancelledCells-before.CancelledCells,

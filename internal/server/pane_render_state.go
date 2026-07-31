@@ -168,16 +168,21 @@ type paneRenderMetrics struct {
 	ptyDrainStoppedError       atomic.Uint64
 	ptyDrainStoppedCancelled   atomic.Uint64
 	ptyDrainPublications       atomic.Uint64
-	ptyDrainPresents           atomic.Uint64
+	ptyDrainCompiledFrames     atomic.Uint64
 	ptyDrainCancelledCells     atomic.Uint64
 	publications               atomic.Uint64
-	presents                   atomic.Uint64
+	compiledFrames             atomic.Uint64
 	candidateCells             atomic.Uint64
 	changedCells               atomic.Uint64
 	changedRuns                atomic.Uint64
 	keyframes                  atomic.Uint64
 	deltas                     atomic.Uint64
-	uncompressedBytes          atomic.Uint64
+	rawCommandPayloadBytes     atomic.Uint64
+	encodedPayloadBytes        atomic.Uint64
+	completeFramedBytes        atomic.Uint64
+	rawSelectedFrames          atomic.Uint64
+	zlibSelectedFrames         atomic.Uint64
+	compressionDurationNanos   atomic.Uint64
 	physicalWrites             atomic.Uint64
 	publicationBufferStarved   atomic.Uint64
 	confirmerWriteBlockedNanos atomic.Uint64
@@ -197,16 +202,21 @@ type paneRenderMetricsSnapshot struct {
 	PTYDrainStoppedError       uint64
 	PTYDrainStoppedCancelled   uint64
 	PTYDrainPublications       uint64
-	PTYDrainPresents           uint64
+	PTYDrainCompiledFrames     uint64
 	PTYDrainCancelledCells     uint64
 	Publications               uint64
-	Presents                   uint64
+	CompiledFrames             uint64
 	CandidateCells             uint64
 	ChangedCells               uint64
 	ChangedRuns                uint64
 	Keyframes                  uint64
 	Deltas                     uint64
-	UncompressedBytes          uint64
+	RawCommandPayloadBytes     uint64
+	EncodedPayloadBytes        uint64
+	CompleteFramedBytes        uint64
+	RawSelectedFrames          uint64
+	ZlibSelectedFrames         uint64
+	CompressionDurationNanos   uint64
 	PhysicalWrites             uint64
 	PublicationBufferStarved   uint64
 	ConfirmerWriteBlockedNanos uint64
@@ -230,16 +240,21 @@ func (m *paneRenderMetrics) snapshot() paneRenderMetricsSnapshot {
 		PTYDrainStoppedError:       m.ptyDrainStoppedError.Load(),
 		PTYDrainStoppedCancelled:   m.ptyDrainStoppedCancelled.Load(),
 		PTYDrainPublications:       m.ptyDrainPublications.Load(),
-		PTYDrainPresents:           m.ptyDrainPresents.Load(),
+		PTYDrainCompiledFrames:     m.ptyDrainCompiledFrames.Load(),
 		PTYDrainCancelledCells:     m.ptyDrainCancelledCells.Load(),
 		Publications:               m.publications.Load(),
-		Presents:                   m.presents.Load(),
+		CompiledFrames:             m.compiledFrames.Load(),
 		CandidateCells:             m.candidateCells.Load(),
 		ChangedCells:               m.changedCells.Load(),
 		ChangedRuns:                m.changedRuns.Load(),
 		Keyframes:                  m.keyframes.Load(),
 		Deltas:                     m.deltas.Load(),
-		UncompressedBytes:          m.uncompressedBytes.Load(),
+		RawCommandPayloadBytes:     m.rawCommandPayloadBytes.Load(),
+		EncodedPayloadBytes:        m.encodedPayloadBytes.Load(),
+		CompleteFramedBytes:        m.completeFramedBytes.Load(),
+		RawSelectedFrames:          m.rawSelectedFrames.Load(),
+		ZlibSelectedFrames:         m.zlibSelectedFrames.Load(),
+		CompressionDurationNanos:   m.compressionDurationNanos.Load(),
 		PhysicalWrites:             m.physicalWrites.Load(),
 		PublicationBufferStarved:   m.publicationBufferStarved.Load(),
 		ConfirmerWriteBlockedNanos: m.confirmerWriteBlockedNanos.Load(),
@@ -283,12 +298,20 @@ func (m *paneRenderMetrics) recordPublication(publication *viewPublication, from
 	}
 }
 
-func (m *paneRenderMetrics) recordCompiledFrame(bytes int, fromPTYDrain bool) {
-	m.presents.Add(1)
+func (m *paneRenderMetrics) recordCompiledFrame(record encodedRenderRecord, fromPTYDrain bool) {
+	m.compiledFrames.Add(1)
 	if fromPTYDrain {
-		m.ptyDrainPresents.Add(1)
+		m.ptyDrainCompiledFrames.Add(1)
 	}
-	m.uncompressedBytes.Add(uint64(bytes))
+	m.rawCommandPayloadBytes.Add(uint64(record.header.RawSize))
+	m.encodedPayloadBytes.Add(uint64(record.header.EncodedSize))
+	m.completeFramedBytes.Add(uint64(len(record.bytes)))
+	m.compressionDurationNanos.Add(uint64(record.compressionDuration))
+	if record.header.Encoding == protocol.RenderEncodingZlib {
+		m.zlibSelectedFrames.Add(1)
+	} else {
+		m.rawSelectedFrames.Add(1)
+	}
 }
 
 type panePublicationState struct {

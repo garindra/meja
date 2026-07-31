@@ -1528,9 +1528,6 @@ func serveClientInstance(ctx context.Context, d *Daemon, conn quic.Connection) e
 		if index, ok := protocol.OutputIndexFromStreamID(uint64(outputStream.StreamID())); !ok || int(index) != slot {
 			return fmt.Errorf("pane output stream ID %d has index %d, want %d", outputStream.StreamID(), index, slot)
 		}
-		if _, err := outputStream.Write([]byte{byte(protocol.DisplayOpcodeNoop)}); err != nil {
-			return fmt.Errorf("materialize pane output stream %d: %w", slot, err)
-		}
 		leaseSlot := slot
 		outputLeases[slot] = &OutputLease{
 			Slot:                  slot,
