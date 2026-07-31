@@ -337,6 +337,12 @@ func drainPTYOpportunity(pane *Pane, reader io.Reader, request ptyDrainRequest) 
 			if errors.Is(readErr, unix.EAGAIN) || errors.Is(readErr, unix.EWOULDBLOCK) {
 				return complete(ptyDrainStoppedEmpty, nil)
 			}
+			// A signal such as SIGCHLD from a short-lived foreground command
+			// may interrupt the readiness/read syscall. It says nothing about
+			// PTY lifetime; end this opportunity and retry on the next credit.
+			if errors.Is(readErr, unix.EINTR) {
+				return complete(ptyDrainStoppedEmpty, nil)
+			}
 			if errors.Is(readErr, io.EOF) {
 				return complete(ptyDrainStoppedEOF, nil)
 			}
@@ -355,11 +361,21 @@ func ptyReadImmediatelyAvailable(reader io.Reader) (bool, error) {
 		// that Read will not block.
 		return true, nil
 	}
-	pollFDs := []unix.PollFd{{
+	pollFDs := [1]unix.PollFd{{
 		Fd:     int32(fdReader.Fd()),
 		Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR,
 	}}
-	n, err := unix.Poll(pollFDs, 0)
+	n, err := unix.Poll(pollFDs[:], 0)
+	return ptyPollReadinessResult(n, err)
+}
+
+func ptyPollReadinessResult(n int, err error) (bool, error) {
+	if errors.Is(err, unix.EINTR) {
+		// The next 50 ms or bounded immediate opportunity will retry. Treating
+		// EINTR as a terminal PTY error would close the master and SIGHUP the
+		// otherwise healthy shell that just reaped a child process.
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}

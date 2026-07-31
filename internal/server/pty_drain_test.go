@@ -31,6 +31,19 @@ type eagainPTYReader struct {
 	reads atomic.Int32
 }
 
+type interruptedPTYReader struct {
+	reads atomic.Int32
+}
+
+func (r *interruptedPTYReader) ptyReadReady() (bool, error) {
+	return true, nil
+}
+
+func (r *interruptedPTYReader) Read([]byte) (int, error) {
+	r.reads.Add(1)
+	return 0, unix.EINTR
+}
+
 type queuedPTYReader struct {
 	mu     sync.Mutex
 	chunks [][]byte
@@ -179,6 +192,50 @@ func TestPTYDrainEAGAINEndsWithoutPollingOrSpinning(t *testing.T) {
 	_, next := runTestPTYDrain(t, pane, reader, ptyDrainRequest{})
 	if next.reason != ptyDrainStoppedEmpty || reader.reads.Load() != before+1 {
 		t.Fatalf("next credit completion=%#v reads=%d, want one new EAGAIN read", next, reader.reads.Load())
+	}
+}
+
+func TestPTYDrainInterruptedReadEndsOpportunityWithoutTerminatingReader(t *testing.T) {
+	pane := &Pane{terminal: newTerminal(16, 1)}
+	pane.initializeRuntime()
+	reader := &interruptedPTYReader{}
+
+	_, first := runTestPTYDrain(t, pane, reader, ptyDrainRequest{})
+	if first.reason != ptyDrainStoppedEmpty || first.err != nil {
+		t.Fatalf("interrupted read completion = %#v, want temporary empty", first)
+	}
+	_, second := runTestPTYDrain(t, pane, reader, ptyDrainRequest{})
+	if second.reason != ptyDrainStoppedEmpty || second.err != nil {
+		t.Fatalf("second interrupted completion = %#v, want temporary empty", second)
+	}
+	if reader.reads.Load() != 2 {
+		t.Fatalf("reads after two interrupted opportunities = %d, want 2", reader.reads.Load())
+	}
+}
+
+func TestPTYReadinessInterruptionIsTemporary(t *testing.T) {
+	ready, err := ptyPollReadinessResult(0, unix.EINTR)
+	if err != nil || ready {
+		t.Fatalf("interrupted poll = ready %t, err %v; want temporary empty", ready, err)
+	}
+}
+
+func TestPTYReadinessPollSteadyStateDoesNotAllocate(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	run := func() {
+		ready, err := ptyReadImmediatelyAvailable(reader)
+		if err != nil || ready {
+			panic("empty pipe unexpectedly became ready")
+		}
+	}
+	run()
+	if allocations := testing.AllocsPerRun(1000, run); allocations != 0 {
+		t.Fatalf("PTY readiness poll allocated %.2f objects, want 0", allocations)
 	}
 }
 
