@@ -11,9 +11,9 @@ import (
 
 func TestPaneHistoryModePublishesImmutableMetadataConcurrently(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
-	ptyOutput := startTestPaneLoop(pane)
+	shutdown := startTestPaneLoop(pane)
 	defer func() {
-		close(ptyOutput)
+		close(shutdown)
 		<-pane.mainDone
 		pane.stop()
 	}()
@@ -371,9 +371,9 @@ func TestPanesRetainIndependentHistoryViews(t *testing.T) {
 func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	pane := &Pane{ID: 0, terminal: newTerminal(4, 2)}
 	setTestRows(pane.terminal, nil, []decodedTestRow{historyTestRow("live"), historyTestRow("end ")})
-	ptyOutput := startTestPaneLoop(pane)
+	shutdown := startTestPaneLoop(pane)
 	defer func() {
-		close(ptyOutput)
+		close(shutdown)
 		<-pane.mainDone
 		pane.stop()
 	}()
@@ -461,9 +461,9 @@ func TestOneLineHistoryMovementEmitsScrollAndOnlyExposedContent(t *testing.T) {
 	)
 	pane.terminal.CursorX = 0
 	pane.terminal.CursorY = 0
-	ptyOutput := startTestPaneLoop(pane)
+	shutdown := startTestPaneLoop(pane)
 	defer func() {
-		close(ptyOutput)
+		close(shutdown)
 		<-pane.mainDone
 		pane.stop()
 	}()

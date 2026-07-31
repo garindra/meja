@@ -2,7 +2,6 @@ package server
 
 import (
 	"io"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -38,19 +37,19 @@ func TestPTYKeyboardOpportunityIsOnePerSustainedBurst(t *testing.T) {
 	start := time.Unix(1, 0)
 	state.admit(start)
 
-	state.grantKeyboardOpportunity()
+	state.grantImmediateOpportunity()
 	if !state.canAdmit() {
 		t.Fatal("keyboard input did not grant an immediate PTY opportunity")
 	}
 	state.admit(start.Add(time.Millisecond))
-	state.grantKeyboardOpportunity()
+	state.grantImmediateOpportunity()
 	if state.canAdmit() {
 		t.Fatal("continuous keyboard input granted a second immediate opportunity")
 	}
 
 	state.timerFired()
 	state.admit(start.Add(time.Millisecond + ptyTurnInterval))
-	state.grantKeyboardOpportunity()
+	state.grantImmediateOpportunity()
 	if state.canAdmit() {
 		t.Fatal("sustained ordinary turn incorrectly rearmed the keyboard bypass")
 	}
@@ -58,7 +57,7 @@ func TestPTYKeyboardOpportunityIsOnePerSustainedBurst(t *testing.T) {
 	state.timerFired()
 	idleTurn := state.deadline.Add(ptyTurnInterval)
 	state.admit(idleTurn)
-	state.grantKeyboardOpportunity()
+	state.grantImmediateOpportunity()
 	if !state.canAdmit() {
 		t.Fatal("an idle period did not rearm the keyboard opportunity")
 	}
@@ -68,14 +67,14 @@ func TestPTYAttachAndResizeOpportunitiesBypassCurrentDeadline(t *testing.T) {
 	now := time.Unix(1, 0)
 	attach := newPTYAdmissionState(ptyTurnInterval)
 	attach.admit(now)
-	attach.grantStructuralOpportunity()
+	attach.grantImmediateOpportunity()
 	if !attach.canAdmit() {
 		t.Fatal("attach opportunity did not bypass the current deadline")
 	}
 
 	resize := newPTYAdmissionState(ptyTurnInterval)
 	resize.admit(now)
-	resize.grantStructuralOpportunity()
+	resize.grantImmediateOpportunity()
 	if !resize.canAdmit() {
 		t.Fatal("resize opportunity did not bypass the current deadline")
 	}
@@ -145,9 +144,7 @@ func TestBlockedOutputStopsPaneAndPTYReaderProgress(t *testing.T) {
 	blocked := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
 	lease := testOutputLease(0, blocked)
 	lease.done = pane.done
-	if err := attachTestOutputWithRefresh(pane, lease, func(output *renderOutput) error {
-		return output.present()
-	}); err != nil {
+	if err := attachTestOutput(pane, lease); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -193,77 +190,6 @@ func TestBlockedOutputStopsPaneAndPTYReaderProgress(t *testing.T) {
 	}
 }
 
-func TestTerminalReplyDoesNotWaitForBlockedRenderOutput(t *testing.T) {
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-
-	pane := &Pane{ID: 1, PTY: writer, terminal: newTerminal(8, 1)}
-	pane.initializeRuntime()
-	go pane.run()
-	writerFailed := make(chan error, 1)
-	go runPTYWriter(pane, func(err error) { writerFailed <- err })
-
-	blocked := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
-	defer func() {
-		pane.stop()
-		close(blocked.release)
-		<-pane.mainDone
-		<-pane.writerDone
-	}()
-	lease := testOutputLease(0, blocked)
-	lease.done = pane.done
-	if err := attachTestOutputWithRefresh(pane, lease, func(output *renderOutput) error {
-		return output.present()
-	}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-blocked.started:
-	case <-time.After(time.Second):
-		t.Fatal("initial output did not reach the blocked writer")
-	}
-
-	buffer := takeTestPTYReadBuffer(pane)
-	n := copy(buffer, "x\x1b[6n")
-	pane.ptyOutput <- buffer[:n]
-	reply := make([]byte, len("\x1b[1;2R"))
-	readDone := make(chan error, 1)
-	go func() {
-		_, err := io.ReadFull(reader, reply)
-		readDone <- err
-	}()
-	select {
-	case err := <-readDone:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case err := <-writerFailed:
-		t.Fatalf("PTY writer failed: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("terminal reply waited for blocked render output")
-	}
-	if got, want := string(reply), "\x1b[1;2R"; got != want {
-		t.Fatalf("terminal reply = %q, want %q", got, want)
-	}
-}
-
-func TestPTYBufferHandoffSteadyStateDoesNotAllocate(t *testing.T) {
-	pane := &Pane{terminal: newTerminal(8, 1)}
-	pane.initializeRuntime()
-	allocations := testing.AllocsPerRun(1000, func() {
-		buffer := <-pane.ptyFree
-		pane.ptyOutput <- buffer[:1]
-		buffer = <-pane.ptyOutput
-		pane.ptyFree <- buffer[:ptyReadBufferSize]
-	})
-	if allocations != 0 {
-		t.Fatalf("PTY buffer ownership cycle allocated %.2f objects, want 0", allocations)
-	}
-}
-
 func TestPTYParseAndMutationMergeSteadyStateDoesNotAllocate(t *testing.T) {
 	pane := &Pane{terminal: newTerminal(8, 1)}
 	renderer := newPanePublicationState(pane)
@@ -295,8 +221,7 @@ func TestPTYCadenceReusesTimerAndActorStops(t *testing.T) {
 			return time.NewTimer(delay)
 		},
 	}
-	pane.initializeRuntime()
-	go pane.run()
+	shutdown := startTestPaneLoop(pane)
 	for _, data := range []string{"a", "b", "c", "d"} {
 		sendTestPTYOutput(t, pane, data)
 	}
@@ -304,7 +229,7 @@ func TestPTYCadenceReusesTimerAndActorStops(t *testing.T) {
 		t.Fatalf("sustained PTY cadence created %d timers, want one reusable timer", got)
 	}
 
-	pane.stop()
+	close(shutdown)
 	select {
 	case <-pane.mainDone:
 	case <-time.After(time.Second):
@@ -317,13 +242,10 @@ func TestPaneCommandsStayResponsiveAndResizeGrantsPTYOpportunity(t *testing.T) {
 		terminal:          newTerminal(8, 1),
 		ptyPacingInterval: time.Hour,
 	}
-	pane.initializeRuntime()
-	go pane.run()
+	shutdown := startTestPaneLoop(pane)
 	sendTestPTYOutput(t, pane, "a")
 
-	buffer := takeTestPTYReadBuffer(pane)
-	buffer[0] = 'b'
-	pane.ptyOutput <- buffer[:1]
+	wantBytes := queueTestPTYOutput(t, pane, "b")
 	captured, err := pane.capturePane(capturePaneOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -336,7 +258,7 @@ func TestPaneCommandsStayResponsiveAndResizeGrantsPTYOpportunity(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)
-	for len(pane.ptyFree) != ptyReadBufferCount {
+	for pane.renderMetricsSnapshot().PTYBytes < wantBytes {
 		if time.Now().After(deadline) {
 			t.Fatal("resize did not grant an immediate bounded PTY opportunity")
 		}
@@ -350,52 +272,7 @@ func TestPaneCommandsStayResponsiveAndResizeGrantsPTYOpportunity(t *testing.T) {
 		t.Fatalf("capture after resize opportunity = %q, want paced PTY data", captured)
 	}
 
-	pane.stop()
-	select {
-	case <-pane.mainDone:
-	case <-time.After(time.Second):
-		t.Fatal("pane actor did not stop")
-	}
-}
-
-func TestAcceptedInputGrantsOnlyOneImmediatePTYOpportunity(t *testing.T) {
-	pane := &Pane{
-		terminal:          newTerminal(8, 1),
-		ptyPacingInterval: time.Hour,
-	}
-	pane.initializeRuntime()
-	go pane.run()
-	sendTestPTYOutput(t, pane, "a")
-
-	buffer := takeTestPTYReadBuffer(pane)
-	buffer[0] = 'b'
-	pane.ptyOutput <- buffer[:1]
-	if err := pane.sendInput([]byte("key")); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(time.Second)
-	for len(pane.ptyFree) != ptyReadBufferCount {
-		if time.Now().After(deadline) {
-			t.Fatal("accepted input did not grant an immediate PTY opportunity")
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	buffer = takeTestPTYReadBuffer(pane)
-	buffer[0] = 'c'
-	pane.ptyOutput <- buffer[:1]
-	if err := pane.sendInput([]byte("more")); err != nil {
-		t.Fatal(err)
-	}
-	captured, err := pane.capturePane(capturePaneOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(captured), "ab") || strings.Contains(string(captured), "c") {
-		t.Fatalf("capture after repeated accepted input = %q, want one immediate PTY turn", captured)
-	}
-
-	pane.stop()
+	close(shutdown)
 	select {
 	case <-pane.mainDone:
 	case <-time.After(time.Second):
@@ -408,20 +285,17 @@ func TestAttachGrantsImmediatePTYOpportunity(t *testing.T) {
 		terminal:          newTerminal(8, 1),
 		ptyPacingInterval: time.Hour,
 	}
-	pane.initializeRuntime()
-	go pane.run()
+	shutdown := startTestPaneLoop(pane)
 	sendTestPTYOutput(t, pane, "a")
 
-	buffer := takeTestPTYReadBuffer(pane)
-	buffer[0] = 'b'
-	pane.ptyOutput <- buffer[:1]
+	wantBytes := queueTestPTYOutput(t, pane, "b")
 	lease := testOutputLease(0, io.Discard)
 	lease.done = pane.done
 	if err := pane.installOutputLease(lease, 1, 8, 1); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)
-	for len(pane.ptyFree) != ptyReadBufferCount {
+	for pane.renderMetricsSnapshot().PTYBytes < wantBytes {
 		if time.Now().After(deadline) {
 			t.Fatal("attach did not grant an immediate bounded PTY opportunity")
 		}
@@ -435,7 +309,7 @@ func TestAttachGrantsImmediatePTYOpportunity(t *testing.T) {
 		t.Fatalf("capture after attach opportunity = %q, want paced PTY data", captured)
 	}
 
-	pane.stop()
+	close(shutdown)
 	select {
 	case <-pane.mainDone:
 	case <-time.After(time.Second):

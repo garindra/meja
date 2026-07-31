@@ -156,7 +156,6 @@ func (v *semanticViewport) reset(cols, rows int) {
 }
 
 type paneRenderMetrics struct {
-	ptyTurns                   atomic.Uint64
 	ptyBytes                   atomic.Uint64
 	ptyDrainOpportunities      atomic.Uint64
 	ptyDrainsCompleted         atomic.Uint64
@@ -186,7 +185,6 @@ type paneRenderMetrics struct {
 }
 
 type paneRenderMetricsSnapshot struct {
-	PTYTurns                   uint64
 	PTYBytes                   uint64
 	PTYDrainOpportunities      uint64
 	PTYDrainsCompleted         uint64
@@ -220,7 +218,6 @@ func (m *paneRenderMetrics) snapshot() paneRenderMetricsSnapshot {
 		return paneRenderMetricsSnapshot{}
 	}
 	return paneRenderMetricsSnapshot{
-		PTYTurns:                   m.ptyTurns.Load(),
 		PTYBytes:                   m.ptyBytes.Load(),
 		PTYDrainOpportunities:      m.ptyDrainOpportunities.Load(),
 		PTYDrainsCompleted:         m.ptyDrainsCompleted.Load(),
@@ -251,7 +248,6 @@ func (m *paneRenderMetrics) snapshot() paneRenderMetricsSnapshot {
 }
 
 func (m *paneRenderMetrics) recordPTYDrain(event ptyDrainEvent) {
-	m.ptyTurns.Add(1)
 	m.ptyDrainsCompleted.Add(1)
 	m.ptyDrainReads.Add(uint64(event.reads))
 	m.ptyDrainDurationNanos.Add(uint64(max(time.Duration(0), event.duration)))
@@ -269,6 +265,30 @@ func (m *paneRenderMetrics) recordPTYDrain(event ptyDrainEvent) {
 	case ptyDrainStoppedCancelled:
 		m.ptyDrainStoppedCancelled.Add(1)
 	}
+}
+
+func (m *paneRenderMetrics) recordPublication(publication *viewPublication, fromPTYDrain bool) {
+	m.publications.Add(1)
+	if fromPTYDrain {
+		m.ptyDrainPublications.Add(1)
+	}
+	m.candidateCells.Add(publication.candidateCells)
+	m.changedCells.Add(publication.changedCells)
+	m.changedRuns.Add(uint64(len(publication.Runs)))
+	m.cancelledCells.Add(publication.cancelledCells)
+	if publication.Kind == PublicationKeyframe {
+		m.keyframes.Add(1)
+	} else {
+		m.deltas.Add(1)
+	}
+}
+
+func (m *paneRenderMetrics) recordCompiledFrame(bytes int, fromPTYDrain bool) {
+	m.presents.Add(1)
+	if fromPTYDrain {
+		m.ptyDrainPresents.Add(1)
+	}
+	m.uncompressedBytes.Add(uint64(bytes))
 }
 
 type panePublicationState struct {
@@ -543,6 +563,10 @@ type currentSemanticCell struct {
 	style protocol.Style
 }
 
+type displayStyleSource interface {
+	LookupStyle(uint32) (protocol.Style, bool)
+}
+
 func canonicalStyle(style protocol.Style) protocol.Style {
 	if style.FG.Mode == "" {
 		style.FG.Mode = "default"
@@ -619,6 +643,15 @@ func semanticStyleAt(styles []protocol.Style, index uint16) (protocol.Style, boo
 	return styles[index], true
 }
 
+func semanticClusterBytes(cell semanticCell, clusters []byte) ([]byte, bool) {
+	start := int(cell.payload)
+	end := start + int(cell.clusterLen)
+	if cell.kind != semanticCluster || start < 0 || end > len(clusters) {
+		return nil, false
+	}
+	return clusters[start:end], true
+}
+
 func currentEqualsSemantic(current currentSemanticCell, previous semanticCell, styles []protocol.Style, clusters []byte) bool {
 	if current.kind != previous.kind || current.width != previous.width {
 		return false
@@ -631,13 +664,12 @@ func currentEqualsSemantic(current currentSemanticCell, previous semanticCell, s
 	case semanticScalar:
 		return uint32(current.r) == previous.payload
 	case semanticCluster:
-		start := int(previous.payload)
-		end := start + int(previous.clusterLen)
-		if start < 0 || end > len(clusters) || len(current.text) != end-start {
+		text, ok := semanticClusterBytes(previous, clusters)
+		if !ok || len(current.text) != len(text) {
 			return false
 		}
-		for index := start; index < end; index++ {
-			if current.text[index-start] != clusters[index] {
+		for index := range text {
+			if current.text[index] != text[index] {
 				return false
 			}
 		}
@@ -694,13 +726,12 @@ func translateSemanticCell(dstStyles *[]protocol.Style, dstClusters *[]byte, src
 	cell := src
 	cell.style = styleIndex
 	if src.kind == semanticCluster {
-		start := int(src.payload)
-		end := start + int(src.clusterLen)
-		if start < 0 || end > len(srcClusters) || len(*dstClusters) > math.MaxUint32-int(src.clusterLen) {
+		text, ok := semanticClusterBytes(src, srcClusters)
+		if !ok || len(*dstClusters) > math.MaxUint32-len(text) {
 			return semanticCell{}, fmt.Errorf("semantic cluster range is invalid")
 		}
 		cell.payload = uint32(len(*dstClusters))
-		*dstClusters = append(*dstClusters, srcClusters[start:end]...)
+		*dstClusters = append(*dstClusters, text...)
 	}
 	return cell, nil
 }
@@ -951,31 +982,29 @@ func (s *panePublicationState) prepareNextSnapshot(publication *viewPublication)
 	rows, cols := int(publication.Rows), int(publication.Cols)
 	next := &s.nextSnapshot
 	next.reset(cols, rows)
-	defaultStyle, err := internSemanticStyle(&next.styles, protocol.CanonicalDefaultStyle())
-	if err != nil {
-		return err
-	}
-	blank := semanticCell{kind: semanticBlank, width: 1, style: defaultStyle}
-	for row := 0; row < rows; row++ {
-		for column := 0; column < cols; column++ {
-			if publication.Kind == PublicationKeyframe || !s.snapshot.valid {
-				next.cells[row*cols+column] = blank
-				continue
-			}
-			sourceRow := row
-			if publication.HasScroll && row >= int(publication.Scroll.Top) && row < int(publication.Scroll.Bottom) {
-				sourceRow = row - int(publication.Scroll.Delta)
-				if sourceRow < int(publication.Scroll.Top) || sourceRow >= int(publication.Scroll.Bottom) {
-					next.cells[row*cols+column] = blank
-					continue
+	if publication.Kind != PublicationKeyframe {
+		defaultStyle, err := internSemanticStyle(&next.styles, protocol.CanonicalDefaultStyle())
+		if err != nil {
+			return err
+		}
+		blank := semanticCell{kind: semanticBlank, width: 1, style: defaultStyle}
+		for row := 0; row < rows; row++ {
+			for column := 0; column < cols; column++ {
+				sourceRow := row
+				if publication.HasScroll && row >= int(publication.Scroll.Top) && row < int(publication.Scroll.Bottom) {
+					sourceRow = row - int(publication.Scroll.Delta)
+					if sourceRow < int(publication.Scroll.Top) || sourceRow >= int(publication.Scroll.Bottom) {
+						next.cells[row*cols+column] = blank
+						continue
+					}
 				}
+				source := s.snapshot.cells[sourceRow*cols+column]
+				copied, err := translateSemanticCell(&next.styles, &next.clusters, source, s.snapshot.styles, s.snapshot.clusters)
+				if err != nil {
+					return err
+				}
+				next.cells[row*cols+column] = copied
 			}
-			source := s.snapshot.cells[sourceRow*cols+column]
-			copied, err := translateSemanticCell(&next.styles, &next.clusters, source, s.snapshot.styles, s.snapshot.clusters)
-			if err != nil {
-				return err
-			}
-			next.cells[row*cols+column] = copied
 		}
 	}
 	for _, run := range publication.Runs {
@@ -1007,20 +1036,7 @@ func (s *panePublicationState) handedOff() {
 	publication := &s.pending.publication
 	s.version = publication.TargetVersion
 	s.snapshot, s.nextSnapshot = s.nextSnapshot, s.snapshot
-	metrics := &s.pane.renderMetrics
-	metrics.publications.Add(1)
-	if s.pending.fromPTYDrain {
-		metrics.ptyDrainPublications.Add(1)
-	}
-	metrics.candidateCells.Add(publication.candidateCells)
-	metrics.changedCells.Add(publication.changedCells)
-	metrics.changedRuns.Add(uint64(len(publication.Runs)))
-	metrics.cancelledCells.Add(publication.cancelledCells)
-	if publication.Kind == PublicationKeyframe {
-		metrics.keyframes.Add(1)
-	} else {
-		metrics.deltas.Add(1)
-	}
+	s.pane.renderMetrics.recordPublication(publication, s.pending.fromPTYDrain)
 	s.pending = nil
 }
 
@@ -1056,12 +1072,11 @@ func semanticCellText(cell semanticCell, clusters []byte) ([]byte, rune, error) 
 	case semanticScalar:
 		return nil, rune(cell.payload), nil
 	case semanticCluster:
-		start := int(cell.payload)
-		end := start + int(cell.clusterLen)
-		if start < 0 || end > len(clusters) {
+		text, ok := semanticClusterBytes(cell, clusters)
+		if !ok {
 			return nil, 0, fmt.Errorf("publication cluster range is invalid")
 		}
-		return clusters[start:end], 0, nil
+		return text, 0, nil
 	case semanticContinuation:
 		return nil, 0, nil
 	default:

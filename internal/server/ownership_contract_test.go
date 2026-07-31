@@ -82,7 +82,6 @@ var atomicFieldContract = map[string]string{
 	"server.Pane.processActivityPending":                  "atomic.Bool",
 	"server.processActivity.pending":                      "*atomic.Bool",
 	"server.processWatch.activityPending":                 "*atomic.Bool",
-	"server.paneRenderMetrics.ptyTurns":                   "atomic.Uint64",
 	"server.paneRenderMetrics.ptyBytes":                   "atomic.Uint64",
 	"server.paneRenderMetrics.ptyDrainOpportunities":      "atomic.Uint64",
 	"server.paneRenderMetrics.ptyDrainsCompleted":         "atomic.Uint64",

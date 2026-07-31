@@ -40,12 +40,9 @@ type ptyDrainRequest struct {
 
 type ptyDrainEvent struct {
 	buffer   []byte
-	complete bool
 	reason   ptyDrainStopReason
-	bytes    int
 	reads    int
 	duration time.Duration
-	err      error
 }
 
 // ptyReadiness is the deterministic test seam for readers without a pollable
@@ -55,47 +52,37 @@ type ptyReadiness interface {
 }
 
 type ptyAdmissionState struct {
-	ready      bool
-	immediate  bool
+	credit     bool
 	bypassUsed bool
 	deadline   time.Time
 	interval   time.Duration
 }
 
 func newPTYAdmissionState(interval time.Duration) ptyAdmissionState {
-	return ptyAdmissionState{ready: true, interval: interval}
+	return ptyAdmissionState{credit: true, interval: interval}
 }
 
 func (s *ptyAdmissionState) canAdmit() bool {
-	return s.ready || s.immediate
+	return s.credit
 }
 
 func (s *ptyAdmissionState) admit(now time.Time) {
 	// A full extra interval with no waiting PTY turn marks a new interactive
 	// burst. Merely reaching each deadline during sustained output does not.
-	if s.ready && !s.deadline.IsZero() && !now.Before(s.deadline.Add(s.interval)) {
+	if s.credit && !s.deadline.IsZero() && !now.Before(s.deadline.Add(s.interval)) {
 		s.bypassUsed = false
 	}
-	s.ready = false
-	s.immediate = false
+	s.credit = false
 	s.deadline = now.Add(s.interval)
 }
 
 func (s *ptyAdmissionState) timerFired() {
-	s.ready = true
-}
-
-func (s *ptyAdmissionState) grantKeyboardOpportunity() {
-	s.grantImmediateOpportunity()
-}
-
-func (s *ptyAdmissionState) grantStructuralOpportunity() {
-	s.grantImmediateOpportunity()
+	s.credit = true
 }
 
 func (s *ptyAdmissionState) grantImmediateOpportunity() {
-	if !s.ready && !s.bypassUsed {
-		s.immediate = true
+	if !s.credit && !s.bypassUsed {
+		s.credit = true
 		s.bypassUsed = true
 	}
 }
@@ -106,10 +93,8 @@ const (
 	renderStreamChunkSize   = 8 << 10
 	startupInputIdle        = 25 * time.Millisecond
 	startupInputMaxWait     = 500 * time.Millisecond
-	maxRetainedRenderBuffer = 64 << 10
+	initialReliableFrameCap = 64 << 10
 )
-
-var errRenderBufferFull = errors.New("pane render buffer is full")
 
 func (p *Pane) installOutputLease(lease *OutputLease, layoutRevision protocol.ClientLayoutRevision, cols, rows uint16) error {
 	installation := &paneOutputInstall{
@@ -269,22 +254,13 @@ func drainPTYOpportunity(pane *Pane, reader io.Reader, request ptyDrainRequest) 
 	bytesRead, reads := 0, 0
 	cancel := func() bool {
 		pane.renderMetrics.recordPTYDrain(ptyDrainEvent{
-			complete: true,
-			reason:   ptyDrainStoppedCancelled,
-			bytes:    bytesRead,
-			reads:    reads,
-			duration: now().Sub(started),
+			reason: ptyDrainStoppedCancelled, reads: reads, duration: now().Sub(started),
 		})
 		return false
 	}
-	complete := func(reason ptyDrainStopReason, err error) bool {
+	complete := func(reason ptyDrainStopReason) bool {
 		event := ptyDrainEvent{
-			complete: true,
-			reason:   reason,
-			bytes:    bytesRead,
-			reads:    reads,
-			duration: now().Sub(started),
-			err:      err,
+			reason: reason, reads: reads, duration: now().Sub(started),
 		}
 		select {
 		case pane.ptyDrainEvents <- event:
@@ -297,16 +273,16 @@ func drainPTYOpportunity(pane *Pane, reader io.Reader, request ptyDrainRequest) 
 	for {
 		ready, err := ptyReadImmediatelyAvailable(reader)
 		if err != nil {
-			return complete(ptyDrainStoppedError, err)
+			return complete(ptyDrainStoppedError)
 		}
 		if !ready {
-			return complete(ptyDrainStoppedEmpty, nil)
+			return complete(ptyDrainStoppedEmpty)
 		}
 		if bytesRead >= request.maxBytes {
-			return complete(ptyDrainStoppedByteBudget, nil)
+			return complete(ptyDrainStoppedByteBudget)
 		}
 		if reads > 0 && now().Sub(started) >= request.maxDuration {
-			return complete(ptyDrainStoppedTimeBudget, nil)
+			return complete(ptyDrainStoppedTimeBudget)
 		}
 
 		var buffer []byte
@@ -335,18 +311,18 @@ func drainPTYOpportunity(pane *Pane, reader io.Reader, request ptyDrainRequest) 
 		}
 		if readErr != nil {
 			if errors.Is(readErr, unix.EAGAIN) || errors.Is(readErr, unix.EWOULDBLOCK) {
-				return complete(ptyDrainStoppedEmpty, nil)
+				return complete(ptyDrainStoppedEmpty)
 			}
 			// A signal such as SIGCHLD from a short-lived foreground command
 			// may interrupt the readiness/read syscall. It says nothing about
 			// PTY lifetime; end this opportunity and retry on the next credit.
 			if errors.Is(readErr, unix.EINTR) {
-				return complete(ptyDrainStoppedEmpty, nil)
+				return complete(ptyDrainStoppedEmpty)
 			}
 			if errors.Is(readErr, io.EOF) {
-				return complete(ptyDrainStoppedEOF, nil)
+				return complete(ptyDrainStoppedEOF)
 			}
-			return complete(ptyDrainStoppedError, readErr)
+			return complete(ptyDrainStoppedError)
 		}
 	}
 }
@@ -505,13 +481,11 @@ func (p *Pane) run() {
 		}
 		failures := renderer.failures()
 		submission, publication := renderer.submission()
-		var ptyOutput <-chan []byte
 		var drainRequests chan<- ptyDrainRequest
 		// Detached panes continue advancing their canonical terminal state at
 		// the same paced cadence. Attached panes additionally stop admission
 		// while visual work is waiting for their bounded output path.
 		if !drainActive && admission.canAdmit() && !renderer.blocksPTY() {
-			ptyOutput = p.ptyOutput
 			drainRequests = p.ptyDrainRequests
 		}
 		select {
@@ -586,7 +560,7 @@ func (p *Pane) run() {
 					continue
 				}
 				renderer.attach(installation.Lease, installation.LayoutRevision)
-				admission.grantStructuralOpportunity()
+				admission.grantImmediateOpportunity()
 				command.done <- nil
 				continue
 			}
@@ -614,7 +588,7 @@ func (p *Pane) run() {
 				p.terminal.Resize(int(command.resize.cols), int(command.resize.rows))
 				p.publishTerminalMetadata()
 				renderer.invalidateEpoch(false)
-				admission.grantStructuralOpportunity()
+				admission.grantImmediateOpportunity()
 				command.done <- err
 			} else {
 				command.done <- nil
@@ -630,7 +604,7 @@ func (p *Pane) run() {
 				}
 				continue
 			}
-			if !event.complete {
+			if event.reason == 0 {
 				continue
 			}
 			drainActive = false
@@ -638,37 +612,14 @@ func (p *Pane) run() {
 			if renderer.hasMutation() {
 				renderer.attributeNextPreparationToDrain()
 			}
-			if event.err != nil {
+			if event.reason == ptyDrainStoppedError {
 				return
-			}
-		case data, ok := <-ptyOutput:
-			if !ok {
-				return
-			}
-			admission.admit(time.Now())
-			p.renderMetrics.ptyDrainOpportunities.Add(1)
-			arm(&ptyTimer, &ptyTimerC, pacingInterval)
-			select {
-			case <-p.ptyInteractive:
-			default:
-			}
-			if err := applyPTYChunk(data); err != nil {
-				return
-			}
-			p.renderMetrics.recordPTYDrain(ptyDrainEvent{
-				complete: true,
-				reason:   ptyDrainStoppedEmpty,
-				bytes:    len(data),
-				reads:    1,
-			})
-			if renderer.hasMutation() {
-				renderer.attributeNextPreparationToDrain()
 			}
 		case <-ptyTimerC:
 			ptyTimerC = nil
 			admission.timerFired()
 		case <-p.ptyInteractive:
-			admission.grantKeyboardOpportunity()
+			admission.grantImmediateOpportunity()
 		case <-startupIdleC:
 			if err := flushStartupInput(); err != nil {
 				return
@@ -723,121 +674,6 @@ func historySelectionContains(selection *paneHistorySelection, row, column int) 
 		return column <= end.Col
 	}
 	return true
-}
-
-func writeHistoryCounter(compiler *displayCompiler, view *paneHistoryView, label string) error {
-	cols := view.Snapshot.Cols
-	if len(label) > cols {
-		label = label[len(label)-cols:]
-	}
-	if err := compiler.moveTo(0, max(0, cols-len(label))); err != nil {
-		return err
-	}
-	if err := compiler.selectStyle(view.Snapshot.CounterStyle); err != nil {
-		return err
-	}
-	return compiler.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte(label)})
-}
-
-func sendFullRender(output *renderOutput, pane *Pane) error {
-	compiler := newLiveDisplayCompiler(output, pane.terminal)
-	for row := 0; row < pane.terminal.Rows; row++ {
-		if err := compiler.writeCells(row, 0, pane.terminal.gridRow(row)); err != nil {
-			return err
-		}
-	}
-	if err := compiler.finish(); err != nil {
-		return err
-	}
-	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.terminal.CursorX, Y: pane.terminal.CursorY}, Visible: pane.terminal.CursorVisible}}); err != nil {
-		return err
-	}
-	return output.present()
-}
-
-func installStyle(output *renderOutput, id uint32, style protocol.Style) error {
-	if id == protocol.CanonicalDefaultStyleID && !protocol.IsCanonicalDefaultStyle(style) {
-		return fmt.Errorf("style %d must be canonical default", id)
-	}
-	if installed, ok := output.installedStyles[id]; ok && installed == style {
-		return nil
-	}
-	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStyleInstall, StyleID: id, Style: style}); err != nil {
-		return err
-	}
-	output.installedStyles[id] = style
-	return nil
-}
-
-type renderOutput struct {
-	stream          io.Writer
-	pending         []byte
-	installedStyles map[uint32]protocol.Style
-	limit           int
-	bufferedOnly    bool
-}
-
-func newRenderOutput(stream ...io.Writer) *renderOutput {
-	output := &renderOutput{stream: io.Discard, installedStyles: make(map[uint32]protocol.Style, 32)}
-	if len(stream) > 0 {
-		output.stream = stream[0]
-	}
-	return output
-}
-
-func (o *renderOutput) hasRoom(bytes int) bool {
-	return o.limit <= 0 || bytes <= o.limit-len(o.pending)
-}
-
-func (o *renderOutput) append(command protocol.DisplayCommand) error {
-	if o.pending == nil {
-		o.pending = make([]byte, 0, 4096)
-	}
-	before := o.pending
-	encoder := protocol.NewDisplayEncoder(before)
-	if err := encoder.AppendCommand(command); err != nil {
-		return err
-	}
-	encoded := encoder.Bytes()
-	if o.limit > 0 && len(encoded) > o.limit {
-		o.pending = before
-		return errRenderBufferFull
-	}
-	o.pending = encoded
-	if o.bufferedOnly {
-		return nil
-	}
-	if len(o.pending) >= renderStreamChunkSize {
-		return o.commit()
-	}
-	return nil
-}
-
-func (o *renderOutput) commit() error {
-	if o.bufferedOnly {
-		return nil
-	}
-	if len(o.pending) == 0 {
-		return nil
-	}
-	data := o.pending
-	err := writeAll(o.stream, data)
-	if cap(data) <= maxRetainedRenderBuffer {
-		o.pending = data[:0]
-	} else {
-		o.pending = nil
-	}
-	return err
-}
-
-func (o *renderOutput) present() error {
-	if err := o.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
-		return err
-	}
-	if o.bufferedOnly {
-		return nil
-	}
-	return o.commit()
 }
 
 func writeAll(w io.Writer, data []byte) error {

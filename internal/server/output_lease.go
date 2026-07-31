@@ -15,7 +15,7 @@ type confirmerMessage struct {
 }
 
 type paneConfirmer struct {
-	output      *renderOutput
+	frame       []byte
 	styleIDs    map[protocol.Style]uint32
 	nextStyleID uint32
 	textScratch []byte
@@ -26,20 +26,27 @@ type paneConfirmer struct {
 
 func newPaneConfirmer() *paneConfirmer {
 	return &paneConfirmer{
-		output:   &renderOutput{pending: make([]byte, 0, maxRetainedRenderBuffer), bufferedOnly: true},
+		frame:    make([]byte, 0, initialReliableFrameCap),
 		styleIDs: make(map[protocol.Style]uint32, maxTerminalStyles),
 	}
 }
 
+func (c *paneConfirmer) append(command protocol.DisplayCommand) error {
+	encoder := protocol.NewDisplayEncoder(c.frame)
+	if err := encoder.AppendCommand(command); err != nil {
+		return err
+	}
+	c.frame = encoder.Bytes()
+	return nil
+}
+
 func (c *paneConfirmer) resetWireStyles() {
 	clear(c.styleIDs)
-	defaultStyle := canonicalStyle(protocol.CanonicalDefaultStyle())
-	c.styleIDs[defaultStyle] = protocol.CanonicalDefaultStyleID
+	c.styleIDs[protocol.CanonicalDefaultStyle()] = protocol.CanonicalDefaultStyleID
 	c.nextStyleID = 1
 }
 
 func (c *paneConfirmer) ensureStyle(style protocol.Style) (uint32, error) {
-	style = canonicalStyle(style)
 	if id, ok := c.styleIDs[style]; ok {
 		return id, nil
 	}
@@ -48,7 +55,7 @@ func (c *paneConfirmer) ensureStyle(style protocol.Style) (uint32, error) {
 	}
 	id := c.nextStyleID
 	c.nextStyleID++
-	if err := c.output.append(protocol.DisplayCommand{
+	if err := c.append(protocol.DisplayCommand{
 		Opcode:  protocol.DisplayOpcodeStyleInstall,
 		StyleID: id,
 		Style:   style,
@@ -60,7 +67,7 @@ func (c *paneConfirmer) ensureStyle(style protocol.Style) (uint32, error) {
 }
 
 func (c *paneConfirmer) appendPosition(row, column int) error {
-	return c.output.append(protocol.DisplayCommand{
+	return c.append(protocol.DisplayCommand{
 		Opcode: protocol.DisplayOpcodeSetWritePosition,
 		Row:    row,
 		Column: column,
@@ -95,13 +102,13 @@ func (c *paneConfirmer) compileRun(publication *viewPublication, run publishedRu
 			if err != nil {
 				return err
 			}
-			if err := c.output.append(protocol.DisplayCommand{
+			if err := c.append(protocol.DisplayCommand{
 				Opcode:  protocol.DisplayOpcodeSetWriteStyle,
 				StyleID: styleID,
 			}); err != nil {
 				return err
 			}
-			if err := c.output.append(protocol.DisplayCommand{
+			if err := c.append(protocol.DisplayCommand{
 				Opcode: protocol.DisplayOpcodeWriteCluster,
 				Width:  cell.width,
 				Text:   text,
@@ -124,7 +131,7 @@ func (c *paneConfirmer) compileRun(publication *viewPublication, run publishedRu
 				continue
 			}
 			currentStyle, ok := semanticStyleAt(publication.Styles, current.style)
-			if !ok || canonicalStyle(currentStyle) != canonicalStyle(style) || current.kind == semanticCluster || current.width != width {
+			if !ok || currentStyle != style || current.kind == semanticCluster || current.width != width {
 				break
 			}
 			_, r, err := semanticCellText(current, publication.Clusters)
@@ -144,14 +151,14 @@ func (c *paneConfirmer) compileRun(publication *viewPublication, run publishedRu
 			opcode = protocol.DisplayOpcodeWriteText
 		}
 		if opcode != protocol.DisplayOpcodeWriteTextUTF8Default {
-			if err := c.output.append(protocol.DisplayCommand{
+			if err := c.append(protocol.DisplayCommand{
 				Opcode:  protocol.DisplayOpcodeSetWriteStyle,
 				StyleID: styleID,
 			}); err != nil {
 				return err
 			}
 		}
-		if err := c.output.append(protocol.DisplayCommand{
+		if err := c.append(protocol.DisplayCommand{
 			Opcode: opcode,
 			Width:  width,
 			Text:   c.textScratch,
@@ -187,10 +194,10 @@ func (c *paneConfirmer) compile(publication *viewPublication) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("publication kind %d is invalid", publication.Kind)
 	}
-	c.output.pending = c.output.pending[:0]
+	c.frame = c.frame[:0]
 	if publication.Barrier {
 		c.resetWireStyles()
-		if err := c.output.append(protocol.DisplayCommand{
+		if err := c.append(protocol.DisplayCommand{
 			Opcode:         protocol.DisplayOpcodeStartRender,
 			LayoutRevision: publication.LayoutRevision,
 			GridCols:       int(publication.Cols),
@@ -198,7 +205,7 @@ func (c *paneConfirmer) compile(publication *viewPublication) ([]byte, error) {
 		}); err != nil {
 			return nil, err
 		}
-		if err := c.output.append(protocol.DisplayCommand{
+		if err := c.append(protocol.DisplayCommand{
 			Opcode:  protocol.DisplayOpcodeStyleInstall,
 			StyleID: protocol.CanonicalDefaultStyleID,
 			Style:   protocol.CanonicalDefaultStyle(),
@@ -209,7 +216,7 @@ func (c *paneConfirmer) compile(publication *viewPublication) ([]byte, error) {
 		return nil, fmt.Errorf("publication has no START_RENDER wire barrier")
 	}
 	if publication.HasScroll {
-		if err := c.output.append(protocol.DisplayCommand{
+		if err := c.append(protocol.DisplayCommand{
 			Opcode: protocol.DisplayOpcodeScrollRegion,
 			ScrollRegion: protocol.ScrollRegion{
 				Top: int(publication.Scroll.Top), Bottom: int(publication.Scroll.Bottom), Delta: int(publication.Scroll.Delta),
@@ -224,7 +231,7 @@ func (c *paneConfirmer) compile(publication *viewPublication) ([]byte, error) {
 		}
 	}
 	if publication.CursorChanged {
-		if err := c.output.append(protocol.DisplayCommand{
+		if err := c.append(protocol.DisplayCommand{
 			Opcode: protocol.DisplayOpcodeCursorUpdate,
 			Cursor: protocol.CursorUpdate{
 				Cursor:  protocol.Cursor{X: int(publication.Cursor.X), Y: int(publication.Cursor.Y)},
@@ -234,13 +241,13 @@ func (c *paneConfirmer) compile(publication *viewPublication) ([]byte, error) {
 			return nil, err
 		}
 	}
-	if err := c.output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
+	if err := c.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
 		return nil, err
 	}
 	c.epoch = publication.Epoch
 	c.version = publication.TargetVersion
 	c.hasBase = true
-	return c.output.pending, nil
+	return c.frame, nil
 }
 
 func (l *OutputLease) startWorker() {
@@ -304,11 +311,7 @@ func (l *OutputLease) runConfirmer() {
 			frame, err := confirmer.compile(&buffer.publication)
 			buffer.release()
 			if err == nil && metrics != nil {
-				metrics.presents.Add(1)
-				if fromPTYDrain {
-					metrics.ptyDrainPresents.Add(1)
-				}
-				metrics.uncompressedBytes.Add(uint64(len(frame)))
+				metrics.recordCompiledFrame(len(frame), fromPTYDrain)
 			}
 			if err == nil {
 				started := time.Now()

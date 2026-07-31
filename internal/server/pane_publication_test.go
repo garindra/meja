@@ -561,8 +561,8 @@ func TestMultiChunkReliableWriteSteadyStateDoesNotAllocate(t *testing.T) {
 
 func TestPaneRenderMetricsKeepOnePresentPerPublication(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(8, 2)}
-	ptyOutput := startTestPaneLoop(pane)
-	defer close(ptyOutput)
+	shutdown := startTestPaneLoop(pane)
+	defer close(shutdown)
 	if err := pane.installOutputLease(testOutputLease(0, io.Discard), 1, 8, 2); err != nil {
 		t.Fatal(err)
 	}
@@ -576,7 +576,7 @@ func TestPaneRenderMetricsKeepOnePresentPerPublication(t *testing.T) {
 	if metrics.ChangedCells > metrics.CandidateCells {
 		t.Fatalf("changed cells=%d candidates=%d", metrics.ChangedCells, metrics.CandidateCells)
 	}
-	if metrics.PTYTurns == 0 || metrics.PTYBytes == 0 {
+	if metrics.PTYDrainsCompleted == 0 || metrics.PTYBytes == 0 {
 		t.Fatalf("PTY diagnostics were not recorded: %#v", metrics)
 	}
 }
@@ -650,7 +650,7 @@ func TestPaneRenderDiagnosticWorkload(t *testing.T) {
 	after := pane.renderMetricsSnapshot()
 	publications := after.Publications - before.Publications
 	presents := after.Presents - before.Presents
-	ptyTurns := after.PTYTurns - before.PTYTurns
+	drains := after.PTYDrainsCompleted - before.PTYDrainsCompleted
 	ptyBytes := after.PTYBytes - before.PTYBytes
 	drainReads := after.PTYDrainReads - before.PTYDrainReads
 	drainsAtEmpty := after.PTYDrainStoppedEmpty - before.PTYDrainStoppedEmpty
@@ -659,10 +659,10 @@ func TestPaneRenderDiagnosticWorkload(t *testing.T) {
 	changed := after.ChangedCells - before.ChangedCells
 	t.Logf("elapsed=%.3fs pty_drains/s=%.2f reads/drain=%.2f bytes/drain=%.1f eagain_pct=%.1f pty_bytes/s=%.0f publications/s=%.2f presents/s=%.2f presents/publication=%.2f wire_bytes/s=%.0f avg_bytes/publication=%.1f candidates=%d changed=%d cancelled=%d",
 		elapsed,
-		float64(ptyTurns)/elapsed,
-		float64(drainReads)/float64(ptyTurns),
-		float64(ptyBytes)/float64(ptyTurns),
-		float64(drainsAtEmpty)*100/float64(ptyTurns),
+		float64(drains)/elapsed,
+		float64(drainReads)/float64(drains),
+		float64(ptyBytes)/float64(drains),
+		float64(drainsAtEmpty)*100/float64(drains),
 		float64(ptyBytes)/elapsed,
 		float64(publications)/elapsed,
 		float64(presents)/elapsed,

@@ -140,7 +140,7 @@ func runTestPTYDrain(t *testing.T, pane *Pane, reader io.Reader, request ptyDrai
 				pane.ptyFree <- event.buffer[:ptyReadBufferSize]
 				continue
 			}
-			if event.complete {
+			if event.reason != 0 {
 				<-done
 				return output, event
 			}
@@ -159,7 +159,7 @@ func TestPTYDrainConsumesAllReadyReadsAndEndsExplicitly(t *testing.T) {
 	if got, want := string(output), "abcdefghi"; got != want {
 		t.Fatalf("drained output = %q, want %q", got, want)
 	}
-	if complete.reason != ptyDrainStoppedEmpty || complete.reads != 3 || complete.bytes != 9 {
+	if complete.reason != ptyDrainStoppedEmpty || complete.reads != 3 || len(output) != 9 {
 		t.Fatalf("completion = %#v, want 3 reads/9 bytes ending empty", complete)
 	}
 	if got := reader.reads.Load(); got != 3 {
@@ -181,7 +181,7 @@ func TestPTYDrainEAGAINEndsWithoutPollingOrSpinning(t *testing.T) {
 	if got, want := string(output), "ready"; got != want {
 		t.Fatalf("drained output = %q, want %q", got, want)
 	}
-	if complete.reason != ptyDrainStoppedEmpty || complete.reads != 2 || complete.bytes != 5 {
+	if complete.reason != ptyDrainStoppedEmpty || complete.reads != 2 || len(output) != 5 {
 		t.Fatalf("completion = %#v, want data followed by EAGAIN", complete)
 	}
 	before := reader.reads.Load()
@@ -201,11 +201,11 @@ func TestPTYDrainInterruptedReadEndsOpportunityWithoutTerminatingReader(t *testi
 	reader := &interruptedPTYReader{}
 
 	_, first := runTestPTYDrain(t, pane, reader, ptyDrainRequest{})
-	if first.reason != ptyDrainStoppedEmpty || first.err != nil {
+	if first.reason != ptyDrainStoppedEmpty {
 		t.Fatalf("interrupted read completion = %#v, want temporary empty", first)
 	}
 	_, second := runTestPTYDrain(t, pane, reader, ptyDrainRequest{})
-	if second.reason != ptyDrainStoppedEmpty || second.err != nil {
+	if second.reason != ptyDrainStoppedEmpty {
 		t.Fatalf("second interrupted completion = %#v, want temporary empty", second)
 	}
 	if reader.reads.Load() != 2 {

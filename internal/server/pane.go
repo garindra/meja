@@ -40,7 +40,6 @@ type Pane struct {
 	ptyDrainRequests       chan ptyDrainRequest
 	ptyDrainEvents         chan ptyDrainEvent
 	ptyDrainNow            func() time.Time
-	ptyOutput              chan []byte
 	ptyInteractive         chan struct{}
 	ptyPacingInterval      time.Duration
 	newTimer               func(time.Duration) *time.Timer
@@ -231,9 +230,6 @@ func (p *Pane) initializeRuntime() {
 	p.ptyFree = make(chan []byte, ptyReadBufferCount)
 	p.ptyDrainRequests = make(chan ptyDrainRequest)
 	p.ptyDrainEvents = make(chan ptyDrainEvent)
-	// ptyOutput is retained as a package-private, one-chunk drain seam for
-	// actor tests. Production PTY I/O uses the explicit request/event protocol.
-	p.ptyOutput = make(chan []byte, 1)
 	p.ptyInteractive = make(chan struct{}, 1)
 	p.ptyInput = make(chan []byte, 64)
 	p.commands = make(chan paneCommand, 8)
