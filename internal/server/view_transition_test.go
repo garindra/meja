@@ -92,7 +92,7 @@ func TestClientViewBindsResolvedPaneWithoutGraphReread(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, pane)
-	commands := decodePendingCommands(t, wire.Bytes())
+	commands := decodeFramedCommands(t, wire.Bytes())
 	if len(commands) == 0 || commands[0].Opcode != protocol.DisplayOpcodeStartRender {
 		t.Fatalf("prepared pane emitted %#v, want START_RENDER", commandOpcodes(commands))
 	}

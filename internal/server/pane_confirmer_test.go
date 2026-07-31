@@ -2,11 +2,88 @@ package server
 
 import (
 	"bytes"
+	"fmt"
+	"io"
 	"os"
 	"testing"
 
 	"github.com/garindra/meja/internal/protocol"
 )
+
+func TestPaneConfirmerSelectsRawOrZlibPerFrame(t *testing.T) {
+	confirmer := newPaneConfirmer()
+	tiny, err := confirmer.encodeRecord([]byte{byte(protocol.DisplayOpcodeNoop)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tiny.header.Encoding != protocol.RenderEncodingRaw {
+		t.Fatalf("tiny encoding=%d, want raw", tiny.header.Encoding)
+	}
+	compressible, err := confirmer.encodeRecord(bytes.Repeat([]byte("render-command-payload-"), 256))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compressible.header.Encoding != protocol.RenderEncodingZlib {
+		t.Fatalf("compressible encoding=%d, want zlib", compressible.header.Encoding)
+	}
+	if int(compressible.header.EncodedSize)+compressible.headerSize != len(compressible.bytes) {
+		t.Fatalf("header=%#v header_size=%d record_bytes=%d", compressible.header, compressible.headerSize, len(compressible.bytes))
+	}
+}
+
+func TestRenderPayloadSelectionFallsBackToRawOnEqualSize(t *testing.T) {
+	raw := []byte("raw")
+	encoding, selected := selectRenderPayload(raw, []byte("zip"))
+	if encoding != protocol.RenderEncodingRaw || !bytes.Equal(selected, raw) {
+		t.Fatalf("selection=%d %q, want raw", encoding, selected)
+	}
+}
+
+func TestPaneConfirmerZlibRecordsDecodeIndependently(t *testing.T) {
+	confirmer := newPaneConfirmer()
+	wants := [][]byte{bytes.Repeat([]byte("alpha"), 200), bytes.Repeat([]byte("beta"), 200)}
+	var wire []byte
+	for _, raw := range wants {
+		record, err := confirmer.encodeRecord(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record.header.Encoding != protocol.RenderEncodingZlib {
+			t.Fatalf("encoding=%d, want zlib", record.header.Encoding)
+		}
+		wire = append(wire, record.bytes...)
+	}
+	reader := protocol.NewRenderFrameReader(bytes.NewReader(wire))
+	for _, want := range wants {
+		frame, err := reader.ReadFrame()
+		if err != nil || !bytes.Equal(frame.Payload, want) {
+			t.Fatalf("decoded frame error=%v", err)
+		}
+	}
+	if _, err := reader.ReadFrame(); err != io.EOF {
+		t.Fatalf("trailing read error=%v", err)
+	}
+}
+
+func BenchmarkPaneConfirmerEncodeRecord(b *testing.B) {
+	for _, size := range []int{32, 4096} {
+		b.Run(fmt.Sprintf("bytes-%d", size), func(b *testing.B) {
+			confirmer := newPaneConfirmer()
+			raw := bytes.Repeat([]byte("render"), (size+5)/6)[:size]
+			if _, err := confirmer.encodeRecord(raw); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for range b.N {
+				if _, err := confirmer.encodeRecord(raw); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
 
 type compilerDiagnosticWorkload struct {
 	name  string
@@ -132,10 +209,10 @@ func TestPaneConfirmerWireDiagnostic(t *testing.T) {
 				counts[command.Opcode]++
 			}
 			text := counts[protocol.DisplayOpcodeWriteText] + counts[protocol.DisplayOpcodeWriteTextUTF8] + counts[protocol.DisplayOpcodeWriteTextUTF8Default]
-			t.Logf("position=%d style=%d text=%d cluster=%d fill=%d install=%d present=%d bytes=%d",
+			t.Logf("position=%d style=%d text=%d cluster=%d fill=%d install=%d bytes=%d",
 				counts[protocol.DisplayOpcodeSetWritePosition], counts[protocol.DisplayOpcodeSetWriteStyle], text,
 				counts[protocol.DisplayOpcodeWriteCluster], counts[protocol.DisplayOpcodeFill],
-				counts[protocol.DisplayOpcodeStyleInstall], counts[protocol.DisplayOpcodePresent], len(frame))
+				counts[protocol.DisplayOpcodeStyleInstall], len(frame))
 		})
 	}
 }
@@ -144,9 +221,6 @@ func compileConfirmerTestFrame(t *testing.T, publication viewPublication) ([]byt
 	t.Helper()
 	frame := bytes.Clone(compileDiagnosticKeyframe(t, publication))
 	commands := decodePendingCommands(t, frame)
-	if got := countOpcode(commandOpcodes(commands), protocol.DisplayOpcodePresent); got != 1 {
-		t.Fatalf("PRESENT count = %d, want 1", got)
-	}
 	return frame, commands
 }
 
@@ -348,8 +422,5 @@ func TestFrameCompilerResetsPenAndStyleAtPublicationBoundary(t *testing.T) {
 	}
 	if countOpcode(opcodes, protocol.DisplayOpcodeStyleInstall) != 0 {
 		t.Fatalf("persistent style dictionary was reset without a barrier: %v", opcodes)
-	}
-	if countOpcode(opcodes, protocol.DisplayOpcodePresent) != 1 {
-		t.Fatalf("second publication PRESENT count = %d", countOpcode(opcodes, protocol.DisplayOpcodePresent))
 	}
 }

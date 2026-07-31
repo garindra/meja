@@ -19,8 +19,7 @@ func TestDisplayWireBytesHaveNoGenericFrameLength(t *testing.T) {
 	if err := encoder.AppendWriteText(WriteText{CellWidth: 2, Text: []byte("界")}); err != nil {
 		t.Fatal(err)
 	}
-	encoder.AppendPresent()
-	want := []byte{0x01, 0x07, 0x50, 0x18, 0x03, 0x04, 0x09, 0x05, 0x02, 0x03, 0xe7, 0x95, 0x8c, 0xff}
+	want := []byte{0x01, 0x07, 0x50, 0x18, 0x03, 0x04, 0x09, 0x05, 0x02, 0x03, 0xe7, 0x95, 0x8c}
 	if !bytes.Equal(encoder.Bytes(), want) {
 		t.Fatalf("wire=% x want % x", encoder.Bytes(), want)
 	}
@@ -57,7 +56,6 @@ func TestDisplayWireBytesCoverAllCommandSchemas(t *testing.T) {
 	_ = encoder.AppendFill(Fill{Columns: 3, Rune: ' ', Width: 1})
 	_ = encoder.AppendCursorUpdate(CursorUpdate{Cursor: Cursor{X: 2, Y: 3}, Visible: true})
 	_ = encoder.AppendScrollRegion(ScrollRegion{Top: 0, Bottom: 24, Delta: -1})
-	encoder.AppendPresent()
 	want := []byte{
 		0x02, 0x02, 0x01, 0x01, 0x07, 0x00,
 		0x03, 0x04, 0x09,
@@ -67,7 +65,6 @@ func TestDisplayWireBytesCoverAllCommandSchemas(t *testing.T) {
 		0x08, 0x03, 0x20, 0x01,
 		0x09, 0x02, 0x03, 0x01,
 		0x0a, 0x00, 0x18, 0x01,
-		0xff,
 	}
 	if !bytes.Equal(encoder.Bytes(), want) {
 		t.Fatalf("wire=% x want % x", encoder.Bytes(), want)
@@ -95,9 +92,7 @@ func TestDisplayCommandRoundTripsAcrossArbitraryReads(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	encoder.AppendPresent()
 	want := append([]DisplayCommand{{Opcode: DisplayOpcodeStartRender, LayoutRevision: 7, GridCols: 80, GridRows: 24}}, commands...)
-	want = append(want, DisplayCommand{Opcode: DisplayOpcodePresent})
 	got := decodeDisplayCommands(t, oneByteReader{Reader: bytes.NewReader(encoder.Bytes())})
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("commands=%#v want %#v", got, want)
@@ -123,9 +118,7 @@ func TestDiverseClustersRoundTripAsOpaqueDisplayUnits(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	encoder.AppendPresent()
 	want := append([]DisplayCommand{{Opcode: DisplayOpcodeStartRender, LayoutRevision: 19, GridCols: 80, GridRows: 24}}, clusters...)
-	want = append(want, DisplayCommand{Opcode: DisplayOpcodePresent})
 	got := decodeDisplayCommands(t, oneByteReader{Reader: bytes.NewReader(encoder.Bytes())})
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("decoded commands = %#v, want %#v", got, want)
@@ -141,9 +134,8 @@ func TestDisplayStyleRoundTripsExtendedAttributesWithoutChangingOldFlags(t *test
 	if err := encoder.AppendStyleInstall(StyleInstall{ID: 1, Style: style}); err != nil {
 		t.Fatal(err)
 	}
-	encoder.AppendPresent()
 	commands := decodeDisplayCommands(t, bytes.NewReader(encoder.Bytes()))
-	if len(commands) != 3 || commands[1].Style != style {
+	if len(commands) != 2 || commands[1].Style != style {
 		t.Fatalf("decoded commands=%#v want style %#v", commands, style)
 	}
 
@@ -158,7 +150,6 @@ func TestDisplayStyleRoundTripsExtendedAttributesWithoutChangingOldFlags(t *test
 
 func TestDisplayEncoderStyleInstallFailurePreservesBytes(t *testing.T) {
 	encoder := NewDisplayEncoder(nil)
-	encoder.AppendPresent()
 	want := append([]byte(nil), encoder.Bytes()...)
 	if err := encoder.AppendStyleInstall(StyleInstall{ID: 4, Style: Style{FG: Color{Mode: "invalid"}}}); err == nil {
 		t.Fatal("accepted invalid style")
@@ -168,34 +159,23 @@ func TestDisplayEncoderStyleInstallFailurePreservesBytes(t *testing.T) {
 	}
 }
 
-func TestDisplayDecoderMultipleBatches(t *testing.T) {
+func TestDisplayDecoderCleanBoundedEOF(t *testing.T) {
 	encoder := NewDisplayEncoder(nil)
-	for _, text := range []string{"one", "two"} {
-		if err := encoder.AppendStartRender(StartRender{LayoutRevision: 3, Cols: 80, Rows: 24}); err != nil {
-			t.Fatal(err)
-		}
-		if err := encoder.AppendWriteTextUTF8([]byte(text)); err != nil {
-			t.Fatal(err)
-		}
-		encoder.AppendPresent()
+	if err := encoder.AppendStartRender(StartRender{LayoutRevision: 3, Cols: 80, Rows: 24}); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.AppendWriteTextUTF8([]byte("one")); err != nil {
+		t.Fatal(err)
 	}
 	decoder := NewDisplayDecoder(bytes.NewReader(encoder.Bytes()))
-	for _, want := range []string{"one", "two"} {
-		barrier, _, err := decoder.ReadCommand()
-		if err != nil || barrier.Opcode != DisplayOpcodeStartRender {
-			t.Fatalf("barrier=%#v err=%v", barrier, err)
-		}
-		text, _, err := decoder.ReadCommand()
-		if err != nil || string(text.Text) != want {
-			t.Fatalf("text=%#v err=%v", text, err)
-		}
-		present, _, err := decoder.ReadCommand()
-		if err != nil || present.Opcode != DisplayOpcodePresent {
-			t.Fatalf("present=%#v err=%v", present, err)
-		}
+	if command, _, err := decoder.ReadCommand(); err != nil || command.Opcode != DisplayOpcodeStartRender {
+		t.Fatalf("barrier=%#v err=%v", command, err)
 	}
-	if _, _, err := decoder.ReadCommand(); !errors.Is(err, io.EOF) {
-		t.Fatalf("final ReadCommand error=%v", err)
+	if command, _, err := decoder.ReadCommand(); err != nil || string(command.Text) != "one" {
+		t.Fatalf("text=%#v err=%v", command, err)
+	}
+	if _, _, err := decoder.ReadCommand(); err == nil {
+		t.Fatal("bounded payload EOF was not reported")
 	}
 }
 

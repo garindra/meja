@@ -471,7 +471,7 @@ func TestPTYDrainRoutesTerminalReplyBeforeVisualCompletion(t *testing.T) {
 	syncPaneRenderer(t, pane)
 	after := pane.renderMetricsSnapshot()
 	if after.PTYDrainPublications-before.PTYDrainPublications != 1 ||
-		after.PTYDrainPresents-before.PTYDrainPresents != 1 {
+		after.PTYDrainCompiledFrames-before.PTYDrainCompiledFrames != 1 {
 		t.Fatalf("completed drain metrics = %#v", after)
 	}
 
@@ -481,7 +481,7 @@ func TestPTYDrainRoutesTerminalReplyBeforeVisualCompletion(t *testing.T) {
 	<-relayDone
 }
 
-func TestPTYDrainSplitRedrawProducesOnePublicationAndPresent(t *testing.T) {
+func TestPTYDrainSplitRedrawProducesOnePublicationAndCompiledFrame(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(9, 1)}
 	pane.initializeRuntime()
 	go pane.run()
@@ -519,8 +519,8 @@ func TestPTYDrainSplitRedrawProducesOnePublicationAndPresent(t *testing.T) {
 	if got := after.PTYDrainPublications - before.PTYDrainPublications; got != 1 {
 		t.Fatalf("publications for split redraw = %d, want 1", got)
 	}
-	if got := after.PTYDrainPresents - before.PTYDrainPresents; got != 1 {
-		t.Fatalf("PRESENTs for split redraw = %d, want 1", got)
+	if got := after.PTYDrainCompiledFrames - before.PTYDrainCompiledFrames; got != 1 {
+		t.Fatalf("compiled frames for split redraw = %d, want 1", got)
 	}
 	captured, err := pane.capturePane(capturePaneOptions{})
 	if err != nil {

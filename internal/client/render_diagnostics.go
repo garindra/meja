@@ -20,22 +20,28 @@ type renderDiagnosticKind uint8
 
 const (
 	renderDiagnosticCommand renderDiagnosticKind = iota + 1
+	renderDiagnosticFrame
 	renderDiagnosticRedraw
 	renderDiagnosticProjection
 	renderDiagnosticStop
 )
 
 type renderDiagnosticReport struct {
-	kind       renderDiagnosticKind
-	slot       uint8
-	opcode     protocol.DisplayOpcode
-	wireBytes  uint64
-	textBytes  uint64
-	styleID    uint32
-	style      protocol.Style
-	reason     string
-	writeBytes int
-	ack        chan struct{}
+	kind                  renderDiagnosticKind
+	slot                  uint8
+	opcode                protocol.DisplayOpcode
+	wireBytes             uint64
+	textBytes             uint64
+	styleID               uint32
+	style                 protocol.Style
+	reason                string
+	writeBytes            int
+	encoding              protocol.RenderEncoding
+	rawBytes              uint32
+	encodedBytes          uint32
+	headerBytes           int
+	decompressionDuration time.Duration
+	ack                   chan struct{}
 }
 
 type renderDiagnostics struct {
@@ -55,6 +61,7 @@ type renderDiagnosticState struct {
 	installedStyles map[renderStyleKey]protocol.Style
 	redrawRequests  uint64
 	redrawWrites    uint64
+	completedFrames uint64
 }
 
 type renderStyleKey struct {
@@ -97,6 +104,17 @@ func (d *renderDiagnostics) reportRedraw(reason string, writeBytes int) {
 		return
 	}
 	d.report(renderDiagnosticReport{kind: renderDiagnosticRedraw, reason: reason, writeBytes: writeBytes})
+}
+
+func (d *renderDiagnostics) reportFrame(slot uint8, frame protocol.DecodedRenderFrame) {
+	if d == nil {
+		return
+	}
+	d.report(renderDiagnosticReport{
+		kind: renderDiagnosticFrame, slot: slot, encoding: frame.Header.Encoding,
+		rawBytes: frame.Header.RawSize, encodedBytes: frame.Header.EncodedSize,
+		headerBytes: frame.HeaderSize, decompressionDuration: frame.DecompressionDuration,
+	})
 }
 
 func (d *renderDiagnostics) reportProjection(reason string) {
@@ -142,6 +160,8 @@ func (d *renderDiagnostics) run(writer io.Writer) {
 					timerC = timer.C
 				}
 				state.recordCommand(report)
+			case renderDiagnosticFrame:
+				state.recordFrame(report)
 			case renderDiagnosticRedraw:
 				state.recordRedraw(report)
 			case renderDiagnosticProjection:
@@ -160,6 +180,22 @@ func (d *renderDiagnostics) run(writer io.Writer) {
 			timer, timerC = nil, nil
 		}
 	}
+}
+
+func (s *renderDiagnosticState) recordFrame(report renderDiagnosticReport) {
+	s.completedFrames++
+	ratio := float64(report.encodedBytes) / float64(report.rawBytes)
+	s.logf("frame #%d slot=%d encoding=%s raw_bytes=%d encoded_bytes=%d header_bytes=%d framed_bytes=%d ratio=%.3f decompression=%s",
+		s.completedFrames, report.slot, renderEncodingName(report.encoding), report.rawBytes,
+		report.encodedBytes, report.headerBytes, uint64(report.headerBytes)+uint64(report.encodedBytes),
+		ratio, report.decompressionDuration)
+}
+
+func renderEncodingName(encoding protocol.RenderEncoding) string {
+	if encoding == protocol.RenderEncodingZlib {
+		return "zlib"
+	}
+	return "raw"
 }
 
 func (s *renderDiagnosticState) startBurst() {
@@ -324,8 +360,6 @@ func incomingRenderOpcodeName(opcode protocol.DisplayOpcode) string {
 		return "CursorUpdate"
 	case protocol.DisplayOpcodeScrollRegion:
 		return "ScrollRegion"
-	case protocol.DisplayOpcodePresent:
-		return "Present"
 	default:
 		return fmt.Sprintf("Opcode0x%02x", byte(opcode))
 	}

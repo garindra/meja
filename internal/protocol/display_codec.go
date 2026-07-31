@@ -10,7 +10,7 @@ import (
 )
 
 // Display streams use this exact grammar, with no generic frame wrapper:
-// [one-byte opcode][opcode-specific fields]... [PRESENT]. Text fields are
+// [one-byte opcode][opcode-specific fields]... until bounded frame EOF. Text fields are
 // [UTF-8 byte length uvarint][raw UTF-8 bytes]. WRITE_TEXT_UTF8 variants are
 // for text the server has established as width 1; this decoder intentionally
 // does not perform terminal wcwidth validation. Width-2 text uses WRITE_TEXT.
@@ -34,7 +34,6 @@ const (
 	DisplayOpcodeCursorUpdate         DisplayOpcode = 0x09
 	DisplayOpcodeScrollRegion         DisplayOpcode = 0x0a
 	DisplayOpcodeWriteCluster         DisplayOpcode = 0x0b
-	DisplayOpcodePresent              DisplayOpcode = 0xff
 )
 
 const MaxDisplayTextBytes = DefaultMaxFrameSize
@@ -87,9 +86,6 @@ func (e *DisplayEncoder) AppendCommand(cmd DisplayCommand) error {
 		return e.AppendCursorUpdate(cmd.Cursor)
 	case DisplayOpcodeScrollRegion:
 		return e.AppendScrollRegion(cmd.ScrollRegion)
-	case DisplayOpcodePresent:
-		e.AppendPresent()
-		return nil
 	default:
 		return fmt.Errorf("unknown display opcode 0x%02x", byte(cmd.Opcode))
 	}
@@ -218,8 +214,6 @@ func (e *DisplayEncoder) AppendScrollRegion(msg ScrollRegion) error {
 	e.buf = appendVarint(e.buf, int64(msg.Delta))
 	return nil
 }
-
-func (e *DisplayEncoder) AppendPresent() { e.opcode(DisplayOpcodePresent) }
 
 func appendUvarint(dst []byte, value uint64) []byte {
 	var buf [10]byte
@@ -365,7 +359,6 @@ func (d *DisplayDecoder) ReadCommand() (DisplayCommand, uint64, error) {
 			err = fmt.Errorf("invalid scroll region [%d,%d) delta %d", cmd.ScrollRegion.Top, cmd.ScrollRegion.Bottom, delta)
 		}
 		cmd.ScrollRegion.Delta = int(delta)
-	case DisplayOpcodePresent:
 	default:
 		err = fmt.Errorf("unknown display opcode 0x%02x", op)
 	}

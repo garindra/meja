@@ -18,6 +18,23 @@ import (
 	"github.com/garindra/meja/internal/version"
 )
 
+type lockedTestBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *lockedTestBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(data)
+}
+
+func (b *lockedTestBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
 func parseTestInvocation(t *testing.T, args ...string) client.Config {
 	t.Helper()
 	stdin, err := os.Open(os.DevNull)
@@ -120,8 +137,9 @@ func TestInteractiveResizeBurstKeepsDetachResponsive(t *testing.T) {
 	socket := shortUnixSocketPath(t)
 	serverCtx, stopServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
+	var serverStderr lockedTestBuffer
 	go func() {
-		serverDone <- server.Run(serverCtx, server.Config{ControlPath: socket, Stdout: io.Discard, Stderr: io.Discard})
+		serverDone <- server.Run(serverCtx, server.Config{ControlPath: socket, Stdout: io.Discard, Stderr: &serverStderr})
 	}()
 	t.Cleanup(func() {
 		stopServer()
@@ -144,6 +162,7 @@ func TestInteractiveResizeBurstKeepsDetachResponsive(t *testing.T) {
 
 	var outputMu sync.Mutex
 	var output bytes.Buffer
+	var stderr bytes.Buffer
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
@@ -171,7 +190,7 @@ func TestInteractiveResizeBurstKeepsDetachResponsive(t *testing.T) {
 				return
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("terminal output did not contain %q", want)
+				t.Fatalf("terminal output did not contain %q; client stderr=%q server stderr=%q", want, stderr.String(), serverStderr.String())
 			}
 			time.Sleep(time.Millisecond)
 		}
@@ -179,7 +198,6 @@ func TestInteractiveResizeBurstKeepsDetachResponsive(t *testing.T) {
 
 	clientCtx, stopClient := context.WithCancel(context.Background())
 	defer stopClient()
-	var stderr bytes.Buffer
 	clientDone := make(chan error, 1)
 	go func() {
 		clientDone <- run(clientCtx, []string{"-S", socket, "new-session", "--", "/bin/sh"}, frontend, frontend, &stderr)
@@ -266,8 +284,9 @@ func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
 	socket := shortUnixSocketPath(t)
 	serverCtx, stopServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
+	var serverStderr lockedTestBuffer
 	go func() {
-		serverDone <- server.Run(serverCtx, server.Config{ControlPath: socket, Stdout: io.Discard, Stderr: io.Discard})
+		serverDone <- server.Run(serverCtx, server.Config{ControlPath: socket, Stdout: io.Discard, Stderr: &serverStderr})
 	}()
 	t.Cleanup(func() {
 		stopServer()
@@ -290,6 +309,7 @@ func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
 
 	var outputMu sync.Mutex
 	var output bytes.Buffer
+	var stderr bytes.Buffer
 	go func() {
 		buffer := make([]byte, 32<<10)
 		for {
@@ -315,7 +335,7 @@ func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
 				return
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("terminal output did not contain %q", want)
+				t.Fatalf("terminal output did not contain %q; client stderr=%q server stderr=%q", want, stderr.String(), serverStderr.String())
 			}
 			time.Sleep(time.Millisecond)
 		}
@@ -323,7 +343,6 @@ func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
 
 	clientCtx, stopClient := context.WithCancel(context.Background())
 	defer stopClient()
-	var stderr bytes.Buffer
 	clientDone := make(chan error, 1)
 	go func() {
 		clientDone <- run(clientCtx, []string{"-S", socket, "new-session", "--", "/bin/sh"}, frontend, frontend, &stderr)
@@ -579,7 +598,7 @@ func TestVerboseVersionCommandOutput(t *testing.T) {
 	if err := run(context.Background(), []string{"version", "--verbose"}, stdin, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	want := "meja:             1.2.3\ncommand protocol: 1\nQUIC profile:     meja-quic/14\n"
+	want := "meja:             1.2.3\ncommand protocol: 1\nQUIC profile:     meja-quic/15\n"
 	if got := stdout.String(); got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}

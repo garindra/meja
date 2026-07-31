@@ -15,19 +15,16 @@ func TestRepresentativeDisplayWireSizes(t *testing.T) {
 			e.AppendSetWritePosition(SetWritePosition{Row: 1, Column: 1})
 			e.AppendSetWriteStyle(SetWriteStyle{StyleID: 1})
 			e.AppendWriteText(WriteText{CellWidth: 1, Text: []byte("x")})
-			e.AppendPresent()
 		}},
 		{"ls-like output", func(e *DisplayEncoder) {
 			e.AppendSetWritePosition(SetWritePosition{Row: 0, Column: 0})
 			e.AppendWriteTextUTF8Default([]byte("total 12\ndrwxr-xr-x file\n"))
-			e.AppendPresent()
 		}},
 		{"TUI-like batch", func(e *DisplayEncoder) {
 			for row := 0; row < 24; row++ {
 				e.AppendSetWritePosition(SetWritePosition{Row: row, Column: 0})
 				e.AppendWriteTextUTF8Default(bytes.Repeat([]byte(" "), 80))
 			}
-			e.AppendPresent()
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -56,7 +53,6 @@ func BenchmarkDisplayCommandCodec(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		encoder := NewDisplayEncoder(nil)
 		_ = encoder.AppendWriteTextUTF8(text)
-		encoder.AppendPresent()
 		decoder := NewDisplayDecoder(bytes.NewReader(encoder.Bytes()))
 		for {
 			if _, _, err := decoder.ReadCommand(); err != nil {

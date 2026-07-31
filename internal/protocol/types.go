@@ -1,7 +1,7 @@
 package protocol
 
 const (
-	ALPN = "meja-quic/14"
+	ALPN = "meja-quic/15"
 
 	// SessionReplacedErrorCode is a terminal QUIC application close: another
 	// client has taken ownership of the session, so the displaced client must

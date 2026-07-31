@@ -468,7 +468,7 @@ func TestLiveSwitchMovesClientAssignmentWithoutChangingReconnectToken(t *testing
 	if len(layout.Panes) != 1 {
 		t.Fatalf("switched layout panes = %#v", layout.Panes)
 	}
-	commands := decodePendingCommands(t, paneOutput.Bytes())
+	commands := decodeFramedCommands(t, paneOutput.Bytes())
 	if len(commands) == 0 || commands[0].Opcode != protocol.DisplayOpcodeStartRender {
 		t.Fatalf("switched pane output = %#v, want START_RENDER", commands)
 	}
@@ -561,7 +561,12 @@ func TestPaneCLINewReconcilesNestedPTYSizeToLiveViewport(t *testing.T) {
 	}
 	decoded := make(chan decodedCommand, 1)
 	go func() {
-		command, _, err := protocol.NewDisplayDecoder(&paneOutput).ReadCommand()
+		frame, err := protocol.NewRenderFrameReader(&paneOutput).ReadFrame()
+		if err != nil {
+			decoded <- decodedCommand{err: err}
+			return
+		}
+		command, _, err := protocol.NewDisplayDecoder(bytes.NewReader(frame.Payload)).ReadCommand()
 		decoded <- decodedCommand{command: command, err: err}
 	}()
 	select {
@@ -1117,7 +1122,7 @@ func stopPersistenceTestSession(t *testing.T, session *SessionState) {
 	stopState(session)
 }
 
-func TestInitialQUICAttachPublishesStructuredStatusAndEightPaneStreams(t *testing.T) {
+func TestInitialQUICAttachPublishesStructuredStatusAndVisiblePaneStream(t *testing.T) {
 	d := newCommandTestDaemonWithActor(t)
 	setCommandTestPersistenceDir(t, d)
 	result := d.executeCommand(protocol.CommandRequest{
@@ -1152,15 +1157,21 @@ func TestInitialQUICAttachPublishesStructuredStatusAndEightPaneStreams(t *testin
 	if status.Revision == 0 || len(status.Windows) != 1 || !status.Windows[0].Active {
 		t.Fatalf("initial structured status = %#v", status)
 	}
-	for want := uint8(0); want < uint8(protocol.MaxRenderSlots); want++ {
-		stream, err := conn.AcceptUniStream(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		index, ok := protocol.OutputIndexFromStreamID(uint64(stream.StreamID()))
-		if !ok || index != want {
-			t.Fatalf("pane stream ID %d has index %d, want %d", stream.StreamID(), index, want)
-		}
+	stream, err := conn.AcceptUniStream(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, ok := protocol.OutputIndexFromStreamID(uint64(stream.StreamID()))
+	if !ok || index != 0 {
+		t.Fatalf("visible pane stream ID %d has index %d, want 0", stream.StreamID(), index)
+	}
+	frame, err := protocol.NewRenderFrameReader(stream).ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, _, err := protocol.NewDisplayDecoder(bytes.NewReader(frame.Payload)).ReadCommand()
+	if err != nil || command.Opcode != protocol.DisplayOpcodeStartRender {
+		t.Fatalf("initial framed command=%#v err=%v", command, err)
 	}
 }
 

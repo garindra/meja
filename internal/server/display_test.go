@@ -162,15 +162,20 @@ func TestConfirmerWritesLargeRedrawAsOneCompleteFrame(t *testing.T) {
 	if len(batches) != 1 {
 		t.Fatalf("large redraw used %d physical writes, want one complete-frame write", len(batches))
 	}
-	if len(batches[0]) <= 8<<10 {
-		t.Fatalf("large redraw frame has %d bytes, want substantially more than 8 KiB", len(batches[0]))
+	commands := decodeFramedCommands(t, batches[0])
+	record, err := protocol.NewRenderFrameReader(bytes.NewReader(batches[0])).ReadFrame()
+	if err != nil {
+		t.Fatal(err)
 	}
-	commands := decodePendingCommands(t, batches[0])
-	if got := countOpcode(commandOpcodes(commands), protocol.DisplayOpcodePresent); got != 1 {
-		t.Fatalf("PRESENT commands = %d, want exactly one semantic commit", got)
+	if record.Header.RawSize <= 8<<10 {
+		t.Fatalf("large redraw command payload has %d bytes, want substantially more than 8 KiB", record.Header.RawSize)
 	}
-	if commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
-		t.Fatalf("final command = %#v, want PRESENT", commands[len(commands)-1])
+	recordReader := protocol.NewRenderFrameReader(bytes.NewReader(batches[0]))
+	if _, err := recordReader.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordReader.ReadFrame(); !errors.Is(err, io.EOF) {
+		t.Fatalf("complete write contains more than one framed record: %v", err)
 	}
 	renderedCells := 0
 	for _, command := range commands {
@@ -281,7 +286,7 @@ func (c *ClientInstance) finishTestHandoff(handoff *outputHandoff, placements []
 	return c.finishOutputHandoff(handoff, plan)
 }
 
-func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
+func TestBindingSnapshotQueuesBarrierInOneFrame(t *testing.T) {
 	session := NewSessionState(0)
 	client := newTestClient(session)
 	client.setTestTerminalSize(8, 3)
@@ -293,8 +298,8 @@ func TestBindingSnapshotQueuesBarrierAndPresentTogether(t *testing.T) {
 	if err := clientForState(session).applyCurrentTestViewWithHandoff(nil); err != nil {
 		t.Fatal(err)
 	}
-	commands := decodePendingCommands(t, wire.Bytes())
-	if len(commands) < 2 || commands[0].Opcode != protocol.DisplayOpcodeStartRender || commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
+	commands := decodeFramedCommands(t, wire.Bytes())
+	if len(commands) < 2 || commands[0].Opcode != protocol.DisplayOpcodeStartRender {
 		t.Fatalf("commands=%#v", commands)
 	}
 	if commands[0].GridCols != 8 || commands[0].GridRows != 3 {
@@ -588,7 +593,7 @@ func TestClientResizeDetachesPaneOutputBeforeChangingGrid(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	for _, batch := range wire.snapshotBatches() {
-		commands = append(commands, decodePendingCommands(t, batch)...)
+		commands = append(commands, decodeFramedCommands(t, batch)...)
 	}
 	if len(commands) == 0 {
 		t.Fatal("resize emitted no replacement pane snapshot")
@@ -1334,7 +1339,7 @@ func TestSplitPaneExitRelayoutsSurvivorBeforePublishingProjection(t *testing.T) 
 	firstOutput.mu.Lock()
 	outputBytes := append([]byte(nil), firstOutput.data.Bytes()...)
 	firstOutput.mu.Unlock()
-	commands := decodePendingCommands(t, outputBytes)
+	commands := decodeFramedCommands(t, outputBytes)
 	foundBarrier := false
 	for _, command := range commands {
 		if command.Opcode == protocol.DisplayOpcodeStartRender &&
@@ -1563,7 +1568,7 @@ func TestPaneProcessExitResizesFallbackAndTransfersPhysicalOutput(t *testing.T) 
 	output.mu.Lock()
 	outputBytes := append([]byte(nil), output.data.Bytes()...)
 	output.mu.Unlock()
-	commands := decodePendingCommands(t, outputBytes[outputOffset:])
+	commands := decodeFramedCommands(t, outputBytes[outputOffset:])
 	foundFallbackRender := false
 	for _, command := range commands {
 		if command.Opcode == protocol.DisplayOpcodeStartRender && command.LayoutRevision == fallback.LayoutRevision {
@@ -1737,7 +1742,7 @@ func assertPaneInputStream(t *testing.T, inputs <-chan []byte, want string) {
 
 func assertRenderRevision(t *testing.T, data []byte, want protocol.ClientLayoutRevision) {
 	t.Helper()
-	commands := decodePendingCommands(t, data)
+	commands := decodeFramedCommands(t, data)
 	for _, command := range commands {
 		if command.Opcode == protocol.DisplayOpcodeStartRender {
 			if command.LayoutRevision != want {
@@ -1858,6 +1863,22 @@ func syncPaneRenderer(t *testing.T, pane *Pane) {
 
 func (w errorWriter) Write([]byte) (int, error) {
 	return 0, w.err
+}
+
+func decodeFramedCommands(tb testing.TB, data []byte) []protocol.DisplayCommand {
+	tb.Helper()
+	reader := protocol.NewRenderFrameReader(bytes.NewReader(data))
+	var commands []protocol.DisplayCommand
+	for {
+		frame, err := reader.ReadFrame()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return commands
+			}
+			tb.Fatal(err)
+		}
+		commands = append(commands, decodePendingCommands(tb, frame.Payload)...)
+	}
 }
 
 func decodePendingCommands(tb testing.TB, data []byte) []protocol.DisplayCommand {
