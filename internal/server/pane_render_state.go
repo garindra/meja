@@ -396,6 +396,9 @@ func (s *panePublicationState) detach() {
 
 func (s *panePublicationState) cancelPending() {
 	if s.pending != nil {
+		// A cancelled START_RENDER has not established the confirmer's stream
+		// state. Preserve its barrier for the replacement publication.
+		s.barrier = s.barrier || s.pending.publication.Barrier
 		s.pending.release()
 		s.pending = nil
 	}

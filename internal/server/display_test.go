@@ -1654,24 +1654,13 @@ func TestDaemonPostedPaneExitCannotDetachNewerFallbackProjection(t *testing.T) {
 type testPaneDrainRuntime struct {
 	pane      *Pane
 	reader    *queuedPTYReader
-	startOnce sync.Once
 	relayDone chan struct{}
 }
 
 var testPaneDrainRuntimes sync.Map
 
-func (r *testPaneDrainRuntime) start() {
-	r.startOnce.Do(func() {
-		go func() {
-			relayPTYOutputFrom(r.pane, r.reader)
-			close(r.relayDone)
-		}()
-	})
-}
-
 func (r *testPaneDrainRuntime) enqueue(data string) {
 	r.reader.enqueue([]byte(data))
-	r.start()
 }
 
 func startTestPaneRenderer(id uint64, cols, rows int) (*Pane, chan struct{}) {
@@ -1685,13 +1674,16 @@ func startTestPaneLoop(pane *Pane) chan struct{} {
 		pane: pane, reader: &queuedPTYReader{}, relayDone: make(chan struct{}),
 	}
 	testPaneDrainRuntimes.Store(pane, runtime)
+	go func() {
+		relayPTYOutputFrom(runtime.pane, runtime.reader)
+		close(runtime.relayDone)
+	}()
 	go pane.run()
 	shutdown := make(chan struct{})
 	go func() {
 		<-shutdown
 		pane.stop()
 		testPaneDrainRuntimes.Delete(pane)
-		runtime.start()
 		<-runtime.relayDone
 	}()
 	return shutdown

@@ -248,6 +248,27 @@ func TestPanePublicationVersionsAndEpochsAdvanceOnlyOnHandoff(t *testing.T) {
 	keyframe.release()
 }
 
+func TestPanePublicationPreservesCancelledStreamBarrier(t *testing.T) {
+	pane := publicationTestPane(4, 1, "test")
+	state := newPanePublicationState(pane)
+	state.lease = &OutputLease{}
+	state.invalidateEpoch(true)
+	buffer := <-state.free
+	if err := state.prepare(buffer); err != nil {
+		t.Fatal(err)
+	}
+	if state.pending == nil || !state.pending.publication.Barrier {
+		t.Fatal("initial publication has no stream barrier")
+	}
+
+	state.invalidateEpoch(false)
+	replacement := takePublicationTestBuffer(t, state)
+	if replacement == nil || !replacement.publication.Barrier {
+		t.Fatal("cancelling an unsubmitted START_RENDER lost the replacement barrier")
+	}
+	replacement.release()
+}
+
 func TestPanePublicationOwnsImmutableClustersStylesAndCursor(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(4, 1)}
 	blue := protocol.Style{Bold: true, FG: protocol.Color{Mode: "indexed", Index: 4}, BG: protocol.Color{Mode: "default"}}

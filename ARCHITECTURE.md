@@ -986,12 +986,20 @@ bytes owned by the publication, and continuation cells preserve server-decided
 width. The confirmer never reads the live terminal, pane style table, or pane
 cluster store.
 
-The confirmer walks the publication's changed runs. It installs each canonical
-style on first wire use, coalesces adjacent scalar cells with equal style and
-width into text commands, emits opaque clusters individually, and skips
-continuation cells. Canonical-default width-one text uses the compact default
-opcode. Scroll and cursor consequences are compiled from the same publication,
-then exactly one `PRESENT` terminates the frame.
+The confirmer walks the publication's changed runs with frame-local pen and
+selected-style latches. Contiguous runs therefore omit redundant position and
+style commands, including exact row wrapping. Compatible scalar cells share
+one canonically length-prefixed text command, repeated cells become merged
+fills when that encoding is smaller, and visually equivalent unadorned blanks
+may bridge a text run. Canonical-default width-one text uses the compact
+default opcode without changing the selected-style latch. Opaque clusters
+flush pending scalar work and preserve their server-decided width.
+
+Pen, selected style, and pending text/fill state begin undefined for every
+publication; no reliable frame depends on a predecessor's transient compiler
+state. Installed wire styles remain physical-stream state until a
+`START_RENDER` barrier resets them. Scroll and cursor consequences are compiled
+from the same publication, then exactly one `PRESENT` terminates the frame.
 
 The pane actor prepares immutable publications in two reusable buffers, while
 the confirmer owns and reuses the encoded frame buffer and text scratch. A
