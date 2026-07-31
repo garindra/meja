@@ -387,9 +387,7 @@ func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 		pane.stop()
 	}()
 	sendPTYOutput := func(data string) {
-		buffer := takePTYReadBuffer()
-		n := copy(buffer, data)
-		ptyOutput <- buffer[:n]
+		sendTestPTYOutput(t, pane, data)
 	}
 
 	var wire bytes.Buffer

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
 	"github.com/creack/pty"
@@ -12,62 +11,70 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
-const ptyReadBufferSize = 32 * 1024
+const (
+	ptyReadBufferSize  = 32 * 1024
+	ptyReadBufferCount = 2
+	ptyTurnInterval    = 50 * time.Millisecond
+)
 
 type ptyReadBuffer [ptyReadBufferSize]byte
 
-var ptyReadBuffers = sync.Pool{New: func() any { return new(ptyReadBuffer) }}
-
-func takePTYReadBuffer() []byte {
-	return ptyReadBuffers.Get().(*ptyReadBuffer)[:]
+type ptyAdmissionState struct {
+	ready      bool
+	immediate  bool
+	bypassUsed bool
+	deadline   time.Time
+	interval   time.Duration
 }
 
-func releasePTYReadBuffer(data []byte) {
-	if cap(data) < ptyReadBufferSize {
-		return
+func newPTYAdmissionState(interval time.Duration) ptyAdmissionState {
+	return ptyAdmissionState{ready: true, interval: interval}
+}
+
+func (s *ptyAdmissionState) canAdmit() bool {
+	return s.ready || s.immediate
+}
+
+func (s *ptyAdmissionState) admit(now time.Time) {
+	// A full extra interval with no waiting PTY turn marks a new interactive
+	// burst. Merely reaching each deadline during sustained output does not.
+	if s.ready && !s.deadline.IsZero() && !now.Before(s.deadline.Add(s.interval)) {
+		s.bypassUsed = false
 	}
-	data = data[:ptyReadBufferSize]
-	ptyReadBuffers.Put((*ptyReadBuffer)(data[:ptyReadBufferSize]))
+	s.ready = false
+	s.immediate = false
+	s.deadline = now.Add(s.interval)
+}
+
+func (s *ptyAdmissionState) timerFired() {
+	s.ready = true
+}
+
+func (s *ptyAdmissionState) grantKeyboardOpportunity() {
+	s.grantImmediateOpportunity()
+}
+
+func (s *ptyAdmissionState) grantStructuralOpportunity() {
+	s.grantImmediateOpportunity()
+}
+
+func (s *ptyAdmissionState) grantImmediateOpportunity() {
+	if !s.ready && !s.bypassUsed {
+		s.immediate = true
+		s.bypassUsed = true
+	}
 }
 
 const (
-	renderIdleFlush   = time.Millisecond
-	renderMaxBatchAge = 16 * time.Millisecond
 	// Finalized commands are streamed at this size while PRESENT remains the
 	// client's atomic frame boundary.
-	renderStreamChunkSize    = 8 << 10
-	startupInputIdle         = 25 * time.Millisecond
-	startupInputMaxWait      = 500 * time.Millisecond
-	maxRetainedRenderBuffer  = 64 << 10
-	paneOutputBytesPerSecond = 8 << 20
-	paneOutputBurstBytes     = 1 << 20
+	renderStreamChunkSize   = 8 << 10
+	startupInputIdle        = 25 * time.Millisecond
+	startupInputMaxWait     = 500 * time.Millisecond
+	maxRetainedRenderBuffer = 64 << 10
 )
 
 var errRenderBufferFull = errors.New("pane render buffer is full")
-
-type paneOutputRateLimiter struct {
-	tokens float64
-	last   time.Time
-}
-
-func newPaneOutputRateLimiter(now time.Time) paneOutputRateLimiter {
-	return paneOutputRateLimiter{tokens: paneOutputBurstBytes, last: now}
-}
-
-func (l *paneOutputRateLimiter) reserve(now time.Time, bytes int) time.Duration {
-	if bytes <= 0 {
-		return 0
-	}
-	if elapsed := now.Sub(l.last); elapsed > 0 {
-		l.tokens = min(float64(paneOutputBurstBytes), l.tokens+elapsed.Seconds()*paneOutputBytesPerSecond)
-	}
-	l.last = now
-	l.tokens -= float64(bytes)
-	if l.tokens >= 0 {
-		return 0
-	}
-	return time.Duration(-l.tokens / paneOutputBytesPerSecond * float64(time.Second))
-}
 
 func (p *Pane) installOutputLease(lease *OutputLease, layoutRevision protocol.ClientLayoutRevision, cols, rows uint16) error {
 	installation := &paneOutputInstall{
@@ -167,40 +174,29 @@ func (p *Pane) sendRenderCommand(command paneCommand) error {
 }
 
 func relayPTYOutput(pane *Pane) {
+	relayPTYOutputFrom(pane, pane.PTY)
+}
+
+func relayPTYOutputFrom(pane *Pane, reader io.Reader) {
 	defer close(pane.ptyOutput)
-	limiter := newPaneOutputRateLimiter(time.Now())
-	var timer *time.Timer
-	defer func() {
-		if timer != nil {
-			timer.Stop()
-		}
-	}()
 	for {
-		buf := takePTYReadBuffer()
-		n, err := pane.PTY.Read(buf)
+		var buf []byte
+		select {
+		case buf = <-pane.ptyFree:
+		case <-pane.done:
+			return
+		}
+		n, err := reader.Read(buf)
 		if n > 0 {
 			pane.notifyProcessActivity()
-			if delay := limiter.reserve(time.Now(), n); delay > 0 {
-				if timer == nil {
-					timer = time.NewTimer(delay)
-				} else {
-					timer.Reset(delay)
-				}
-				select {
-				case <-timer.C:
-				case <-pane.done:
-					releasePTYReadBuffer(buf)
-					return
-				}
-			}
 			select {
 			case pane.ptyOutput <- buf[:n]:
 			case <-pane.done:
-				releasePTYReadBuffer(buf)
+				pane.ptyFree <- buf
 				return
 			}
 		} else {
-			releasePTYReadBuffer(buf)
+			pane.ptyFree <- buf
 		}
 		if err != nil {
 			return
@@ -232,8 +228,17 @@ func (p *Pane) run() {
 	}()
 	renderer := newPaneRenderState(p)
 	var update Update
-	var idle, maxAge *time.Timer
-	var idleC, maxC <-chan time.Time
+	pacingInterval := p.ptyPacingInterval
+	if pacingInterval <= 0 {
+		pacingInterval = ptyTurnInterval
+	}
+	admission := newPTYAdmissionState(pacingInterval)
+	newTimer := time.NewTimer
+	if p.newTimer != nil {
+		newTimer = p.newTimer
+	}
+	var ptyTimer *time.Timer
+	var ptyTimerC <-chan time.Time
 	var startupIdle *time.Timer
 	var startupIdleC <-chan time.Time
 	startupInput := p.startupInput
@@ -244,7 +249,6 @@ func (p *Pane) run() {
 		startupMax = time.NewTimer(startupInputMaxWait)
 		startupMaxC = startupMax.C
 	}
-	batching := false
 	stop := func(timer *time.Timer) {
 		if timer != nil && !timer.Stop() {
 			select {
@@ -254,14 +258,13 @@ func (p *Pane) run() {
 		}
 	}
 	defer func() {
-		stop(idle)
-		stop(maxAge)
+		stop(ptyTimer)
 		stop(startupIdle)
 		stop(startupMax)
 	}()
 	arm := func(timer **time.Timer, channel *<-chan time.Time, duration time.Duration) {
 		if *timer == nil {
-			*timer = time.NewTimer(duration)
+			*timer = newTimer(duration)
 		} else {
 			stop(*timer)
 			(*timer).Reset(duration)
@@ -282,18 +285,16 @@ func (p *Pane) run() {
 		startupInput = nil
 		return p.sendOwnedInput(input)
 	}
-	flush := func() {
-		if !batching {
-			return
-		}
-		disarm(idle, &idleC)
-		disarm(maxAge, &maxC)
-		batching = false
-		renderer.due = renderer.hasWork()
-	}
 	for {
 		available := renderer.available()
 		failures := renderer.failures()
+		var ptyOutput <-chan []byte
+		// Detached panes continue advancing their canonical terminal state at
+		// the same paced cadence. Attached panes additionally stop admission
+		// while visual work is waiting for their bounded output path.
+		if admission.canAdmit() && (p.outputLease == nil || !renderer.hasWork()) {
+			ptyOutput = p.ptyOutput
+		}
 		select {
 		case buffer := <-available:
 			lease := p.outputLease
@@ -349,6 +350,7 @@ func (p *Pane) run() {
 					continue
 				}
 				renderer.attach(installation.Lease, installation.LayoutRevision, installation.Refresh)
+				admission.grantStructuralOpportunity()
 				command.done <- nil
 				continue
 			}
@@ -375,6 +377,7 @@ func (p *Pane) run() {
 				}
 				p.terminal.Resize(int(command.resize.cols), int(command.resize.rows))
 				p.publishTerminalMetadata()
+				admission.grantStructuralOpportunity()
 				if p.outputLease != nil {
 					renderer.markFull()
 					renderer.due = true
@@ -383,10 +386,15 @@ func (p *Pane) run() {
 			} else {
 				command.done <- nil
 			}
-		case data, ok := <-p.ptyOutput:
+		case data, ok := <-ptyOutput:
 			if !ok {
-				flush()
 				return
+			}
+			admission.admit(time.Now())
+			arm(&ptyTimer, &ptyTimerC, pacingInterval)
+			select {
+			case <-p.ptyInteractive:
+			default:
 			}
 			trackDamage := p.outputLease != nil && p.currentViewMode() == paneViewLive
 			var currentFrontendWrite func([]byte) error
@@ -398,7 +406,7 @@ func (p *Pane) run() {
 			if len(startupInput) > 0 {
 				arm(&startupIdle, &startupIdleC, startupInputIdle)
 			}
-			releasePTYReadBuffer(data)
+			p.ptyFree <- data[:ptyReadBufferSize]
 			for _, reply := range update.Replies {
 				if err := p.sendOwnedInput(reply); err != nil {
 					return
@@ -415,16 +423,12 @@ func (p *Pane) run() {
 			if !renderer.hasWork() {
 				continue
 			}
-			if renderer.due {
-				continue
-			}
-			if !batching {
-				batching = true
-				arm(&maxAge, &maxC, renderMaxBatchAge)
-			}
-			arm(&idle, &idleC, renderIdleFlush)
-		case <-idleC:
-			flush()
+			renderer.due = true
+		case <-ptyTimerC:
+			ptyTimerC = nil
+			admission.timerFired()
+		case <-p.ptyInteractive:
+			admission.grantKeyboardOpportunity()
 		case <-startupIdleC:
 			if err := flushStartupInput(); err != nil {
 				return
@@ -433,8 +437,6 @@ func (p *Pane) run() {
 			if err := flushStartupInput(); err != nil {
 				return
 			}
-		case <-maxC:
-			flush()
 		case <-p.done:
 			return
 		}

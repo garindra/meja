@@ -190,6 +190,7 @@ func isIndicVirama(r rune) bool {
 type Update struct {
 	DirtySpans     []DirtySpan
 	ScrollRegion   *ScrollRegion
+	scrollRegion   ScrollRegion
 	FullRedraw     bool
 	CursorChanged  bool
 	VisibleChange  bool
@@ -1448,7 +1449,8 @@ func (u *Update) recordScrollRegion(top, bottom, delta int) {
 		clear(spans[:shift])
 	}
 	if u.ScrollRegion == nil {
-		u.ScrollRegion = &ScrollRegion{Top: top, Bottom: bottom, Delta: delta}
+		u.scrollRegion = ScrollRegion{Top: top, Bottom: bottom, Delta: delta}
+		u.ScrollRegion = &u.scrollRegion
 		return
 	}
 	u.ScrollRegion.Delta += delta

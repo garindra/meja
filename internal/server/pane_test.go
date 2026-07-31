@@ -29,7 +29,7 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	query := takePTYReadBuffer()
+	query := takeTestPTYReadBuffer(pane)
 	n := copy(query, "\x1b[?1h\x1b[6n")
 	pane.ptyOutput <- query[:n]
 
@@ -85,7 +85,7 @@ func TestPaneForwardsApplicationOSC52ToAttachedFrontend(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	output := takePTYReadBuffer()
+	output := takeTestPTYReadBuffer(pane)
 	const sequence = "\x1b]52;c;Y29weQ==\x1b\\"
 	n := copy(output, sequence)
 	pane.ptyOutput <- output[:n]
@@ -157,7 +157,7 @@ func TestPaneStartupInputWaitsForInitialOutputToSettle(t *testing.T) {
 		<-pane.writerDone
 	}()
 
-	prompt := takePTYReadBuffer()
+	prompt := takeTestPTYReadBuffer(pane)
 	n := copy(prompt, "user@host:~$ ")
 	pane.ptyOutput <- prompt[:n]
 

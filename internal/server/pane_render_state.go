@@ -28,6 +28,7 @@ type paneRenderState struct {
 	dirty           []DirtySpan
 	dirtyRows       int
 	scrollRegion    *ScrollRegion
+	scrollRegionBuf ScrollRegion
 	cursorDirty     bool
 	nextRow         int
 	progressive     bool
@@ -219,8 +220,8 @@ func (s *paneRenderState) mergeViewMutation(update ViewMutation) {
 			} else {
 				s.dirtyRows -= shiftDirtyRows(s.dirty, region.Top, region.Bottom, region.Delta)
 				if s.scrollRegion == nil {
-					copyRegion := *region
-					s.scrollRegion = &copyRegion
+					s.scrollRegionBuf = *region
+					s.scrollRegion = &s.scrollRegionBuf
 				} else {
 					s.scrollRegion.Delta += region.Delta
 					height := region.Bottom - region.Top

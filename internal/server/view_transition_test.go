@@ -124,7 +124,7 @@ func TestRejectedTargetTransitionDoesNotReleaseInstalledOutput(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unknown window 999") {
 		t.Fatalf("transition error = %v, want unknown target", err)
 	}
-	updates <- []byte("x")
+	sendTestPTYOutput(t, pane, "x")
 	syncPaneRenderer(t, pane)
 	if wire.Len() == 0 {
 		t.Fatal("rejected target transition released the installed pane output")

@@ -522,15 +522,15 @@ The actor model continues down to each pane. A pane's main goroutine exclusively
 * output attachment, release, and refresh; and
 * PTY resize as coordinated with terminal resize.
 
-The main loop selects among PTY-output buffers, pane commands, render-buffer availability, output failures, batching timers, and shutdown. It never blocks on a PTY read or a QUIC write. There is no pane-side render mutex: terminal mutation, damage merging, resize, capture, history state, and render compilation all happen as turns of this one actor.
+The main loop selects among an eligible PTY-output buffer, pane commands, render-buffer availability, output failures, one reusable PTY-admission timer, startup-input timers, and shutdown. It never blocks on a PTY read or a QUIC write. There is no pane-side render mutex: terminal mutation, damage merging, resize, capture, history state, and render compilation all happen as turns of this one actor.
 
-Separate narrow workers read the PTY, write the PTY, and wait for the process. The reader may block in `PTY.Read`, but it only owns raw pooled byte buffers and transfers them through a bounded channel. The writer may block while delivering user input or terminal-generated replies. Neither worker concurrently mutates the terminal grid. Keeping the blocking read outside the actor is essential: an idle child must not prevent attach, resize, capture, a returned render buffer, or shutdown from being processed.
+Separate narrow workers read the PTY, write the PTY, and wait for the process. Each pane has exactly two reusable 32 KiB PTY read buffers and a one-chunk reader-to-actor channel. Ownership circulates from the pane's free-buffer channel to the reader, then to the actor, and back to the free channel. The reader may block in `PTY.Read` or while handing over its current buffer, but it owns no terminal semantics. When both buffers are downstream it stops reading, so the kernel PTY buffer and eventually the child process absorb backpressure. The writer may block while delivering user input or terminal-generated replies. Neither worker concurrently mutates the terminal grid. Keeping the blocking read outside the actor is essential: an idle child must not prevent attach, resize, capture, a returned render buffer, or shutdown from being processed.
 
-Each output lease has another narrow worker for its physical QUIC stream. That worker owns a single fixed-capacity render buffer whenever it is writing or idle. It offers the buffer to the pane actor, waits for the actor to return one complete `PRESENT`-terminated batch, performs the potentially blocking stream write, clears the buffer, and offers it again. While the worker is blocked, the pane actor remains free to parse PTY output and merge newer damage. At most one side owns the buffer at any instant.
+Each output lease has another narrow worker for its physical QUIC stream. That worker owns a single fixed-capacity render buffer whenever it is writing or idle. It offers the buffer to the pane actor, waits for the actor to return one complete `PRESENT`-terminated batch, performs the potentially blocking stream write, clears the buffer, and offers it again. While the worker is blocked, the pane actor remains responsive to commands. It may admit one bounded PTY turn that discovers new damage, then stops ordinary PTY admission until that work can enter the output path. At most one side owns the render buffer at any instant.
 
 ```mermaid
 flowchart LR
-    PR["PTY reader<br/>blocking read"] -->|"bounded pooled byte buffers"| PA["Pane actor<br/>terminal + damage"]
+    PR["PTY reader<br/>blocking read"] -->|"two fixed 32 KiB buffers<br/>one queued chunk"| PA["Pane actor<br/>terminal + damage"]
     PA -->|"input and terminal replies"| PW["PTY writer<br/>blocking write"]
     OW["Output-lease worker<br/>32 KiB buffer + QUIC write"] -->|"offer buffer"| PA
     PA -->|"commands + cursor + PRESENT"| OW
@@ -848,12 +848,13 @@ history contents at those coordinates. Compatible scrolls coalesce
 only when their `[top,bottom)` regions and directions match. Dirty spans move
 only inside that region. Different regions, opposing directions, full-region
 displacement, and other coordinate-space ambiguities intentionally promote the
-pending work to a full redraw. A brief idle period makes newly accumulated work
-eligible for rendering quickly; a maximum batch age prevents a continuous
-stream from postponing it forever. Damage coordinates are client-relative
-visible rows, even though the underlying row store also contains history.
-Detached panes parse without tracking render damage because their
-authoritative grid is sufficient for the next full refresh.
+pending work to a full redraw. A paced PTY turn makes newly accumulated work
+eligible for rendering in that same actor turn; there is no additional
+pane-side idle-flush or maximum-batch-age delay. Damage coordinates are
+client-relative visible rows, even though the underlying row store also
+contains history. Detached panes continue parsing and updating their
+authoritative terminal at the same 50 ms admission cadence, but without
+tracking render damage because the next attachment starts with a full refresh.
 
 `KEYFRAME` and `DELTA` terminology is reserved for a future immutable,
 revisioned publication layer containing concrete cell values. A
@@ -862,7 +863,7 @@ state until rendering.
 
 Eligibility and buffer availability are separate. Once damage is due, the actor borrows the lease's buffer when the output worker offers it and encodes as much current grid state as fits. A successfully encoded prefix advances that row's dirty-span start; a complete span is cleared. A span that does not fit is left unchanged, and an encoded prefix leaves its suffix dirty. New PTY damage is unioned with any retained suffix, so later batches render the newest authoritative cells rather than an old cell snapshot. Scroll during a progressive multi-batch update promotes the work to a full redraw when shifting retained coordinates would be ambiguous.
 
-This separates terminal correctness from transport frequency. The parser can consume arbitrary chunks, while the renderer chooses a useful presentation cadence.
+Ordinary admission is immediate after idle. After one turn, the actor does not admit another ordinary chunk before that turn's time plus 50 ms. Accepted keyboard input, attach, and resize may spend one edge-coalesced immediate credit; continuous interaction cannot repeatedly bypass the cadence until the PTY stream has gone idle. Commands, history operations, captures, terminal replies from an admitted chunk, and other non-PTY work remain responsive while the admission timer is pending.
 
 ---
 
@@ -1007,7 +1008,7 @@ output worker offers empty buffer
     → output worker clears and offers the same buffer again
 ```
 
-The pane actor does not wait for the write. While the buffer is unavailable it continues processing PTY bytes, commands, resize, capture, and damage. Remaining dirty spans are actor state rather than buffer contents, so detachment can discard the render progress safely; a later attachment begins with a complete view from the authoritative grid. A stream write error is reported back through the lease failure channel and invalidates the transport rather than freezing the pane actor behind a blocked write.
+The pane actor does not wait for the write. While the buffer is unavailable it continues processing commands, resize, capture, and other local state changes, but stops accepting ordinary PTY buffers once attached visual work is waiting. That bounded stop propagates through the two-buffer PTY handoff to the child. Remaining dirty spans are actor state rather than buffer contents, so detachment can discard the render progress safely; a later attachment begins with a complete view from the authoritative grid. A stream write error is reported back through the lease failure channel and invalidates the transport rather than freezing the pane actor behind a blocked write.
 
 Relayout uses an explicit handoff:
 
@@ -1504,7 +1505,7 @@ The suite includes:
 * frontend setup, registered cleanup, disconnect cleanup, and render-loop terminal ownership;
 * output-lease release, atomic replacement installation, exact-pointer stale detach, `START_RENDER`, grid validation, and revision activation;
 * resolved-view ownership, exact client-layout publication, grid/layout agreement, and rejected-target source preservation;
-* blocked output workers without blocked pane actors;
+* blocked output workers with responsive pane commands and bounded PTY backpressure;
 * bounded progressive render batches, retained dirty suffixes, and a terminating `PRESENT` in every batch;
 * prediction confirmation, partial confirmation, conflict, and repair;
 * history independence, frozen projection, selection overlays, and extraction;
@@ -1536,7 +1537,7 @@ The following statements summarize the contracts contributors should preserve:
 15. Pane terminal modes are learned from authoritative PTY output and published as immutable pane metadata, including history mode; frontend events are encoded for the pane's current published modes on the server.
 16. Pointer hit testing uses the layout revision the frontend reported, not an unrelated current geometry.
 17. An output lease is owned by at most one pane actor, and its render buffer is owned by exactly one of that actor or the lease worker at a time. Pane resize, lease replacement, renderer attachment, and full-snapshot start occur in one pane-actor installation turn.
-18. Blocking PTY reads, PTY writes, and pane-stream writes occur outside the pane actor and do not mutate its terminal state.
+18. Blocking PTY reads, PTY writes, and pane-stream writes occur outside the pane actor and do not mutate its terminal state. Each pane owns exactly two reusable 32 KiB PTY buffers, queues at most one reader-to-actor chunk, and paces ordinary actor admission at 50 ms.
 19. A render slot is a transport resource, not a permanent pane identity.
 20. Every pane render after rebinding begins with `START_RENDER` containing the prepared revision and grid dimensions, followed by a complete refresh that may span multiple presented frames. Reconnection always allocates a newer `ClientLayoutRevision`, even when canonical window geometry is unchanged, and stale teardown can detach only the exact old lease.
 21. Every submitted pane render buffer ends with `PRESENT`; no partial batch becomes visible in the UI.

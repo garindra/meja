@@ -243,24 +243,6 @@ func TestRenderOutputRetainsOnlyBoundedScratchBuffer(t *testing.T) {
 	}
 }
 
-func TestPaneOutputRateLimiterAllowsBurstThenLimitsSustainedOutput(t *testing.T) {
-	start := time.Unix(1, 0)
-	limiter := newPaneOutputRateLimiter(start)
-	if delay := limiter.reserve(start, paneOutputBurstBytes); delay != 0 {
-		t.Fatalf("initial burst delay = %v, want 0", delay)
-	}
-	halfSecondBytes := paneOutputBytesPerSecond / 2
-	if delay := limiter.reserve(start, halfSecondBytes); delay != 500*time.Millisecond {
-		t.Fatalf("first sustained delay = %v, want 500ms", delay)
-	}
-	if delay := limiter.reserve(start.Add(500*time.Millisecond), halfSecondBytes); delay != 500*time.Millisecond {
-		t.Fatalf("second sustained delay = %v, want 500ms", delay)
-	}
-	if delay := limiter.reserve(start.Add(1500*time.Millisecond), paneOutputBurstBytes); delay != 0 {
-		t.Fatalf("refilled burst delay = %v, want 0", delay)
-	}
-}
-
 type countingBuffer struct {
 	bytes.Buffer
 	writes   int
@@ -1949,6 +1931,24 @@ func startTestPaneLoop(pane *Pane) chan []byte {
 	return pane.ptyOutput
 }
 
+func takeTestPTYReadBuffer(pane *Pane) []byte {
+	return <-pane.ptyFree
+}
+
+func sendTestPTYOutput(t *testing.T, pane *Pane, data string) {
+	t.Helper()
+	buffer := takeTestPTYReadBuffer(pane)
+	n := copy(buffer, data)
+	pane.ptyOutput <- buffer[:n]
+	deadline := time.Now().Add(time.Second)
+	for len(pane.ptyFree) != ptyReadBufferCount {
+		if time.Now().After(deadline) {
+			t.Fatal("pane did not return its PTY buffer")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func assertPaneInputStream(t *testing.T, inputs <-chan []byte, want string) {
 	t.Helper()
 	var got []byte
@@ -2012,7 +2012,7 @@ func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("attach waited for the snapshot write")
 	}
-	ptyBytes := takePTYReadBuffer()
+	ptyBytes := takeTestPTYReadBuffer(pane)
 	n := copy(ptyBytes, "still-live")
 	output <- ptyBytes[:n]
 	captured := make(chan []byte, 1)
