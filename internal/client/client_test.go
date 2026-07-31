@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -571,6 +575,165 @@ func TestMalformedOrPartialNetworkFrameProducesNoRenderEvent(t *testing.T) {
 				t.Fatalf("frames=%#v err=%v", frames, err)
 			}
 		})
+	}
+}
+
+func testQUICCertificate(t testing.TB) (tls.Certificate, string) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "meja-client-test"},
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(parsed.RawSubjectPublicKeyInfo)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: privateKey}, fmt.Sprintf("%x", hash[:])
+}
+
+func TestOpenConnectionReportsMalformedRenderStreamForReconnect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cert, certHash := testQUICCertificate(t)
+	listener, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{protocol.ALPN},
+		MinVersion:   tls.VersionTLS13,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	validCommands := protocol.NewDisplayEncoder(nil)
+	if err := validCommands.AppendStartRender(protocol.StartRender{LayoutRevision: 1, Cols: 8, Rows: 2}); err != nil {
+		t.Fatal(err)
+	}
+	validFrame := rawRenderFrameForTest(t, validCommands.Bytes())
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		control, err := conn.AcceptStream(ctx)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		attach, err := protocol.NewDecoder(control, protocol.DefaultMaxFrameSize).ReadFrame()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if attach.Type != protocol.MsgSessionAttach {
+			serverDone <- fmt.Errorf("initial control frame type = %d", attach.Type)
+			return
+		}
+		controlEncoder := protocol.NewEncoder(control)
+		attachOK, err := protocol.EncodeSessionAttachOK(nil, protocol.SessionAttachOK{ResumeToken: "resume-token"})
+		if err == nil {
+			err = controlEncoder.WriteFrame(protocol.Frame{Type: protocol.MsgSessionAttachOK, Payload: attachOK})
+		}
+		exitCommand, encodeErr := protocol.EncodeFrontendRegisterTerminalExitCommand(nil, protocol.FrontendRegisterTerminalExitCommand{})
+		if err == nil {
+			err = encodeErr
+		}
+		if err == nil {
+			err = controlEncoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendRegisterTerminalExitCommand, Payload: exitCommand})
+		}
+		setup, encodeErr := protocol.EncodeFrontendTerminalWrite(nil, protocol.FrontendTerminalWrite{})
+		if err == nil {
+			err = encodeErr
+		}
+		if err == nil {
+			err = controlEncoder.WriteFrame(protocol.Frame{Type: protocol.MsgFrontendTerminalWrite, Payload: setup})
+		}
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		streams := make([]quic.SendStream, 0, protocol.OutputStreamCount)
+		for slot := uint64(0); slot < protocol.OutputStreamCount; slot++ {
+			stream, openErr := conn.OpenUniStreamSync(ctx)
+			if openErr != nil {
+				serverDone <- openErr
+				return
+			}
+			streams = append(streams, stream)
+			wire := []byte{0}
+			if slot == 0 {
+				wire = append(append([]byte(nil), validFrame...), 0)
+			}
+			if _, writeErr := stream.Write(wire); writeErr != nil {
+				serverDone <- writeErr
+				return
+			}
+			if slot == 0 {
+				if closeErr := stream.Close(); closeErr != nil {
+					serverDone <- closeErr
+					return
+				}
+			}
+		}
+		<-ctx.Done()
+		_ = streams
+		serverDone <- nil
+	}()
+
+	addr := listener.Addr().(*net.UDPAddr)
+	ui := &runtimeState{events: make(chan renderEvent, 32), renderDone: make(chan struct{})}
+	go func() {
+		event := <-ui.events
+		registered := event.(terminalExitCommandEvent)
+		close(registered.done)
+	}()
+	live, err := openConnection(ctx, protocol.CommandBootstrap{
+		Port:           uint16(addr.Port),
+		AttachToken:    "attach-token",
+		CertSPKISHA256: certHash,
+	}, "127.0.0.1", 8, 3, Config{}, "", ui, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.destroy()
+
+	initialFrameSeen := false
+	for !initialFrameSeen {
+		select {
+		case event := <-ui.events:
+			frame, ok := event.(paneFrameEvent)
+			initialFrameSeen = ok && frame.slot == 0 && frame.frame.layoutRevision == 1
+		case <-ctx.Done():
+			t.Fatal("valid initial render frame was not delivered")
+		}
+	}
+	select {
+	case result := <-live.done:
+		if result.graceful || result.err == nil {
+			t.Fatalf("connection result = %#v, want non-graceful render-stream failure", result)
+		}
+		if !strings.Contains(result.err.Error(), "read display stream on slot 0") {
+			t.Fatalf("connection error = %v", result.err)
+		}
+	case <-ctx.Done():
+		t.Fatal("malformed render stream did not fail the live connection")
 	}
 }
 

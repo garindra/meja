@@ -561,6 +561,27 @@ func (c *liveConnection) destroy() {
 	c.workers.Wait()
 }
 
+func (c *liveConnection) monitorWorkerErrors(errs <-chan error, diagnostics *renderDiagnostics) {
+	for {
+		select {
+		case err := <-errs:
+			if err == nil {
+				continue
+			}
+			if diagnostics != nil {
+				diagnostics.reportProjection(fmt.Sprintf("connection worker error=%v", err))
+			}
+			select {
+			case c.done <- connectionResult{err: err}:
+			case <-c.ctx.Done():
+			}
+			return
+		case <-c.ctx.Done():
+			return
+		}
+	}
+}
+
 type terminalAttachError struct{ reason string }
 
 func (e *terminalAttachError) Error() string { return e.reason }
@@ -665,19 +686,7 @@ func openConnection(ctx context.Context, bootstrap protocol.CommandBootstrap, ho
 		return fail(ctx.Err())
 	}
 	live.start(func() { controlLoop(controlDecoder, ui, live.controlFrames, live.done, &live.lastContact) })
-	live.start(func() {
-		for {
-			select {
-			case err := <-errs:
-				// The control stream is the authoritative lifecycle signal.
-				if err != nil && ui.diagnostics != nil {
-					ui.diagnostics.reportProjection(fmt.Sprintf("connection worker error=%v", err))
-				}
-			case <-connCtx.Done():
-				return
-			}
-		}
-	})
+	live.start(func() { live.monitorWorkerErrors(errs, ui.diagnostics) })
 	return live, nil
 }
 
