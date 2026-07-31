@@ -354,11 +354,8 @@ func (p *Pane) run() {
 			}
 			if command.history != nil {
 				result := p.handleHistoryRequest(command.history)
-				// History handlers historically rendered as a side effect even when
-				// their Changed result only described mode transitions. Repaint from
-				// the authoritative current view for every successful request.
-				if result.Err == nil && p.outputLease != nil {
-					renderer.markFull()
+				if result.Render.HasRenderChange() && p.outputLease != nil {
+					renderer.mergeViewMutation(result.Render)
 					renderer.due = true
 				}
 				command.history.Result <- result

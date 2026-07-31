@@ -150,6 +150,7 @@ type paneHistoryResult struct {
 	Changed bool
 	Data    []byte
 	Err     error
+	Render  ViewMutation
 }
 
 type paneResize struct {

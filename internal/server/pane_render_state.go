@@ -192,6 +192,21 @@ func (s *paneRenderState) merge(update Update) {
 	if s.lease == nil || s.pane.currentViewMode() != paneViewLive {
 		return
 	}
+	s.mergeViewMutation(ViewMutation{
+		DirtySpans:    update.DirtySpans,
+		ScrollRegion:  update.ScrollRegion,
+		FullRedraw:    update.FullRedraw,
+		CursorChanged: update.CursorChanged || update.VisibleChange,
+	})
+}
+
+// mergeViewMutation mechanically combines explicit structural damage.
+// Ambiguous or structurally incompatible transitions intentionally become
+// full redraws.
+func (s *paneRenderState) mergeViewMutation(update ViewMutation) {
+	if s.lease == nil {
+		return
+	}
 	s.ensureRows()
 	if update.FullRedraw || update.ScrollRegion != nil && s.progressive {
 		s.markFull()
@@ -224,7 +239,13 @@ func (s *paneRenderState) merge(update Update) {
 			}
 		}
 	}
-	s.cursorDirty = s.cursorDirty || update.CursorChanged || update.VisibleChange
+	if region := s.scrollRegion; region != nil {
+		height := region.Bottom - region.Top
+		if region.Delta <= -height || region.Delta >= height {
+			s.markFull()
+		}
+	}
+	s.cursorDirty = s.cursorDirty || update.CursorChanged
 }
 
 func shiftDirtyRows(spans []DirtySpan, top, bottom, delta int) int {

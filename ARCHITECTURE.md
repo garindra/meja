@@ -828,7 +828,8 @@ The packed representation is an implementation optimization, not a change to ter
 
 ## Damage rather than repeated snapshots
 
-Applying PTY bytes produces an `Update` describing visible consequences:
+Applying PTY bytes produces a parser `Update` containing terminal side effects
+and visible consequences:
 
 * one dirty column span for each affected visible row;
 * an optional full-width `ScrollRegion` with inclusive `top`, exclusive
@@ -837,17 +838,27 @@ Applying PTY bytes produces an `Update` describing visible consequences:
 * terminal replies; and
 * a full-redraw marker for transformations that cannot be expressed safely as local damage.
 
-The pane actor merges updates into persistent per-row dirty spans. Compatible
-scrolls coalesce only when their `[top,bottom)` regions and directions match;
-the accumulated delta is clamped to the region height. Dirty spans move only
-inside that region. Different regions, opposing directions, and other
-coordinate-space ambiguities promote the pending work to a full redraw. A
-brief idle period makes newly accumulated work eligible for rendering quickly;
-a maximum batch age prevents a continuous stream from postponing it forever.
-Damage coordinates are client-relative visible rows, even though the
-underlying row store also contains history. Detached panes parse without
-tracking render damage because their authoritative grid is sufficient for the
-next full refresh.
+The parser's visual fields and history operations both produce a
+`ViewMutation` at the renderer boundary. This is late-bound structural damage
+metadata: it contains coordinates, scroll operations, and cursor-change
+information, but no concrete cell values or revisions. The pane actor
+mechanically merges mutations into persistent per-row dirty spans. When the
+renderer consumes a mutation, it materializes the latest authoritative pane or
+history contents at those coordinates. Compatible scrolls coalesce
+only when their `[top,bottom)` regions and directions match. Dirty spans move
+only inside that region. Different regions, opposing directions, full-region
+displacement, and other coordinate-space ambiguities intentionally promote the
+pending work to a full redraw. A brief idle period makes newly accumulated work
+eligible for rendering quickly; a maximum batch age prevents a continuous
+stream from postponing it forever. Damage coordinates are client-relative
+visible rows, even though the underlying row store also contains history.
+Detached panes parse without tracking render damage because their
+authoritative grid is sufficient for the next full refresh.
+
+`KEYFRAME` and `DELTA` terminology is reserved for a future immutable,
+revisioned publication layer containing concrete cell values. A
+`ViewMutation` is neither: it remains late-bound to the actor's authoritative
+state until rendering.
 
 Eligibility and buffer availability are separate. Once damage is due, the actor borrows the lease's buffer when the output worker offers it and encodes as much current grid state as fits. A successfully encoded prefix advances that row's dirty-span start; a complete span is cleared. A span that does not fit is left unchanged, and an encoded prefix leaves its suffix dirty. New PTY damage is unioned with any retained suffix, so later batches render the newest authoritative cells rather than an old cell snapshot. Scroll during a progressive multi-batch update promotes the work to a full redraw when shifting retained coordinates would be ambiguous.
 
@@ -1234,7 +1245,7 @@ The governing invariants are:
 
 History belongs to each pane's terminal state, not to the client terminal's scrollback buffer. Full primary-screen scrolls append rows to the bounded server-side row store. Partial scroll regions do not pretend to be shell history.
 
-Entering history mode asks the pane actor to clone its bounded row store, cluster references, styles, visible grid, and cursor into a frozen view. Subsequent PTY output continues updating the live authoritative terminal, but the pane's output lease renders the frozen history projection. Navigation can use display scroll operations plus small repair runs rather than redraw every row.
+Entering history mode asks the pane actor to clone its bounded row store, cluster references, styles, visible grid, and cursor into a frozen view. Subsequent PTY output continues updating the live authoritative terminal, but the pane's output lease renders the frozen history projection. Each history operation returns its explicit visual consequence. Ordinary same-direction viewport movement accumulates one full-width `SCROLL_REGION`, repaints only newly exposed rows and any displaced counter overlay, then appends the current counter and cursor. Entering or leaving history, effective top/bottom jumps, opposing pending movement, progressive-render ambiguity, a full-viewport displacement, and complex selection changes intentionally fall back to a complete authoritative redraw. A jump already at its destination is a no-op.
 
 The frozen view has its own cursor and optional selection. Keyboard commands can move through history, start or extend a selection, copy it, or cancel. Pointer selection uses layout-aware hit testing and capture: when Meja owns the mouse, a primary-button drag can enter a temporary history view, update only the spans whose selection styling changed, and return to the live view after copying.
 

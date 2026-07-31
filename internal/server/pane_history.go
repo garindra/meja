@@ -45,8 +45,6 @@ const maxClipboardSelectionBytes = 1 << 20
 type historyMove struct {
 	Delta      int
 	OldCounter string
-	NewCounter string
-	Cursor     protocol.Cursor
 	Changed    bool
 }
 
@@ -158,8 +156,6 @@ func (p *Pane) moveHistory(direction int) (historyMove, bool) {
 			move.Changed = true
 		}
 	}
-	move.NewCounter = historyCounter(view)
-	move.Cursor = protocol.Cursor{X: min(view.CursorCol, view.Snapshot.Cols-1), Y: view.CursorRow - view.ViewTop}
 	return move, true
 }
 
@@ -168,15 +164,18 @@ func (p *Pane) jumpHistory(oldest bool) bool {
 	if view == nil {
 		return false
 	}
+	viewTop := view.Snapshot.InitialTop
+	cursorRow := viewTop + view.Snapshot.ViewportRows - 1
 	if oldest {
-		view.ViewTop = 0
-		view.CursorRow = 0
-		view.CursorCol = 0
-	} else {
-		view.ViewTop = view.Snapshot.InitialTop
-		view.CursorRow = view.ViewTop + view.Snapshot.ViewportRows - 1
-		view.CursorCol = 0
+		viewTop = 0
+		cursorRow = 0
 	}
+	if view.ViewTop == viewTop && view.CursorRow == cursorRow && view.CursorCol == 0 {
+		return false
+	}
+	view.ViewTop = viewTop
+	view.CursorRow = cursorRow
+	view.CursorCol = 0
 	return true
 }
 
@@ -232,10 +231,10 @@ func (p *Pane) handleHistoryRequest(request *paneHistoryRequest) paneHistoryResu
 			return paneHistoryResult{}
 		}
 		err := p.installHistoryView(captureTerminalHistorySnapshot(p.terminal))
-		return paneHistoryResult{Changed: err == nil, Err: err}
+		return fullHistoryResult(err == nil, nil, err)
 	case paneHistoryExit:
 		changed := p.exitHistoryModeNow()
-		return paneHistoryResult{Changed: changed}
+		return fullHistoryResult(changed, nil, nil)
 	case paneHistoryInput:
 		return p.handleHistoryInputNow(request.Data)
 	case paneHistorySelectionBegin:
@@ -254,6 +253,18 @@ func (p *Pane) handleHistoryRequest(request *paneHistoryRequest) paneHistoryResu
 		return p.clearHistorySelectionNow()
 	default:
 		return paneHistoryResult{Err: fmt.Errorf("pane %d received invalid history action %d", p.ID, request.Action)}
+	}
+}
+
+// History operations return their explicit visual consequence. A full redraw is
+// the intentional fallback when incremental damage is ambiguous or structurally
+// incompatible with the previous view.
+func fullHistoryResult(changed bool, data []byte, err error) paneHistoryResult {
+	return paneHistoryResult{
+		Changed: changed,
+		Data:    data,
+		Err:     err,
+		Render:  ViewMutation{FullRedraw: changed},
 	}
 }
 
@@ -316,7 +327,7 @@ func (p *Pane) beginHistorySelectionNow(row, column int, auto bool) paneHistoryR
 	view := p.historyView
 	position := view.pointerPosition(row, column)
 	view.Selection = &paneHistorySelection{Anchor: position, Head: position, ExitOnFinish: auto}
-	return paneHistoryResult{Changed: true}
+	return fullHistoryResult(true, nil, nil)
 }
 
 func (p *Pane) beginHistorySelectionAtCursorNow(auto bool) paneHistoryResult {
@@ -326,7 +337,7 @@ func (p *Pane) beginHistorySelectionAtCursorNow(auto bool) paneHistoryResult {
 	}
 	position := view.cursorPosition()
 	view.Selection = &paneHistorySelection{Anchor: position, Head: position, ExitOnFinish: auto}
-	return paneHistoryResult{Changed: true}
+	return fullHistoryResult(true, nil, nil)
 }
 
 func (p *Pane) clearHistorySelectionNow() paneHistoryResult {
@@ -335,7 +346,7 @@ func (p *Pane) clearHistorySelectionNow() paneHistoryResult {
 		return paneHistoryResult{}
 	}
 	view.Selection = nil
-	return paneHistoryResult{Changed: true}
+	return fullHistoryResult(true, nil, nil)
 }
 
 func (p *Pane) updateHistorySelectionNow(row, column int) paneHistoryResult {
@@ -348,7 +359,7 @@ func (p *Pane) updateHistorySelectionNow(row, column int) paneHistoryResult {
 		return paneHistoryResult{}
 	}
 	view.Selection.Head = position
-	return paneHistoryResult{Changed: true}
+	return fullHistoryResult(true, nil, nil)
 }
 
 func (p *Pane) finishHistorySelectionNow(forceCancel ...bool) paneHistoryResult {
@@ -371,7 +382,7 @@ func (p *Pane) finishHistorySelectionNow(forceCancel ...bool) paneHistoryResult 
 	} else {
 		view.Selection = nil
 	}
-	return paneHistoryResult{Changed: true, Data: data, Err: resultErr}
+	return fullHistoryResult(true, data, resultErr)
 }
 
 func (p *Pane) cancelHistorySelectionNow() paneHistoryResult {
@@ -384,7 +395,7 @@ func (p *Pane) cancelHistorySelectionNow() paneHistoryResult {
 	} else {
 		view.Selection = nil
 	}
-	return paneHistoryResult{Changed: true}
+	return fullHistoryResult(true, nil, nil)
 }
 
 func (v *paneHistoryView) pointerPosition(row, column int) paneHistoryPosition {
@@ -458,31 +469,101 @@ func extractHistorySelection(snapshot *paneHistorySnapshot, selection paneHistor
 }
 
 func (p *Pane) handleHistoryInputNow(data []byte) paneHistoryResult {
+	view := p.historyView
+	if view == nil {
+		return paneHistoryResult{}
+	}
+	var render ViewMutation
+	render.reset(view.Snapshot.ViewportRows)
+	changed := false
+
+	result := func(data []byte, err error) paneHistoryResult {
+		return paneHistoryResult{Changed: changed, Data: data, Err: err, Render: render}
+	}
+	fullRedraw := func() {
+		render.forceFullRedraw()
+	}
+	markSelectionChange := func(before, after paneHistoryPosition) {
+		if before.Row != after.Row {
+			fullRedraw()
+			return
+		}
+		row := before.Row - view.ViewTop
+		start, end := min(before.Col, after.Col), max(before.Col, after.Col)+1
+		render.markDirty(row, start, end, view.Snapshot.Cols)
+	}
+	recordMove := func(move historyMove, selectionChanged bool) {
+		render.CursorChanged = true
+		if selectionChanged {
+			fullRedraw()
+			return
+		}
+		if move.Delta == 0 || render.FullRedraw {
+			return
+		}
+		rows, cols := view.Snapshot.ViewportRows, view.Snapshot.Cols
+		if render.ScrollRegion == nil {
+			// The counter is part of the client's cached row zero. Mark it
+			// before shifting so a downward scroll repaints the old overlay at
+			// its post-scroll row. Upward scroll naturally discards it.
+			render.markDirty(0, cols-len(move.OldCounter), cols, cols)
+		}
+		render.recordScrollRegion(0, rows, move.Delta)
+		if render.FullRedraw {
+			return
+		}
+		if region := render.ScrollRegion; region != nil && (region.Delta <= -rows || region.Delta >= rows) {
+			fullRedraw()
+			return
+		}
+		if move.Delta < 0 {
+			render.markDirty(rows-1, 0, cols, cols)
+		} else {
+			render.markDirty(0, 0, cols, cols)
+		}
+	}
+
 	for len(data) > 0 {
 		if data[0] == ' ' {
-			view := p.historyView
-			if view == nil {
-				return paneHistoryResult{}
-			}
 			position := view.cursorPosition()
+			if view.Selection != nil {
+				fullRedraw()
+			} else {
+				row := position.Row - view.ViewTop
+				render.markDirty(row, position.Col, position.Col+1, view.Snapshot.Cols)
+			}
 			view.Selection = &paneHistorySelection{Anchor: position, Head: position, ExitOnFinish: true, CopySingle: true}
+			changed = true
 			data = data[1:]
 			continue
 		}
 		if data[0] == '\r' || data[0] == '\n' {
-			result := p.finishHistorySelectionNow()
-			if result.Changed || result.Err != nil {
-				return result
+			finished := p.finishHistorySelectionNow()
+			if finished.Changed || finished.Err != nil {
+				changed = changed || finished.Changed
+				fullRedraw()
+				return result(finished.Data, finished.Err)
 			}
 			data = data[1:]
 			continue
 		}
 		if delta, consumed := decodeHistoryHorizontalInput(data); consumed > 0 {
-			view := p.historyView
-			view.CursorCol = min(max(view.CursorCol+delta, 0), view.Snapshot.Cols-1)
+			nextColumn := min(max(view.CursorCol+delta, 0), view.Snapshot.Cols-1)
+			if nextColumn == view.CursorCol {
+				data = data[min(consumed, len(data)):]
+				continue
+			}
+			var oldHead paneHistoryPosition
+			if view.Selection != nil {
+				oldHead = view.Selection.Head
+			}
+			view.CursorCol = nextColumn
 			if view.Selection != nil {
 				view.Selection.Head = view.cursorPosition()
+				markSelectionChange(oldHead, view.Selection.Head)
 			}
+			changed = true
+			render.CursorChanged = true
 			data = data[min(consumed, len(data)):]
 			continue
 		}
@@ -493,30 +574,41 @@ func (p *Pane) handleHistoryInputNow(data []byte) paneHistoryResult {
 		data = data[min(consumed, len(data)):]
 		if exit {
 			exited := p.exitHistoryModeNow()
-			return paneHistoryResult{Changed: exited}
+			changed = changed || exited
+			if exited {
+				fullRedraw()
+			}
+			return result(nil, nil)
 		}
 		if count < 0 {
 			if p.jumpHistory(count == -1) {
 				if p.historyView.Selection != nil {
 					p.historyView.Selection.Head = p.historyView.cursorPosition()
 				}
+				changed = true
+				fullRedraw()
 			}
 			continue
 		}
 		for i := 0; i < count; i++ {
 			move, ok := p.moveHistory(direction)
 			if !ok {
-				return paneHistoryResult{}
+				return result(nil, nil)
 			}
 			if !move.Changed {
 				break
 			}
+			selectionChanged := false
 			if p.historyView.Selection != nil {
+				oldHead := p.historyView.Selection.Head
 				p.historyView.Selection.Head = p.historyView.cursorPosition()
+				selectionChanged = oldHead != p.historyView.Selection.Head
 			}
+			changed = true
+			recordMove(move, selectionChanged)
 		}
 	}
-	return paneHistoryResult{}
+	return result(nil, nil)
 }
 
 func decodeHistoryHorizontalInput(data []byte) (delta, consumed int) {
