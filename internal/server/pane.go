@@ -39,6 +39,7 @@ type Pane struct {
 	ptyFree                chan []byte
 	ptyDrainRequests       chan ptyDrainRequest
 	ptyDrainEvents         chan ptyDrainEvent
+	ptyReaderDone          chan struct{}
 	ptyDrainNow            func() time.Time
 	ptyInteractive         chan struct{}
 	ptyPacingInterval      time.Duration
@@ -230,6 +231,7 @@ func (p *Pane) initializeRuntime() {
 	p.ptyFree = make(chan []byte, ptyReadBufferCount)
 	p.ptyDrainRequests = make(chan ptyDrainRequest)
 	p.ptyDrainEvents = make(chan ptyDrainEvent)
+	p.ptyReaderDone = make(chan struct{})
 	p.ptyInteractive = make(chan struct{}, 1)
 	p.ptyInput = make(chan []byte, 64)
 	p.commands = make(chan paneCommand, 8)

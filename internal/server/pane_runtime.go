@@ -225,7 +225,10 @@ func relayPTYOutput(pane *Pane) {
 }
 
 func relayPTYOutputFrom(pane *Pane, reader io.Reader) {
-	defer close(pane.ptyDrainEvents)
+	defer func() {
+		close(pane.ptyDrainEvents)
+		close(pane.ptyReaderDone)
+	}()
 	for {
 		var request ptyDrainRequest
 		select {
@@ -375,6 +378,12 @@ func runPTYWriter(pane *Pane, failed func(error)) {
 
 func (p *Pane) run() {
 	defer func() {
+		// Stop the reader and wait until it no longer accesses the PTY before
+		// closing the file. os.File.Close racing a readiness Fd call is unsafe.
+		p.stop()
+		if p.ptyReaderDone != nil {
+			<-p.ptyReaderDone
+		}
 		if p.PTY != nil {
 			_ = p.PTY.Close()
 		}
