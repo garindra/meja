@@ -354,14 +354,8 @@ func (p *Pane) run() {
 			}
 			if command.history != nil {
 				result := p.handleHistoryRequest(command.history)
-				if result.Err == nil && result.Changed && p.outputLease != nil {
-					if result.Render.HasRenderChange() {
-						renderer.mergeHistory(result.Render)
-					} else {
-						// Mode transitions, jumps, and complex selection changes
-						// deliberately retain the authoritative full-redraw path.
-						renderer.markFull()
-					}
+				if result.Render.HasRenderChange() && p.outputLease != nil {
+					renderer.mergeViewUpdate(result.Render)
 					renderer.due = true
 				}
 				command.history.Result <- result

@@ -78,7 +78,7 @@ func TestHistorySnapshotIsIndependentAndMovesAtViewportBoundary(t *testing.T) {
 		}
 	}
 	move, ok := pane.moveHistory(-1)
-	if !ok || move.Delta != 1 || move.NewCounter != "[1/2]" {
+	if !ok || move.Delta != 1 || historyCounter(pane.historyView) != "[1/2]" {
 		t.Fatalf("boundary move = %#v ok=%v", move, ok)
 	}
 }
@@ -149,8 +149,8 @@ func TestHistoryRenderStateCoalescesSameDirectionAndFallsBackSafely(t *testing.T
 	state := newPaneRenderState(pane)
 	state.lease = &OutputLease{}
 	state.ensureRows()
-	state.mergeHistory(first.Render)
-	state.mergeHistory(second.Render)
+	state.mergeViewUpdate(first.Render)
+	state.mergeViewUpdate(second.Render)
 	if state.scrollRegion == nil || *state.scrollRegion != (ScrollRegion{Top: 0, Bottom: 3, Delta: -2}) {
 		t.Fatalf("coalesced history scroll = %#v", state.scrollRegion)
 	}
@@ -160,10 +160,10 @@ func TestHistoryRenderStateCoalescesSameDirectionAndFallsBackSafely(t *testing.T
 		t.Fatalf("coalesced exposed-row damage = %#v", state.dirty)
 	}
 
-	opposing := Update{}
-	opposing.Reset(3)
+	opposing := ViewUpdate{}
+	opposing.reset(3)
 	opposing.ScrollRegion = &ScrollRegion{Top: 0, Bottom: 3, Delta: 1}
-	state.mergeHistory(opposing)
+	state.mergeViewUpdate(opposing)
 	if state.scrollRegion != nil || state.dirtyRows != 3 {
 		t.Fatalf("opposing movement did not force full redraw: %#v", state)
 	}
@@ -172,7 +172,7 @@ func TestHistoryRenderStateCoalescesSameDirectionAndFallsBackSafely(t *testing.T
 	state.lease = &OutputLease{}
 	state.ensureRows()
 	state.progressive = true
-	state.mergeHistory(first.Render)
+	state.mergeViewUpdate(first.Render)
 	if state.scrollRegion != nil || state.progressive || state.dirtyRows != 3 {
 		t.Fatalf("progressive history movement did not force full redraw: %#v", state)
 	}
@@ -208,15 +208,17 @@ func TestHistoryCursorAndSimpleSelectionDamageStayIncremental(t *testing.T) {
 }
 
 func TestHistoryInputFallsBackForJumpsAndSelectionMovement(t *testing.T) {
-	for _, input := range []string{"g", "G"} {
-		pane := newHistoryRenderTestPane(t)
-		jump := pane.handleHistoryInputNow([]byte(input))
-		if !jump.Changed || !jump.Render.FullRedraw || jump.Render.ScrollRegion != nil {
-			t.Fatalf("jump %q render = %#v", input, jump.Render)
-		}
+	pane := newHistoryRenderTestPane(t)
+	jump := pane.handleHistoryInputNow([]byte("g"))
+	if !jump.Changed || !jump.Render.FullRedraw || jump.Render.ScrollRegion != nil {
+		t.Fatalf("jump %q render = %#v", "g", jump.Render)
+	}
+	jump = pane.handleHistoryInputNow([]byte("G"))
+	if !jump.Changed || !jump.Render.FullRedraw || jump.Render.ScrollRegion != nil {
+		t.Fatalf("jump %q render = %#v", "G", jump.Render)
 	}
 
-	pane := newHistoryRenderTestPane(t)
+	pane = newHistoryRenderTestPane(t)
 	pane.historyView.ViewTop = 0
 	pane.historyView.CursorRow = 2
 	position := pane.historyView.cursorPosition()
@@ -232,6 +234,54 @@ func TestHistoryInputFallsBackForJumpsAndSelectionMovement(t *testing.T) {
 	fullViewport := pane.handleHistoryInputNow([]byte("jjj"))
 	if !fullViewport.Changed || !fullViewport.Render.FullRedraw || fullViewport.Render.ScrollRegion != nil {
 		t.Fatalf("full-viewport movement render = %#v", fullViewport.Render)
+	}
+}
+
+func TestHistoryJumpsAtTheirDestinationAreNoOps(t *testing.T) {
+	pane := newHistoryRenderTestPane(t)
+	if result := pane.handleHistoryInputNow([]byte("G")); !result.Changed || !result.Render.FullRedraw {
+		t.Fatalf("initial bottom jump = %#v", result)
+	}
+	if result := pane.handleHistoryInputNow([]byte("G")); result.Changed || result.Render.HasRenderChange() {
+		t.Fatalf("repeated bottom jump = %#v", result)
+	}
+	if result := pane.handleHistoryInputNow([]byte("g")); !result.Changed || !result.Render.FullRedraw {
+		t.Fatalf("initial top jump = %#v", result)
+	}
+	if result := pane.handleHistoryInputNow([]byte("g")); result.Changed || result.Render.HasRenderChange() {
+		t.Fatalf("top jump at top = %#v", result)
+	}
+	if result := pane.handleHistoryInputNow([]byte("G")); !result.Changed || !result.Render.FullRedraw {
+		t.Fatalf("bottom jump after top = %#v", result)
+	}
+	if result := pane.handleHistoryInputNow([]byte("G")); result.Changed || result.Render.HasRenderChange() {
+		t.Fatalf("repeated bottom jump = %#v", result)
+	}
+}
+
+func TestHistoryStructuralChangesReturnExplicitFullRedraws(t *testing.T) {
+	pane := &Pane{ID: 0, terminal: newTerminal(8, 3)}
+	enter := pane.handleHistoryRequest(&paneHistoryRequest{Action: paneHistoryEnter})
+	if !enter.Changed || enter.Err != nil || !enter.Render.FullRedraw {
+		t.Fatalf("history enter = %#v", enter)
+	}
+
+	begin := pane.beginHistorySelectionAtCursorNow(false)
+	if !begin.Changed || !begin.Render.FullRedraw {
+		t.Fatalf("selection begin = %#v", begin)
+	}
+	update := pane.updateHistorySelectionNow(1, 1)
+	if !update.Changed || !update.Render.FullRedraw {
+		t.Fatalf("selection update = %#v", update)
+	}
+	clear := pane.clearHistorySelectionNow()
+	if !clear.Changed || !clear.Render.FullRedraw {
+		t.Fatalf("selection clear = %#v", clear)
+	}
+
+	exit := pane.handleHistoryRequest(&paneHistoryRequest{Action: paneHistoryExit})
+	if !exit.Changed || !exit.Render.FullRedraw {
+		t.Fatalf("history exit = %#v", exit)
 	}
 }
 

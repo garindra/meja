@@ -94,6 +94,21 @@ func TestPaneRenderStateRejectsRegionDuringProgressiveRender(t *testing.T) {
 	}
 }
 
+func TestPaneRenderStatePromotesFullRegionDisplacementToFullRedraw(t *testing.T) {
+	pane := &Pane{terminal: newTerminal(4, 5)}
+	state := newPaneRenderState(pane)
+	state.lease = &OutputLease{}
+	state.ensureRows()
+
+	update := Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -2}}
+	state.merge(update)
+	update.ScrollRegion = &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}
+	state.merge(update)
+	if state.scrollRegion != nil || state.dirtyRows != 5 {
+		t.Fatalf("full-region displacement did not force full redraw: %#v", state)
+	}
+}
+
 func TestDisplayCompilerMergesCompatibleRows(t *testing.T) {
 	word := func(r rune) cellWord {
 		value, _ := makeScalarCellWord(r, 1, 0)
