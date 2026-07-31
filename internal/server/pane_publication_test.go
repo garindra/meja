@@ -618,24 +618,32 @@ func TestPaneRenderDiagnosticWorkload(t *testing.T) {
 		t.Skip("set MEJA_RUN_RENDER_DIAGNOSTIC=1 to run the paced render diagnostic")
 	}
 	pane := &Pane{ID: 1, terminal: newTerminal(80, 24)}
-	ptyOutput := startTestPaneLoop(pane)
-	defer close(ptyOutput)
+	pane.initializeRuntime()
+	go pane.run()
 	if err := pane.installOutputLease(testOutputLease(0, io.Discard), 1, 80, 24); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, pane)
 	before := pane.renderMetricsSnapshot()
-	first := string(bytes.Repeat([]byte{'A'}, ptyReadBufferSize))
-	second := string(bytes.Repeat([]byte{'B'}, ptyReadBufferSize))
-	started := time.Now()
-	turns := 0
-	for time.Since(started) < time.Second {
-		if turns%2 == 0 {
-			sendTestPTYOutput(t, pane, first)
+	first := bytes.Repeat([]byte{'A'}, ptyReadBufferSize)
+	second := bytes.Repeat([]byte{'B'}, ptyReadBufferSize)
+	chunks := make([][]byte, 128)
+	for index := range chunks {
+		if index%2 == 0 {
+			chunks[index] = first
 		} else {
-			sendTestPTYOutput(t, pane, second)
+			chunks[index] = second
 		}
-		turns++
+	}
+	reader := &scriptedPTYReader{chunks: chunks}
+	relayDone := make(chan struct{})
+	go func() {
+		relayPTYOutputFrom(pane, reader)
+		close(relayDone)
+	}()
+	started := time.Now()
+	for time.Since(started) < time.Second {
+		time.Sleep(time.Millisecond)
 	}
 	syncPaneRenderer(t, pane)
 	elapsed := time.Since(started).Seconds()
@@ -644,12 +652,17 @@ func TestPaneRenderDiagnosticWorkload(t *testing.T) {
 	presents := after.Presents - before.Presents
 	ptyTurns := after.PTYTurns - before.PTYTurns
 	ptyBytes := after.PTYBytes - before.PTYBytes
+	drainReads := after.PTYDrainReads - before.PTYDrainReads
+	drainsAtEmpty := after.PTYDrainStoppedEmpty - before.PTYDrainStoppedEmpty
 	wireBytes := after.UncompressedBytes - before.UncompressedBytes
 	candidates := after.CandidateCells - before.CandidateCells
 	changed := after.ChangedCells - before.ChangedCells
-	t.Logf("elapsed=%.3fs pty_turns/s=%.2f pty_bytes/s=%.0f publications/s=%.2f presents/s=%.2f presents/publication=%.2f wire_bytes/s=%.0f avg_bytes/publication=%.1f candidates=%d changed=%d cancelled=%d",
+	t.Logf("elapsed=%.3fs pty_drains/s=%.2f reads/drain=%.2f bytes/drain=%.1f eagain_pct=%.1f pty_bytes/s=%.0f publications/s=%.2f presents/s=%.2f presents/publication=%.2f wire_bytes/s=%.0f avg_bytes/publication=%.1f candidates=%d changed=%d cancelled=%d",
 		elapsed,
 		float64(ptyTurns)/elapsed,
+		float64(drainReads)/float64(ptyTurns),
+		float64(ptyBytes)/float64(ptyTurns),
+		float64(drainsAtEmpty)*100/float64(ptyTurns),
 		float64(ptyBytes)/elapsed,
 		float64(publications)/elapsed,
 		float64(presents)/elapsed,
@@ -660,6 +673,9 @@ func TestPaneRenderDiagnosticWorkload(t *testing.T) {
 		changed,
 		after.CancelledCells-before.CancelledCells,
 	)
+	pane.stop()
+	<-pane.mainDone
+	<-relayDone
 }
 
 func BenchmarkPaneDeltaPublication(b *testing.B) {

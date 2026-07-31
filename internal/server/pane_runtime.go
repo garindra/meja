@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 
 	"github.com/garindra/meja/internal/protocol"
 )
@@ -14,10 +15,44 @@ import (
 const (
 	ptyReadBufferSize  = 32 * 1024
 	ptyReadBufferCount = 2
+	ptyDrainByteBudget = 64 * 1024
+	ptyDrainTimeBudget = 2 * time.Millisecond
 	ptyTurnInterval    = 50 * time.Millisecond
 )
 
 type ptyReadBuffer [ptyReadBufferSize]byte
+
+type ptyDrainStopReason uint8
+
+const (
+	ptyDrainStoppedEmpty ptyDrainStopReason = iota + 1
+	ptyDrainStoppedByteBudget
+	ptyDrainStoppedTimeBudget
+	ptyDrainStoppedEOF
+	ptyDrainStoppedError
+	ptyDrainStoppedCancelled
+)
+
+type ptyDrainRequest struct {
+	maxBytes    int
+	maxDuration time.Duration
+}
+
+type ptyDrainEvent struct {
+	buffer   []byte
+	complete bool
+	reason   ptyDrainStopReason
+	bytes    int
+	reads    int
+	duration time.Duration
+	err      error
+}
+
+// ptyReadiness is the deterministic test seam for readers without a pollable
+// descriptor. Production PTYs use poll(2) with a zero timeout.
+type ptyReadiness interface {
+	ptyReadReady() (bool, error)
+}
 
 type ptyAdmissionState struct {
 	ready      bool
@@ -205,30 +240,130 @@ func relayPTYOutput(pane *Pane) {
 }
 
 func relayPTYOutputFrom(pane *Pane, reader io.Reader) {
-	defer close(pane.ptyOutput)
+	defer close(pane.ptyDrainEvents)
 	for {
-		var buf []byte
+		var request ptyDrainRequest
 		select {
-		case buf = <-pane.ptyFree:
+		case request = <-pane.ptyDrainRequests:
 		case <-pane.done:
 			return
 		}
-		n, err := reader.Read(buf)
-		if n > 0 {
-			pane.notifyProcessActivity()
-			select {
-			case pane.ptyOutput <- buf[:n]:
-			case <-pane.done:
-				pane.ptyFree <- buf
-				return
-			}
-		} else {
-			pane.ptyFree <- buf
-		}
-		if err != nil {
+		if !drainPTYOpportunity(pane, reader, request) {
 			return
 		}
 	}
+}
+
+func drainPTYOpportunity(pane *Pane, reader io.Reader, request ptyDrainRequest) bool {
+	now := time.Now
+	if pane.ptyDrainNow != nil {
+		now = pane.ptyDrainNow
+	}
+	if request.maxBytes <= 0 {
+		request.maxBytes = ptyDrainByteBudget
+	}
+	if request.maxDuration <= 0 {
+		request.maxDuration = ptyDrainTimeBudget
+	}
+	started := now()
+	bytesRead, reads := 0, 0
+	cancel := func() bool {
+		pane.renderMetrics.recordPTYDrain(ptyDrainEvent{
+			complete: true,
+			reason:   ptyDrainStoppedCancelled,
+			bytes:    bytesRead,
+			reads:    reads,
+			duration: now().Sub(started),
+		})
+		return false
+	}
+	complete := func(reason ptyDrainStopReason, err error) bool {
+		event := ptyDrainEvent{
+			complete: true,
+			reason:   reason,
+			bytes:    bytesRead,
+			reads:    reads,
+			duration: now().Sub(started),
+			err:      err,
+		}
+		select {
+		case pane.ptyDrainEvents <- event:
+			return reason != ptyDrainStoppedEOF && reason != ptyDrainStoppedError
+		case <-pane.done:
+			return cancel()
+		}
+	}
+
+	for {
+		ready, err := ptyReadImmediatelyAvailable(reader)
+		if err != nil {
+			return complete(ptyDrainStoppedError, err)
+		}
+		if !ready {
+			return complete(ptyDrainStoppedEmpty, nil)
+		}
+		if bytesRead >= request.maxBytes {
+			return complete(ptyDrainStoppedByteBudget, nil)
+		}
+		if reads > 0 && now().Sub(started) >= request.maxDuration {
+			return complete(ptyDrainStoppedTimeBudget, nil)
+		}
+
+		var buffer []byte
+		select {
+		case buffer = <-pane.ptyFree:
+		case <-pane.done:
+			return cancel()
+		}
+		remaining := request.maxBytes - bytesRead
+		if remaining < len(buffer) {
+			buffer = buffer[:remaining]
+		}
+		n, readErr := reader.Read(buffer)
+		reads++
+		if n > 0 {
+			bytesRead += n
+			pane.notifyProcessActivity()
+			select {
+			case pane.ptyDrainEvents <- ptyDrainEvent{buffer: buffer[:n]}:
+			case <-pane.done:
+				pane.ptyFree <- buffer[:ptyReadBufferSize]
+				return cancel()
+			}
+		} else {
+			pane.ptyFree <- buffer[:ptyReadBufferSize]
+		}
+		if readErr != nil {
+			if errors.Is(readErr, unix.EAGAIN) || errors.Is(readErr, unix.EWOULDBLOCK) {
+				return complete(ptyDrainStoppedEmpty, nil)
+			}
+			if errors.Is(readErr, io.EOF) {
+				return complete(ptyDrainStoppedEOF, nil)
+			}
+			return complete(ptyDrainStoppedError, readErr)
+		}
+	}
+}
+
+func ptyReadImmediatelyAvailable(reader io.Reader) (bool, error) {
+	if readiness, ok := reader.(ptyReadiness); ok {
+		return readiness.ptyReadReady()
+	}
+	fdReader, ok := reader.(interface{ Fd() uintptr })
+	if !ok {
+		// Non-file readers are used only by tests and adapters which guarantee
+		// that Read will not block.
+		return true, nil
+	}
+	pollFDs := []unix.PollFd{{
+		Fd:     int32(fdReader.Fd()),
+		Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR,
+	}}
+	n, err := unix.Poll(pollFDs, 0)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func runPTYWriter(pane *Pane, failed func(error)) {
@@ -312,19 +447,63 @@ func (p *Pane) run() {
 		startupInput = nil
 		return p.sendOwnedInput(input)
 	}
+	drainActive := false
+	ptyDrainEvents := (<-chan ptyDrainEvent)(p.ptyDrainEvents)
+	applyPTYChunk := func(data []byte) error {
+		p.renderMetrics.ptyBytes.Add(uint64(len(data)))
+		trackDamage := p.outputLease != nil && p.currentViewMode() == paneViewLive
+		var currentFrontendWrite func([]byte) error
+		if p.outputLease != nil {
+			currentFrontendWrite = p.outputLease.frontendTerminalWrite
+		}
+		update.ResetFor(p.terminal.Rows, trackDamage)
+		p.terminal.ApplyInto(data, &update)
+		if len(startupInput) > 0 {
+			arm(&startupIdle, &startupIdleC, startupInputIdle)
+		}
+		p.ptyFree <- data[:ptyReadBufferSize]
+		for _, reply := range update.Replies {
+			if err := p.sendOwnedInput(reply); err != nil {
+				return err
+			}
+		}
+		if err := p.routeFrontendWrites(&update, currentFrontendWrite); err != nil {
+			return err
+		}
+		p.publishTerminalMetadata()
+		if trackDamage {
+			renderer.merge(update)
+		}
+		return nil
+	}
 	for {
 		renderer.flushSyncWaiters()
 		available := renderer.available()
+		if drainActive {
+			// Commands and protocol side effects remain live during a drain,
+			// but visual publication is gated on its explicit completion.
+			// Commands interleave at chunk boundaries: capture observes the
+			// canonical state parsed so far, while structural changes update
+			// the epoch/keyframe state that the completed drain will publish.
+			available = nil
+		}
 		failures := renderer.failures()
 		submission, publication := renderer.submission()
 		var ptyOutput <-chan []byte
+		var drainRequests chan<- ptyDrainRequest
 		// Detached panes continue advancing their canonical terminal state at
 		// the same paced cadence. Attached panes additionally stop admission
 		// while visual work is waiting for their bounded output path.
-		if admission.canAdmit() && !renderer.blocksPTY() {
+		if !drainActive && admission.canAdmit() && !renderer.blocksPTY() {
 			ptyOutput = p.ptyOutput
+			drainRequests = p.ptyDrainRequests
 		}
 		select {
+		case drainRequests <- ptyDrainRequest{maxBytes: ptyDrainByteBudget, maxDuration: ptyDrainTimeBudget}:
+			drainActive = true
+			admission.admit(time.Now())
+			p.renderMetrics.ptyDrainOpportunities.Add(1)
+			arm(&ptyTimer, &ptyTimerC, pacingInterval)
 		case buffer := <-available:
 			lease := p.outputLease
 			if err := renderer.prepare(buffer); err != nil {
@@ -424,42 +603,51 @@ func (p *Pane) run() {
 			} else {
 				command.done <- nil
 			}
+		case event, ok := <-ptyDrainEvents:
+			if !ok {
+				ptyDrainEvents = nil
+				continue
+			}
+			if event.buffer != nil {
+				if err := applyPTYChunk(event.buffer); err != nil {
+					return
+				}
+				continue
+			}
+			if !event.complete {
+				continue
+			}
+			drainActive = false
+			p.renderMetrics.recordPTYDrain(event)
+			if renderer.hasMutation() {
+				renderer.attributeNextPreparationToDrain()
+			}
+			if event.err != nil {
+				return
+			}
 		case data, ok := <-ptyOutput:
 			if !ok {
 				return
 			}
 			admission.admit(time.Now())
-			p.renderMetrics.ptyTurns.Add(1)
-			p.renderMetrics.ptyBytes.Add(uint64(len(data)))
+			p.renderMetrics.ptyDrainOpportunities.Add(1)
 			arm(&ptyTimer, &ptyTimerC, pacingInterval)
 			select {
 			case <-p.ptyInteractive:
 			default:
 			}
-			trackDamage := p.outputLease != nil && p.currentViewMode() == paneViewLive
-			var currentFrontendWrite func([]byte) error
-			if p.outputLease != nil {
-				currentFrontendWrite = p.outputLease.frontendTerminalWrite
-			}
-			update.ResetFor(p.terminal.Rows, trackDamage)
-			p.terminal.ApplyInto(data, &update)
-			if len(startupInput) > 0 {
-				arm(&startupIdle, &startupIdleC, startupInputIdle)
-			}
-			p.ptyFree <- data[:ptyReadBufferSize]
-			for _, reply := range update.Replies {
-				if err := p.sendOwnedInput(reply); err != nil {
-					return
-				}
-			}
-			if err := p.routeFrontendWrites(&update, currentFrontendWrite); err != nil {
+			if err := applyPTYChunk(data); err != nil {
 				return
 			}
-			p.publishTerminalMetadata()
-			if !trackDamage {
-				continue
+			p.renderMetrics.recordPTYDrain(ptyDrainEvent{
+				complete: true,
+				reason:   ptyDrainStoppedEmpty,
+				bytes:    len(data),
+				reads:    1,
+			})
+			if renderer.hasMutation() {
+				renderer.attributeNextPreparationToDrain()
 			}
-			renderer.merge(update)
 		case <-ptyTimerC:
 			ptyTimerC = nil
 			admission.timerFired()

@@ -91,7 +91,27 @@ func (r *countingPTYReader) Read(data []byte) (int, error) {
 	return 1, nil
 }
 
-func TestPTYReaderHandoffIsBoundedAndShutdownReturnsHeldBuffer(t *testing.T) {
+func (r *countingPTYReader) ptyReadReady() (bool, error) {
+	return false, nil
+}
+
+type saturatingPTYReader struct {
+	reads atomic.Int32
+}
+
+func (r *saturatingPTYReader) Read(data []byte) (int, error) {
+	r.reads.Add(1)
+	for index := range data {
+		data[index] = 'x'
+	}
+	return len(data), nil
+}
+
+func (r *saturatingPTYReader) ptyReadReady() (bool, error) {
+	return true, nil
+}
+
+func TestPTYReaderWaitsForDrainCreditAndShutdownPreservesBuffers(t *testing.T) {
 	pane := &Pane{terminal: newTerminal(8, 1)}
 	pane.initializeRuntime()
 	reader := &countingPTYReader{}
@@ -101,31 +121,19 @@ func TestPTYReaderHandoffIsBoundedAndShutdownReturnsHeldBuffer(t *testing.T) {
 		close(exited)
 	}()
 
-	deadline := time.Now().Add(time.Second)
-	for reader.reads.Load() < ptyReadBufferCount {
-		if time.Now().After(deadline) {
-			t.Fatal("PTY reader did not fill the bounded handoff")
-		}
-		time.Sleep(time.Millisecond)
-	}
 	time.Sleep(10 * time.Millisecond)
-	if got := reader.reads.Load(); got != ptyReadBufferCount {
-		t.Fatalf("reader completed %d reads with a full one-slot handoff, want %d", got, ptyReadBufferCount)
+	if got := reader.reads.Load(); got != 0 {
+		t.Fatalf("reader completed %d reads without drain credit, want 0", got)
 	}
 
 	pane.stop()
 	select {
 	case <-exited:
 	case <-time.After(time.Second):
-		t.Fatal("PTY reader did not stop while blocked on pane handoff")
+		t.Fatal("PTY reader did not stop while waiting for drain credit")
 	}
-	if got := len(pane.ptyFree) + len(pane.ptyOutput); got != ptyReadBufferCount {
+	if got := len(pane.ptyFree); got != ptyReadBufferCount {
 		t.Fatalf("buffer ownership after shutdown = %d buffers, want %d", got, ptyReadBufferCount)
-	}
-	first := <-pane.ptyOutput
-	second := <-pane.ptyFree
-	if &first[0] == &second[0] {
-		t.Fatal("PTY buffer was returned twice")
 	}
 }
 
@@ -148,22 +156,27 @@ func TestBlockedOutputStopsPaneAndPTYReaderProgress(t *testing.T) {
 		t.Fatal("initial output did not reach the blocked writer")
 	}
 
-	reader := &countingPTYReader{}
+	reader := &saturatingPTYReader{}
 	relayDone := make(chan struct{})
 	go func() {
 		relayPTYOutputFrom(pane, reader)
 		close(relayDone)
 	}()
 	deadline := time.Now().Add(time.Second)
-	for reader.reads.Load() < ptyReadBufferCount+1 {
+	for reader.reads.Load() < 2 {
 		if time.Now().After(deadline) {
-			t.Fatalf("reader made only %d bounded pipeline reads", reader.reads.Load())
+			t.Fatal("initial bounded drain did not run")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	time.Sleep(10 * time.Millisecond)
-	if got := reader.reads.Load(); got != ptyReadBufferCount+1 {
-		t.Fatalf("blocked output allowed %d PTY reads, want bounded pipeline depth %d", got, ptyReadBufferCount+1)
+	time.Sleep(150 * time.Millisecond)
+	bounded := reader.reads.Load()
+	if bounded > 4 {
+		t.Fatalf("blocked publication path allowed %d reads, want at most two 64 KiB drains", bounded)
+	}
+	time.Sleep(75 * time.Millisecond)
+	if got := reader.reads.Load(); got != bounded {
+		t.Fatalf("blocked publication path kept draining: before=%d after=%d", bounded, got)
 	}
 
 	pane.stop()

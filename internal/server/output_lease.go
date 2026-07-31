@@ -300,10 +300,14 @@ func (l *OutputLease) runConfirmer() {
 				continue
 			}
 			metrics := buffer.metrics
+			fromPTYDrain := buffer.fromPTYDrain
 			frame, err := confirmer.compile(&buffer.publication)
 			buffer.release()
 			if err == nil && metrics != nil {
 				metrics.presents.Add(1)
+				if fromPTYDrain {
+					metrics.ptyDrainPresents.Add(1)
+				}
 				metrics.uncompressedBytes.Add(uint64(len(frame)))
 			}
 			if err == nil {

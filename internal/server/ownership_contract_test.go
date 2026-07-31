@@ -47,7 +47,8 @@ func (f synchronizedField) key() string {
 //
 // server.paneRenderMetrics.*
 //
-//	owner: pane render pipeline; writers: pane actor and its single confirmer;
+//	owner: pane render pipeline; writers: pane actor, PTY adapter cancellation,
+//	and its single confirmer;
 //	readers: diagnostics and tests; published values: monotonic counters for
 //	semantic publication, output backpressure, and physical confirmation.
 //
@@ -83,6 +84,19 @@ var atomicFieldContract = map[string]string{
 	"server.processWatch.activityPending":                 "*atomic.Bool",
 	"server.paneRenderMetrics.ptyTurns":                   "atomic.Uint64",
 	"server.paneRenderMetrics.ptyBytes":                   "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainOpportunities":      "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainsCompleted":         "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainReads":              "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainDurationNanos":      "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainStoppedEmpty":       "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainStoppedByteBudget":  "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainStoppedTimeBudget":  "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainStoppedEOF":         "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainStoppedError":       "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainStoppedCancelled":   "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainPublications":       "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainPresents":           "atomic.Uint64",
+	"server.paneRenderMetrics.ptyDrainCancelledCells":     "atomic.Uint64",
 	"server.paneRenderMetrics.publications":               "atomic.Uint64",
 	"server.paneRenderMetrics.presents":                   "atomic.Uint64",
 	"server.paneRenderMetrics.candidateCells":             "atomic.Uint64",

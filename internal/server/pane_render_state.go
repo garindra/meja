@@ -5,6 +5,7 @@ import (
 	"math"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/garindra/meja/internal/protocol"
 )
@@ -88,9 +89,10 @@ type viewPublication struct {
 }
 
 type viewPublicationBuffer struct {
-	publication viewPublication
-	returnTo    chan<- *viewPublicationBuffer
-	metrics     *paneRenderMetrics
+	publication  viewPublication
+	returnTo     chan<- *viewPublicationBuffer
+	metrics      *paneRenderMetrics
+	fromPTYDrain bool
 }
 
 func (b *viewPublicationBuffer) reset(cols, rows int) {
@@ -114,6 +116,7 @@ func (b *viewPublicationBuffer) reset(cols, rows int) {
 	p.candidateCells = 0
 	p.changedCells = 0
 	p.cancelledCells = 0
+	b.fromPTYDrain = false
 }
 
 func (b *viewPublicationBuffer) release() {
@@ -155,6 +158,19 @@ func (v *semanticViewport) reset(cols, rows int) {
 type paneRenderMetrics struct {
 	ptyTurns                   atomic.Uint64
 	ptyBytes                   atomic.Uint64
+	ptyDrainOpportunities      atomic.Uint64
+	ptyDrainsCompleted         atomic.Uint64
+	ptyDrainReads              atomic.Uint64
+	ptyDrainDurationNanos      atomic.Uint64
+	ptyDrainStoppedEmpty       atomic.Uint64
+	ptyDrainStoppedByteBudget  atomic.Uint64
+	ptyDrainStoppedTimeBudget  atomic.Uint64
+	ptyDrainStoppedEOF         atomic.Uint64
+	ptyDrainStoppedError       atomic.Uint64
+	ptyDrainStoppedCancelled   atomic.Uint64
+	ptyDrainPublications       atomic.Uint64
+	ptyDrainPresents           atomic.Uint64
+	ptyDrainCancelledCells     atomic.Uint64
 	publications               atomic.Uint64
 	presents                   atomic.Uint64
 	candidateCells             atomic.Uint64
@@ -172,6 +188,19 @@ type paneRenderMetrics struct {
 type paneRenderMetricsSnapshot struct {
 	PTYTurns                   uint64
 	PTYBytes                   uint64
+	PTYDrainOpportunities      uint64
+	PTYDrainsCompleted         uint64
+	PTYDrainReads              uint64
+	PTYDrainDurationNanos      uint64
+	PTYDrainStoppedEmpty       uint64
+	PTYDrainStoppedByteBudget  uint64
+	PTYDrainStoppedTimeBudget  uint64
+	PTYDrainStoppedEOF         uint64
+	PTYDrainStoppedError       uint64
+	PTYDrainStoppedCancelled   uint64
+	PTYDrainPublications       uint64
+	PTYDrainPresents           uint64
+	PTYDrainCancelledCells     uint64
 	Publications               uint64
 	Presents                   uint64
 	CandidateCells             uint64
@@ -193,6 +222,19 @@ func (m *paneRenderMetrics) snapshot() paneRenderMetricsSnapshot {
 	return paneRenderMetricsSnapshot{
 		PTYTurns:                   m.ptyTurns.Load(),
 		PTYBytes:                   m.ptyBytes.Load(),
+		PTYDrainOpportunities:      m.ptyDrainOpportunities.Load(),
+		PTYDrainsCompleted:         m.ptyDrainsCompleted.Load(),
+		PTYDrainReads:              m.ptyDrainReads.Load(),
+		PTYDrainDurationNanos:      m.ptyDrainDurationNanos.Load(),
+		PTYDrainStoppedEmpty:       m.ptyDrainStoppedEmpty.Load(),
+		PTYDrainStoppedByteBudget:  m.ptyDrainStoppedByteBudget.Load(),
+		PTYDrainStoppedTimeBudget:  m.ptyDrainStoppedTimeBudget.Load(),
+		PTYDrainStoppedEOF:         m.ptyDrainStoppedEOF.Load(),
+		PTYDrainStoppedError:       m.ptyDrainStoppedError.Load(),
+		PTYDrainStoppedCancelled:   m.ptyDrainStoppedCancelled.Load(),
+		PTYDrainPublications:       m.ptyDrainPublications.Load(),
+		PTYDrainPresents:           m.ptyDrainPresents.Load(),
+		PTYDrainCancelledCells:     m.ptyDrainCancelledCells.Load(),
 		Publications:               m.publications.Load(),
 		Presents:                   m.presents.Load(),
 		CandidateCells:             m.candidateCells.Load(),
@@ -208,29 +250,55 @@ func (m *paneRenderMetrics) snapshot() paneRenderMetricsSnapshot {
 	}
 }
 
+func (m *paneRenderMetrics) recordPTYDrain(event ptyDrainEvent) {
+	m.ptyTurns.Add(1)
+	m.ptyDrainsCompleted.Add(1)
+	m.ptyDrainReads.Add(uint64(event.reads))
+	m.ptyDrainDurationNanos.Add(uint64(max(time.Duration(0), event.duration)))
+	switch event.reason {
+	case ptyDrainStoppedEmpty:
+		m.ptyDrainStoppedEmpty.Add(1)
+	case ptyDrainStoppedByteBudget:
+		m.ptyDrainStoppedByteBudget.Add(1)
+	case ptyDrainStoppedTimeBudget:
+		m.ptyDrainStoppedTimeBudget.Add(1)
+	case ptyDrainStoppedEOF:
+		m.ptyDrainStoppedEOF.Add(1)
+	case ptyDrainStoppedError:
+		m.ptyDrainStoppedError.Add(1)
+	case ptyDrainStoppedCancelled:
+		m.ptyDrainStoppedCancelled.Add(1)
+	}
+}
+
 type panePublicationState struct {
-	pane           *Pane
-	lease          *OutputLease
-	failure        <-chan error
-	layoutRevision protocol.ClientLayoutRevision
-	epoch          RenderEpoch
-	version        RenderVersion
-	snapshot       semanticViewport
-	nextSnapshot   semanticViewport
-	free           chan *viewPublicationBuffer
-	buffers        [publicationBufferCount]viewPublicationBuffer
-	pending        *viewPublicationBuffer
-	dirty          []DirtySpan
-	dirtyRows      int
-	scroll         *ScrollRegion
-	scrollBuf      ScrollRegion
-	cursorDirty    bool
-	keyframe       bool
-	barrier        bool
-	starved        bool
-	diff           []bool
-	counterScratch []byte
-	syncWaiters    []chan<- *OutputLease
+	pane              *Pane
+	lease             *OutputLease
+	failure           <-chan error
+	layoutRevision    protocol.ClientLayoutRevision
+	epoch             RenderEpoch
+	version           RenderVersion
+	snapshot          semanticViewport
+	nextSnapshot      semanticViewport
+	free              chan *viewPublicationBuffer
+	buffers           [publicationBufferCount]viewPublicationBuffer
+	pending           *viewPublicationBuffer
+	dirty             []DirtySpan
+	dirtyRows         int
+	scroll            *ScrollRegion
+	scrollBuf         ScrollRegion
+	cursorDirty       bool
+	keyframe          bool
+	barrier           bool
+	starved           bool
+	diff              []bool
+	counterScratch    []byte
+	syncWaiters       []chan<- *OutputLease
+	attributePTYDrain bool
+}
+
+func (s *panePublicationState) attributeNextPreparationToDrain() {
+	s.attributePTYDrain = true
 }
 
 func newPanePublicationState(pane *Pane) *panePublicationState {
@@ -859,11 +927,17 @@ func (s *panePublicationState) prepare(buffer *viewPublicationBuffer) error {
 	if len(publication.Runs) == 0 && !publication.HasScroll && !publication.CursorChanged && !keyframe {
 		s.pane.renderMetrics.candidateCells.Add(publication.candidateCells)
 		s.pane.renderMetrics.cancelledCells.Add(publication.cancelledCells)
+		if s.attributePTYDrain {
+			s.pane.renderMetrics.ptyDrainCancelledCells.Add(publication.cancelledCells)
+			s.attributePTYDrain = false
+		}
 		s.clearMutation()
 		buffer.release()
 		return nil
 	}
 	buffer.metrics = &s.pane.renderMetrics
+	buffer.fromPTYDrain = s.attributePTYDrain
+	s.attributePTYDrain = false
 	if err := s.prepareNextSnapshot(publication); err != nil {
 		buffer.release()
 		return err
@@ -935,6 +1009,9 @@ func (s *panePublicationState) handedOff() {
 	s.snapshot, s.nextSnapshot = s.nextSnapshot, s.snapshot
 	metrics := &s.pane.renderMetrics
 	metrics.publications.Add(1)
+	if s.pending.fromPTYDrain {
+		metrics.ptyDrainPublications.Add(1)
+	}
 	metrics.candidateCells.Add(publication.candidateCells)
 	metrics.changedCells.Add(publication.changedCells)
 	metrics.changedRuns.Add(uint64(len(publication.Runs)))
