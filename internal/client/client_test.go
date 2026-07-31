@@ -1547,6 +1547,23 @@ func TestCleanQUICCloseWinsWhenOutputEOFArrivesFirst(t *testing.T) {
 	}
 }
 
+func TestConnectionErrorReporterLeavesTerminalCloseToControlLoop(t *testing.T) {
+	errs := make(chan error, 1)
+	terminalClose := fmt.Errorf("accept output stream: %w", &quic.ApplicationError{ErrorCode: 0})
+	sendConnectionError(context.Background(), errs, terminalClose)
+	select {
+	case err := <-errs:
+		t.Fatalf("terminal close was reported as worker failure: %v", err)
+	default:
+	}
+
+	want := errors.New("render stream failed")
+	sendConnectionError(context.Background(), errs, want)
+	if got := <-errs; !errors.Is(got, want) {
+		t.Fatalf("worker error = %v, want %v", got, want)
+	}
+}
+
 func TestPostExitMessageDropsTerminalControlCharacters(t *testing.T) {
 	if got, want := sanitizePostExitMessage("\x1b[31m[detached]\r\n"), "[31m[detached]"; got != want {
 		t.Fatalf("sanitized post-exit message = %q, want %q", got, want)

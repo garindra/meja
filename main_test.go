@@ -415,7 +415,7 @@ func TestInteractiveShellExitFallsBackToLiveWindow(t *testing.T) {
 			t.Fatalf("client failed after pane-exit fallback: %v; stderr: %s", err, stderr.String())
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("client did not detach after pane-exit fallback")
+		t.Fatalf("client did not detach after pane-exit fallback; client stderr=%q server stderr=%q", stderr.String(), serverStderr.String())
 	}
 }
 

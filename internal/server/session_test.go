@@ -1080,8 +1080,12 @@ func TestSessionShutdownEscalatesAndReapsPaneProcess(t *testing.T) {
 	if elapsed < timeouts.hangup+timeouts.terminate {
 		t.Fatalf("shutdown completed in %v before signal escalation deadlines elapsed", elapsed)
 	}
-	if elapsed >= time.Second {
-		t.Fatalf("shutdown took %v after SIGKILL", elapsed)
+	// Race instrumentation and hosted-runner scheduling can delay process
+	// observation after SIGKILL. Keep the operation bounded by its configured
+	// escalation windows while allowing a small amount of scheduler latency.
+	maxElapsed := timeouts.hangup + timeouts.terminate + timeouts.kill + 250*time.Millisecond
+	if elapsed >= maxElapsed {
+		t.Fatalf("shutdown took %v after SIGKILL, want less than %v", elapsed, maxElapsed)
 	}
 	if pane.Process.ProcessState == nil {
 		t.Fatalf("pane process was not reaped: %#v", pane.Process.ProcessState)

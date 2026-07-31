@@ -1504,8 +1504,18 @@ func writeFrames(ctx context.Context, stream io.Writer, frames <-chan protocol.F
 }
 
 func sendConnectionError(ctx context.Context, errs chan<- error, err error) {
+	// Terminal application closes are owned by controlLoop, which translates
+	// them into the graceful connection result. Letting an output acceptor or
+	// writer report the same close as a worker failure can race that result and
+	// incorrectly send the client through reconnect.
+	if err == nil || isTerminalQUICClose(err) {
+		return
+	}
 	if ctx == nil {
 		errs <- err
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	select {
