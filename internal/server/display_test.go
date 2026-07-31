@@ -13,31 +13,6 @@ import (
 	"github.com/garindra/meja/internal/protocol"
 )
 
-type displayStyleMap map[uint32]protocol.Style
-
-func (m displayStyleMap) LookupStyle(id uint32) (protocol.Style, bool) {
-	style, ok := m[id]
-	return style, ok
-}
-
-func TestDisplayCompilerUsesSpecializedTextAndFill(t *testing.T) {
-	output := newRenderOutput()
-	cells := []decodedTestCell{{Width: 1}, {Width: 1}, {Width: 1}, {Cluster: "o", Width: 1}, {Cluster: "k", Width: 1}}
-	if err := newTestDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(2, 4, cells); err != nil {
-		t.Fatal(err)
-	}
-	commands := decodePendingCommands(t, output.pending)
-	want := []protocol.DisplayOpcode{protocol.DisplayOpcodeSetWritePosition, protocol.DisplayOpcodeSetWriteStyle, protocol.DisplayOpcodeFill, protocol.DisplayOpcodeWriteTextUTF8}
-	if len(commands) != len(want) {
-		t.Fatalf("commands=%#v", commands)
-	}
-	for i, opcode := range want {
-		if commands[i].Opcode != opcode {
-			t.Fatalf("commands[%d]=0x%02x want 0x%02x", i, commands[i].Opcode, opcode)
-		}
-	}
-}
-
 func TestShiftDirtyRowsWithinRegionPreservesOutsideDamage(t *testing.T) {
 	spans := []DirtySpan{
 		{Start: 0, End: 1},
@@ -65,206 +40,37 @@ func TestShiftDirtyRowsWithinRegionPreservesOutsideDamage(t *testing.T) {
 
 func TestPaneRenderStateCoalescesOnlyCompatibleRegions(t *testing.T) {
 	pane := &Pane{terminal: newTerminal(4, 5)}
-	state := newPaneRenderState(pane)
+	state := newPanePublicationState(pane)
 	state.lease = &OutputLease{}
-	state.ensureRows()
+	state.ensureGeometry()
 
 	first := Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}}
 	second := Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}}
 	state.merge(first)
 	state.merge(second)
-	if state.scrollRegion == nil || *state.scrollRegion != (ScrollRegion{Top: 1, Bottom: 4, Delta: -2}) {
-		t.Fatalf("coalesced render region = %#v", state.scrollRegion)
+	if state.scroll == nil || *state.scroll != (ScrollRegion{Top: 1, Bottom: 4, Delta: -2}) {
+		t.Fatalf("coalesced render region = %#v", state.scroll)
 	}
 
 	state.merge(Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 0, Bottom: 4, Delta: -1}})
-	if state.scrollRegion != nil || state.dirtyRows != 5 {
-		t.Fatalf("incompatible region did not force full redraw: region=%#v dirty=%#v", state.scrollRegion, state.dirty)
-	}
-}
-
-func TestPaneRenderStateRejectsRegionDuringProgressiveRender(t *testing.T) {
-	pane := &Pane{terminal: newTerminal(4, 5)}
-	state := newPaneRenderState(pane)
-	state.lease = &OutputLease{}
-	state.progressive = true
-	state.merge(Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}})
-	if state.scrollRegion != nil || state.progressive || state.dirtyRows != 5 {
-		t.Fatalf("progressive scroll did not force full redraw: %#v", state)
+	if state.scroll != nil || state.dirtyRows != 5 {
+		t.Fatalf("incompatible region did not force full redraw: region=%#v dirty=%#v", state.scroll, state.dirty)
 	}
 }
 
 func TestPaneRenderStatePromotesFullRegionDisplacementToFullRedraw(t *testing.T) {
 	pane := &Pane{terminal: newTerminal(4, 5)}
-	state := newPaneRenderState(pane)
+	state := newPanePublicationState(pane)
 	state.lease = &OutputLease{}
-	state.ensureRows()
+	state.ensureGeometry()
 
 	update := Update{DirtySpans: make([]DirtySpan, 5), ScrollRegion: &ScrollRegion{Top: 1, Bottom: 4, Delta: -2}}
 	state.merge(update)
 	update.ScrollRegion = &ScrollRegion{Top: 1, Bottom: 4, Delta: -1}
 	state.merge(update)
-	if state.scrollRegion != nil || state.dirtyRows != 5 {
+	if state.scroll != nil || state.dirtyRows != 5 {
 		t.Fatalf("full-region displacement did not force full redraw: %#v", state)
 	}
-}
-
-func TestDisplayCompilerMergesCompatibleRows(t *testing.T) {
-	word := func(r rune) cellWord {
-		value, _ := makeScalarCellWord(r, 1, 0)
-		return value
-	}
-	output := newRenderOutput()
-	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, nil, 4)
-	if err := compiler.writeCells(0, 0, []cellWord{word('a'), word('b'), word('c'), word('d')}); err != nil {
-		t.Fatal(err)
-	}
-	if err := compiler.writeCells(1, 0, []cellWord{word('e'), word('f'), word('g'), word('h')}); err != nil {
-		t.Fatal(err)
-	}
-	if err := compiler.finish(); err != nil {
-		t.Fatal(err)
-	}
-	commands := decodePendingCommands(t, output.pending)
-	if len(commands) != 2 || commands[0].Opcode != protocol.DisplayOpcodeSetWritePosition || commands[1].Opcode != protocol.DisplayOpcodeWriteTextUTF8Default || string(commands[1].Text) != "abcdefgh" {
-		t.Fatalf("commands = %#v", commands)
-	}
-}
-
-func TestDisplayCompilerStreamsBoundedCompatibleText(t *testing.T) {
-	word := func(r rune) cellWord {
-		value, _ := makeScalarCellWord(r, 1, 0)
-		return value
-	}
-	const (
-		cols = 1024
-		rows = 12
-	)
-	row := make([]cellWord, cols)
-	for column := range row {
-		row[column] = word(rune('a' + column%26))
-	}
-	var wire countingBuffer
-	output := newRenderOutput(&wire)
-	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, nil, cols)
-	for rowIndex := 0; rowIndex < rows; rowIndex++ {
-		if err := compiler.writeCells(rowIndex, 0, row); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := compiler.finish(); err != nil {
-		t.Fatal(err)
-	}
-	if err := output.present(); err != nil {
-		t.Fatal(err)
-	}
-	if wire.writes < 2 {
-		t.Fatalf("physical writes = %d, want incremental streaming", wire.writes)
-	}
-	if wire.maxWrite > renderStreamChunkSize {
-		t.Fatalf("largest write = %d, want at most %d", wire.maxWrite, renderStreamChunkSize)
-	}
-	commands := decodePendingCommands(t, wire.Bytes())
-	if got := countOpcode(commandOpcodes(commands), protocol.DisplayOpcodeSetWritePosition); got != 1 {
-		t.Fatalf("position commands = %d, want 1", got)
-	}
-	if got := countOpcode(commandOpcodes(commands), protocol.DisplayOpcodeWriteTextUTF8Default); got < 2 {
-		t.Fatalf("text commands = %d, want split commands", got)
-	}
-	textBytes := 0
-	for _, command := range commands {
-		if command.Opcode == protocol.DisplayOpcodeWriteTextUTF8Default {
-			textBytes += len(command.Text)
-		}
-	}
-	if textBytes != cols*rows {
-		t.Fatalf("text bytes = %d, want %d", textBytes, cols*rows)
-	}
-	if len(output.pending) != 0 || cap(output.pending) > maxRetainedRenderBuffer {
-		t.Fatalf("reusable buffer len=%d cap=%d", len(output.pending), cap(output.pending))
-	}
-}
-
-func TestDisplayCompilerMergesFillAcrossRows(t *testing.T) {
-	output := newRenderOutput()
-	compiler := newDisplayCompiler(output, displayStyleMap{0: protocol.CanonicalDefaultStyle()}, nil, 4)
-	row := []cellWord{0, 0, 0, 0}
-	if err := compiler.writeCells(0, 0, row); err != nil {
-		t.Fatal(err)
-	}
-	if err := compiler.writeCells(1, 0, row); err != nil {
-		t.Fatal(err)
-	}
-	if err := compiler.finish(); err != nil {
-		t.Fatal(err)
-	}
-	commands := decodePendingCommands(t, output.pending)
-	if len(commands) != 3 || commands[2].Opcode != protocol.DisplayOpcodeFill || commands[2].Fill.Columns != 8 {
-		t.Fatalf("commands = %#v", commands)
-	}
-}
-
-func TestRenderOutputPublishesOnePhysicalBatchAtPresent(t *testing.T) {
-	var wire countingBuffer
-	output := newRenderOutput(&wire)
-	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeSetWritePosition, Row: 0, Column: 0}); err != nil {
-		t.Fatal(err)
-	}
-	if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeWriteTextUTF8, Text: []byte("x")}); err != nil {
-		t.Fatal(err)
-	}
-	if err := output.present(); err != nil {
-		t.Fatal(err)
-	}
-	batch := wire.Bytes()
-	if len(batch) == 0 || batch[len(batch)-1] != byte(protocol.DisplayOpcodePresent) {
-		t.Fatalf("batch=% x", batch)
-	}
-	if wire.writes != 1 {
-		t.Fatalf("physical writes = %d, want 1", wire.writes)
-	}
-}
-
-func TestRenderOutputRetainsOnlyBoundedScratchBuffer(t *testing.T) {
-	output := newRenderOutput(io.Discard)
-	if err := output.present(); err != nil {
-		t.Fatal(err)
-	}
-	if len(output.pending) != 0 || cap(output.pending) == 0 || cap(output.pending) > maxRetainedRenderBuffer {
-		t.Fatalf("small render buffer len=%d cap=%d", len(output.pending), cap(output.pending))
-	}
-
-	output.pending = make([]byte, maxRetainedRenderBuffer+1)
-	if err := output.commit(); err != nil {
-		t.Fatal(err)
-	}
-	if output.pending != nil {
-		t.Fatalf("oversized render buffer was retained with cap=%d", cap(output.pending))
-	}
-}
-
-func TestPaneOutputRateLimiterAllowsBurstThenLimitsSustainedOutput(t *testing.T) {
-	start := time.Unix(1, 0)
-	limiter := newPaneOutputRateLimiter(start)
-	if delay := limiter.reserve(start, paneOutputBurstBytes); delay != 0 {
-		t.Fatalf("initial burst delay = %v, want 0", delay)
-	}
-	halfSecondBytes := paneOutputBytesPerSecond / 2
-	if delay := limiter.reserve(start, halfSecondBytes); delay != 500*time.Millisecond {
-		t.Fatalf("first sustained delay = %v, want 500ms", delay)
-	}
-	if delay := limiter.reserve(start.Add(500*time.Millisecond), halfSecondBytes); delay != 500*time.Millisecond {
-		t.Fatalf("second sustained delay = %v, want 500ms", delay)
-	}
-	if delay := limiter.reserve(start.Add(1500*time.Millisecond), paneOutputBurstBytes); delay != 0 {
-		t.Fatalf("refilled burst delay = %v, want 0", delay)
-	}
-}
-
-type countingBuffer struct {
-	bytes.Buffer
-	writes   int
-	maxWrite int
 }
 
 type renderBatchWriter struct {
@@ -336,7 +142,7 @@ func (w *renderBatchWriter) snapshotBatches() [][]byte {
 	return append([][]byte(nil), w.batches...)
 }
 
-func TestFixedLeaseBufferPresentsLargeRedrawInBoundedBatches(t *testing.T) {
+func TestConfirmerWritesLargeRedrawAsOneCompleteFrame(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(int(protocol.MaxGridCols), 64)}
 	for row := 0; row < pane.terminal.Rows; row++ {
 		cells := pane.terminal.gridRow(row)
@@ -344,39 +150,41 @@ func TestFixedLeaseBufferPresentsLargeRedrawInBoundedBatches(t *testing.T) {
 			pane.terminal.replaceTextCell(cells, column, string(rune('a'+column%26)), 1, 0)
 		}
 	}
-	ptyOutput := startTestPaneLoop(pane)
-	defer close(ptyOutput)
+	shutdown := startTestPaneLoop(pane)
+	defer close(shutdown)
 
 	wire := &renderBatchWriter{}
 	if err := pane.installOutputLease(testOutputLease(0, wire), 1, uint16(pane.terminal.Cols), uint16(pane.terminal.Rows)); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, pane)
-	if len(wire.batches) < 2 {
-		t.Fatalf("large redraw used %d batch, want progressive presentation", len(wire.batches))
+	batches := wire.snapshotBatches()
+	if len(batches) != 1 {
+		t.Fatalf("large redraw used %d physical writes, want one complete-frame write", len(batches))
+	}
+	if len(batches[0]) <= 8<<10 {
+		t.Fatalf("large redraw frame has %d bytes, want substantially more than 8 KiB", len(batches[0]))
+	}
+	commands := decodePendingCommands(t, batches[0])
+	if got := countOpcode(commandOpcodes(commands), protocol.DisplayOpcodePresent); got != 1 {
+		t.Fatalf("PRESENT commands = %d, want exactly one semantic commit", got)
+	}
+	if commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
+		t.Fatalf("final command = %#v, want PRESENT", commands[len(commands)-1])
 	}
 	renderedCells := 0
-	for index, batch := range wire.batches {
-		if len(batch) > paneRenderBufferCapacity {
-			t.Fatalf("batch %d has %d bytes, capacity %d", index, len(batch), paneRenderBufferCapacity)
-		}
-		commands := decodePendingCommands(t, batch)
-		if len(commands) == 0 || commands[len(commands)-1].Opcode != protocol.DisplayOpcodePresent {
-			t.Fatalf("batch %d is not PRESENT-terminated: %#v", index, commands)
-		}
-		for _, command := range commands {
-			switch command.Opcode {
-			case protocol.DisplayOpcodeWriteText, protocol.DisplayOpcodeWriteTextUTF8, protocol.DisplayOpcodeWriteTextUTF8Default:
-				width := int(command.Width)
-				if command.Opcode != protocol.DisplayOpcodeWriteText {
-					width = 1
-				}
-				renderedCells += utf8.RuneCount(command.Text) * width
-			case protocol.DisplayOpcodeWriteCluster:
-				renderedCells += int(command.Width)
-			case protocol.DisplayOpcodeFill:
-				renderedCells += command.Fill.Columns
+	for _, command := range commands {
+		switch command.Opcode {
+		case protocol.DisplayOpcodeWriteText, protocol.DisplayOpcodeWriteTextUTF8, protocol.DisplayOpcodeWriteTextUTF8Default:
+			width := int(command.Width)
+			if command.Opcode != protocol.DisplayOpcodeWriteText {
+				width = 1
 			}
+			renderedCells += utf8.RuneCount(command.Text) * width
+		case protocol.DisplayOpcodeWriteCluster:
+			renderedCells += int(command.Width)
+		case protocol.DisplayOpcodeFill:
+			renderedCells += command.Fill.Columns
 		}
 	}
 	if want := pane.terminal.Cols * pane.terminal.Rows; renderedCells != want {
@@ -384,76 +192,22 @@ func TestFixedLeaseBufferPresentsLargeRedrawInBoundedBatches(t *testing.T) {
 	}
 }
 
-func (b *countingBuffer) Write(data []byte) (int, error) {
-	b.writes++
-	b.maxWrite = max(b.maxWrite, len(data))
-	return b.Buffer.Write(data)
-}
-
 func testOutputLease(slot int, stream io.Writer) *OutputLease {
 	return &OutputLease{Slot: slot, Stream: stream}
 }
 
-func attachTestOutputWithRefresh(pane *Pane, lease *OutputLease, refresh func(*renderOutput) error) error {
-	installation := &paneOutputInstall{
-		Lease: lease, Cols: uint16(pane.terminal.Cols), Rows: uint16(pane.terminal.Rows), Refresh: refresh,
-	}
-	if pane.commands == nil {
-		if refresh == nil {
-			return nil
-		}
-		return refresh(newRenderOutput(lease.Stream))
-	}
-	select {
-	case pane.commands <- paneCommand{install: installation, done: make(chan error, 1)}:
-		return nil
-	case <-pane.mainDone:
-		return nil
-	case <-pane.done:
-		return nil
-	}
+func attachTestOutput(pane *Pane, lease *OutputLease) error {
+	return pane.installOutputLease(lease, 0, uint16(pane.terminal.Cols), uint16(pane.terminal.Rows))
 }
 
-func applyTestRender(pane *Pane, render func(*renderOutput) error) error {
+func republishTestPane(pane *Pane) error {
 	if pane.commands == nil {
 		return nil
 	}
-	return pane.sendRenderCommand(paneCommand{apply: render})
-}
-
-func emitTestTerminalUpdate(output *renderOutput, pane *Pane, update Update) error {
-	if update.FullRedraw {
-		return sendFullRender(output, pane)
-	}
-	if !update.HasDamage() && !update.CursorChanged && !update.VisibleChange && update.ScrollRegion == nil {
-		return nil
-	}
-	if update.ScrollRegion != nil {
-		region := protocol.ScrollRegion{Top: update.ScrollRegion.Top, Bottom: update.ScrollRegion.Bottom, Delta: update.ScrollRegion.Delta}
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeScrollRegion, ScrollRegion: region}); err != nil {
-			return err
-		}
-	}
-	compiler := newLiveDisplayCompiler(output, pane.terminal)
-	for row := 0; row < pane.terminal.Rows; row++ {
-		span := update.DirtySpans[row]
-		if span.End == 0 {
-			continue
-		}
-		cells := pane.terminal.gridRow(row)[span.Start:span.End]
-		if err := compiler.writeCells(row, span.Start, cells); err != nil {
-			return err
-		}
-	}
-	if err := compiler.finish(); err != nil {
+	if err := pane.sendRenderCommand(paneCommand{republish: true}); err != nil {
 		return err
 	}
-	if update.CursorChanged || update.VisibleChange {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeCursorUpdate, Cursor: protocol.CursorUpdate{Cursor: protocol.Cursor{X: pane.terminal.CursorX, Y: pane.terminal.CursorY}, Visible: pane.terminal.CursorVisible}}); err != nil {
-			return err
-		}
-	}
-	return output.present()
+	return pane.syncOutput()
 }
 
 func resizeTestSessionWindow(state *SessionState, windowID uint64, cols, rows uint16) error {
@@ -555,12 +309,7 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 
 	var first, second bytes.Buffer
 	firstLease := testOutputLease(0, &first)
-	if err := attachTestOutputWithRefresh(pane, firstLease, func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 1, GridCols: 80, GridRows: 24}); err != nil {
-			return err
-		}
-		return output.present()
-	}); err != nil {
+	if err := attachTestOutput(pane, firstLease); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, pane)
@@ -579,21 +328,14 @@ func TestPaneRendererOwnsAndSwapsOutputStream(t *testing.T) {
 		t.Fatal("pane retained the released stream")
 	}
 	firstSize := first.Len()
-	if err := applyTestRender(pane, func(output *renderOutput) error {
-		return output.present()
-	}); err != nil {
+	if err := republishTestPane(pane); err != nil {
 		t.Fatal(err)
 	}
 	if first.Len() != firstSize {
 		t.Fatal("detached stream received output")
 	}
 
-	if err := attachTestOutputWithRefresh(pane, testOutputLease(0, &second), func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodeStartRender, LayoutRevision: 2, GridCols: 80, GridRows: 24}); err != nil {
-			return err
-		}
-		return output.present()
-	}); err != nil {
+	if err := attachTestOutput(pane, testOutputLease(0, &second)); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, pane)
@@ -609,21 +351,16 @@ func TestOldStreamCleanupDoesNotDetachReplacement(t *testing.T) {
 
 	var oldStream, replacement bytes.Buffer
 	oldLease := testOutputLease(0, &oldStream)
-	if err := attachTestOutputWithRefresh(pane, oldLease, nil); err != nil {
+	if err := attachTestOutput(pane, oldLease); err != nil {
 		t.Fatal(err)
 	}
-	if err := attachTestOutputWithRefresh(pane, testOutputLease(0, &replacement), nil); err != nil {
+	if err := attachTestOutput(pane, testOutputLease(0, &replacement)); err != nil {
 		t.Fatal(err)
 	}
 	if err := pane.detachOutputLease(oldLease); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyTestRender(pane, func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
-			return err
-		}
-		return output.commit()
-	}); err != nil {
+	if err := republishTestPane(pane); err != nil {
 		t.Fatal(err)
 	}
 	if replacement.Len() == 0 {
@@ -661,12 +398,7 @@ func TestInstallOutputLeaseAtomicallyReplacesAttachedGrid(t *testing.T) {
 	if len(replacementWire.takeBatches()) == 0 {
 		t.Fatal("replacement output did not receive its initial snapshot")
 	}
-	if err := applyTestRender(pane, func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
-			return err
-		}
-		return output.commit()
-	}); err != nil {
+	if err := republishTestPane(pane); err != nil {
 		t.Fatal(err)
 	}
 	if len(replacementWire.takeBatches()) == 0 {
@@ -680,23 +412,13 @@ func TestPaneRendererCanAttachReplacementAfterWriteFailure(t *testing.T) {
 	defer close(output)
 
 	writeErr := errors.New("stream closed")
-	if err := attachTestOutputWithRefresh(pane, testOutputLease(0, errorWriter{err: writeErr}), func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
-			return err
-		}
-		return output.commit()
-	}); err != nil {
+	if err := attachTestOutput(pane, testOutputLease(0, errorWriter{err: writeErr})); err != nil {
 		t.Fatal(err)
 	}
-	syncPaneRenderer(t, pane)
+	_ = pane.syncOutput()
 
 	var replacement bytes.Buffer
-	if err := attachTestOutputWithRefresh(pane, testOutputLease(0, &replacement), func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
-			return err
-		}
-		return output.commit()
-	}); err != nil {
+	if err := attachTestOutput(pane, testOutputLease(0, &replacement)); err != nil {
 		t.Fatal(err)
 	}
 	syncPaneRenderer(t, pane)
@@ -928,12 +650,7 @@ func TestReturningToSplitWindowKeepsFirstPaneAttached(t *testing.T) {
 	syncPaneRenderer(t, second)
 
 	before := slot0.Len()
-	if err := applyTestRender(first, func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
-			return err
-		}
-		return output.commit()
-	}); err != nil {
+	if err := republishTestPane(first); err != nil {
 		t.Fatal(err)
 	}
 	if slot0.Len() <= before {
@@ -1436,12 +1153,7 @@ func TestClosingSplitPaneDoesNotLetDuplicateProcessExitDetachRemainingPane(t *te
 	syncPaneRenderer(t, first)
 
 	before := slot0.Len()
-	if err := applyTestRender(first, func(output *renderOutput) error {
-		if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
-			return err
-		}
-		return output.commit()
-	}); err != nil {
+	if err := republishTestPane(first); err != nil {
 		t.Fatal(err)
 	}
 	if slot0.Len() <= before {
@@ -1895,12 +1607,10 @@ func TestDaemonPostedPaneExitCannotDetachNewerFallbackProjection(t *testing.T) {
 	}
 
 	lease := testOutputLease(0, &bytes.Buffer{})
-	if err := attachTestOutputWithRefresh(first, lease, nil); err != nil {
+	if err := attachTestOutput(first, lease); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyTestRender(first, func(*renderOutput) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
+	syncPaneRenderer(t, first)
 	client.Output[0] = lease
 	firstPlacement := protocol.PanePlacement{PaneID: first.ID, Slot: 0}
 	client.currentView.Layout.Panes = []protocol.PanePlacement{firstPlacement}
@@ -1938,15 +1648,70 @@ func TestDaemonPostedPaneExitCannotDetachNewerFallbackProjection(t *testing.T) {
 	}
 }
 
-func startTestPaneRenderer(id uint64, cols, rows int) (*Pane, chan []byte) {
+type testPaneDrainRuntime struct {
+	pane      *Pane
+	reader    *queuedPTYReader
+	relayDone chan struct{}
+}
+
+var testPaneDrainRuntimes sync.Map
+
+func (r *testPaneDrainRuntime) enqueue(data string) {
+	r.reader.enqueue([]byte(data))
+}
+
+func startTestPaneRenderer(id uint64, cols, rows int) (*Pane, chan struct{}) {
 	pane := &Pane{ID: id, terminal: newTerminal(cols, rows)}
 	return pane, startTestPaneLoop(pane)
 }
 
-func startTestPaneLoop(pane *Pane) chan []byte {
+func startTestPaneLoop(pane *Pane) chan struct{} {
 	pane.initializeRuntime()
+	runtime := &testPaneDrainRuntime{
+		pane: pane, reader: &queuedPTYReader{}, relayDone: make(chan struct{}),
+	}
+	testPaneDrainRuntimes.Store(pane, runtime)
+	go func() {
+		relayPTYOutputFrom(runtime.pane, runtime.reader)
+		close(runtime.relayDone)
+	}()
 	go pane.run()
-	return pane.ptyOutput
+	shutdown := make(chan struct{})
+	go func() {
+		<-shutdown
+		pane.stop()
+		testPaneDrainRuntimes.Delete(pane)
+		<-runtime.relayDone
+	}()
+	return shutdown
+}
+
+func queueTestPTYOutput(t *testing.T, pane *Pane, data string) uint64 {
+	t.Helper()
+	value, ok := testPaneDrainRuntimes.Load(pane)
+	if !ok {
+		t.Fatal("pane has no test PTY drain runtime")
+	}
+	before := pane.renderMetricsSnapshot().PTYBytes
+	value.(*testPaneDrainRuntime).enqueue(data)
+	return before + uint64(len(data))
+}
+
+func sendTestPTYOutput(t *testing.T, pane *Pane, data string) {
+	t.Helper()
+	want := queueTestPTYOutput(t, pane, data)
+	waitTestPTYBytes(t, pane, want)
+}
+
+func waitTestPTYBytes(t *testing.T, pane *Pane, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for pane.renderMetricsSnapshot().PTYBytes < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("pane PTY bytes = %d, want at least %d", pane.renderMetricsSnapshot().PTYBytes, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func assertPaneInputStream(t *testing.T, inputs <-chan []byte, want string) {
@@ -1992,12 +1757,7 @@ func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
 	stream := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
 	attached := make(chan error, 1)
 	go func() {
-		attached <- attachTestOutputWithRefresh(pane, testOutputLease(0, stream), func(output *renderOutput) error {
-			if err := output.append(protocol.DisplayCommand{Opcode: protocol.DisplayOpcodePresent}); err != nil {
-				return err
-			}
-			return output.commit()
-		})
+		attached <- attachTestOutput(pane, testOutputLease(0, stream))
 	}()
 	select {
 	case <-stream.started:
@@ -2012,9 +1772,7 @@ func TestPaneAttachmentDoesNotWaitForSnapshotWrite(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("attach waited for the snapshot write")
 	}
-	ptyBytes := takePTYReadBuffer()
-	n := copy(ptyBytes, "still-live")
-	output <- ptyBytes[:n]
+	sendTestPTYOutput(t, pane, "still-live")
 	captured := make(chan []byte, 1)
 	go func() {
 		data, _ := pane.capturePane(capturePaneOptions{})
@@ -2093,352 +1851,13 @@ type errorWriter struct {
 
 func syncPaneRenderer(t *testing.T, pane *Pane) {
 	t.Helper()
-	if err := applyTestRender(pane, func(*renderOutput) error { return nil }); err != nil {
+	if err := pane.syncOutput(); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func (w errorWriter) Write([]byte) (int, error) {
 	return 0, w.err
-}
-
-func TestDisplayCompilerDefaultOverrideDoesNotLatchStyle(t *testing.T) {
-	output := newRenderOutput()
-	styles := map[uint32]protocol.Style{0: {}, 2: {Bold: true}}
-	compiler := newTestDisplayCompiler(output, styles)
-	cells := append(textCells("bold", 2), textCells(" default", 0)...)
-	cells = append(cells, textCells("bold", 2)...)
-	if err := compiler.writeCells(0, 0, cells); err != nil {
-		t.Fatal(err)
-	}
-	commands := decodePendingCommands(t, output.pending)
-	var opcodes []protocol.DisplayOpcode
-	for _, command := range commands {
-		opcodes = append(opcodes, command.Opcode)
-	}
-	if !containsOpcode(opcodes, protocol.DisplayOpcodeWriteTextUTF8Default) || countOpcode(opcodes, protocol.DisplayOpcodeSetWriteStyle) != 1 {
-		t.Fatalf("opcodes=%v", opcodes)
-	}
-}
-
-func TestDisplayCompilerKeepsWidthTwoFallback(t *testing.T) {
-	output := newRenderOutput()
-	cells := []decodedTestCell{{Cluster: "界", Width: 2, StyleID: 0}, {Width: 0}}
-	if err := newTestDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
-		t.Fatal(err)
-	}
-	commands := decodePendingCommands(t, output.pending)
-	if len(commands) == 0 || commands[len(commands)-1].Opcode != protocol.DisplayOpcodeWriteText || commands[len(commands)-1].Width != 2 {
-		t.Fatalf("commands=%#v", commands)
-	}
-}
-
-func TestDisplayCompilerWritesMultiRuneClusterAtomically(t *testing.T) {
-	output := newRenderOutput()
-	cells := []decodedTestCell{{Cluster: "👩‍💻", Width: 2}, {Width: 0}, {Cluster: "X", Width: 1}}
-	if err := newTestDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
-		t.Fatal(err)
-	}
-	commands := decodePendingCommands(t, output.pending)
-	var cluster *protocol.DisplayCommand
-	for i := range commands {
-		if commands[i].Opcode == protocol.DisplayOpcodeWriteCluster {
-			cluster = &commands[i]
-			break
-		}
-	}
-	if cluster == nil || string(cluster.Text) != "👩‍💻" || cluster.Width != 2 {
-		t.Fatalf("commands=%#v", commands)
-	}
-	for _, command := range commands {
-		if command.Opcode == protocol.DisplayOpcodeSetWritePosition && command.Column == 2 {
-			t.Fatal("compiler unnecessarily repositioned after atomic cluster")
-		}
-	}
-}
-
-func TestDisplayCompilerPreservesRepresentativeInternationalClusters(t *testing.T) {
-	tests := []struct {
-		name    string
-		cluster string
-		width   uint8
-	}{
-		{name: "hebrew points", cluster: "שָׁ", width: 1},
-		{name: "tamil vowel sign", cluster: "நி", width: 1},
-		{name: "devanagari conjunct", cluster: "क्ष", width: 2},
-		{name: "cjk variation selector", cluster: "葛\U000e0100", width: 2},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			output := newRenderOutput()
-			cells := []decodedTestCell{{Cluster: tt.cluster, Width: tt.width}}
-			if tt.width == 2 {
-				cells = append(cells, decodedTestCell{Width: 0})
-			}
-			cells = append(cells, decodedTestCell{Cluster: "X", Width: 1})
-			if err := newTestDisplayCompiler(output, map[uint32]protocol.Style{0: {}}).writeCells(0, 0, cells); err != nil {
-				t.Fatal(err)
-			}
-			commands := decodePendingCommands(t, output.pending)
-			var clusterCommands []protocol.DisplayCommand
-			for _, command := range commands {
-				if command.Opcode == protocol.DisplayOpcodeWriteCluster {
-					clusterCommands = append(clusterCommands, command)
-				}
-			}
-			if len(clusterCommands) != 1 || string(clusterCommands[0].Text) != tt.cluster || clusterCommands[0].Width != tt.width {
-				t.Fatalf("cluster commands = %#v", clusterCommands)
-			}
-		})
-	}
-}
-
-func TestCompilerBridgesVisuallyEquivalentBlankStyles(t *testing.T) {
-	styles := compilerBenchmarkStyles()
-	cells := append(textCells("Desktop", 2), textCells("    ", 0)...)
-	cells = append(cells, textCells("Downloads", 2)...)
-	output := newRenderOutput()
-	if err := newTestDisplayCompiler(output, styles).writeCells(0, 0, cells); err != nil {
-		t.Fatal(err)
-	}
-	commands := decodePendingCommands(t, output.pending)
-	texts := 0
-	for _, command := range commands {
-		if command.Opcode == protocol.DisplayOpcodeWriteTextUTF8 {
-			texts++
-			if string(command.Text) != "Desktop    Downloads" {
-				t.Fatalf("text=%q", command.Text)
-			}
-		}
-	}
-	if texts != 1 {
-		t.Fatalf("text commands=%d, want 1", texts)
-	}
-}
-
-func TestDisplayCompilerPreservesVisibleBackgroundBoundary(t *testing.T) {
-	styles := map[uint32]protocol.Style{1: {BG: protocol.Color{Mode: "indexed", Index: 4}}, 2: {BG: protocol.Color{Mode: "indexed", Index: 1}}}
-	cells := append(textCells("blue", 1), textCells("   ", 2)...)
-	cells = append(cells, textCells("panel", 1)...)
-	output := newRenderOutput()
-	if err := newTestDisplayCompiler(output, styles).writeCells(0, 0, cells); err != nil {
-		t.Fatal(err)
-	}
-	commands := decodePendingCommands(t, output.pending)
-	if countOpcode(commandOpcodes(commands), protocol.DisplayOpcodeWriteTextUTF8) != 2 || countOpcode(commandOpcodes(commands), protocol.DisplayOpcodeFill) != 1 {
-		t.Fatalf("commands=%#v", commands)
-	}
-}
-
-func TestStyleInstallIsCachedUntilRelayout(t *testing.T) {
-	output := newRenderOutput()
-	style := protocol.Style{Bold: true}
-	if err := installStyle(output, 7, style); err != nil {
-		t.Fatal(err)
-	}
-	if err := installStyle(output, 7, style); err != nil {
-		t.Fatal(err)
-	}
-	if got := countOpcode(commandOpcodes(decodePendingCommands(t, output.pending)), protocol.DisplayOpcodeStyleInstall); got != 1 {
-		t.Fatalf("style commands=%d", got)
-	}
-	output.installedStyles = make(map[uint32]protocol.Style)
-	if err := installStyle(output, 7, style); err != nil {
-		t.Fatal(err)
-	}
-	if got := countOpcode(commandOpcodes(decodePendingCommands(t, output.pending)), protocol.DisplayOpcodeStyleInstall); got != 2 {
-		t.Fatalf("style commands after reset=%d", got)
-	}
-}
-
-func TestStyleZeroMustBeCanonicalDefault(t *testing.T) {
-	output := newRenderOutput()
-	if err := installStyle(output, protocol.CanonicalDefaultStyleID, protocol.Style{Bold: true}); err == nil {
-		t.Fatal("accepted noncanonical style 0")
-	}
-	if len(output.pending) != 0 {
-		t.Fatalf("invalid style changed pending bytes: %x", output.pending)
-	}
-}
-
-func TestColoredEraseInstallsReferencedStyle(t *testing.T) {
-	session := NewSessionState(0)
-	client := newTestClient(session)
-	client.setTestTerminalSize(8, 3)
-	pane := &Pane{ID: testAddPaneID(session), terminal: newTerminal(8, 3)}
-	createTestWindow(session, pane)
-	output := newRenderOutput()
-	update := pane.terminal.Apply([]byte("\x1b[44m\x1b[2K"))
-	if err := emitTestTerminalUpdate(output, pane, update); err != nil {
-		t.Fatal(err)
-	}
-	installed := map[uint32]bool{}
-	for _, command := range decodePendingCommands(t, output.pending) {
-		switch command.Opcode {
-		case protocol.DisplayOpcodeStyleInstall:
-			installed[command.StyleID] = true
-		case protocol.DisplayOpcodeSetWriteStyle:
-			if !installed[command.StyleID] {
-				t.Fatalf("style %d selected before installation", command.StyleID)
-			}
-		}
-	}
-}
-
-func TestBottomEdgeOutputEmitsScrollBeforeNewRow(t *testing.T) {
-	session := NewSessionState(0)
-	client := newTestClient(session)
-	client.setTestTerminalSize(3, 3)
-	pane := &Pane{ID: testAddPaneID(session), terminal: newTerminal(3, 2)}
-	createTestWindow(session, pane)
-	pane.terminal.Apply([]byte("aaa\r\nbbb"))
-	update := pane.terminal.Apply([]byte("\r\nccc"))
-
-	var wire bytes.Buffer
-	if err := emitTestTerminalUpdate(newRenderOutput(&wire), pane, update); err != nil {
-		t.Fatal(err)
-	}
-	commands := decodePendingCommands(t, wire.Bytes())
-	if len(commands) == 0 || commands[0].Opcode != protocol.DisplayOpcodeScrollRegion ||
-		commands[0].ScrollRegion != (protocol.ScrollRegion{Top: 0, Bottom: 2, Delta: -1}) {
-		t.Fatalf("first command = %#v, want scroll -1", commands)
-	}
-	positions := 0
-	for _, command := range commands {
-		if command.Opcode != protocol.DisplayOpcodeSetWritePosition {
-			continue
-		}
-		positions++
-		if command.Row != 1 {
-			t.Fatalf("write position row = %d, want only bottom row 1", command.Row)
-		}
-	}
-	if positions != 1 {
-		t.Fatalf("write positions = %d, want one bottom-row write", positions)
-	}
-}
-
-func TestVimStyleMarginScrollEmitsOnlyExposedRow(t *testing.T) {
-	session := NewSessionState(0)
-	client := newTestClient(session)
-	client.setTestTerminalSize(4, 21)
-	pane := &Pane{ID: testAddPaneID(session), terminal: newTerminal(4, 20)}
-	createTestWindow(session, pane)
-
-	var initial bytes.Buffer
-	for row := 0; row < 20; row++ {
-		initial.WriteString("\x1b[")
-		initial.WriteString(itoa(row + 1))
-		initial.WriteString(";1H")
-		initial.WriteByte(byte('A' + row))
-	}
-	pane.terminal.Apply(initial.Bytes())
-	statusBefore := rowString(pane.terminal, 19, 4)
-	pane.terminal.Apply([]byte("\x1b[1;19r\x1b[19;1H"))
-	update := pane.terminal.Apply([]byte("\nNEW"))
-	if update.FullRedraw || update.ScrollRegion == nil || *update.ScrollRegion != (ScrollRegion{Top: 0, Bottom: 19, Delta: -1}) {
-		t.Fatalf("margin scroll update = %#v", update)
-	}
-	if got := rowString(pane.terminal, 19, 4); got != statusBefore {
-		t.Fatalf("status row = %q, want unchanged %q", got, statusBefore)
-	}
-
-	var wire bytes.Buffer
-	if err := emitTestTerminalUpdate(newRenderOutput(&wire), pane, update); err != nil {
-		t.Fatal(err)
-	}
-	commands := decodePendingCommands(t, wire.Bytes())
-	scrolls, positions := 0, 0
-	for _, command := range commands {
-		switch command.Opcode {
-		case protocol.DisplayOpcodeScrollRegion:
-			scrolls++
-			if command.ScrollRegion != (protocol.ScrollRegion{Top: 0, Bottom: 19, Delta: -1}) {
-				t.Fatalf("scroll command = %#v", command.ScrollRegion)
-			}
-		case protocol.DisplayOpcodeSetWritePosition:
-			positions++
-			if command.Row != 18 {
-				t.Fatalf("ordinary write targeted row %d, want only exposed row 18", command.Row)
-			}
-		}
-	}
-	if scrolls != 1 || positions != 1 {
-		t.Fatalf("commands contain %d scrolls and %d write positions: %#v", scrolls, positions, commands)
-	}
-}
-
-func TestChineseTerminalOutputUsesWidthTwoDisplayCommand(t *testing.T) {
-	session := NewSessionState(0)
-	client := newTestClient(session)
-	client.setTestTerminalSize(8, 2)
-	pane := &Pane{ID: testAddPaneID(session), terminal: newTerminal(8, 1)}
-	createTestWindow(session, pane)
-	update := pane.terminal.Apply([]byte("界"))
-
-	var wire bytes.Buffer
-	if err := emitTestTerminalUpdate(newRenderOutput(&wire), pane, update); err != nil {
-		t.Fatal(err)
-	}
-	for _, command := range decodePendingCommands(t, wire.Bytes()) {
-		if command.Opcode == protocol.DisplayOpcodeWriteText && command.Width == 2 && string(command.Text) == "界" {
-			return
-		}
-	}
-	t.Fatalf("display commands did not contain width-two Chinese output: %#v", decodePendingCommands(t, wire.Bytes()))
-}
-
-func TestDisplayWireMeasurement(t *testing.T) {
-	rows := compilerBenchmarkRows()
-	output := newRenderOutput()
-	compiler := newTestDisplayCompiler(output, compilerBenchmarkStyles())
-	for row, cells := range rows {
-		if err := compiler.writeCells(row, 0, cells); err != nil {
-			t.Fatal(err)
-		}
-	}
-	actual := append(append([]byte(nil), output.pending...), byte(protocol.DisplayOpcodePresent))
-	conceptual := conceptualFramedDisplaySize(t, actual)
-	t.Logf("TUI-like batch commands=%d before_framed=%d after_display=%d savings=%d", len(decodePendingCommands(t, output.pending)), conceptual, len(actual), conceptual-len(actual))
-}
-
-func BenchmarkPaneOutputHotPath(b *testing.B) {
-	pane := &Pane{terminal: newTerminal(80, 24)}
-	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
-	pane.terminal.Apply(bytes.Repeat([]byte{'w'}, 80*terminalRowCapacity))
-	output := newRenderOutput(io.Discard)
-	var update Update
-	update.Reset(pane.terminal.Rows)
-	pane.terminal.ApplyInto(chunk, &update)
-	if err := emitTestTerminalUpdate(output, pane, update); err != nil {
-		b.Fatal(err)
-	}
-	b.ReportAllocs()
-	b.SetBytes(int64(len(chunk)))
-	b.ResetTimer()
-	for range b.N {
-		update.Reset(pane.terminal.Rows)
-		pane.terminal.ApplyInto(chunk, &update)
-		if err := emitTestTerminalUpdate(output, pane, update); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkFullPaneRender(b *testing.B) {
-	pane := &Pane{terminal: newTerminal(80, 24)}
-	pane.terminal.Apply(bytes.Repeat([]byte("styled \x1b[32mtext\x1b[0m "), 200))
-	output := newRenderOutput(io.Discard)
-	if err := sendFullRender(output, pane); err != nil {
-		b.Fatal(err)
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		if err := sendFullRender(output, pane); err != nil {
-			b.Fatal(err)
-		}
-	}
 }
 
 func decodePendingCommands(tb testing.TB, data []byte) []protocol.DisplayCommand {
@@ -2477,69 +1896,4 @@ func countOpcode(opcodes []protocol.DisplayOpcode, want protocol.DisplayOpcode) 
 		}
 	}
 	return count
-}
-
-func textCells(text string, styleID uint32) []decodedTestCell {
-	cells := make([]decodedTestCell, 0, len(text))
-	for _, r := range text {
-		cells = append(cells, decodedTestCell{Cluster: string(r), StyleID: styleID, Width: 1})
-	}
-	return cells
-}
-
-func compilerBenchmarkRows() [][]decodedTestCell {
-	rows := make([][]decodedTestCell, 39)
-	for row := range rows {
-		cells := make([]decodedTestCell, 120)
-		for col := range cells {
-			style := uint32(0)
-			r := ' '
-			if col >= 12 && col < 42 {
-				style = 2
-			}
-			if col >= 18 && col < 35 {
-				style = 3
-				r = rune('a' + col%26)
-			}
-			cells[col] = decodedTestCell{Cluster: string(r), StyleID: style, Width: 1}
-		}
-		rows[row] = cells
-	}
-	return rows
-}
-
-func compilerBenchmarkStyles() map[uint32]protocol.Style {
-	return map[uint32]protocol.Style{
-		0: {FG: protocol.Color{Mode: "default"}, BG: protocol.Color{Mode: "default"}},
-		2: {FG: protocol.Color{Mode: "indexed", Index: 4}, BG: protocol.Color{Mode: "default"}},
-		3: {FG: protocol.Color{Mode: "indexed", Index: 1}, BG: protocol.Color{Mode: "default"}},
-	}
-}
-
-func conceptualFramedDisplaySize(tb testing.TB, stream []byte) int {
-	tb.Helper()
-	decoder := protocol.NewDisplayDecoder(bytes.NewReader(stream))
-	total := 0
-	for {
-		command, wireBytes, err := decoder.ReadCommand()
-		if err != nil {
-			return total
-		}
-		payload := int(wireBytes) - 1
-		var scratch [10]byte
-		typeBytes := putUvarint(scratch[:], uint64(command.Opcode))
-		lengthBytes := putUvarint(scratch[:], uint64(payload))
-		total += typeBytes + lengthBytes + payload
-	}
-}
-
-func putUvarint(dst []byte, value uint64) int {
-	count := 0
-	for value >= 0x80 {
-		dst[count] = byte(value) | 0x80
-		value >>= 7
-		count++
-	}
-	dst[count] = byte(value)
-	return count + 1
 }

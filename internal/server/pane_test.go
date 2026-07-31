@@ -19,8 +19,7 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 	defer reader.Close()
 
 	pane := &Pane{ID: 1, PTY: writer, terminal: newTerminal(8, 3)}
-	pane.initializeRuntime()
-	go pane.run()
+	shutdown := startTestPaneLoop(pane)
 	writeFailed := make(chan error, 1)
 	go runPTYWriter(pane, func(err error) { writeFailed <- err })
 
@@ -29,9 +28,7 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	query := takePTYReadBuffer()
-	n := copy(query, "\x1b[?1h\x1b[6n")
-	pane.ptyOutput <- query[:n]
+	queueTestPTYOutput(t, pane, "\x1b[?1h\x1b[6n")
 
 	want := []byte("用户\x1b[1;1R")
 	got := make([]byte, len(want))
@@ -57,18 +54,16 @@ func TestPaneWriterSerializesNetworkInputAndDeviceReply(t *testing.T) {
 		t.Fatal("pane main loop did not publish application cursor mode")
 	}
 
-	close(pane.ptyOutput)
+	close(shutdown)
 	<-pane.mainDone
-	pane.stop()
 	<-pane.writerDone
 }
 
 func TestPaneForwardsApplicationOSC52ToAttachedFrontend(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
-	pane.initializeRuntime()
-	go pane.run()
+	shutdown := startTestPaneLoop(pane)
 	defer func() {
-		close(pane.ptyOutput)
+		close(shutdown)
 		<-pane.mainDone
 	}()
 
@@ -85,10 +80,8 @@ func TestPaneForwardsApplicationOSC52ToAttachedFrontend(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	output := takePTYReadBuffer()
 	const sequence = "\x1b]52;c;Y29weQ==\x1b\\"
-	n := copy(output, sequence)
-	pane.ptyOutput <- output[:n]
+	queueTestPTYOutput(t, pane, sequence)
 
 	select {
 	case got := <-writes:
@@ -146,20 +139,16 @@ func TestPaneStartupInputWaitsForInitialOutputToSettle(t *testing.T) {
 		terminal:     newTerminal(16, 3),
 		startupInput: []byte("vi mnt.sh"),
 	}
-	pane.initializeRuntime()
-	go pane.run()
+	shutdown := startTestPaneLoop(pane)
 	writeFailed := make(chan error, 1)
 	go runPTYWriter(pane, func(err error) { writeFailed <- err })
 	defer func() {
-		close(pane.ptyOutput)
+		close(shutdown)
 		<-pane.mainDone
-		pane.stop()
 		<-pane.writerDone
 	}()
 
-	prompt := takePTYReadBuffer()
-	n := copy(prompt, "user@host:~$ ")
-	pane.ptyOutput <- prompt[:n]
+	queueTestPTYOutput(t, pane, "user@host:~$ ")
 
 	got := make([]byte, len("vi mnt.sh"))
 	readDone := make(chan error, 1)
@@ -300,10 +289,9 @@ func TestResolveRootDirectoryDefaultsToHostUserHome(t *testing.T) {
 
 func TestPaneResizeRunsOnPaneMainLoop(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
-	pane.initializeRuntime()
-	go pane.run()
+	shutdown := startTestPaneLoop(pane)
 	defer func() {
-		close(pane.ptyOutput)
+		close(shutdown)
 		<-pane.mainDone
 	}()
 

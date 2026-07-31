@@ -11,9 +11,9 @@ import (
 
 func TestPaneHistoryModePublishesImmutableMetadataConcurrently(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(8, 3)}
-	ptyOutput := startTestPaneLoop(pane)
+	shutdown := startTestPaneLoop(pane)
 	defer func() {
-		close(ptyOutput)
+		close(shutdown)
 		<-pane.mainDone
 		pane.stop()
 	}()
@@ -146,13 +146,13 @@ func TestHistoryRenderStateCoalescesSameDirectionAndFallsBackSafely(t *testing.T
 	first := pane.handleHistoryInputNow([]byte("j"))
 	second := pane.handleHistoryInputNow([]byte("j"))
 
-	state := newPaneRenderState(pane)
+	state := newPanePublicationState(pane)
 	state.lease = &OutputLease{}
-	state.ensureRows()
+	state.ensureGeometry()
 	state.mergeViewMutation(first.Render)
 	state.mergeViewMutation(second.Render)
-	if state.scrollRegion == nil || *state.scrollRegion != (ScrollRegion{Top: 0, Bottom: 3, Delta: -2}) {
-		t.Fatalf("coalesced history scroll = %#v", state.scrollRegion)
+	if state.scroll == nil || *state.scroll != (ScrollRegion{Top: 0, Bottom: 3, Delta: -2}) {
+		t.Fatalf("coalesced history scroll = %#v", state.scroll)
 	}
 	if state.dirty[0] != (DirtySpan{}) ||
 		state.dirty[1] != (DirtySpan{Start: 0, End: 8}) ||
@@ -164,17 +164,8 @@ func TestHistoryRenderStateCoalescesSameDirectionAndFallsBackSafely(t *testing.T
 	opposing.reset(3)
 	opposing.ScrollRegion = &ScrollRegion{Top: 0, Bottom: 3, Delta: 1}
 	state.mergeViewMutation(opposing)
-	if state.scrollRegion != nil || state.dirtyRows != 3 {
+	if state.scroll != nil || state.dirtyRows != 3 {
 		t.Fatalf("opposing movement did not force full redraw: %#v", state)
-	}
-
-	state = newPaneRenderState(pane)
-	state.lease = &OutputLease{}
-	state.ensureRows()
-	state.progressive = true
-	state.mergeViewMutation(first.Render)
-	if state.scrollRegion != nil || state.progressive || state.dirtyRows != 3 {
-		t.Fatalf("progressive history movement did not force full redraw: %#v", state)
 	}
 }
 
@@ -380,16 +371,14 @@ func TestPanesRetainIndependentHistoryViews(t *testing.T) {
 func TestPaneOutputStreamRendersItsOwnedFrozenHistoryMode(t *testing.T) {
 	pane := &Pane{ID: 0, terminal: newTerminal(4, 2)}
 	setTestRows(pane.terminal, nil, []decodedTestRow{historyTestRow("live"), historyTestRow("end ")})
-	ptyOutput := startTestPaneLoop(pane)
+	shutdown := startTestPaneLoop(pane)
 	defer func() {
-		close(ptyOutput)
+		close(shutdown)
 		<-pane.mainDone
 		pane.stop()
 	}()
 	sendPTYOutput := func(data string) {
-		buffer := takePTYReadBuffer()
-		n := copy(buffer, data)
-		ptyOutput <- buffer[:n]
+		sendTestPTYOutput(t, pane, data)
 	}
 
 	var wire bytes.Buffer
@@ -472,9 +461,9 @@ func TestOneLineHistoryMovementEmitsScrollAndOnlyExposedContent(t *testing.T) {
 	)
 	pane.terminal.CursorX = 0
 	pane.terminal.CursorY = 0
-	ptyOutput := startTestPaneLoop(pane)
+	shutdown := startTestPaneLoop(pane)
 	defer func() {
-		close(ptyOutput)
+		close(shutdown)
 		<-pane.mainDone
 		pane.stop()
 	}()
@@ -518,7 +507,7 @@ func TestOneLineHistoryMovementEmitsScrollAndOnlyExposedContent(t *testing.T) {
 			if command.Row == 2 {
 				exposedPositions++
 			} else if command.Row != 0 {
-				t.Fatalf("incremental history repaint targeted row %d", command.Row)
+				t.Fatalf("incremental history repaint targeted row %d: %#v", command.Row, commands)
 			}
 		case protocol.DisplayOpcodeWriteTextUTF8:
 			counterFound = counterFound || string(command.Text) == "[1/4]"

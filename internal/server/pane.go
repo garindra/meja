@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/garindra/meja/internal/protocol"
@@ -34,7 +35,15 @@ type Pane struct {
 	terminationOnce        sync.Once
 	terminationRemaining   bool
 	metadata               atomic.Pointer[paneTerminalMetadata]
-	ptyOutput              chan []byte
+	ptyReadBuffers         [ptyReadBufferCount]ptyReadBuffer
+	ptyFree                chan []byte
+	ptyDrainRequests       chan ptyDrainRequest
+	ptyDrainEvents         chan ptyDrainEvent
+	ptyReaderDone          chan struct{}
+	ptyDrainNow            func() time.Time
+	ptyInteractive         chan struct{}
+	ptyPacingInterval      time.Duration
+	newTimer               func(time.Duration) *time.Timer
 	ptyInput               chan []byte
 	commands               chan paneCommand
 	mainDone               chan struct{}
@@ -48,6 +57,7 @@ type Pane struct {
 	startupInput           []byte
 	viewMode               paneViewMode
 	historyView            *paneHistoryView
+	renderMetrics          paneRenderMetrics
 
 	// Held exclusively by the pane main goroutine. A lease contains the actual
 	// QUIC stream. Same-client handoff returns it; a new connection atomically
@@ -58,6 +68,13 @@ type Pane struct {
 	// that owned the pane when the sequence began until its terminator arrives.
 	pendingOSC52FrontendWrite func([]byte) error
 	pendingOSC52Sequence      uint64
+}
+
+func (p *Pane) renderMetricsSnapshot() paneRenderMetricsSnapshot {
+	if p == nil {
+		return paneRenderMetricsSnapshot{}
+	}
+	return p.renderMetrics.snapshot()
 }
 
 // notifyProcessActivity is called directly by the PTY/input producers. The
@@ -92,14 +109,15 @@ type paneRequest struct {
 }
 
 type paneCommand struct {
-	install *paneOutputInstall
-	detach  *paneOutputDetach
-	release *paneOutputRelease
-	apply   func(*renderOutput) error
-	capture *paneCaptureRequest
-	resize  *paneResize
-	history *paneHistoryRequest
-	done    chan error
+	install   *paneOutputInstall
+	detach    *paneOutputDetach
+	release   *paneOutputRelease
+	capture   *paneCaptureRequest
+	resize    *paneResize
+	history   *paneHistoryRequest
+	sync      chan<- *OutputLease
+	republish bool
+	done      chan error
 }
 
 type paneOutputInstall struct {
@@ -107,7 +125,6 @@ type paneOutputInstall struct {
 	LayoutRevision protocol.ClientLayoutRevision
 	Cols           uint16
 	Rows           uint16
-	Refresh        func(*renderOutput) error
 }
 
 type paneOutputDetach struct {
@@ -211,12 +228,19 @@ func (p *Pane) initializeRuntime() {
 	if p.commands != nil {
 		return
 	}
-	p.ptyOutput = make(chan []byte, 16)
+	p.ptyFree = make(chan []byte, ptyReadBufferCount)
+	p.ptyDrainRequests = make(chan ptyDrainRequest)
+	p.ptyDrainEvents = make(chan ptyDrainEvent)
+	p.ptyReaderDone = make(chan struct{})
+	p.ptyInteractive = make(chan struct{}, 1)
 	p.ptyInput = make(chan []byte, 64)
 	p.commands = make(chan paneCommand, 8)
 	p.mainDone = make(chan struct{})
 	p.writerDone = make(chan struct{})
 	p.done = make(chan struct{})
+	for index := range p.ptyReadBuffers {
+		p.ptyFree <- p.ptyReadBuffers[index][:]
+	}
 	p.publishTerminalMetadata()
 }
 
@@ -364,7 +388,24 @@ func (p *Pane) resize(cols, rows uint16) error {
 }
 
 func (p *Pane) sendInput(data []byte) error {
-	return p.sendOwnedInput(append([]byte(nil), data...))
+	if len(data) == 0 {
+		return nil
+	}
+	if err := p.sendOwnedInput(append([]byte(nil), data...)); err != nil {
+		return err
+	}
+	p.grantInteractivePTYOpportunity()
+	return nil
+}
+
+func (p *Pane) grantInteractivePTYOpportunity() {
+	if p.ptyInteractive == nil {
+		return
+	}
+	select {
+	case p.ptyInteractive <- struct{}{}:
+	default:
+	}
 }
 
 func (p *Pane) sendOwnedInput(data []byte) error {
@@ -375,7 +416,8 @@ func (p *Pane) sendOwnedInput(data []byte) error {
 		p.notifyProcessActivity()
 	}
 	if p.ptyInput == nil {
-		return writeAll(p.PTY, data)
+		_, err := writeAll(p.PTY, data)
+		return err
 	}
 	select {
 	case p.ptyInput <- data:

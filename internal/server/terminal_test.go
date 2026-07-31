@@ -1566,33 +1566,6 @@ func setTestRows(t *TerminalState, history, visible []decodedTestRow) {
 	}
 }
 
-type testDisplayCompiler struct {
-	*displayCompiler
-	terminal *TerminalState
-}
-
-func newTestDisplayCompiler(output *renderOutput, styles map[uint32]protocol.Style) *testDisplayCompiler {
-	terminal := &TerminalState{}
-	return &testDisplayCompiler{
-		displayCompiler: newDisplayCompiler(output, displayStyleMap(styles), &terminal.clusters, int(protocol.MaxGridCols)),
-		terminal:        terminal,
-	}
-}
-
-func (d *testDisplayCompiler) writeCells(row, column int, cells []decodedTestCell) error {
-	words := make([]cellWord, len(cells))
-	for i, cell := range cells {
-		if cell.Width == 0 {
-			words[i] = makeContinuationCellWord(uint16(cell.StyleID))
-		} else {
-			words[i] = d.terminal.makeTextCellWord(cell.Cluster, cell.Width, uint16(cell.StyleID))
-		}
-	}
-	if err := d.displayCompiler.writeCells(row, column, words); err != nil {
-		return err
-	}
-	return d.displayCompiler.finish()
-}
 func TestCellWordRepresentations(t *testing.T) {
 	tests := []struct {
 		name    string
