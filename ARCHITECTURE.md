@@ -974,9 +974,11 @@ exclusive.
 The command stream is stateful, but the state is deliberately small and reconstructable. `START_RENDER` supplies the grid needed to validate implicit advancement. Style installations and selection are local to the physical render stream. Position advances after writes, including an exact wrap from the last column to column zero of the next row. Cursor state is remembered separately and copied into the completed frame at `PRESENT`.
 
 `PRESENT` is the atomic publication boundary. The confirmer appends it exactly
-once after compiling a complete immutable publication. Physical writes may
-split the encoded frame, but the client does not expose any of those chunks
-until it decodes the terminating `PRESENT`.
+once after compiling a complete immutable publication. The confirmer passes
+the complete reliable frame byte slice to the stream. The write helper handles
+genuine short writes; QUIC owns transport segmentation and packetization. The
+client does not expose any frame commands until it decodes the terminating
+`PRESENT`.
 
 ## Server display-compiler strategy
 

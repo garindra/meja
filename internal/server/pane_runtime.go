@@ -88,9 +88,6 @@ func (s *ptyAdmissionState) grantImmediateOpportunity() {
 }
 
 const (
-	// Finalized commands are streamed at this size while PRESENT remains the
-	// client's atomic frame boundary.
-	renderStreamChunkSize   = 8 << 10
 	startupInputIdle        = 25 * time.Millisecond
 	startupInputMaxWait     = 500 * time.Millisecond
 	initialReliableFrameCap = 64 << 10
@@ -366,7 +363,7 @@ func runPTYWriter(pane *Pane, failed func(error)) {
 	for {
 		select {
 		case data := <-pane.ptyInput:
-			if err := writeAll(pane.PTY, data); err != nil {
+			if _, err := writeAll(pane.PTY, data); err != nil {
 				failed(err)
 				return
 			}
@@ -685,16 +682,17 @@ func historySelectionContains(selection *paneHistorySelection, row, column int) 
 	return true
 }
 
-func writeAll(w io.Writer, data []byte) error {
+func writeAll(w io.Writer, data []byte) (writes uint64, err error) {
 	for len(data) > 0 {
-		n, err := w.Write(data)
-		if err != nil {
-			return err
+		n, writeErr := w.Write(data)
+		writes++
+		if writeErr != nil {
+			return writes, writeErr
 		}
 		if n == 0 {
-			return io.ErrShortWrite
+			return writes, io.ErrShortWrite
 		}
 		data = data[n:]
 	}
-	return nil
+	return writes, nil
 }

@@ -142,7 +142,7 @@ func (w *renderBatchWriter) snapshotBatches() [][]byte {
 	return append([][]byte(nil), w.batches...)
 }
 
-func TestConfirmerPresentsLargeRedrawAtomicallyAcrossBoundedWrites(t *testing.T) {
+func TestConfirmerWritesLargeRedrawAsOneCompleteFrame(t *testing.T) {
 	pane := &Pane{ID: 1, terminal: newTerminal(int(protocol.MaxGridCols), 64)}
 	for row := 0; row < pane.terminal.Rows; row++ {
 		cells := pane.terminal.gridRow(row)
@@ -159,11 +159,13 @@ func TestConfirmerPresentsLargeRedrawAtomicallyAcrossBoundedWrites(t *testing.T)
 	}
 	syncPaneRenderer(t, pane)
 	batches := wire.snapshotBatches()
-	if len(batches) < 2 {
-		t.Fatalf("large redraw used %d physical write, want bounded streaming", len(batches))
+	if len(batches) != 1 {
+		t.Fatalf("large redraw used %d physical writes, want one complete-frame write", len(batches))
 	}
-	joined := bytes.Join(batches, nil)
-	commands := decodePendingCommands(t, joined)
+	if len(batches[0]) <= 8<<10 {
+		t.Fatalf("large redraw frame has %d bytes, want substantially more than 8 KiB", len(batches[0]))
+	}
+	commands := decodePendingCommands(t, batches[0])
 	if got := countOpcode(commandOpcodes(commands), protocol.DisplayOpcodePresent); got != 1 {
 		t.Fatalf("PRESENT commands = %d, want exactly one semantic commit", got)
 	}
@@ -171,11 +173,6 @@ func TestConfirmerPresentsLargeRedrawAtomicallyAcrossBoundedWrites(t *testing.T)
 		t.Fatalf("final command = %#v, want PRESENT", commands[len(commands)-1])
 	}
 	renderedCells := 0
-	for index, batch := range batches {
-		if len(batch) > renderStreamChunkSize {
-			t.Fatalf("physical write %d has %d bytes, limit %d", index, len(batch), renderStreamChunkSize)
-		}
-	}
 	for _, command := range commands {
 		switch command.Opcode {
 		case protocol.DisplayOpcodeWriteText, protocol.DisplayOpcodeWriteTextUTF8, protocol.DisplayOpcodeWriteTextUTF8Default:

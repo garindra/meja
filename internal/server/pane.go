@@ -416,7 +416,8 @@ func (p *Pane) sendOwnedInput(data []byte) error {
 		p.notifyProcessActivity()
 	}
 	if p.ptyInput == nil {
-		return writeAll(p.PTY, data)
+		_, err := writeAll(p.PTY, data)
+		return err
 	}
 	select {
 	case p.ptyInput <- data:

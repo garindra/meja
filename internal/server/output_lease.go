@@ -589,24 +589,11 @@ func (l *OutputLease) writeFrame(frame []byte, metrics *paneRenderMetrics) error
 		_ = deadlineWriter.SetWriteDeadline(time.Now().Add(quicMaxIdleTimeout))
 		defer deadlineWriter.SetWriteDeadline(time.Time{})
 	}
-	for len(frame) > 0 {
-		chunk := frame[:min(len(frame), renderStreamChunkSize)]
-		for len(chunk) > 0 {
-			n, err := l.Stream.Write(chunk)
-			if metrics != nil {
-				metrics.physicalWrites.Add(1)
-			}
-			if err != nil {
-				return err
-			}
-			if n == 0 {
-				return io.ErrShortWrite
-			}
-			chunk = chunk[n:]
-			frame = frame[n:]
-		}
+	writes, err := writeAll(l.Stream, frame)
+	if metrics != nil {
+		metrics.physicalWrites.Add(writes)
 	}
-	return nil
+	return err
 }
 
 func (l *OutputLease) failures() <-chan error {

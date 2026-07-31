@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"testing"
@@ -549,34 +550,174 @@ func TestPaneDeltaKeyframeAndCancellationSteadyStateDoNotAllocate(t *testing.T) 
 	}
 }
 
-type chunkCountingDiscard struct {
-	writes int
-	max    int
+type fullWriteRecorder struct {
+	writes   int
+	received []byte
 }
 
-func (w *chunkCountingDiscard) Write(data []byte) (int, error) {
+func (w *fullWriteRecorder) Write(data []byte) (int, error) {
 	w.writes++
-	w.max = max(w.max, len(data))
+	w.received = data
 	return len(data), nil
 }
 
-func TestMultiChunkReliableWriteSteadyStateDoesNotAllocate(t *testing.T) {
-	writer := &chunkCountingDiscard{}
+func TestCompleteFrameReliableWriteSteadyStateDoesNotAllocate(t *testing.T) {
+	writer := &fullWriteRecorder{}
 	lease := testOutputLease(0, writer)
-	frame := make([]byte, 4*renderStreamChunkSize+17)
-	if err := lease.writeFrame(frame, nil); err != nil {
+	frame := bytes.Repeat([]byte("complete-frame"), 4<<10)
+	metrics := &paneRenderMetrics{}
+	if err := lease.writeFrame(frame, metrics); err != nil {
 		t.Fatal(err)
 	}
-	if writer.writes != 5 || writer.max > renderStreamChunkSize {
-		t.Fatalf("physical writes=%d max=%d, want 5 writes bounded by %d", writer.writes, writer.max, renderStreamChunkSize)
+	if writer.writes != 1 {
+		t.Fatalf("physical writes = %d, want 1", writer.writes)
+	}
+	if !bytes.Equal(writer.received, frame) {
+		t.Fatal("writer did not receive the complete frame")
+	}
+	if got := metrics.physicalWrites.Load(); got != 1 {
+		t.Fatalf("metric physical writes = %d, want 1", got)
 	}
 	if allocations := testing.AllocsPerRun(1000, func() {
-		writer.writes, writer.max = 0, 0
-		if err := lease.writeFrame(frame, nil); err != nil {
+		writer.writes, writer.received = 0, nil
+		if err := lease.writeFrame(frame, metrics); err != nil {
 			panic(err)
 		}
 	}); allocations != 0 {
-		t.Fatalf("multi-chunk reliable writing allocated %.2f objects, want 0", allocations)
+		t.Fatalf("complete-frame reliable writing allocated %.2f objects, want 0", allocations)
+	}
+}
+
+type boundedWriteRecorder struct {
+	limit    int
+	writes   int
+	received []byte
+}
+
+func (w *boundedWriteRecorder) Write(data []byte) (int, error) {
+	w.writes++
+	n := min(len(data), w.limit)
+	w.received = append(w.received, data[:n]...)
+	return n, nil
+}
+
+func TestReliableWriteRetriesGenuineShortWrites(t *testing.T) {
+	frame := bytes.Repeat([]byte("ordered-frame-data"), 1024)
+	writer := &boundedWriteRecorder{limit: 997}
+	metrics := &paneRenderMetrics{}
+	if err := testOutputLease(0, writer).writeFrame(frame, metrics); err != nil {
+		t.Fatal(err)
+	}
+	wantWrites := (len(frame) + writer.limit - 1) / writer.limit
+	if writer.writes != wantWrites {
+		t.Fatalf("physical writes = %d, want %d genuine short-write attempts", writer.writes, wantWrites)
+	}
+	if got := metrics.physicalWrites.Load(); got != uint64(wantWrites) {
+		t.Fatalf("metric physical writes = %d, want %d", got, wantWrites)
+	}
+	if !bytes.Equal(writer.received, frame) {
+		t.Fatal("short writes lost, duplicated, or reordered frame bytes")
+	}
+}
+
+type zeroWriteWriter struct{}
+
+func (zeroWriteWriter) Write([]byte) (int, error) { return 0, nil }
+
+func TestReliableWriteRejectsZeroLengthWrite(t *testing.T) {
+	metrics := &paneRenderMetrics{}
+	err := testOutputLease(0, zeroWriteWriter{}).writeFrame([]byte("frame"), metrics)
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("write error = %v, want io.ErrShortWrite", err)
+	}
+	if got := metrics.physicalWrites.Load(); got != 1 {
+		t.Fatalf("metric physical writes = %d, want 1", got)
+	}
+}
+
+type partialThenErrorWriter struct {
+	err      error
+	writes   int
+	received []byte
+}
+
+func (w *partialThenErrorWriter) Write(data []byte) (int, error) {
+	w.writes++
+	if w.writes == 1 {
+		n := min(7, len(data))
+		w.received = append(w.received, data[:n]...)
+		return n, nil
+	}
+	return 0, w.err
+}
+
+func TestReliableWritePropagatesErrorAfterPartialWrite(t *testing.T) {
+	wantErr := errors.New("write failed")
+	writer := &partialThenErrorWriter{err: wantErr}
+	metrics := &paneRenderMetrics{}
+	err := testOutputLease(0, writer).writeFrame([]byte("complete frame"), metrics)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("write error = %v, want %v", err, wantErr)
+	}
+	if !bytes.Equal(writer.received, []byte("complet")) {
+		t.Fatalf("accepted prefix = %q, want %q", writer.received, "complet")
+	}
+	if writer.writes != 2 || metrics.physicalWrites.Load() != 2 {
+		t.Fatalf("writes=%d metric=%d, want 2", writer.writes, metrics.physicalWrites.Load())
+	}
+}
+
+type deadlineWriteRecorder struct {
+	writer            io.Writer
+	deadline          time.Time
+	sets              int
+	clears            int
+	wroteWithDeadline bool
+}
+
+func (w *deadlineWriteRecorder) SetWriteDeadline(deadline time.Time) error {
+	w.deadline = deadline
+	if deadline.IsZero() {
+		w.clears++
+	} else {
+		w.sets++
+	}
+	return nil
+}
+
+func (w *deadlineWriteRecorder) Write(data []byte) (int, error) {
+	w.wroteWithDeadline = !w.deadline.IsZero()
+	return w.writer.Write(data)
+}
+
+type fixedErrorWriter struct{ err error }
+
+func (w fixedErrorWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestReliableWriteDeadlineIsSetAndCleared(t *testing.T) {
+	wantErr := errors.New("write failed")
+	tests := []struct {
+		name    string
+		writer  io.Writer
+		wantErr error
+	}{
+		{name: "success", writer: io.Discard},
+		{name: "error", writer: fixedErrorWriter{err: wantErr}, wantErr: wantErr},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			writer := &deadlineWriteRecorder{writer: test.writer}
+			err := testOutputLease(0, writer).writeFrame([]byte("frame"), nil)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("write error = %v, want %v", err, test.wantErr)
+			}
+			if !writer.wroteWithDeadline {
+				t.Fatal("write occurred without a deadline")
+			}
+			if writer.sets != 1 || writer.clears != 1 || !writer.deadline.IsZero() {
+				t.Fatalf("deadline sets=%d clears=%d final=%v, want set once then cleared", writer.sets, writer.clears, writer.deadline)
+			}
+		})
 	}
 }
 
