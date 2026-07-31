@@ -1,16 +1,20 @@
 package server
 
-// ViewUpdate describes only the visual consequences of a state change.
-// Terminal-parser side effects such as replies and frontend writes do not cross
-// this renderer boundary.
-type ViewUpdate struct {
+// ViewMutation is late-bound structural damage metadata. It identifies dirty
+// coordinates, scroll operations, and cursor changes, but contains neither
+// concrete cell values nor a revision. The renderer materializes the latest
+// authoritative pane or history contents when it consumes the mutation.
+//
+// KEYFRAME and DELTA are reserved for a future immutable, revisioned
+// publication layer whose messages contain concrete cell values.
+type ViewMutation struct {
 	DirtySpans    []DirtySpan
 	ScrollRegion  *ScrollRegion
 	FullRedraw    bool
 	CursorChanged bool
 }
 
-func (u *ViewUpdate) reset(rows int) {
+func (u *ViewMutation) reset(rows int) {
 	if rows < 0 {
 		rows = 0
 	}
@@ -25,7 +29,7 @@ func (u *ViewUpdate) reset(rows int) {
 	u.CursorChanged = false
 }
 
-func (u *ViewUpdate) markDirty(row, start, end, cols int) {
+func (u *ViewMutation) markDirty(row, start, end, cols int) {
 	if u == nil || u.FullRedraw || row < 0 || row >= len(u.DirtySpans) || start >= end || cols <= 0 {
 		return
 	}
@@ -52,7 +56,7 @@ func (u *ViewUpdate) markDirty(row, start, end, cols int) {
 	u.DirtySpans[row] = span
 }
 
-func (u *ViewUpdate) recordScrollRegion(top, bottom, delta int) {
+func (u *ViewMutation) recordScrollRegion(top, bottom, delta int) {
 	if u == nil {
 		return
 	}
@@ -91,13 +95,13 @@ func (u *ViewUpdate) recordScrollRegion(top, bottom, delta int) {
 	}
 }
 
-func (u *ViewUpdate) forceFullRedraw() {
+func (u *ViewMutation) forceFullRedraw() {
 	u.FullRedraw = true
 	u.ScrollRegion = nil
 	clear(u.DirtySpans)
 }
 
-func (u ViewUpdate) HasDamage() bool {
+func (u ViewMutation) HasDamage() bool {
 	for _, span := range u.DirtySpans {
 		if span.End != 0 {
 			return true
@@ -106,6 +110,6 @@ func (u ViewUpdate) HasDamage() bool {
 	return false
 }
 
-func (u ViewUpdate) HasRenderChange() bool {
+func (u ViewMutation) HasRenderChange() bool {
 	return u.FullRedraw || u.ScrollRegion != nil || u.CursorChanged || u.HasDamage()
 }

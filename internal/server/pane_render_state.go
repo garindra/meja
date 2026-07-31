@@ -192,7 +192,7 @@ func (s *paneRenderState) merge(update Update) {
 	if s.lease == nil || s.pane.currentViewMode() != paneViewLive {
 		return
 	}
-	s.mergeViewUpdate(ViewUpdate{
+	s.mergeViewMutation(ViewMutation{
 		DirtySpans:    update.DirtySpans,
 		ScrollRegion:  update.ScrollRegion,
 		FullRedraw:    update.FullRedraw,
@@ -200,9 +200,10 @@ func (s *paneRenderState) merge(update Update) {
 	})
 }
 
-// mergeViewUpdate mechanically combines explicit view damage. Ambiguous or
-// structurally incompatible transitions intentionally become full redraws.
-func (s *paneRenderState) mergeViewUpdate(update ViewUpdate) {
+// mergeViewMutation mechanically combines explicit structural damage.
+// Ambiguous or structurally incompatible transitions intentionally become
+// full redraws.
+func (s *paneRenderState) mergeViewMutation(update ViewMutation) {
 	if s.lease == nil {
 		return
 	}

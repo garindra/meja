@@ -838,9 +838,13 @@ and visible consequences:
 * terminal replies; and
 * a full-redraw marker for transformations that cannot be expressed safely as local damage.
 
-The parser's visual fields and history operations both produce a `ViewUpdate`
-at the renderer boundary. The pane actor mechanically merges that explicit
-view damage into persistent per-row dirty spans. Compatible scrolls coalesce
+The parser's visual fields and history operations both produce a
+`ViewMutation` at the renderer boundary. This is late-bound structural damage
+metadata: it contains coordinates, scroll operations, and cursor-change
+information, but no concrete cell values or revisions. The pane actor
+mechanically merges mutations into persistent per-row dirty spans. When the
+renderer consumes a mutation, it materializes the latest authoritative pane or
+history contents at those coordinates. Compatible scrolls coalesce
 only when their `[top,bottom)` regions and directions match. Dirty spans move
 only inside that region. Different regions, opposing directions, full-region
 displacement, and other coordinate-space ambiguities intentionally promote the
@@ -850,6 +854,11 @@ stream from postponing it forever. Damage coordinates are client-relative
 visible rows, even though the underlying row store also contains history.
 Detached panes parse without tracking render damage because their
 authoritative grid is sufficient for the next full refresh.
+
+`KEYFRAME` and `DELTA` terminology is reserved for a future immutable,
+revisioned publication layer containing concrete cell values. A
+`ViewMutation` is neither: it remains late-bound to the actor's authoritative
+state until rendering.
 
 Eligibility and buffer availability are separate. Once damage is due, the actor borrows the lease's buffer when the output worker offers it and encodes as much current grid state as fits. A successfully encoded prefix advances that row's dirty-span start; a complete span is cleared. A span that does not fit is left unchanged, and an encoded prefix leaves its suffix dirty. New PTY damage is unioned with any retained suffix, so later batches render the newest authoritative cells rather than an old cell snapshot. Scroll during a progressive multi-batch update promotes the work to a full redraw when shifting retained coordinates would be ambiguous.
 

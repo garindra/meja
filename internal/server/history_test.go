@@ -149,8 +149,8 @@ func TestHistoryRenderStateCoalescesSameDirectionAndFallsBackSafely(t *testing.T
 	state := newPaneRenderState(pane)
 	state.lease = &OutputLease{}
 	state.ensureRows()
-	state.mergeViewUpdate(first.Render)
-	state.mergeViewUpdate(second.Render)
+	state.mergeViewMutation(first.Render)
+	state.mergeViewMutation(second.Render)
 	if state.scrollRegion == nil || *state.scrollRegion != (ScrollRegion{Top: 0, Bottom: 3, Delta: -2}) {
 		t.Fatalf("coalesced history scroll = %#v", state.scrollRegion)
 	}
@@ -160,10 +160,10 @@ func TestHistoryRenderStateCoalescesSameDirectionAndFallsBackSafely(t *testing.T
 		t.Fatalf("coalesced exposed-row damage = %#v", state.dirty)
 	}
 
-	opposing := ViewUpdate{}
+	opposing := ViewMutation{}
 	opposing.reset(3)
 	opposing.ScrollRegion = &ScrollRegion{Top: 0, Bottom: 3, Delta: 1}
-	state.mergeViewUpdate(opposing)
+	state.mergeViewMutation(opposing)
 	if state.scrollRegion != nil || state.dirtyRows != 3 {
 		t.Fatalf("opposing movement did not force full redraw: %#v", state)
 	}
@@ -172,7 +172,7 @@ func TestHistoryRenderStateCoalescesSameDirectionAndFallsBackSafely(t *testing.T
 	state.lease = &OutputLease{}
 	state.ensureRows()
 	state.progressive = true
-	state.mergeViewUpdate(first.Render)
+	state.mergeViewMutation(first.Render)
 	if state.scrollRegion != nil || state.progressive || state.dirtyRows != 3 {
 		t.Fatalf("progressive history movement did not force full redraw: %#v", state)
 	}

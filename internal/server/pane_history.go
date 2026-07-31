@@ -264,7 +264,7 @@ func fullHistoryResult(changed bool, data []byte, err error) paneHistoryResult {
 		Changed: changed,
 		Data:    data,
 		Err:     err,
-		Render:  ViewUpdate{FullRedraw: changed},
+		Render:  ViewMutation{FullRedraw: changed},
 	}
 }
 
@@ -473,7 +473,7 @@ func (p *Pane) handleHistoryInputNow(data []byte) paneHistoryResult {
 	if view == nil {
 		return paneHistoryResult{}
 	}
-	var render ViewUpdate
+	var render ViewMutation
 	render.reset(view.Snapshot.ViewportRows)
 	changed := false
 

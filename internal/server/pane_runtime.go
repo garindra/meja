@@ -355,7 +355,7 @@ func (p *Pane) run() {
 			if command.history != nil {
 				result := p.handleHistoryRequest(command.history)
 				if result.Render.HasRenderChange() && p.outputLease != nil {
-					renderer.mergeViewUpdate(result.Render)
+					renderer.mergeViewMutation(result.Render)
 					renderer.due = true
 				}
 				command.history.Result <- result
