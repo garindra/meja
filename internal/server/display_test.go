@@ -1670,10 +1670,13 @@ func startTestPaneRenderer(id uint64, cols, rows int) (*Pane, chan struct{}) {
 	return pane, startTestPaneLoop(pane)
 }
 
-func startTestPaneLoop(pane *Pane) chan struct{} {
+func startTestPaneLoop(pane *Pane, initialPTY ...string) chan struct{} {
 	pane.initializeRuntime()
 	runtime := &testPaneDrainRuntime{
 		pane: pane, reader: &queuedPTYReader{}, relayDone: make(chan struct{}),
+	}
+	for _, data := range initialPTY {
+		runtime.enqueue(data)
 	}
 	testPaneDrainRuntimes.Store(pane, runtime)
 	go func() {

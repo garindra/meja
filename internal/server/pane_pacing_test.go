@@ -242,8 +242,8 @@ func TestPaneCommandsStayResponsiveAndResizeGrantsPTYOpportunity(t *testing.T) {
 		terminal:          newTerminal(8, 1),
 		ptyPacingInterval: time.Hour,
 	}
-	shutdown := startTestPaneLoop(pane)
-	sendTestPTYOutput(t, pane, "a")
+	shutdown := startTestPaneLoop(pane, "a")
+	waitTestPTYBytes(t, pane, 1)
 
 	wantBytes := queueTestPTYOutput(t, pane, "b")
 	captured, err := pane.capturePane(capturePaneOptions{})
@@ -285,8 +285,8 @@ func TestAttachGrantsImmediatePTYOpportunity(t *testing.T) {
 		terminal:          newTerminal(8, 1),
 		ptyPacingInterval: time.Hour,
 	}
-	shutdown := startTestPaneLoop(pane)
-	sendTestPTYOutput(t, pane, "a")
+	shutdown := startTestPaneLoop(pane, "a")
+	waitTestPTYBytes(t, pane, 1)
 
 	wantBytes := queueTestPTYOutput(t, pane, "b")
 	lease := testOutputLease(0, io.Discard)
