@@ -111,6 +111,11 @@ meja -h devbox restore -t work
 
 Meja creates and enters a new session with the saved windows, panes, directories, and prepared commands.
 
+To see which named recovery snapshots are available:
+
+```sh
+meja -h devbox restore --list
+```
 
 You can also run `save` to save the current session as a readable and editable `.meja` file:
 

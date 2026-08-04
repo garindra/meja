@@ -773,7 +773,7 @@ func commandDefinitions() []commandDefinition {
 		{name: "server-version", usage: "server-version", description: "Show the running daemon build and protocol versions.", run: runServerVersionCommand},
 		{name: "new-session", aliases: []string{"new"}, usage: "new-session [-d] [-P] [-F format] [-s name] [-r directory] [-t base] [-- command args...] | new-session -f file [-s name] [--run | --commands=prepare|skip|run]", description: "Create a session, optionally from a .meja file, and attach unless -d is supplied.", run: runNewSessionCommand},
 		{name: "attach-session", aliases: []string{"attach", "a"}, usage: "attach-session -t session-id-or-name", description: "Attach to an existing session.", run: runAttachSessionCommand},
-		{name: "restore-session", aliases: []string{"restore"}, usage: "restore-session -t name [-s new-name] [--run | --commands=prepare|skip|run]", description: "Restore a named session's automatic snapshot and attach.", run: runRestoreSessionCommand},
+		{name: "restore-session", aliases: []string{"restore"}, usage: "restore-session -t name [-s new-name] [--run | --commands=prepare|skip|run] | restore-session --list [-F format]", description: "Restore a named session's automatic snapshot, attach, or list recovery records.", run: runRestoreSessionCommand},
 		{name: "save-session", aliases: []string{"save"}, usage: "save-session [-t session-id-or-name] -o file [-f]", description: "Save a live session to a .meja file.", run: runSaveSessionCommand},
 		{name: "list-sessions", aliases: []string{"ls"}, usage: "list-sessions [-F format]", description: "List active sessions.", run: runListSessionsCommand},
 		{name: "kill-session", usage: "kill-session [-t session]", description: "Terminate a session and its panes.", run: runKillSessionCommand},
@@ -1621,6 +1621,13 @@ func runAttachSessionCommand(d *Daemon, ctx CommandContext, args []string) (comm
 }
 
 func runRestoreSessionCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
+	if restoreSessionListRequested(args) {
+		if err := requireCommandOutputCLI(ctx, "restore-session --list"); err != nil {
+			return commandOutcome{}, err
+		}
+		output, err := d.listRestorableSessionsOutput(args)
+		return commandOutcome{Stdout: output}, err
+	}
 	client, err := commandOriginClient(d, ctx)
 	if err != nil {
 		return commandOutcome{}, err
@@ -1630,6 +1637,22 @@ func runRestoreSessionCommand(d *Daemon, ctx CommandContext, args []string) (com
 		return commandOutcome{}, err
 	}
 	return sessionActivationOutcome(d, client, result)
+}
+
+func restoreSessionListRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == "--list" || arg == "-l" {
+			return true
+		}
+		if strings.HasPrefix(arg, "--list=") || strings.HasPrefix(arg, "-l=") {
+			value, err := strconv.ParseBool(strings.SplitN(arg, "=", 2)[1])
+			return err == nil && value
+		}
+	}
+	return false
 }
 
 func resolveSessionCommandContextValue(d *Daemon, ctx CommandContext, kind commandTargetKind, args []string) (*commandSessionSnapshot, *commandClientSnapshot, []string, error) {
@@ -2337,12 +2360,17 @@ func (d *Daemon) commandAttachSession(args []string, issueBootstrap bool) (sessi
 
 func (d *Daemon) commandRestoreSession(args []string, issueBootstrap bool) (sessionCommandResult, error) {
 	fs := commandFlagSet("restore-session")
+	list := fs.Bool("list", false, "list recovery records")
+	shortList := fs.Bool("l", false, "list recovery records")
 	target := fs.String("t", "", "persisted session name")
 	name := fs.String("s", "", "new session name")
 	mode := fs.String("commands", "prepare", "restore command mode")
 	run := fs.Bool("run", false, "run restored commands")
 	if err := fs.Parse(args); err != nil {
 		return sessionCommandResult{}, err
+	}
+	if *list || *shortList {
+		return sessionCommandResult{}, errors.New("restore-session --list must be handled through the CLI")
 	}
 	if *target == "" || len(fs.Args()) != 0 {
 		return sessionCommandResult{}, errors.New("restore-session requires -t <session-name>")
@@ -2514,6 +2542,86 @@ func (d *Daemon) listSessionsOutput(args []string) ([]byte, error) {
 			status = "attached"
 		}
 		if _, err := fmt.Fprintf(table, "%d\t%s\t%s\n", session.id, name, status); err != nil {
+			return nil, err
+		}
+	}
+	if err := table.Flush(); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
+func (d *Daemon) listRestorableSessionsOutput(args []string) ([]byte, error) {
+	fs := commandFlagSet("restore-session")
+	list := fs.Bool("list", false, "list recovery records")
+	shortList := fs.Bool("l", false, "list recovery records")
+	target := fs.String("t", "", "persisted session name")
+	name := fs.String("s", "", "new session name")
+	format := fs.String("F", "", "format")
+	_ = fs.String("commands", "prepare", "restore command mode")
+	run := fs.Bool("run", false, "run restored commands")
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	if !*list && !*shortList {
+		return nil, errors.New("restore-session requires -t <session-name> or --list")
+	}
+	commandsProvided := false
+	fs.Visit(func(flag *flag.Flag) {
+		commandsProvided = commandsProvided || flag.Name == "commands"
+	})
+	if *target != "" || *name != "" || *run || commandsProvided || len(fs.Args()) != 0 {
+		return nil, errors.New("restore-session --list cannot be combined with -t, -s, --run, --commands, or positional arguments")
+	}
+	formatProvided := false
+	fs.Visit(func(flag *flag.Flag) {
+		if flag.Name == "F" {
+			formatProvided = true
+		}
+	})
+	if !formatProvided {
+		*format = "#{session_name}\t#{session_saved_at}\t#{session_status}\t#{session_root}\t#{session_windows}\t#{session_panes}"
+	}
+
+	sessions, err := readRestorableSessions(d.sessionPersistenceDir)
+	if err != nil {
+		return nil, err
+	}
+	liveNames := make(map[string]struct{})
+	if d != nil {
+		d.call(func() {
+			for _, session := range d.sessions {
+				if session != nil && session.Name != "" {
+					liveNames[session.Name] = struct{}{}
+				}
+			}
+		})
+	}
+	for index := range sessions {
+		sessions[index].Status = "available"
+		if _, ok := liveNames[sessions[index].Name]; ok {
+			sessions[index].Status = "active"
+		}
+	}
+
+	var output bytes.Buffer
+	if formatProvided {
+		for _, session := range sessions {
+			if _, err := fmt.Fprintln(&output, expandFormat(*format, formatContext{restorable: &session})); err != nil {
+				return nil, err
+			}
+		}
+		return output.Bytes(), nil
+	}
+	if _, err := fmt.Fprintln(&output, "Restorable Sessions"); err != nil {
+		return nil, err
+	}
+	table := tabwriter.NewWriter(&output, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(table, "NAME\tSAVED AT\tSTATUS\tROOT\tWINDOWS\tPANES"); err != nil {
+		return nil, err
+	}
+	for _, session := range sessions {
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%d\t%d\n", session.Name, session.SavedAt.Format(time.RFC3339), session.Status, session.Root, session.Windows, session.Panes); err != nil {
 			return nil, err
 		}
 	}

@@ -27,6 +27,16 @@ const (
 	sessionPersistenceTimeout = 10 * time.Second
 )
 
+type restorableSessionInfo struct {
+	Name    string
+	SavedAt time.Time
+	SavedID uint64
+	Root    string
+	Windows int
+	Panes   int
+	Status  string
+}
+
 type restoreCommandMode string
 
 const (
@@ -1723,6 +1733,51 @@ func readSessionPersistence(path, expectedName string) (SessionPersistence, erro
 		return SessionPersistence{}, fmt.Errorf("session name %q does not match requested name %q", persistence.Name, expectedName)
 	}
 	return persistence, nil
+}
+
+func readRestorableSessions(directory string) ([]restorableSessionInfo, error) {
+	entries, err := os.ReadDir(directory)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read session persistence directory: %w", err)
+	}
+
+	const suffix = ".session.meja"
+	result := make([]restorableSessionInfo, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
+			continue
+		}
+		name := strings.TrimSuffix(entry.Name(), suffix)
+		persistence, err := readSessionPersistence(filepath.Join(directory, entry.Name()), name)
+		if err != nil {
+			// A malformed recovery record is not restorable. Leave it for the
+			// explicit restore command to report with its detailed parse error.
+			continue
+		}
+		result = append(result, restorableSessionInfo{
+			Name:    persistence.Name,
+			SavedAt: persistence.SavedAt,
+			SavedID: persistence.SessionID,
+			Root:    persistence.Root,
+			Windows: len(persistence.Plan.Windows),
+			Panes:   countPersistedPanes(persistence.Plan),
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
+	return result, nil
+}
+
+func countPersistedPanes(plan SessionPlan) int {
+	count := 0
+	for _, window := range plan.Windows {
+		count += len(window.Panes)
+	}
+	return count
 }
 
 func planNodesWithoutLegacyVersion(nodes []*document.Node) []*document.Node {
