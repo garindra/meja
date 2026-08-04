@@ -534,6 +534,87 @@ func TestListSessionsKeepsTableAndListPanesAllUsesDaemonWideIDs(t *testing.T) {
 	}
 }
 
+func TestRestoreListShowsRecoveryRecordsAndFormats(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	setCommandTestPersistenceDir(t, d)
+	root := t.TempDir()
+	plan := func(name string) SessionPlan {
+		return SessionPlan{
+			Version:           mejaFormatVersion,
+			Name:              name,
+			Root:              root,
+			ActiveWindowIndex: 0,
+			Windows: []PlanWindow{{
+				ID: 1, Cwd: root, ActivePane: 1,
+				Layout: PlanLayout{Pane: paneIDRef(1)},
+				Panes:  []PlanPane{{ID: 1, Cwd: root}},
+			}},
+		}
+	}
+	if _, err := writeSessionPersistence(d.sessionPersistenceDir, SessionPersistence{
+		Version: mejaFormatVersion, SessionID: 12, Name: "work",
+		SavedAt: time.Date(2026, time.August, 5, 10, 20, 30, 0, time.UTC),
+		Root:    root, Plan: plan("work"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeSessionPersistence(d.sessionPersistenceDir, SessionPersistence{
+		Version: mejaFormatVersion, SessionID: 8, Name: "live",
+		SavedAt: time.Date(2026, time.August, 4, 9, 10, 11, 0, time.UTC),
+		Root:    root, Plan: plan("live"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	live := NewSessionState(21)
+	live.daemon = d
+	live.setSessionName("live")
+	d.sessions[live.ID] = live
+	d.names[live.Name] = live
+	t.Cleanup(func() { stopState(live) })
+
+	table := d.executeCommand(protocol.CommandRequest{Args: []string{"restore", "--list"}})
+	if table.exitCode != 0 {
+		t.Fatalf("restore --list = %#v", table)
+	}
+	output := string(table.stdout)
+	for _, want := range []string{
+		"Restorable Sessions\n",
+		"NAME  SAVED AT              STATUS",
+		"live  2026-08-04T09:10:11Z  active",
+		"work  2026-08-05T10:20:30Z  available",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("restore --list output omitted %q:\n%s", want, output)
+		}
+	}
+
+	formatted := d.executeCommand(protocol.CommandRequest{Args: []string{
+		"restore", "-l", "-F", "#{session_name}|#{session_saved_at}|#{session_saved_id}|#{session_status}|#{session_root}|#{session_windows}|#{session_panes}",
+	}})
+	want := "live|2026-08-04T09:10:11Z|8|active|" + root + "|1|1\n" +
+		"work|2026-08-05T10:20:30Z|12|available|" + root + "|1|1\n"
+	if formatted.exitCode != 0 || string(formatted.stdout) != want {
+		t.Fatalf("formatted restore list = %#v, want %q", formatted, want)
+	}
+}
+
+func TestRestoreListRejectsRestoreFlags(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	setCommandTestPersistenceDir(t, d)
+	for _, args := range [][]string{
+		{"restore", "--list", "-t", "work"},
+		{"restore", "--list", "-s", "new-name"},
+		{"restore", "--list", "--run"},
+		{"restore", "--list", "--commands=skip"},
+	} {
+		result := d.executeCommand(protocol.CommandRequest{Args: args})
+		if result.exitCode == 0 || !strings.Contains(string(result.stderr), "cannot be combined") {
+			t.Fatalf("restore list validation for %v = %#v", args, result)
+		}
+	}
+}
+
 func TestNewSessionRootFlagsSetRootAndInitialPaneCwd(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	setCommandTestPersistenceDir(t, d)

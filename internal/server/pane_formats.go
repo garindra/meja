@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type formatSessionSnapshot struct {
@@ -30,8 +31,9 @@ type formatPaneSnapshot struct {
 }
 
 type formatContext struct {
-	session *formatSessionSnapshot
-	pane    *formatPaneSnapshot
+	session    *formatSessionSnapshot
+	pane       *formatPaneSnapshot
+	restorable *restorableSessionInfo
 }
 
 // formatSnapshot is collected from passive session state. The command layer
@@ -267,6 +269,15 @@ func writePaneFormatLines(output *strings.Builder, format string, snapshot forma
 
 func expandFormat(format string, context formatContext) string {
 	values := make(map[string]string, 16)
+	if context.restorable != nil {
+		values["session_name"] = context.restorable.Name
+		values["session_saved_at"] = context.restorable.SavedAt.Format(time.RFC3339)
+		values["session_saved_id"] = strconv.FormatUint(context.restorable.SavedID, 10)
+		values["session_root"] = context.restorable.Root
+		values["session_windows"] = strconv.Itoa(context.restorable.Windows)
+		values["session_panes"] = strconv.Itoa(context.restorable.Panes)
+		values["session_status"] = context.restorable.Status
+	}
 	if context.session != nil {
 		values["session_id"] = strconv.FormatUint(context.session.ID, 10)
 		values["session_name"] = context.session.Name

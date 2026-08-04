@@ -223,6 +223,9 @@ meja [transport-options] restore-session
      -t session-name
      [-s new-name]
      [--run | --commands=prepare|skip|run]
+
+meja [transport-options] restore-session
+     --list [-l] [-F format]
 ```
 
 ```sh
@@ -238,6 +241,35 @@ Restore does not read arbitrary project files; use `new -f`. It starts the selec
 
 `--run` is shorthand for `--commands=run`. It cannot be combined with
 `--commands`.
+
+`--list` lists valid private recovery records without restoring or attaching
+to one. `-l` is a short form. The records are ordered by session name and the
+human-readable form is:
+
+```text
+Restorable Sessions
+NAME  SAVED AT              STATUS     ROOT  WINDOWS  PANES
+work  2026-08-05T10:20:30Z  available  ...   2        4
+```
+
+`STATUS` is `available` when the named session is not live and `active` when a
+live session currently has the same name. Use `attach -t <name>` for an active
+session. Malformed recovery files are omitted because they cannot be
+restored; `restore -t <name>` reports the detailed parse error when requested
+explicitly.
+
+`--list` cannot be combined with `-t`, `-s`, `--run`, or `--commands`. With
+`-F`, it prints one machine-readable line per record. Supported variables are:
+
+```text
+#{session_name}       persisted session name
+#{session_saved_at}   save time in RFC3339 form
+#{session_saved_id}   session ID recorded in the recovery file
+#{session_status}     available or active
+#{session_root}       persisted session root
+#{session_windows}    number of saved windows
+#{session_panes}      number of saved panes
+```
 
 ## `save-session` / `save`
 
