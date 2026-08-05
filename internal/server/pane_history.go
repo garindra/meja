@@ -251,6 +251,8 @@ func (p *Pane) handleHistoryRequest(request *paneHistoryRequest) paneHistoryResu
 		return p.finishHistorySelectionNow(request.Cancel)
 	case paneHistorySelectionClear:
 		return p.clearHistorySelectionNow()
+	case paneHistorySelectionAutoscroll:
+		return p.autoscrollHistorySelectionNow(request.Direction, request.Column)
 	default:
 		return paneHistoryResult{Err: fmt.Errorf("pane %d received invalid history action %d", p.ID, request.Action)}
 	}
@@ -279,6 +281,13 @@ func (p *Pane) beginHistorySelection(row, column int, auto bool) error {
 func (p *Pane) updateHistorySelection(row, column int) error {
 	_, err := p.sendHistoryRequest(paneHistoryRequest{Action: paneHistorySelectionUpdate, Row: row, Column: column})
 	return err
+}
+
+func (p *Pane) autoscrollHistorySelection(direction, column int) (bool, error) {
+	result, err := p.sendHistoryRequest(paneHistoryRequest{
+		Action: paneHistorySelectionAutoscroll, Direction: direction, Column: column,
+	})
+	return result.Changed, err
 }
 
 func (p *Pane) finishHistorySelection() ([]byte, error) {
@@ -359,6 +368,28 @@ func (p *Pane) updateHistorySelectionNow(row, column int) paneHistoryResult {
 		return paneHistoryResult{}
 	}
 	view.Selection.Head = position
+	return fullHistoryResult(true, nil, nil)
+}
+
+func (p *Pane) autoscrollHistorySelectionNow(direction, column int) paneHistoryResult {
+	view := p.historyView
+	if view == nil || view.Selection == nil || direction == 0 {
+		return paneHistoryResult{}
+	}
+	row := 0
+	if direction < 0 {
+		if view.ViewTop == 0 {
+			return paneHistoryResult{}
+		}
+		view.ViewTop--
+	} else {
+		if view.ViewTop >= view.Snapshot.InitialTop {
+			return paneHistoryResult{}
+		}
+		view.ViewTop++
+		row = view.Snapshot.ViewportRows - 1
+	}
+	view.Selection.Head = view.pointerPosition(row, column)
 	return fullHistoryResult(true, nil, nil)
 }
 

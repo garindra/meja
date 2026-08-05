@@ -1374,7 +1374,7 @@ top/bottom jumps, opposing pending movement, a full-viewport displacement, and
 complex selection changes intentionally fall back to a complete keyframe. A
 jump already at its destination is a no-op.
 
-The frozen view has its own cursor and optional selection. Keyboard commands can move through history, start or extend a selection, copy it, or cancel. Pointer selection uses layout-aware hit testing and capture: when Meja owns the mouse, a primary-button drag can enter a temporary history view, update only the spans whose selection styling changed, and return to the live view after copying.
+The frozen view has its own cursor and optional selection. Keyboard commands can move through history, start or extend a selection, copy it, or cancel. Pointer selection uses layout-aware hit testing and capture: when Meja owns the mouse, a primary-button drag can enter a temporary history view, extend through available history with actor-delivered autoscroll ticks while held at a vertical pane edge, and return to the live view after copying.
 
 Selection styling is a projection over the snapshot rather than a mutation of terminal cells. The renderer maps selected cells to a dedicated foreground/background style while preserving their text, widths, and cluster boundaries. Extracted clipboard data is bounded and produced from complete display units across the normalized selection range.
 

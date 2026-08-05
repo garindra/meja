@@ -659,7 +659,7 @@ Movement after Space extends the selection. Enter without movement copies the cu
 
 ## Mouse
 
-Clicking focuses a pane. When its application is not using mouse tracking, left-drag selects from a frozen history snapshot and copies with OSC 52 on release. Wheel input scrolls history in copy mode; in a normal pane without mouse tracking it is delivered as Up/Down keys.
+Clicking focuses a pane. When its application is not using mouse tracking, left-drag selects from a frozen history snapshot and copies with OSC 52 on release. Holding a drag at the top or bottom pane edge automatically scrolls the selection through available history. Wheel input scrolls history in copy mode; in a normal pane without mouse tracking it is delivered as Up/Down keys.
 
 When an application enables mouse reporting, Meja routes supported press, release, drag/motion, modifier, and wheel events to the application instead of starting selection.
 

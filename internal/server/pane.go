@@ -151,16 +151,18 @@ const (
 	paneHistorySelectionBeginCursor
 	paneHistorySelectionCopy
 	paneHistorySelectionClear
+	paneHistorySelectionAutoscroll
 )
 
 type paneHistoryRequest struct {
-	Action paneHistoryAction
-	Data   []byte
-	Row    int
-	Column int
-	Auto   bool
-	Cancel bool
-	Result chan<- paneHistoryResult
+	Action    paneHistoryAction
+	Data      []byte
+	Row       int
+	Column    int
+	Direction int
+	Auto      bool
+	Cancel    bool
+	Result    chan<- paneHistoryResult
 }
 
 type paneHistoryResult struct {
