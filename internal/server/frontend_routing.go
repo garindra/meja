@@ -4,13 +4,18 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strconv"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/garindra/meja/internal/protocol"
 )
 
-const frontendWheelReportsPerStep = 3
+const (
+	frontendWheelReportsPerStep       = 3
+	frontendSelectionAutoscrollDelay  = 250 * time.Millisecond
+	frontendSelectionAutoscrollRepeat = 75 * time.Millisecond
+)
 
 func (c *ClientInstance) coalesceFrontendWheelBursts(events []frontendInputEvent) []frontendInputEvent {
 	result := make([]frontendInputEvent, 0, len(events))
@@ -173,6 +178,7 @@ func (c *ClientInstance) cancelFrontendPointerCapture() error {
 		return nil
 	}
 	capture := c.pointerCapture
+	c.stopFrontendSelectionAutoscroll()
 	c.pointerCapture = frontendPaneCapture{}
 	if !capture.active || !capture.mejaSelection || !capture.selecting {
 		return nil
@@ -185,6 +191,73 @@ func (c *ClientInstance) cancelFrontendPointerCapture() error {
 		return nil
 	}
 	return pane.cancelHistorySelection()
+}
+
+func (c *ClientInstance) setFrontendSelectionAutoscroll(direction, column int) {
+	if c == nil {
+		return
+	}
+	if direction == 0 || !c.pointerCapture.active || !c.pointerCapture.selecting {
+		c.stopFrontendSelectionAutoscroll()
+		return
+	}
+	if c.pointerCapture.autoscrollDirection == direction && c.pointerAutoscrollTimer != nil {
+		c.pointerCapture.autoscrollColumn = column
+		return
+	}
+	c.stopFrontendSelectionAutoscroll()
+	c.pointerCapture.autoscrollDirection = direction
+	c.pointerCapture.autoscrollColumn = column
+	c.pointerAutoscrollToken++
+	c.scheduleFrontendSelectionAutoscroll(c.pointerAutoscrollToken, frontendSelectionAutoscrollDelay)
+}
+
+func (c *ClientInstance) scheduleFrontendSelectionAutoscroll(token uint64, delay time.Duration) {
+	c.pointerAutoscrollTimer = time.AfterFunc(delay, func() {
+		c.postCommand(clientInstanceCommand{PointerAutoscroll: token})
+	})
+}
+
+func (c *ClientInstance) stopFrontendSelectionAutoscroll() {
+	if c == nil {
+		return
+	}
+	c.pointerAutoscrollToken++
+	if c.pointerAutoscrollTimer != nil {
+		c.pointerAutoscrollTimer.Stop()
+		c.pointerAutoscrollTimer = nil
+	}
+	c.pointerCapture.autoscrollDirection = 0
+}
+
+func (c *ClientInstance) runFrontendSelectionAutoscroll(token uint64) error {
+	if c == nil || token != c.pointerAutoscrollToken {
+		return nil
+	}
+	c.pointerAutoscrollTimer = nil
+	capture := c.pointerCapture
+	if !capture.active || !capture.mejaSelection || !capture.selecting || capture.autoscrollDirection == 0 {
+		return nil
+	}
+	pane := capture.pane
+	if pane == nil {
+		pane = c.currentView.Pane(capture.paneID)
+	}
+	if pane == nil {
+		c.stopFrontendSelectionAutoscroll()
+		return nil
+	}
+	changed, err := pane.autoscrollHistorySelection(capture.autoscrollDirection, capture.autoscrollColumn)
+	if err != nil {
+		c.stopFrontendSelectionAutoscroll()
+		return err
+	}
+	if !changed {
+		c.stopFrontendSelectionAutoscroll()
+		return nil
+	}
+	c.scheduleFrontendSelectionAutoscroll(token, frontendSelectionAutoscrollRepeat)
+	return nil
 }
 
 func isMejaPrefixKey(key frontendKeyEvent) bool {
@@ -502,6 +575,7 @@ func (c *ClientInstance) handleFrontendPointer(revision protocol.ClientLayoutRev
 	}
 	pane := c.currentView.Pane(paneID)
 	if pane == nil {
+		c.stopFrontendSelectionAutoscroll()
 		c.pointerCapture = frontendPaneCapture{}
 		return nil
 	}
@@ -530,19 +604,24 @@ func (c *ClientInstance) handleFrontendPointer(revision protocol.ClientLayoutRev
 		c.pointerCapture = frontendPaneCapture{paneID: paneID, pane: pane, active: true, button: pointer.Button, rect: rect}
 	}
 	if pointer.Action == frontendPointerRelease {
-		defer func() { c.pointerCapture = frontendPaneCapture{} }()
+		defer func() {
+			c.stopFrontendSelectionAutoscroll()
+			c.pointerCapture = frontendPaneCapture{}
+		}()
 	}
 	if captured && capture.mejaSelection {
 		if pointer.Action == frontendPointerMove && pointer.Button != capture.button {
 			return c.cancelFrontendPointerCapture()
 		}
-		row := min(max(pointer.Y-rect.Y, 0), max(rect.Height-1, 0))
+		rawRow := pointer.Y - rect.Y
+		row := min(max(rawRow, 0), max(rect.Height-1, 0))
 		column := min(max(pointer.X-rect.X, 0), max(rect.Width-1, 0))
 		if !capture.selecting {
 			if pointer.Action != frontendPointerMove || (row == capture.anchorRow && column == capture.anchorColumn) {
 				return nil
 			}
 			if err := pane.beginHistorySelection(capture.anchorRow, capture.anchorColumn, capture.autoSelection); err != nil {
+				c.stopFrontendSelectionAutoscroll()
 				c.pointerCapture = frontendPaneCapture{}
 				return err
 			}
@@ -551,7 +630,20 @@ func (c *ClientInstance) handleFrontendPointer(revision protocol.ClientLayoutRev
 		}
 		switch pointer.Action {
 		case frontendPointerMove:
-			return pane.updateHistorySelection(row, column)
+			if err := pane.updateHistorySelection(row, column); err != nil {
+				c.stopFrontendSelectionAutoscroll()
+				return err
+			}
+			direction := 0
+			if rect.Height > 1 {
+				if rawRow <= 0 {
+					direction = -1
+				} else if rawRow >= rect.Height-1 {
+					direction = 1
+				}
+			}
+			c.setFrontendSelectionAutoscroll(direction, column)
+			return nil
 		case frontendPointerRelease:
 			data, err := pane.finishHistorySelection()
 			if err != nil || len(data) == 0 {

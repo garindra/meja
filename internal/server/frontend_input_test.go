@@ -643,6 +643,71 @@ func TestMouseSelectionCopiesThroughOSC52AndReturnsToLivePane(t *testing.T) {
 	}
 }
 
+func TestMouseSelectionAutoscrollsWhileHeldAtPaneEdge(t *testing.T) {
+	s := NewSessionState(1)
+	fixtureClient := newTestClient(s)
+	fixtureClient.setTestTerminalSize(8, 4)
+	pane := &Pane{ID: testAddPaneID(s), terminal: newTerminal(8, 3)}
+	setTestRows(pane.terminal,
+		[]decodedTestRow{
+			historyTestRow("h000"),
+			historyTestRow("h111"),
+			historyTestRow("h222"),
+		},
+		[]decodedTestRow{
+			historyTestRow("v000"),
+			historyTestRow("v111"),
+			historyTestRow("v222"),
+		},
+	)
+	createTestWindow(s, pane)
+	if _, err := testClientLayout(s); err != nil {
+		t.Fatal(err)
+	}
+	frontend := newFrontendTestClient(s)
+	layout := frontend.currentView.Layout
+	rect := layout.Panes[0].Rect
+
+	for _, pointer := range []frontendPointerEvent{
+		{Action: frontendPointerPress, Button: 0, X: rect.X, Y: rect.Y + 1},
+		{Action: frontendPointerMove, Button: 0, X: rect.X + 1, Y: rect.Y},
+	} {
+		if err := frontend.handleFrontendPointer(layout.LayoutRevision, pointer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !frontend.pointerCapture.selecting || frontend.pointerCapture.autoscrollDirection != -1 ||
+		frontend.pointerAutoscrollTimer == nil {
+		t.Fatalf("top-edge drag did not arm autoscroll: %#v", frontend.pointerCapture)
+	}
+	initialTop := pane.historyView.ViewTop
+	token := frontend.pointerAutoscrollToken
+	frontend.pointerAutoscrollTimer.Stop()
+	frontend.pointerAutoscrollTimer = nil
+	if err := frontend.runFrontendSelectionAutoscroll(token); err != nil {
+		t.Fatal(err)
+	}
+	if pane.historyView.ViewTop != initialTop-1 ||
+		pane.historyView.Selection.Head != (paneHistoryPosition{Row: initialTop - 1, Col: 1}) {
+		t.Fatalf("autoscroll view=%#v, initial top=%d", pane.historyView, initialTop)
+	}
+	if frontend.pointerAutoscrollTimer == nil {
+		t.Fatal("successful autoscroll did not schedule a repeat")
+	}
+
+	if err := frontend.handleFrontendPointer(layout.LayoutRevision, frontendPointerEvent{
+		Action: frontendPointerMove, Button: 0, X: rect.X + 1, Y: rect.Y + 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if frontend.pointerAutoscrollTimer != nil || frontend.pointerCapture.autoscrollDirection != 0 {
+		t.Fatalf("leaving edge did not stop autoscroll: %#v", frontend.pointerCapture)
+	}
+	if err := frontend.cancelFrontendPointerCapture(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMouseClickWithoutDragDoesNotCopy(t *testing.T) {
 	s := NewSessionState(1)
 	fixtureClient := newTestClient(s)

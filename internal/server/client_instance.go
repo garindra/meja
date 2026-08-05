@@ -61,6 +61,8 @@ type ClientInstance struct {
 	activePrompt              *activePrompt
 	nextPromptID              uint64
 	pointerCapture            frontendPaneCapture
+	pointerAutoscrollTimer    *time.Timer
+	pointerAutoscrollToken    uint64
 	pasteCapture              frontendPaneCapture
 }
 
@@ -76,6 +78,7 @@ type clientInstanceCommand struct {
 	SendKeys           []string
 	RunPasteBuffer     bool
 	PasteBuffer        []string
+	PointerAutoscroll  uint64
 	Close              bool
 	CloseCode          quic.ApplicationErrorCode
 	CloseReason        string
@@ -302,6 +305,8 @@ func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
 		err = sendKeysToClient(c, command.SendKeys)
 	case command.RunPasteBuffer:
 		err = pasteBufferToClient(c, command.PasteBuffer)
+	case command.PointerAutoscroll != 0:
+		err = c.runFrontendSelectionAutoscroll(command.PointerAutoscroll)
 	case command.Close:
 		if command.CloseCode == 0 {
 			c.ended = true
@@ -361,11 +366,13 @@ type frontendPaneCapture struct {
 	mejaSelection bool
 	// selecting becomes true only after motion leaves the pressed cell and the
 	// pane has actually entered history mode.
-	selecting     bool
-	autoSelection bool
-	anchorRow     int
-	anchorColumn  int
-	rect          protocol.Rect
+	selecting           bool
+	autoSelection       bool
+	anchorRow           int
+	anchorColumn        int
+	autoscrollDirection int
+	autoscrollColumn    int
+	rect                protocol.Rect
 }
 
 type ClientID uint64
@@ -759,6 +766,7 @@ func (c *ClientInstance) resetInputForSessionSwitch() {
 	clear(c.heldKeys)
 	c.activePrompt = nil
 	c.promptContinuation = nil
+	c.stopFrontendSelectionAutoscroll()
 	c.pointerCapture = frontendPaneCapture{}
 	c.pasteCapture = frontendPaneCapture{}
 	c.currentView.Layout = protocol.ClientLayout{}

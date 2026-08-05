@@ -276,6 +276,37 @@ func TestHistoryStructuralChangesReturnExplicitFullRedraws(t *testing.T) {
 	}
 }
 
+func TestHistoryMouseSelectionAutoscrollMovesViewportAndEdge(t *testing.T) {
+	pane := newHistoryRenderTestPane(t)
+	view := pane.historyView
+	view.ViewTop = 2
+	view.Selection = &paneHistorySelection{
+		Anchor: paneHistoryPosition{Row: 3, Col: 1},
+		Head:   paneHistoryPosition{Row: 3, Col: 1},
+	}
+
+	up := pane.autoscrollHistorySelectionNow(-1, 3)
+	if !up.Changed || !up.Render.FullRedraw || view.ViewTop != 1 ||
+		view.Selection.Head != (paneHistoryPosition{Row: 1, Col: 3}) {
+		t.Fatalf("upward autoscroll = %#v view=%#v", up, view)
+	}
+
+	down := pane.autoscrollHistorySelectionNow(1, 5)
+	if !down.Changed || !down.Render.FullRedraw || view.ViewTop != 2 ||
+		view.Selection.Head != (paneHistoryPosition{Row: 4, Col: 5}) {
+		t.Fatalf("downward autoscroll = %#v view=%#v", down, view)
+	}
+
+	view.ViewTop = 0
+	if result := pane.autoscrollHistorySelectionNow(-1, 0); result.Changed || result.Render.HasRenderChange() {
+		t.Fatalf("autoscroll above oldest row = %#v", result)
+	}
+	view.ViewTop = view.Snapshot.InitialTop
+	if result := pane.autoscrollHistorySelectionNow(1, 0); result.Changed || result.Render.HasRenderChange() {
+		t.Fatalf("autoscroll below newest row = %#v", result)
+	}
+}
+
 func TestHistorySnapshotNeverSplitsClusterAcrossRows(t *testing.T) {
 	term := newTerminal(5, 1)
 	rows := []decodedTestRow{{Cells: []decodedTestCell{
