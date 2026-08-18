@@ -76,8 +76,6 @@ type clientInstanceCommand struct {
 	EnterHistory       bool
 	RunSendKeys        bool
 	SendKeys           []string
-	RunPasteBuffer     bool
-	PasteBuffer        []string
 	PointerAutoscroll  uint64
 	Close              bool
 	CloseCode          quic.ApplicationErrorCode
@@ -221,7 +219,7 @@ func postClientCommand(connection *clientConnection, command clientInstanceComma
 	}
 	if command.RefreshStatus && command.Transition == nil && !command.Close &&
 		command.FocusDirection == 0 && !command.EnterHistory &&
-		!command.RunSendKeys && !command.RunPasteBuffer {
+		!command.RunSendKeys {
 		connection.enqueueStatusRefresh(command.Status, command.HasStatus)
 		return
 	}
@@ -303,8 +301,6 @@ func (c *ClientInstance) runClientCommand(command clientInstanceCommand) {
 		err = c.commandEnterHistory()
 	case command.RunSendKeys:
 		err = sendKeysToClient(c, command.SendKeys)
-	case command.RunPasteBuffer:
-		err = pasteBufferToClient(c, command.PasteBuffer)
 	case command.PointerAutoscroll != 0:
 		err = c.runFrontendSelectionAutoscroll(command.PointerAutoscroll)
 	case command.Close:

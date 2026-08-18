@@ -125,3 +125,27 @@ func TestPasteBufferCommandUsesTmuxSeparatorsAndDeletes(t *testing.T) {
 		t.Fatalf("-d did not delete buffer: %#v", missing)
 	}
 }
+
+func TestDetachedPasteBufferUsesActivePane(t *testing.T) {
+	d, pane, reader := newDetachedCommandPane(t, 8, 1)
+	pane.metadata.Store(&paneTerminalMetadata{bracketedPaste: true})
+
+	if result := d.executeCommand(protocol.CommandRequest{Args: []string{"set-buffer", "-b", "named", "one\ntwo"}}); result.exitCode != 0 {
+		t.Fatalf("set-buffer result = %#v", result)
+	}
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"paste-buffer", "-t", "work", "-b", "named", "-p", "-d"}})
+	if result.exitCode != 0 {
+		t.Fatalf("paste-buffer result = %#v", result)
+	}
+	want := []byte("\x1b[200~one\rtwo\x1b[201~")
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(reader, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("pasted bytes = %q, want %q", got, want)
+	}
+	if result := d.executeCommand(protocol.CommandRequest{Args: []string{"show-buffer", "-b", "named"}}); result.exitCode == 0 {
+		t.Fatalf("-d did not delete buffer: %#v", result)
+	}
+}
