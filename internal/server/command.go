@@ -294,13 +294,10 @@ func (d *Daemon) applyExternalCommandAction(action commandAction) error {
 			return errors.New("send-keys target client is no longer attached")
 		}
 		return sendReservedClientCommand(action.Delivery, clientInstanceCommand{RunSendKeys: true, SendKeys: action.Args})
-	case pasteClientBufferAction:
-		client := commandClientValue(d, CommandContext{Caller: CommandCaller{Origin: CommandOriginStandaloneCLI}}, action.SessionID)
-		if client == nil || client.ID != action.ClientID {
-			action.Delivery.Required.cancel()
-			return errors.New("paste-buffer target client is no longer attached")
-		}
-		return sendReservedClientCommand(action.Delivery, clientInstanceCommand{RunPasteBuffer: true, PasteBuffer: action.Args})
+	case sendPaneKeysAction:
+		return sendKeysToPane(d.commandActivePane(action.SessionID), action.Args)
+	case pastePaneBufferAction:
+		return pasteBufferToPane(d, d.commandActivePane(action.SessionID), action.Args)
 	case detachClientAction:
 		return errors.New("external detach action is not implemented")
 	case promptAction:
@@ -422,14 +419,19 @@ type sendClientKeysAction struct {
 
 func (sendClientKeysAction) commandAction() {}
 
-type pasteClientBufferAction struct {
-	ClientID  ClientID
+type sendPaneKeysAction struct {
 	SessionID uint64
 	Args      []string
-	Delivery  clientCommandDelivery
 }
 
-func (pasteClientBufferAction) commandAction() {}
+func (sendPaneKeysAction) commandAction() {}
+
+type pastePaneBufferAction struct {
+	SessionID uint64
+	Args      []string
+}
+
+func (pastePaneBufferAction) commandAction() {}
 
 type PromptRequest struct {
 	Mode     PromptMode
@@ -994,11 +996,10 @@ func (c *ClientInstance) applyAttachedCommandOutcome(outcome commandOutcome) (bo
 			return false, errors.New("send-keys action belongs to another client")
 		}
 		return false, sendKeysToClient(c, action.Args)
-	case pasteClientBufferAction:
-		if action.ClientID != c.clientID {
-			return false, errors.New("paste-buffer action belongs to another client")
-		}
-		return false, pasteBufferToClient(c, action.Args)
+	case sendPaneKeysAction:
+		return false, sendKeysToPane(c.Daemon.commandActivePane(action.SessionID), action.Args)
+	case pastePaneBufferAction:
+		return false, pasteBufferToPane(c.Daemon, c.Daemon.commandActivePane(action.SessionID), action.Args)
 	default:
 		return false, fmt.Errorf("command returned unsupported attached action %T", action)
 	}
@@ -1014,9 +1015,19 @@ func cancelCommandActionDelivery(action commandAction) {
 		action.Delivery.Required.cancel()
 	case sendClientKeysAction:
 		action.Delivery.Required.cancel()
-	case pasteClientBufferAction:
-		action.Delivery.Required.cancel()
 	}
+}
+
+func (d *Daemon) commandActivePane(sessionID uint64) *Pane {
+	var pane *Pane
+	if d != nil {
+		d.call(func() {
+			if session := d.sessions[sessionID]; session != nil {
+				pane = session.activePane()
+			}
+		})
+	}
+	return pane
 }
 
 // refreshCommandStatusSnapshot is used only after an interactive command has

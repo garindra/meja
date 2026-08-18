@@ -124,6 +124,56 @@ func TestPaneCommandsWorkThroughTheDaemonCommandEngine(t *testing.T) {
 	}
 }
 
+func newDetachedCommandPane(t *testing.T, cols, rows uint16) (*Daemon, *Pane, *os.File) {
+	t.Helper()
+	d := newCommandTestDaemon(t)
+	s := NewSessionState(1)
+	t.Cleanup(func() { stopState(s) })
+	s.daemon = d
+	s.setSessionName("work")
+	client := newTestClient(s)
+	client.setTestTerminalSize(cols, rows)
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+	pane := &Pane{ID: testAddPaneID(s), PTY: writer, terminal: newTerminal(int(cols), int(rows))}
+	createTestWindow(s, pane)
+	d.sessions[s.ID] = s
+	d.names[s.Name] = s
+	setTestClient(s, nil)
+	return d, pane, reader
+}
+
+func TestDetachedSendKeysUsesActivePane(t *testing.T) {
+	d, _, reader := newDetachedCommandPane(t, 8, 1)
+
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"send-keys", "-t", "work", "C-a", "Enter"}})
+	if result.exitCode != 0 {
+		t.Fatalf("send-keys result = %#v", result)
+	}
+	got := make([]byte, 2)
+	if _, err := io.ReadFull(reader, got); err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte{1, '\r'}; !bytes.Equal(got, want) {
+		t.Fatalf("sent keys = %q, want %q", got, want)
+	}
+}
+
+func TestDetachedSendKeysCopyModeRequiresClient(t *testing.T) {
+	d, _, _ := newDetachedCommandPane(t, 8, 1)
+
+	result := d.executeCommand(protocol.CommandRequest{Args: []string{"send-keys", "-t", "work", "-X", "scroll-up"}})
+	if result.exitCode == 0 || !strings.Contains(string(result.stderr), "send-keys -X requires an attached client") {
+		t.Fatalf("send-keys -X result = %#v", result)
+	}
+}
+
 func TestCapturePaneSupportsHistoryRangesAndEscapes(t *testing.T) {
 	oldest, err := parseCapturePaneArgs([]string{"-p", "-S", "-"})
 	if err != nil {

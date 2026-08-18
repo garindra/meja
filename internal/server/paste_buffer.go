@@ -460,38 +460,28 @@ func preparePasteBufferData(data []byte, options pasteBufferOptions, bracketedPa
 }
 
 func runPasteBufferCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
-	_, client, remaining, err := resolveSessionCommandContextValue(d, ctx, sessionTarget, args)
+	session, _, remaining, err := resolveSessionCommandContextValue(d, ctx, sessionTarget, args)
 	if err != nil {
 		return commandOutcome{}, err
 	}
-	if client == nil {
-		return commandOutcome{}, errors.New("command requires an attached client")
-	}
-	delivery, err := reserveCommandActionDelivery(d, ctx, client)
-	if err != nil {
-		return commandOutcome{}, err
-	}
-	return commandOutcome{Action: pasteClientBufferAction{
-		ClientID:  client.ID,
-		SessionID: client.SessionID,
+	return commandOutcome{Action: pastePaneBufferAction{
+		SessionID: session.ID,
 		Args:      append([]string(nil), remaining...),
-		Delivery:  delivery,
 	}}, nil
 }
 
-func pasteBufferToClient(s *ClientInstance, args []string) error {
+func pasteBufferToPane(d *Daemon, pane *Pane, args []string) error {
 	options, err := parsePasteBufferArgs(args)
 	if err != nil {
 		return err
 	}
-	if s == nil || s.Daemon == nil {
+	if d == nil {
 		return errors.New("paste-buffer requires a running daemon")
 	}
-	data, resolved, exists := s.Daemon.pasteBuffers.get(options.name)
+	data, resolved, exists := d.pasteBuffers.get(options.name)
 	if !exists {
 		return fmt.Errorf("no paste buffer %q", resolved)
 	}
-	pane := s.activePane()
 	if pane == nil {
 		return errors.New("paste-buffer requires an active pane")
 	}
@@ -500,7 +490,7 @@ func pasteBufferToClient(s *ClientInstance, args []string) error {
 		return fmt.Errorf("paste-buffer: %w", err)
 	}
 	if options.delete {
-		if err := s.Daemon.pasteBuffers.delete(resolved); err != nil {
+		if err := d.pasteBuffers.delete(resolved); err != nil {
 			return err
 		}
 	}

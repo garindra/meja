@@ -170,9 +170,11 @@ boundary for an omitted attached or pane-CLI target.
 The result contains stdout/stderr, an optional attachment bootstrap, and at
 most one typed action. Canonical mutations happen in the daemon. A visible
 change returns a daemon-prepared `applyViewTransitionAction`; status, focus,
-history, send-keys, and paste operations return narrow ClientInstance actions.
-Attached execution applies an action locally, while command-socket execution
-routes it through the target identity's active `clientConnection`.
+history, and copy-mode operations return narrow ClientInstance actions.
+Ordinary send-keys and paste operations instead target the session's active
+pane directly, so detached sessions remain drivable. Attached execution applies
+client actions locally, while command-socket execution routes them through the
+target identity's active `clientConnection`.
 
 Text-only commands reject attached UI when it has no output surface. Prompts
 and confirmations are also typed outcomes whose callbacks revalidate stable

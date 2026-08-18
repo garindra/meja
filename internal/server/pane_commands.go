@@ -42,12 +42,22 @@ type paneCaptureResult struct {
 }
 
 func runSendKeysCommand(d *Daemon, ctx CommandContext, args []string) (commandOutcome, error) {
-	_, client, remaining, err := resolveSessionCommandContextValue(d, ctx, sessionTarget, args)
+	session, client, remaining, err := resolveSessionCommandContextValue(d, ctx, sessionTarget, args)
 	if err != nil {
 		return commandOutcome{}, err
 	}
+	_, copyMode, err := parseSendKeysModeArgs(remaining)
+	if err != nil {
+		return commandOutcome{}, err
+	}
+	if !copyMode {
+		return commandOutcome{Action: sendPaneKeysAction{
+			SessionID: session.ID,
+			Args:      append([]string(nil), remaining...),
+		}}, nil
+	}
 	if client == nil {
-		return commandOutcome{}, errors.New("command requires an attached client")
+		return commandOutcome{}, errors.New("send-keys -X requires an attached client")
 	}
 	delivery, err := reserveCommandActionDelivery(d, ctx, client)
 	if err != nil {
@@ -69,11 +79,14 @@ func sendKeysToClient(s *ClientInstance, args []string) error {
 	if mode {
 		return sendKeysCopyModeCommand(s, modeArgs)
 	}
+	return sendKeysToPane(s.activePane(), args)
+}
+
+func sendKeysToPane(pane *Pane, args []string) error {
 	literal, keys, err := parseSendKeysArgs(args)
 	if err != nil {
 		return err
 	}
-	pane := s.activePane()
 	if pane == nil {
 		return errors.New("send-keys requires an active pane")
 	}
