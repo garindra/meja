@@ -899,6 +899,21 @@ func (d *Daemon) allocatePaneIDNow() (uint64, error) {
 	return id, nil
 }
 
+// allocateWindowIDNow runs on the daemon actor. Window IDs identify canonical
+// live windows across every session, so restored and newly created windows
+// must use the same daemon-wide sequence.
+func (d *Daemon) allocateWindowIDNow() (uint64, error) {
+	if d.nextWindowID == 0 {
+		d.nextWindowID = 1
+	}
+	if d.nextWindowID == ^uint64(0) {
+		return 0, errors.New("window ID exhausted")
+	}
+	id := d.nextWindowID
+	d.nextWindowID++
+	return id, nil
+}
+
 // sessionByName runs only on the daemon actor.
 func (d *Daemon) sessionByName(name string) *SessionState {
 	if state := d.names[name]; state != nil {

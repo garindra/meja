@@ -988,7 +988,11 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 	}
 	windowsByDisplay := make(map[int]uint64, len(plan.Windows))
 	for index, persistedWindow := range plan.Windows {
-		windowID := uint64(index + 1)
+		windowID, err := d.allocateWindowIDNow()
+		if err != nil {
+			cleanup()
+			return err
+		}
 		windowsByDisplay[index] = windowID
 		layoutCycleIndex := layoutPresetCustom
 		if preset, ok := namedLayoutPreset(persistedWindow.NamedLayout); ok {
@@ -1026,16 +1030,13 @@ func (d *Daemon) restoreSessionPlan(s *SessionState, plan SessionPlan, persisted
 		if s.group != nil {
 			s.group.Windows[windowID] = window
 		}
-		if s.daemon != nil && s.daemon.nextWindowID <= windowID {
-			s.daemon.nextWindowID = windowID + 1
-		}
 	}
 	if s.group != nil {
 		for paneID, pane := range s.Panes {
 			s.group.Panes[paneID] = pane
 		}
 	}
-	s.ActiveWindowID = uint64(plan.ActiveWindowIndex + 1)
+	s.ActiveWindowID = windowsByDisplay[plan.ActiveWindowIndex]
 	if persisted != nil {
 		if persisted.HasPreviousWindowIndex {
 			s.PreviousWindowID = windowsByDisplay[persisted.PreviousWindowIndex]

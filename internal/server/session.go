@@ -164,11 +164,10 @@ func (s *SessionState) createWindowNow(pane *Pane, cols, rows uint16) (*Window, 
 	if s.daemon == nil {
 		return nil, errSessionUnavailable
 	}
-	if s.daemon.nextWindowID == 0 {
-		s.daemon.nextWindowID = 1
+	windowID, err := s.daemon.allocateWindowIDNow()
+	if err != nil {
+		return nil, err
 	}
-	windowID := s.daemon.nextWindowID
-	s.daemon.nextWindowID++
 	displayIndex := s.lowestAvailableWindowDisplayIndex()
 	window := &Window{
 		ID:               windowID,

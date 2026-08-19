@@ -621,6 +621,82 @@ func TestDaemonRestoresPersistenceWindowsLayoutsAndPanes(t *testing.T) {
 	stopState(session)
 }
 
+func TestRestoredSessionsAllocateIndependentWindowIdentities(t *testing.T) {
+	d := newCommandTestDaemon(t)
+	setCommandTestPersistenceDir(t, d)
+	root := t.TempDir()
+	plan := func(name string) SessionPlan {
+		return SessionPlan{
+			Version: mejaFormatVersion, Name: name, Root: root, ActiveWindowIndex: 0,
+			Windows: []PlanWindow{
+				{Cwd: root, ActivePane: 0, Layout: PlanLayout{Pane: paneIDRef(0)}, Panes: []PlanPane{{ID: 0, Cwd: root, Shell: "/bin/sh"}}},
+				{Cwd: root, ActivePane: 1, Layout: PlanLayout{Pane: paneIDRef(1)}, Panes: []PlanPane{{ID: 1, Cwd: root, Shell: "/bin/sh"}}},
+			},
+		}
+	}
+	for _, name := range []string{"first", "second"} {
+		persistence := SessionPersistence{
+			Version: mejaFormatVersion, SessionID: 17, Name: name, SavedAt: time.Now(), Root: root, Plan: plan(name),
+		}
+		if _, err := writeSessionPersistence(d.sessionPersistenceDir, persistence); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstResult, err := d.executeSessionOperation("restore-session", commandSessionTarget{name: "first", restoreMode: restoreCommandsSkip})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResult, err := d.executeSessionOperation("restore-session", commandSessionTarget{name: "second", restoreMode: restoreCommandsSkip})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := testOperationSession(d, firstResult)
+	second := testOperationSession(d, secondResult)
+	defer func() {
+		for _, state := range []*SessionState{first, second} {
+			for _, pane := range state.PanesSnapshot() {
+				_ = terminatePane(pane)
+			}
+			stopState(state)
+		}
+	}()
+
+	firstWindow0, ok := d.clientWindowIDByIndex(first.ID, 0)
+	if !ok {
+		t.Fatal("first session has no window 0")
+	}
+	firstWindow1, ok := d.clientWindowIDByIndex(first.ID, 1)
+	if !ok {
+		t.Fatal("first session has no window 1")
+	}
+	secondWindow1, ok := d.clientWindowIDByIndex(second.ID, 1)
+	if !ok {
+		t.Fatal("second session has no window 1")
+	}
+	if firstWindow1 == secondWindow1 {
+		t.Fatalf("separate restored sessions share window ID %d", firstWindow1)
+	}
+
+	firstClient := &ClientIdentity{ID: 10, SessionID: first.ID, terminalCols: 80, terminalRows: 24}
+	secondClient := &ClientIdentity{ID: 11, SessionID: second.ID, terminalCols: 80, terminalRows: 24}
+	d.call(func() {
+		d.clients[firstClient.ID] = firstClient
+		d.clients[secondClient.ID] = secondClient
+		first.ClientID = firstClient.ID
+		second.ClientID = secondClient.ID
+		second.ActiveWindowID = secondWindow1
+		d.windowLeases[firstWindow0] = &WindowViewLease{WindowID: firstWindow0, SessionID: first.ID, ClientID: firstClient.ID, Generation: 1}
+		d.windowLeases[secondWindow1] = &WindowViewLease{WindowID: secondWindow1, SessionID: second.ID, ClientID: secondClient.ID, Generation: 1}
+	})
+
+	if _, err := d.selectWindow(firstClient.ID, first.ID, firstWindow1); err != nil {
+		t.Fatalf("selecting the same display index used by another session: %v", err)
+	}
+	if first.ActiveWindowID != firstWindow1 || second.ActiveWindowID != secondWindow1 {
+		t.Fatalf("active windows after selection: first=%d second=%d", first.ActiveWindowID, second.ActiveWindowID)
+	}
+}
+
 func TestDaemonRestoresPositionalWindowMetadataWithSafePaneFallback(t *testing.T) {
 	d := newCommandTestDaemon(t)
 	setCommandTestPersistenceDir(t, d)
