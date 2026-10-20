@@ -683,6 +683,35 @@ func (l *OutputLease) sync() error {
 	}
 }
 
+// reclaimAbandoned returns publications handed off after the confirmer exited.
+// The FIFO keeps its spare slot once the worker's exit drain has run, so a
+// handoff can still succeed with nobody left to release the buffer. Only the
+// pane's render loop hands off publications, so once it stops using the lease
+// nothing else can race this drain.
+func (l *OutputLease) reclaimAbandoned() {
+	if l == nil || l.workerDone == nil {
+		return
+	}
+	select {
+	case <-l.workerDone:
+	default:
+		return
+	}
+	for {
+		select {
+		case abandoned := <-l.ready:
+			if abandoned.publication != nil {
+				abandoned.publication.release()
+			}
+			if abandoned.sync != nil {
+				abandoned.sync <- io.ErrClosedPipe
+			}
+		default:
+			return
+		}
+	}
+}
+
 func (l *OutputLease) reportFailure(err error) {
 	if l == nil || err == nil {
 		return

@@ -944,3 +944,35 @@ func takePublicationBenchmarkBuffer(b *testing.B, state *panePublicationState) *
 	state.handedOff()
 	return publication
 }
+
+func TestDetachReclaimsPublicationHandedToExitedConfirmer(t *testing.T) {
+	pane := publicationTestPane(2, 1, "ab")
+	done := make(chan struct{})
+	lease := &OutputLease{Stream: io.Discard, done: done}
+	state := newPanePublicationState(pane)
+	state.attach(lease, 0)
+	close(done)
+	<-lease.workerDone
+
+	buffer := <-state.free
+	if err := state.prepare(buffer); err != nil {
+		t.Fatal(err)
+	}
+	submission, message := state.submission()
+	if submission == nil {
+		t.Fatal("prepared keyframe has no submission")
+	}
+	// The confirmer's FIFO still has room after the worker exits, so the
+	// handoff succeeds with nobody left to return the buffer.
+	select {
+	case submission <- message:
+		state.handedOff()
+	case <-time.After(time.Second):
+		t.Fatal("publication handoff blocked")
+	}
+
+	state.detach()
+	if got := len(state.free); got != publicationBufferCount {
+		t.Fatalf("free publication buffers after detach = %d, want %d", got, publicationBufferCount)
+	}
+}
