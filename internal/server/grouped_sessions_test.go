@@ -329,3 +329,31 @@ func TestFocusOnlyProjectionPreservesRenderedLayoutRevision(t *testing.T) {
 		t.Fatalf("focus-only projection did not install pane focus: got %d", got)
 	}
 }
+
+func TestDetachedGroupKillPaneProjectsRemovalToAttachedMembers(t *testing.T) {
+	d := groupedTestDaemon()
+	base := groupedTestSession(d, 1, "base")
+	newTestClient(base)
+	setTestClientSize(base, 80, 23)
+	createTestWindow(base, &Pane{ID: 1, terminal: newTerminal(80, 23)})
+	killed, _ := createTestWindow(base, &Pane{ID: 2, terminal: newTerminal(80, 23)})
+	mirror := groupedTestSession(d, 2, "mirror")
+	if err := groupTestSessions(d, base, mirror); err != nil {
+		t.Fatal(err)
+	}
+	baseIdentity := testClientIdentity(testClientOf(base))
+	var before uint64
+	d.call(func() {
+		mirror.ActiveWindowID = killed.ID
+		before = baseIdentity.projectionRevision
+	})
+
+	if _, err := d.killCommandPaneNow(mirror.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	var after uint64
+	d.call(func() { after = baseIdentity.projectionRevision })
+	if after <= before {
+		t.Fatalf("attached member projection revision = %d, want newer than %d", after, before)
+	}
+}

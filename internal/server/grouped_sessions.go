@@ -1174,6 +1174,39 @@ type clientPaneRemoval struct {
 	ClosedWindowID uint64
 	FinalPane      bool
 	Removed        bool
+	Peers          groupPeerDelivery
+}
+
+// groupPeerDelivery carries the views of the other attached group members
+// after a command removed a pane from the shared graph.
+type groupPeerDelivery struct {
+	Transitions        []ViewTransition
+	Clients            []clientDeliveryTarget
+	TerminalSessionIDs []uint64
+}
+
+func (d *Daemon) groupPeerDeliveryNow(state *SessionState, pane *Pane) groupPeerDelivery {
+	if state == nil || state.group == nil {
+		return groupPeerDelivery{}
+	}
+	var peers groupPeerDelivery
+	peers.Transitions, peers.Clients, peers.TerminalSessionIDs = d.groupMemberTransitionsNow(state.group, state.ID, viewTransitionClosePane, pane)
+	return peers
+}
+
+// deliver runs after the daemon transaction, like postPaneProcessExit.
+func (p groupPeerDelivery) deliver(d *Daemon) {
+	for index, client := range p.Clients {
+		transition := p.Transitions[index]
+		postClientCommand(client.Connection, clientInstanceCommand{Transition: &transition})
+	}
+	if len(p.TerminalSessionIDs) > 0 {
+		go func() {
+			for _, sessionID := range p.TerminalSessionIDs {
+				_ = d.shutdownSessionID(sessionID, defaultPaneTerminationTimeouts)
+			}
+		}()
+	}
 }
 
 func (d *Daemon) removeClientPane(clientID ClientID, paneID uint64) (clientPaneRemoval, error) {
@@ -1202,6 +1235,7 @@ func (d *Daemon) removeClientPane(clientID ClientID, paneID uint64) (clientPaneR
 		if !removed {
 			return
 		}
+		result.Peers = d.groupPeerDeliveryNow(state, pane)
 		result.WindowClosed = owner != nil && state.Windows[owner.ID] == nil
 		if result.WindowClosed {
 			result.ClosedWindowID = owner.ID
@@ -1247,6 +1281,7 @@ func (d *Daemon) closeCommandPane(clientID ClientID, sessionID, paneID uint64) (
 	if err != nil {
 		return nil, err
 	}
+	result.Peers.deliver(d)
 	_ = terminatePane(result.Pane)
 	if result.FinalPane {
 		_ = d.shutdownSessionID(sessionID, defaultPaneTerminationTimeouts)
@@ -1280,6 +1315,7 @@ func (d *Daemon) killCommandPaneNow(sessionID, paneID uint64) (*ViewTransition, 
 	}
 	var pane *Pane
 	var final bool
+	var peers groupPeerDelivery
 	var err error
 	d.call(func() {
 		state := d.sessions[sessionID]
@@ -1295,11 +1331,13 @@ func (d *Daemon) killCommandPaneNow(sessionID, paneID uint64) (*ViewTransition, 
 		final = err == nil && (state.ActiveWindowID == 0 || len(state.Windows) == 0)
 		if err == nil {
 			state.markSessionChangedForPersistence()
+			peers = d.groupPeerDeliveryNow(state, pane)
 		}
 	})
 	if err != nil {
 		return nil, err
 	}
+	peers.deliver(d)
 	_ = terminatePane(pane)
 	if final {
 		return nil, d.shutdownSessionID(sessionID, defaultPaneTerminationTimeouts)

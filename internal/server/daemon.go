@@ -297,9 +297,20 @@ func (d *Daemon) applyPaneExit(paneID uint64) ([]ViewTransition, []clientDeliver
 	pane = removedPane
 	delete(d.processObservations, paneID)
 	delete(d.processSaveCandidates, paneID)
+	transitions, clients, terminalSessionIDs = d.groupMemberTransitionsNow(group, 0, viewTransitionPaneExit, pane)
+	return transitions, clients, terminalSessionIDs, true
+}
+
+// groupMemberTransitionsNow projects a removal from a group's shared graph onto
+// every attached member except skipSessionID, whose caller already carries its
+// own view. It also reports the members left with no windows.
+func (d *Daemon) groupMemberTransitionsNow(group *GroupState, skipSessionID uint64, reason ViewTransitionReason, pane *Pane) ([]ViewTransition, []clientDeliveryTarget, []uint64) {
+	var transitions []ViewTransition
+	var clients []clientDeliveryTarget
+	var terminalSessionIDs []uint64
 	for _, memberID := range group.memberIDsSnapshot() {
 		state := d.sessions[memberID]
-		if state == nil {
+		if state == nil || state.ID == skipSessionID {
 			continue
 		}
 		if len(state.Windows) == 0 {
@@ -312,7 +323,7 @@ func (d *Daemon) applyPaneExit(paneID uint64) ([]ViewTransition, []clientDeliver
 		if state.ActiveWindowID != 0 {
 			_, _ = prepareClientWindowGeometryNow(client, state, state.ActiveWindowID)
 		}
-		transition := d.prepareViewTransitionNow(viewTransitionPaneExit, client, state, pane)
+		transition := d.prepareViewTransitionNow(reason, client, state, pane)
 		if state.ActiveWindowID == 0 {
 			transition.Projection.Close = true
 			transition.Projection.CloseReason = "no viewable fallback window"
@@ -320,7 +331,7 @@ func (d *Daemon) applyPaneExit(paneID uint64) ([]ViewTransition, []clientDeliver
 		transitions = append(transitions, transition)
 		clients = append(clients, clientDeliveryTarget{ClientID: client.ID, Connection: client.State.Active})
 	}
-	return transitions, clients, terminalSessionIDs, true
+	return transitions, clients, terminalSessionIDs
 }
 
 func Run(ctx context.Context, cfg Config) error {

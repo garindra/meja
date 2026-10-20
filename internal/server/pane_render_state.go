@@ -410,6 +410,7 @@ func (s *panePublicationState) attach(lease *OutputLease, layoutRevision protoco
 
 func (s *panePublicationState) detach() {
 	s.cancelPending()
+	s.lease.reclaimAbandoned()
 	s.lease = nil
 	s.failure = nil
 	s.layoutRevision = 0
