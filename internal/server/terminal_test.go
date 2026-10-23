@@ -1083,15 +1083,18 @@ func TestLFCreatesHardBoundary(t *testing.T) {
 	}
 }
 
-func TestCRDoesNotCreateFalseWrapChain(t *testing.T) {
+func TestCRPreservesIncomingSoftWrapAndClearsOutgoingSoftWrap(t *testing.T) {
 	term := newTerminal(5, 2)
 	term.Apply([]byte("abcdef"))
 	if !term.rowWrapped(0) {
 		t.Fatal("expected initial soft wrap")
 	}
 	term.Apply([]byte("\rZ"))
-	if term.rowWrapped(0) {
-		t.Fatal("carriage-return overwrite should conservatively break the wrap chain")
+	if !term.rowWrapped(0) {
+		t.Fatal("carriage return discarded the soft wrap into the current row")
+	}
+	if term.rowWrapped(1) {
+		t.Fatal("carriage return retained a soft wrap out of the current row")
 	}
 }
 

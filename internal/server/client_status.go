@@ -42,16 +42,7 @@ func (c *ClientInstance) publishClientStatus() error {
 		ServerHome:     serverHome(),
 		Root:           status.Root,
 		Kind:           protocol.ClientStatusNormal,
-		Windows:        make([]protocol.ClientStatusWindow, 0, len(status.Windows)),
-	}
-	for _, window := range status.Windows {
-		msg.Windows = append(msg.Windows, protocol.ClientStatusWindow{
-			WindowID: window.WindowID,
-			Index:    window.Index,
-			Title:    window.Title,
-			Active:   window.Active,
-			Zoomed:   window.Zoomed,
-		})
+		Windows:        statusWindows(status.Windows),
 	}
 	if prompt := c.ActivePrompt(); prompt != nil {
 		msg.Kind = protocol.ClientStatusPrompt
@@ -67,6 +58,35 @@ func (c *ClientInstance) publishClientStatus() error {
 		msg.Message = protocol.ClientStatusMessageState{ID: c.statusMessageID, Text: c.statusMessage}
 	}
 	return sendEncoded(c.controlOut, protocol.MsgClientStatus, msg, protocol.EncodeClientStatus)
+}
+
+func statusWindows(windows []WindowStatus) []protocol.ClientStatusWindow {
+	out := make([]protocol.ClientStatusWindow, 0, len(windows))
+	for _, window := range windows {
+		out = append(out, protocol.ClientStatusWindow{
+			WindowID: window.WindowID,
+			Index:    window.Index,
+			Title:    window.Title,
+			Active:   window.Active,
+			Zoomed:   window.Zoomed,
+		})
+	}
+	return out
+}
+
+// statusTabWindowAt maps a pointer cell on the status row to a window index.
+// Clicks are ignored while a prompt or message replaces the tab list.
+func (c *ClientInstance) statusTabWindowAt(x, y int) (int, bool) {
+	if c == nil || !c.currentView.StatusValid || c.terminalRows == 0 || y != int(c.terminalRows)-1 {
+		return 0, false
+	}
+	if c.ActivePrompt() != nil || c.statusMessage != "" {
+		return 0, false
+	}
+	status := c.currentView.Status
+	text, tabs := protocol.StatusText(status.SessionName, status.SessionID, statusWindows(status.Windows))
+	location := protocol.StatusLocation(serverHostname(), status.Root, serverHome())
+	return protocol.StatusTabAt(int(c.terminalCols), x, text, location, tabs)
 }
 
 func serverHostname() string {

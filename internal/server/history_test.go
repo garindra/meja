@@ -363,6 +363,24 @@ func TestHistorySelectionExtractsUTF8AndJoinsSoftWrappedRows(t *testing.T) {
 	}
 }
 
+func TestHistorySelectionJoinsAutowrapAfterCRLF(t *testing.T) {
+	term := newTerminal(5, 3)
+	term.Apply([]byte("abcdef\r\n"))
+	snapshot := captureTerminalHistorySnapshot(term)
+	defer snapshot.release()
+
+	data, err := extractHistorySelection(snapshot, paneHistorySelection{
+		Anchor: paneHistoryPosition{Row: 0, Col: 0},
+		Head:   paneHistoryPosition{Row: 1, Col: 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), "abcdef"; got != want {
+		t.Fatalf("selection after autowrap and CRLF = %q, want %q", got, want)
+	}
+}
+
 func TestHistorySelectionPositionSnapsWideContinuationToAnchor(t *testing.T) {
 	term := newTerminal(4, 1)
 	setTestRows(term, nil, []decodedTestRow{{Cells: []decodedTestCell{
