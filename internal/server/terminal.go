@@ -525,7 +525,10 @@ func (t *TerminalState) ApplyInto(data []byte, update *Update) {
 				t.Parser.state = parserESC
 			case '\r':
 				t.invalidateTail()
-				t.breakWrapChainAt(t.CursorY)
+				// Returning to the start of this row can invalidate a soft wrap
+				// from it, but not the soft wrap into it. The latter still joins
+				// this row to the preceding part of the same logical line.
+				t.setRowWrapped(t.CursorY, false)
 				t.CursorX = 0
 				t.wrapPending = false
 				update.CursorChanged = true
@@ -1959,7 +1962,10 @@ func itoa(v int) string {
 }
 
 func (t *TerminalState) lineFeed(update *Update) {
-	t.breakWrapChainAt(t.CursorY)
+	// LF ends this row, but a soft wrap into the row remains part of the
+	// logical line. Clearing the preceding row's flag here makes copy mode
+	// insert a newline inside autowrapped content after a typical CRLF.
+	t.setRowWrapped(t.CursorY, false)
 	if t.CursorY == t.ScrollBottom {
 		styleID := t.eraseStyleID()
 		t.scrollUpRegion(t.ScrollTop, t.ScrollBottom, styleID)

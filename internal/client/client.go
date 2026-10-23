@@ -13,7 +13,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -2247,27 +2246,10 @@ func (s *scanoutState) emitStatus() {
 		style = protocol.Style{FG: protocol.Color{Mode: "indexed", Index: 0}, BG: protocol.Color{Mode: "indexed", Index: 3}}
 		text = s.status.Message.Text
 	default:
-		if s.status.SessionName != "" {
-			text = fmt.Sprintf("[%s] ", s.status.SessionName)
-		} else {
-			text = fmt.Sprintf("[%d] ", s.status.SessionID)
-		}
-		for _, window := range s.status.Windows {
-			flags := ""
-			if window.Active {
-				flags += "*"
-			}
-			if window.Zoomed {
-				flags += "Z"
-			}
-			if flags == "" {
-				flags = " "
-			}
-			text += fmt.Sprintf("%d:%s%s ", window.Index, window.Title, flags)
-		}
+		text, _ = protocol.StatusText(s.status.SessionName, s.status.SessionID, s.status.Windows)
 	}
-	location := statusLocation(s.status.ServerHostname, s.status.Root, s.status.ServerHome)
-	left, right := statusLineParts(s.cols, text, location)
+	location := protocol.StatusLocation(s.status.ServerHostname, s.status.Root, s.status.ServerHome)
+	left, right := protocol.StatusLineParts(s.cols, text, location)
 	row := s.rows
 	s.ansi.WriteString("\x1b[?25l\x1b[?7l")
 	writeCursorPosition(&s.ansi, row, 1)
@@ -2286,106 +2268,6 @@ func (s *scanoutState) emitStatus() {
 	s.ansi.WriteString("\x1b[?7h")
 	s.selectAuthoritativeCursor()
 	s.emitActiveCursor()
-}
-
-func statusLineParts(width int, text, location string) ([]rune, []rune) {
-	if width <= 0 {
-		return nil, nil
-	}
-	left, right := []rune(text), []rune(location)
-	if len(left)+len(right) <= width {
-		return left, right
-	}
-	leftWidth := width / 2
-	rightWidth := width - leftWidth
-	if len(left) < leftWidth {
-		rightWidth += leftWidth - len(left)
-		leftWidth = len(left)
-	}
-	if len(right) < rightWidth {
-		leftWidth += rightWidth - len(right)
-		rightWidth = len(right)
-	}
-	if len(left) > leftWidth {
-		left = ellipsizeStatusPrefix(left, leftWidth)
-	}
-	if len(right) > rightWidth {
-		right = ellipsizeStatusLocation(right, rightWidth)
-	}
-	return left, right
-}
-
-func ellipsizeStatusPrefix(value []rune, width int) []rune {
-	if width <= 0 {
-		return nil
-	}
-	if width == 1 {
-		return []rune{'…'}
-	}
-	result := make([]rune, width)
-	copy(result, value[:width-1])
-	result[width-1] = '…'
-	return result
-}
-
-func ellipsizeStatusLocation(value []rune, width int) []rune {
-	if width <= 0 {
-		return nil
-	}
-	if width == 1 {
-		return []rune{'…'}
-	}
-	colon := -1
-	for i, r := range value {
-		if r == ':' {
-			colon = i
-			break
-		}
-	}
-	if len(value) >= 3 && value[0] == '[' && value[len(value)-1] == ']' && colon > 0 {
-		prefixWidth := colon + 1
-		tailWidth := width - prefixWidth - 2
-		if tailWidth >= 4 {
-			result := make([]rune, 0, width)
-			result = append(result, value[:prefixWidth]...)
-			result = append(result, '…')
-			result = append(result, value[len(value)-1-tailWidth:len(value)-1]...)
-			result = append(result, ']')
-			return result
-		}
-	}
-	result := make([]rune, width)
-	result[0] = '…'
-	copy(result[1:], value[len(value)-width+1:])
-	return result
-}
-
-func statusLocation(hostname, root, home string) string {
-	if root != "" {
-		root = filepath.Clean(root)
-	}
-	if home != "" {
-		home = filepath.Clean(home)
-	}
-	if root == "." {
-		root = ""
-	}
-	if root != "" && home != "" {
-		if relative, err := filepath.Rel(home, root); err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			if relative == "." {
-				root = "~"
-			} else {
-				root = "~/" + filepath.ToSlash(relative)
-			}
-		}
-	}
-	if hostname == "" {
-		hostname = "?"
-	}
-	if root == "" {
-		return "[" + hostname + "]"
-	}
-	return "[" + hostname + ":" + filepath.ToSlash(root) + "]"
 }
 
 func (r *runtimeState) renderLoop(ctx context.Context, errs chan<- error) {

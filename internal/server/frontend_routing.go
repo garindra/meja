@@ -553,6 +553,15 @@ func (c *ClientInstance) handleFrontendPointer(revision protocol.ClientLayoutRev
 			return err
 		}
 	}
+	if pointer.Action == frontendPointerPress && pointer.Button == 0 {
+		if index, ok := c.statusTabWindowAt(pointer.X, pointer.Y); ok {
+			_, err := c.executeAttachedCommand([]string{"select-window", "-t", ":" + strconv.Itoa(index)})
+			if err != nil {
+				c.showStatusMessage(err.Error())
+			}
+			return c.publishClientStatus()
+		}
+	}
 	layout, current := c.inputLayoutForRevision(revision)
 	paneID, rect, found := uint64(0), protocol.Rect{}, false
 	if current {
