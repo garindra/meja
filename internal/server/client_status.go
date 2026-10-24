@@ -75,9 +75,10 @@ func statusWindows(windows []WindowStatus) []protocol.ClientStatusWindow {
 }
 
 // statusTabWindowAt maps a pointer cell on the status row to a window index.
-// Clicks are ignored while a prompt or message replaces the tab list.
+// terminalRows counts content rows only, so the status row sits directly below
+// them. Clicks are ignored while a prompt or message replaces the tab list.
 func (c *ClientInstance) statusTabWindowAt(x, y int) (int, bool) {
-	if c == nil || !c.currentView.StatusValid || c.terminalRows == 0 || y != int(c.terminalRows)-1 {
+	if c == nil || !c.currentView.StatusValid || c.terminalRows == 0 || y != int(c.terminalRows) {
 		return 0, false
 	}
 	if c.ActivePrompt() != nil || c.statusMessage != "" {
